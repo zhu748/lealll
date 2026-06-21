@@ -14,6 +14,10 @@
  *      is safe and matches ZCode's `applyCacheControl: true` default.
  *   3. Anthropic format + `ctx.userId` set → inject `metadata: { user_id }`.
  *      Mirrors `user_id: B.metadata.userId` at bundle offset ~4760586.
+ *   4. Anthropic format → strip fields unsupported by GLM upstream
+ *      (`thinking`, `context_management`, `output_config`) and relocate
+ *      `role: "system"` messages from the messages array to the `system` field.
+ *      These Claude-Code-specific fields cause upstream 3001 "parameter error".
  *
  * @see _reverse/NOTEPAD.md "How Credential is Used for LLM Calls"
  */
@@ -53,6 +57,8 @@ export function transformRequestBody(body: string | undefined, ctx: TransformCon
     if (ctx.startPlan) {
       modified = applyStartPlanSystem(obj) || modified;
     }
+    modified = stripUnsupportedAnthropicFields(obj) || modified;
+    modified = relocateSystemMessages(obj) || modified;
     modified = applyAnthropicCacheControl(obj) || modified;
     if (ctx.userId) {
       modified = applyAnthropicUserId(obj, ctx.userId) || modified;
@@ -122,6 +128,88 @@ function applyAnthropicUserId(body: Record<string, unknown>, userId: string): bo
     ...(isPlainObject(existing) ? existing : {}),
     user_id: userId,
   };
+  return true;
+}
+
+/**
+ * Strip top-level Anthropic request fields that GLM upstream does not support.
+ * These are sent by Claude Code but cause upstream 3001 "parameter error".
+ *
+ * Removed fields:
+ *   - `thinking` — extended thinking / adaptive thinking (GLM has no equivalent)
+ *   - `context_management` — context window management hints (GLM-specific)
+ *   - `output_config` — effort level configuration (GLM has no equivalent)
+ */
+function stripUnsupportedAnthropicFields(body: Record<string, unknown>): boolean {
+  let changed = false;
+  for (const key of ["thinking", "context_management", "output_config"] as const) {
+    if (key in body) {
+      delete body[key];
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+/**
+ * Relocate `role: "system"` messages from the `messages` array to the `system` field.
+ *
+ * Claude Code places system instructions in `messages[].role = "system"`, but the
+ * Anthropic Messages API requires system content in the top-level `system` field —
+ * `role: "system"` is not a valid value inside `messages`. GLM's Anthropic-compatible
+ * endpoint rejects this with 3001 "parameter error".
+ *
+ * Existing `system` content (string or array) is preserved; relocated system messages
+ * are appended after any existing system blocks.
+ */
+function relocateSystemMessages(body: Record<string, unknown>): boolean {
+  const messages = body.messages;
+  if (!Array.isArray(messages)) return false;
+
+  const systemMsgs: Array<Record<string, unknown>> = [];
+  const remaining: unknown[] = [];
+
+  for (const msg of messages) {
+    if (isPlainObject(msg) && msg.role === "system") {
+      systemMsgs.push(msg);
+    } else {
+      remaining.push(msg);
+    }
+  }
+
+  if (systemMsgs.length === 0) return false;
+
+  // Move system messages out of the messages array
+  body.messages = remaining;
+
+  // Append their content to the top-level `system` field
+  const newBlocks: Array<{ type: string; text: string }> = [];
+  for (const msg of systemMsgs) {
+    const content = msg.content;
+    if (typeof content === "string" && content.trim()) {
+      newBlocks.push({ type: "text", text: content });
+    } else if (Array.isArray(content)) {
+      for (const block of content) {
+        if (isPlainObject(block) && block.type === "text" && typeof block.text === "string" && block.text.trim()) {
+          newBlocks.push({ type: "text", text: block.text });
+        }
+      }
+    }
+  }
+
+  if (newBlocks.length === 0) return true; // messages array was modified even if nothing to append
+
+  // Merge with existing system field
+  const existing = body.system;
+  if (existing == null) {
+    body.system = newBlocks;
+  } else if (typeof existing === "string") {
+    body.system = [{ type: "text", text: existing }, ...newBlocks];
+  } else if (Array.isArray(existing)) {
+    body.system = [...existing, ...newBlocks];
+  }
+  // If system is some other type, overwrite with newBlocks (shouldn't happen)
+
   return true;
 }
 
