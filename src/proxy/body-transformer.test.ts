@@ -413,11 +413,15 @@ describe("transformRequestBody — strip thinking blocks from messages (Anthropi
     const out = transformRequestBody(body, { format: "anthropic" });
     const parsed = JSON.parse(out as string);
     // thinking block gone, tool_use preserved
-    expect(parsed.messages[0].content.length).toBe(1);
-    expect(parsed.messages[0].content[0].type).toBe("tool_use");
-    expect(parsed.messages[0].content[0].id).toBe("t1");
-    expect(parsed.messages[0].content[0].name).toBe("Bash");
-    expect(parsed.messages[0].content[0].input).toEqual({ cmd: "ls" });
+    // After v2.1.3.7beta0: empty text block inserted at front (gateway requires
+    // assistant messages to have a text block)
+    expect(parsed.messages[0].content.length).toBe(2);
+    expect(parsed.messages[0].content[0].type).toBe("text");
+    expect(parsed.messages[0].content[0].text).toBe("");
+    expect(parsed.messages[0].content[1].type).toBe("tool_use");
+    expect(parsed.messages[0].content[1].id).toBe("t1");
+    expect(parsed.messages[0].content[1].name).toBe("Bash");
+    expect(parsed.messages[0].content[1].input).toEqual({ cmd: "ls" });
     // tool_result preserved, cache_control NOT attached to it (gateway rejects)
     expect(parsed.messages[1].content[0].type).toBe("tool_result");
     expect(parsed.messages[1].content[0].tool_use_id).toBe("t1");
@@ -828,11 +832,13 @@ describe("transformRequestBody — strip cache_control from tool_result (Anthrop
   });
 
   it("skips cache_control entirely when no text block exists in any message", () => {
-    // Edge case: all messages have only tool_use / tool_result blocks, no text.
-    // Cache_control should be skipped, not forced onto a non-text block.
+    // After v2.1.3.7beta0, assistant messages with only tool_use get an empty
+    // text block inserted. So cache_control lands on that inserted text block
+    // in the assistant message — NOT on tool_use, NOT on tool_result, NOT on
+    // the first user message (which would have been the fallback before).
     const body = JSON.stringify({
       messages: [
-        { role: "user", content: "你好" },  // string → converted to text block
+        { role: "user", content: "你好" },  // string content
         {
           role: "assistant",
           content: [{ type: "tool_use", id: "t1", name: "Bash", input: { cmd: "ls" } }],
@@ -847,17 +853,262 @@ describe("transformRequestBody — strip cache_control from tool_result (Anthrop
     });
     const out = transformRequestBody(body, { format: "anthropic" });
     const parsed = JSON.parse(out as string);
-    // The first user message (string "你好") gets converted to a text block
-    // with cache_control — that's the only text block in the conversation.
+
+    // First user message: string content stays as string (cache_control did
+    // NOT land here, because the assistant's inserted text block was found first)
     const firstUser = parsed.messages[0];
-    expect(Array.isArray(firstUser.content)).toBe(true);
-    expect(firstUser.content[0].type).toBe("text");
-    expect(firstUser.content[0].cache_control).toEqual({ type: "ephemeral" });
-    // No tool_use or tool_result block should have cache_control
+    expect(typeof firstUser.content).toBe("string");
+    expect(firstUser.content).toBe("你好");
+
+    // Assistant message: empty text block inserted at front, cache_control
+    // attached to that text block
     const assistant = parsed.messages[1];
-    expect(assistant.content[0].cache_control).toBeUndefined();
+    expect(Array.isArray(assistant.content)).toBe(true);
+    expect(assistant.content[0].type).toBe("text");
+    expect(assistant.content[0].text).toBe("");
+    expect(assistant.content[0].cache_control).toEqual({ type: "ephemeral" });
+    // tool_use block has NO cache_control
+    expect(assistant.content[1].type).toBe("tool_use");
+    expect(assistant.content[1].cache_control).toBeUndefined();
+
+    // Last user message: tool_result, NO cache_control
     const lastUser = parsed.messages[2];
+    expect(lastUser.content[0].type).toBe("tool_result");
     expect(lastUser.content[0].cache_control).toBeUndefined();
+  });
+});
+
+describe("transformRequestBody — ensure assistant has text block (v2.1.3.7beta0)", () => {
+  it("inserts empty text block when assistant has only tool_use (after thinking strip)", () => {
+    // Reproduces the v2.1.3.6beta0 user report: rounds 3-5 had assistant
+    // messages like [thinking, tool_use]; after thinking strip they became
+    // [tool_use] only, which ZCode gateway rejects with 3001.
+    const body = JSON.stringify({
+      messages: [
+        { role: "user", content: "你好" },
+        {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "let me check", signature: "" },
+            { type: "tool_use", id: "t1", name: "Bash", input: { cmd: "ls" } },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            { tool_use_id: "t1", type: "tool_result", content: "out", is_error: false },
+          ],
+        },
+      ],
+    });
+    const out = transformRequestBody(body, { format: "anthropic" });
+    const parsed = JSON.parse(out as string);
+    const assistant = parsed.messages[1];
+    // After thinking strip + ensureAssistantTextBlock:
+    // content should be [text(""), tool_use]
+    expect(assistant.content.length).toBe(2);
+    expect(assistant.content[0].type).toBe("text");
+    expect(assistant.content[0].text).toBe("");
+    expect(assistant.content[1].type).toBe("tool_use");
+    expect(assistant.content[1].id).toBe("t1");
+  });
+
+  it("inserts empty text block when assistant originally has only tool_use (no thinking)", () => {
+    // Claude Code sometimes sends assistant messages with only tool_use
+    // (no thinking, no text). ZCode gateway rejects these too.
+    const body = JSON.stringify({
+      messages: [
+        { role: "user", content: "你好" },
+        {
+          role: "assistant",
+          content: [
+            { type: "tool_use", id: "t1", name: "Bash", input: { cmd: "ls" } },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            { tool_use_id: "t1", type: "tool_result", content: "out", is_error: false },
+          ],
+        },
+      ],
+    });
+    const out = transformRequestBody(body, { format: "anthropic" });
+    const parsed = JSON.parse(out as string);
+    const assistant = parsed.messages[1];
+    expect(assistant.content.length).toBe(2);
+    expect(assistant.content[0].type).toBe("text");
+    expect(assistant.content[0].text).toBe("");
+    expect(assistant.content[1].type).toBe("tool_use");
+  });
+
+  it("does NOT modify assistant that already has a text block", () => {
+    const body = JSON.stringify({
+      messages: [
+        { role: "user", content: "你好" },
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "let me check" },
+            { type: "tool_use", id: "t1", name: "Bash", input: { cmd: "ls" } },
+          ],
+        },
+      ],
+    });
+    const out = transformRequestBody(body, { format: "anthropic" });
+    const parsed = JSON.parse(out as string);
+    const assistant = parsed.messages[1];
+    expect(assistant.content.length).toBe(2);
+    expect(assistant.content[0].type).toBe("text");
+    expect(assistant.content[0].text).toBe("let me check");
+  });
+
+  it("does NOT modify user messages (user can be all tool_result)", () => {
+    const body = JSON.stringify({
+      messages: [
+        { role: "user", content: "你好" },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "checking" }],
+        },
+        {
+          role: "user",
+          content: [
+            { tool_use_id: "t1", type: "tool_result", content: "out", is_error: false },
+          ],
+        },
+      ],
+    });
+    const out = transformRequestBody(body, { format: "anthropic" });
+    const parsed = JSON.parse(out as string);
+    // user message with only tool_result should NOT get a text block inserted
+    const userMsg = parsed.messages[2];
+    expect(userMsg.content.length).toBe(1);
+    expect(userMsg.content[0].type).toBe("tool_result");
+  });
+
+  it("full Claude Code multi-round regression (v2.1.3.6beta0 round-7 scenario)", () => {
+    // Reproduces the EXACT message structure from user's v2.1.3.6beta0 log:
+    //   msgs[[0]user/{text,text},[1]assistant/{text},[2]user/str,
+    //        [3]assistant/{tool_use},[4]user/{tool_result},
+    //        [5]assistant/{tool_use},[6]user/{tool_result},
+    //        [7]assistant/{tool_use},[8]user/{tool_result},
+    //        [9]assistant/{text+cc,tool_use},[10]user/{tool_result}]
+    // [3],[5],[7] had thinking blocks stripped → became [tool_use] only.
+    // ZCode gateway 3001'd on round 7 because of these text-less assistant msgs.
+    const body = JSON.stringify({
+      model: "glm-5.2",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "<system-reminder>...</system-reminder>" },
+            { type: "text", text: "你好" },
+          ],
+        },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "你好！我是 ZCode..." }],
+        },
+        { role: "user", content: "帮我看看这个项目是干嘛的" },
+        // Round 3: [thinking, tool_use] → after strip: [text(""), tool_use]
+        {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "...", signature: "" },
+            { type: "tool_use", id: "call_1", name: "Bash", input: { command: "ls" } },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            { tool_use_id: "call_1", type: "tool_result", content: "out1", is_error: false },
+          ],
+        },
+        // Round 4: [thinking, tool_use] → after strip: [text(""), tool_use]
+        {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "...", signature: "" },
+            { type: "tool_use", id: "call_2", name: "Bash", input: { command: "ls subdir" } },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            { tool_use_id: "call_2", type: "tool_result", content: "out2", is_error: false },
+          ],
+        },
+        // Round 5: [thinking, tool_use] → after strip: [text(""), tool_use]
+        {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "...", signature: "" },
+            { type: "tool_use", id: "call_3", name: "Bash", input: { command: "ls subdir2" } },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            { tool_use_id: "call_3", type: "tool_result", content: "out3", is_error: false },
+          ],
+        },
+        // Round 6: [thinking, text, tool_use] → after strip: [text, tool_use]
+        {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "...", signature: "" },
+            { type: "text", text: "让我再看几个关键文件确认细节。" },
+            { type: "tool_use", id: "call_4", name: "Read", input: { file_path: "x" } },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            { tool_use_id: "call_4", type: "tool_result", content: "out4", is_error: false },
+          ],
+        },
+      ],
+      system: [{ type: "text", text: "You are Claude Code." }],
+      tools: [],
+      thinking: { type: "adaptive" },
+      context_management: { edits: [] },
+      output_config: { effort: "max" },
+    });
+    const out = transformRequestBody(body, {
+      format: "anthropic",
+      userId: "u-123",
+      startPlan: true,
+    });
+    const parsed = JSON.parse(out as string);
+
+    // Every assistant message MUST have at least one text block
+    const assistants = parsed.messages.filter((m: any) => m.role === "assistant");
+    for (const a of assistants) {
+      const hasText = Array.isArray(a.content) &&
+        a.content.some((b: any) => b.type === "text");
+      expect(hasText).toBe(true);
+    }
+
+    // Specifically check the round-3,4,5 assistants (which had thinking stripped)
+    // They should now be [text(""), tool_use]
+    const round3Assistant = parsed.messages.find((m: any) =>
+      m.role === "assistant" && Array.isArray(m.content) &&
+      m.content.some((b: any) => b.id === "call_1")
+    );
+    expect(round3Assistant.content.length).toBe(2);
+    expect(round3Assistant.content[0].type).toBe("text");
+    expect(round3Assistant.content[0].text).toBe("");
+    expect(round3Assistant.content[1].type).toBe("tool_use");
+
+    // No thinking blocks anywhere
+    for (const m of parsed.messages) {
+      if (!Array.isArray(m.content)) continue;
+      for (const b of m.content) {
+        expect(b.type).not.toBe("thinking");
+        expect(b.type).not.toBe("redacted_thinking");
+      }
+    }
   });
 });
 

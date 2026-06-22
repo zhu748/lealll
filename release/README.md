@@ -1,5 +1,21 @@
 # zcode-proxy 使用说明
 
+> **v2.1.3.7beta0 — 修复 assistant 消息只有 tool_use 块（无 text）触发 3001**
+> - **根因定位**：v2.1.3.6beta0 诊断日志显示跑了 6 轮才挂，第 7 轮 3001：
+>   ```
+>   msgs[[0]user/{text,text},[1]assistant/{text},[2]user/str,
+>        [3]assistant/{tool_use},[4]user/{tool_result},
+>        [5]assistant/{tool_use},[6]user/{tool_result},
+>        [7]assistant/{tool_use},[8]user/{tool_result},
+>        [9]assistant/{text+cc,tool_use},[10]user/{tool_result}]
+>   ```
+>   所有 `tool_use` 和 `tool_result` 都没有 `+cc` ✅，cache_control 只在 text 块上 ✅，角色交替正确 ✅。
+>   **但 [3]、[5]、[7] 这三条 assistant 消息只有 `tool_use` 块，没有 `text` 块！**
+> - **原因**：这些 assistant 消息原本是 `[thinking, tool_use]`，thinking 块被剥离后只剩 `[tool_use]`。**ZCode 网关要求 assistant 消息必须有至少一个 text 块**——Anthropic 官方 API 接受只有 tool_use 的 assistant 消息，但 ZCode 网关更严格。
+> - **为什么前 6 轮能跑**：前几轮的 assistant 消息要么有 text 块，要么 thinking 还没被剥离（第一轮无历史）。随着对话累积，越来越多的 text-less assistant 消息堆积，最终触发网关校验。
+> - **修复**：新增 `ensureAssistantTextBlock()` — 检查每条 assistant 消息，如果没有 text 块就在 content 数组开头插入一个空 text 块 `{type:"text", text:""}`。空 text 块在对话中渲染为空，但满足网关要求。
+> - **新增 5 个测试**，包括完整复现 v2.1.3.6beta0 第 7 轮场景的回归测试；全套 282 测试通过
+>
 > **v2.1.3.6beta0 — 修复 tool_use 块上的 cache_control 也触发 3001**
 > - **根因定位**：v2.1.3.5beta0 修复了 tool_result 上的 cache_control，但诊断日志显示新的 3001：
 >   ```

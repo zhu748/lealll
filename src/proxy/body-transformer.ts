@@ -78,6 +78,7 @@ export function transformRequestBodyObj(parsed: unknown, ctx: TransformContext):
     modified = transformUnsupportedAnthropicFields(obj) || modified;
     modified = relocateSystemMessages(obj) || modified;
     modified = stripThinkingBlocksFromMessages(obj) || modified;
+    modified = ensureAssistantTextBlock(obj) || modified;
     modified = sanitizeContentBlocks(obj) || modified;
     modified = applyAnthropicCacheControl(obj) || modified;
     if (ctx.userId) {
@@ -306,6 +307,16 @@ function relocateSystemMessages(body: Record<string, unknown>): boolean {
  * removed from `messages` entirely (an empty assistant turn would also
  * trip GLM's parameter validation).
  *
+ * If stripping leaves an ASSISTANT message with only non-text blocks (e.g.
+ * only `tool_use` blocks — which happens when the original was
+ * `[thinking, tool_use]` and thinking is stripped), an empty `text` block
+ * is inserted at the front. ZCode's start-plan gateway rejects assistant
+ * messages that contain only `tool_use` blocks with 3001 "parameter error"
+ * — Anthropic's official API accepts them, but the gateway is stricter.
+ * This was the root cause of the v2.1.3.6beta0 user report: rounds 3-5
+ * had assistant messages `[tool_use]` (after thinking strip) and the
+ * gateway 3001'd on round 7 once enough had accumulated.
+ *
  * No-op for non-array `content` (string content is never a thinking block).
  */
 function stripThinkingBlocksFromMessages(body: Record<string, unknown>): boolean {
@@ -350,11 +361,74 @@ function stripThinkingBlocksFromMessages(body: Record<string, unknown>): boolean
       continue;
     }
     msg.content = filtered;
+
+    // If this is an assistant message that now has ONLY non-text blocks
+    // (e.g. only tool_use), insert an empty text block at the front.
+    // ZCode gateway rejects assistant messages with no text block.
+    if (msg.role === "assistant") {
+      const hasText = filtered.some((b: unknown) =>
+        isPlainObject(b) && b.type === "text"
+      );
+      if (!hasText) {
+        msg.content = [{ type: "text", text: "" }, ...filtered];
+      }
+    }
+
     surviving.push(msg);
   }
 
   if (changed) {
     body.messages = surviving;
+  }
+  return changed;
+}
+
+/**
+ * Ensure every assistant message has at least one `text` content block.
+ *
+ * ZCode's start-plan gateway rejects assistant messages that contain only
+ * `tool_use` blocks (no text) with 3001 "parameter error". Anthropic's
+ * official API accepts assistant messages with only tool_use blocks, but
+ * the gateway is stricter.
+ *
+ * This can happen in two scenarios:
+ *   1. Claude Code sends an assistant message with `[thinking, tool_use]`
+ *      and stripThinkingBlocksFromMessages removes the thinking block,
+ *      leaving only `[tool_use]`.
+ *   2. Claude Code sends an assistant message with only `[tool_use]`
+ *      directly (less common, but possible when the model calls a tool
+ *      without any preamble text).
+ *
+ * In both cases, we insert an empty `text` block at the front of the
+ * content array. The empty text is harmless — it renders as nothing in
+ * the conversation, but satisfies the gateway's requirement that
+ * assistant messages have a text block.
+ *
+ * No-op for:
+ *   - Non-array content (string content is already text)
+ *   - Messages that already have a text block
+ *   - Non-assistant messages (user messages can be all tool_result)
+ */
+function ensureAssistantTextBlock(body: Record<string, unknown>): boolean {
+  const messages = body.messages;
+  if (!Array.isArray(messages)) return false;
+
+  let changed = false;
+  for (const msg of messages) {
+    if (!isPlainObject(msg)) continue;
+    if (msg.role !== "assistant") continue;
+    const content = msg.content;
+    if (!Array.isArray(content)) continue;
+
+    const hasText = content.some((b: unknown) =>
+      isPlainObject(b) && b.type === "text"
+    );
+    if (!hasText) {
+      // Insert empty text block at the front.
+      // Using unshift on the existing array to mutate in place.
+      content.unshift({ type: "text", text: "" });
+      changed = true;
+    }
   }
   return changed;
 }
