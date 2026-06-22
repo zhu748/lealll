@@ -1,13 +1,63 @@
 # Release 构建与发布指令
 
 > 供 Agent 参考的完整构建流程。每次发版前务必按此文档执行。
+>
+> **重要**：`start.bat` / `start.sh` 已纳入仓库 `release/` 目录，不再每次重写。
+> 仅 `zcode-proxy.exe`（编译产物）和 `config.yaml`（从模板复制）需要每次构建时生成。
 
 ---
 
-## 1. 编译 Windows 可执行文件
+## 0. 前置准备
 
 ```bash
-cd /home/z/my-project/zhipu
+cd /home/z/my-project/lealll
+# 确保仓库已拉取最新代码
+git pull
+```
+
+确认 `release/` 目录已包含：
+- `start.bat`  — Windows 启动脚本（仓库内，ASCII + CRLF）
+- `start.sh`   — Linux/macOS 启动脚本（仓库内，可执行）
+- `README.md`  — 使用说明（仓库内，每次发版时更新版本号）
+
+如果以上文件缺失，从 git 历史恢复即可：`git checkout main -- release/`。
+
+---
+
+## 1. 更新版本号
+
+三处版本号必须同步：
+
+```bash
+VERSION="2.1.3.5"   # 替换为当前版本
+
+# package.json
+sed -i "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" package.json
+
+# src/index.ts (VERSION 常量)
+sed -i "s/const VERSION = \".*\"/const VERSION = \"$VERSION\"/" src/index.ts
+
+# release/README.md (顶部版本说明，手动更新改进列表)
+
+# src/admin/dashboard.html.txt (侧栏版本号)
+sed -i "s|<span>v2\.[0-9.]*</span>|<span>v$VERSION</span>|" src/admin/dashboard.html.txt
+```
+
+---
+
+## 2. 跑测试 + 类型检查
+
+```bash
+bun test             # 必须全部通过
+bun x tsc --noEmit   # 必须零错误
+```
+
+---
+
+## 3. 编译 Windows 可执行文件
+
+```bash
+cd /home/z/my-project/lealll
 
 # 必须加 --target=bun-windows-x64，否则编译出的是 Linux ELF 格式，Windows 无法运行
 bun build --compile \
@@ -26,280 +76,86 @@ file release/zcode-proxy.exe
 
 ---
 
-## 2. 准备 release 目录文件
+## 4. 准备 release 目录文件
 
-目录结构：
+目录结构（仓库已含 start.bat / start.sh / README.md，编译后只需补两个文件）：
 ```
 release/
 ├── zcode-proxy.exe    ← 上一步编译的
 ├── config.yaml        ← 从 config.example.yaml 复制
-├── start.bat          ← Windows 启动脚本（必须纯 ASCII + CRLF 换行）
-├── start.sh           ← Linux/macOS 启动脚本
-└── README.md          ← 使用说明
+├── start.bat          ← 仓库内（不要重写）
+├── start.sh           ← 仓库内（不要重写）
+└── README.md          ← 仓库内（每次发版手动更新版本说明）
 ```
 
-### 2.1 config.yaml
+### 4.1 config.yaml
 
 ```bash
 cp config.example.yaml release/config.yaml
 ```
 
-### 2.2 start.bat
+### 4.2 验证 start.bat / start.sh 格式
 
-**关键要求**：
-- **必须纯 ASCII**，不能有中文（Windows CMD 默认 GBK 编码，中文会乱码）
-- **必须 CRLF 换行符**（LF 会导致 `if/goto` 等多行结构解析失败）
-- 包含 Plan 选择：OAuth 登录时区分 Coding Plan 和 Start Plan
-- 导入也区分 Plan（`--plan=coding-plan` / `--plan=start-plan`）
+每次发版前快速验证仓库里的脚本格式没有损坏（理论上不会，但防御性检查）：
 
-生成方法：
 ```bash
-cat > release/start.bat << 'BATCHEOF'
-@echo off
-echo.
-echo ============================================
-echo          zcode-proxy Manager
-echo ============================================
-echo.
-echo   1. Start proxy server
-echo   2. OAuth login (Bigmodel) - Coding Plan
-echo   3. OAuth login (Z.AI) - Coding Plan
-echo   4. OAuth login (Bigmodel) - Start Plan
-echo   5. OAuth login (Z.AI) - Start Plan
-echo   6. Import key from ZCode (Bigmodel)
-echo   7. Import key from ZCode (Z.AI)
-echo   8. Check login status
-echo   9. Logout
-echo   0. Exit
-echo.
-set /p choice=Select: 
+# start.bat 必须是 ASCII + CRLF
+file release/start.bat
+# 期望: DOS batch file, ASCII text, with CRLF line terminators
 
-if "%choice%"=="1" goto serve
-if "%choice%"=="2" goto login_bigmodel_cp
-if "%choice%"=="3" goto login_zai_cp
-if "%choice%"=="4" goto login_bigmodel_sp
-if "%choice%"=="5" goto login_zai_sp
-if "%choice%"=="6" goto import_bigmodel
-if "%choice%"=="7" goto import_zai
-if "%choice%"=="8" goto status
-if "%choice%"=="9" goto logout
-if "%choice%"=="0" exit
-goto end
+# start.sh 必须可执行
+[ -x release/start.sh ] && echo "OK" || chmod +x release/start.sh
+```
 
-:serve
-echo.
-echo Starting proxy server...
-zcode-proxy.exe serve config.yaml
-pause
-goto end
-
-:login_bigmodel_cp
-echo.
-echo Starting Bigmodel OAuth login (Coding Plan)...
-zcode-proxy.exe auth login bigmodel --plan=coding-plan
-pause
-goto end
-
-:login_zai_cp
-echo.
-echo Starting Z.AI OAuth login (Coding Plan)...
-zcode-proxy.exe auth login zai --plan=coding-plan
-pause
-goto end
-
-:login_bigmodel_sp
-echo.
-echo Starting Bigmodel OAuth login (Start Plan)...
-zcode-proxy.exe auth login bigmodel --plan=start-plan
-pause
-goto end
-
-:login_zai_sp
-echo.
-echo Starting Z.AI OAuth login (Start Plan)...
-zcode-proxy.exe auth login zai --plan=start-plan
-pause
-goto end
-
-:import_bigmodel
-echo.
-echo Importing key from ZCode (Bigmodel)...
-zcode-proxy.exe auth login bigmodel --import
-pause
-goto end
-
-:import_zai
-echo.
-echo Importing key from ZCode (Z.AI)...
-zcode-proxy.exe auth login zai --import
-pause
-goto end
-
-:status
-echo.
-zcode-proxy.exe auth status
-pause
-goto end
-
-:logout
-echo.
-zcode-proxy.exe auth logout
-pause
-goto end
-
-:end
-BATCHEOF
-
-# 转换为 CRLF 换行符
+如果 start.bat 不是 CRLF（被编辑器改坏了）：
+```bash
 sed -i 's/$/\r/' release/start.bat
 ```
 
-验证：
+如果 start.bat 含中文，请从 git 历史恢复：
 ```bash
-file release/start.bat
-# 应输出: DOS batch file, ASCII text, with CRLF line terminators
-```
-
-### 2.3 start.sh
-
-与 start.bat 对应的 Linux/macOS 版本，同样包含 Plan 选择：
-
-```bash
-cat > release/start.sh << 'SHEOF'
-#!/usr/bin/env bash
-
-echo ""
-echo "============================================"
-echo "         zcode-proxy Manager"
-echo "============================================"
-echo ""
-echo "  1. Start proxy server"
-echo "  2. OAuth login (Bigmodel) - Coding Plan"
-echo "  3. OAuth login (Z.AI) - Coding Plan"
-echo "  4. OAuth login (Bigmodel) - Start Plan"
-echo "  5. OAuth login (Z.AI) - Start Plan"
-echo "  6. Import key from ZCode (Bigmodel)"
-echo "  7. Import key from ZCode (Z.AI)"
-echo "  8. Check login status"
-echo "  9. Logout"
-echo "  0. Exit"
-echo ""
-read -p "Select: " choice
-
-case $choice in
-  1)
-    echo ""
-    echo "Starting proxy server..."
-    echo ""
-    chmod +x zcode-proxy.exe
-    ./zcode-proxy.exe serve config.yaml
-    ;;
-  2)
-    echo ""
-    echo "Starting Bigmodel OAuth login (Coding Plan)..."
-    echo "Browser will open automatically for authorization..."
-    echo ""
-    ./zcode-proxy.exe auth login bigmodel --plan=coding-plan
-    ;;
-  3)
-    echo ""
-    echo "Starting Z.AI OAuth login (Coding Plan)..."
-    echo "Browser will open automatically for authorization..."
-    echo ""
-    ./zcode-proxy.exe auth login zai --plan=coding-plan
-    ;;
-  4)
-    echo ""
-    echo "Starting Bigmodel OAuth login (Start Plan)..."
-    echo "Browser will open automatically for authorization..."
-    echo ""
-    ./zcode-proxy.exe auth login bigmodel --plan=start-plan
-    ;;
-  5)
-    echo ""
-    echo "Starting Z.AI OAuth login (Start Plan)..."
-    echo "Browser will open automatically for authorization..."
-    echo ""
-    ./zcode-proxy.exe auth login zai --plan=start-plan
-    ;;
-  6)
-    echo ""
-    echo "Importing key from ZCode (Bigmodel)..."
-    echo ""
-    ./zcode-proxy.exe auth login bigmodel --import
-    ;;
-  7)
-    echo ""
-    echo "Importing key from ZCode (Z.AI)..."
-    echo ""
-    ./zcode-proxy.exe auth login zai --import
-    ;;
-  8)
-    echo ""
-    ./zcode-proxy.exe auth status
-    ;;
-  9)
-    echo ""
-    ./zcode-proxy.exe auth logout
-    ;;
-  0)
-    exit 0
-    ;;
-  *)
-    echo "Invalid option"
-    ;;
-esac
-SHEOF
-
-chmod +x release/start.sh
-```
-
-### 2.4 README.md
-
-更新版本号与 `package.json` 一致，包含多账号管理、Plan 绑定、凭证导入导出等使用说明。版本号从 `package.json` 读取：
-
-```bash
-VERSION=$(node -p "require('./package.json').version")
-# 确认 README.md 中的版本号与 $VERSION 一致
+git checkout main -- release/start.bat
 ```
 
 ---
 
-## 3. 打包 zip
+## 5. 打包 zip
 
 版本号从 `package.json` 读取：
 
 ```bash
-cd /home/z/my-project/zhipu
+cd /home/z/my-project/lealll
 VERSION=$(node -p "require('./package.json').version")
 
 cd release
 zip -9 ../zcode-proxy-v${VERSION}.zip zcode-proxy.exe config.yaml start.bat start.sh README.md
+cd ..
 ```
 
 ---
 
-## 4. 推送代码到 GitHub
+## 6. 推送代码到 GitHub
 
 ```bash
-cd /home/z/my-project/zhipu
+cd /home/z/my-project/lealll
 
-# 暂存 zip（不应提交到仓库，仅用于 Release 附件）
-# 确保 .gitignore 包含 *.zip
+# zip 不应提交到仓库（确保 .gitignore 包含 *.zip）
+git status   # 确认 zcode-proxy.exe / config.yaml / *.zip 都不在待提交列表
 
 git add -A
-git commit -m "release: v{版本号}"
-git push https://{用户名}:{token}@github.com/zhu748/zhipu.git main
+git commit -m "release: v${VERSION}"
+git push https://{用户名}:{token}@github.com/zhu748/lealll.git main
 ```
 
 ---
 
-## 5. 创建 GitHub Release 并上传
+## 7. 创建 GitHub Release 并上传
 
 ```bash
-VERSION="0.1.0"  # 从 package.json 读取
+cd /home/z/my-project/lealll
+VERSION=$(node -p "require('./package.json').version")
 TOKEN="{token}"
-REPO="zhu748/zhipu"
+REPO="zhu748/lealll"
 
 # 创建 Release
 RESPONSE=$(curl -s -X POST \
@@ -310,7 +166,7 @@ RESPONSE=$(curl -s -X POST \
     \"tag_name\": \"v$VERSION\",
     \"target_commitish\": \"main\",
     \"name\": \"zcode-proxy v$VERSION\",
-    \"body\": \"## zcode-proxy v$VERSION\\n\\n### 新特性\\n- 多账号管理 + Plan 绑定\\n- OAuth 登录支持 --plan 参数\\n- Dashboard Plan 编辑器\\n- 凭证导入/导出\\n\\n### 文件说明\\n- zcode-proxy.exe — Windows 可执行文件\\n- start.bat / start.sh — 启动脚本（含 Plan 选择）\\n- config.yaml — 配置模板\\n- README.md — 使用说明\",
+    \"body\": \"## zcode-proxy v$VERSION\\n\\n详见 release/README.md\\n\",
     \"draft\": false,
     \"prerelease\": false
   }")
@@ -326,39 +182,66 @@ curl -s -X POST \
   "https://uploads.github.com/repos/$REPO/releases/$RELEASE_ID/assets?name=zcode-proxy-v${VERSION}.zip"
 ```
 
-如果已有同版本 Release，需先删除旧 asset 再上传：
+### 7.1 如果已有同版本 Release（重新发版）
+
 ```bash
 # 查询已有 asset
-ASSET_ID=$(curl -s -H "Authorization: token $TOKEN" \
+ASSET_IDS=$(curl -s -H "Authorization: token $TOKEN" \
   https://api.github.com/repos/$REPO/releases/tags/v$VERSION | \
   python3 -c "import sys,json; d=json.load(sys.stdin); [print(a['id']) for a in d.get('assets',[])]")
 
-# 删除旧 asset
-curl -s -X DELETE \
-  -H "Authorization: token $TOKEN" \
-  https://api.github.com/repos/$REPO/releases/assets/$ASSET_ID
+# 删除所有旧 asset
+for ASSET_ID in $ASSET_IDS; do
+  curl -s -X DELETE \
+    -H "Authorization: token $TOKEN" \
+    https://api.github.com/repos/$REPO/releases/assets/$ASSET_ID
+done
 
-# 再上传新的
+# 然后再上传新的（用上面 RELEASE_ID，从 RELEASE_ID=$(...) 那行重新获取）
+```
+
+### 7.2 如果需要更新已有 Release 的描述
+
+```bash
+curl -s -X PATCH \
+  -H "Authorization: token $TOKEN" \
+  -H "Accept: application/vnd.github+json" \
+  -H "X-GitHub-Api-Version: 2022-11-28" \
+  https://api.github.com/repos/$REPO/releases/$RELEASE_ID \
+  -d "$(jq -n --arg body "$(cat /tmp/release-body.md)" '{body: $body}')"
 ```
 
 ---
 
-## 6. 踩坑清单
+## 8. 清理 token
+
+推送/上传完成后，立即从 remote URL 中移除 token，并提醒用户去 GitHub 删除 token：
+
+```bash
+git remote set-url origin "https://github.com/zhu748/lealll.git"
+```
+
+> ⚠️ **安全提示**：每次发版用的临时 token，发版完成后必须立刻去 https://github.com/settings/tokens 删除。
+
+---
+
+## 9. 踩坑清单
 
 | 坑 | 症状 | 解决 |
 |----|------|------|
 | 没加 `--target=bun-windows-x64` | Windows 报"不兼容的16位应用程序" | 编译时必须加 target |
-| bat 文件含中文 | CMD 乱码，命令被截断 | 全部用英文 |
+| bat 文件含中文 | CMD 乱码，命令被截断 | 全部用英文（仓库内 start.bat 已合规，不要重写） |
 | bat 文件用 LF 换行 | `if/goto` 解析失败，命令被截断 | 必须 CRLF（`sed -i 's/$/\r/'`） |
 | zip 包没含 config.yaml | 用户不知道怎么配置 | 必须包含模板配置 |
 | OAuth 登录未指定 plan | 凭证默认 coding-plan，但用户可能需要 start-plan | 必须传 `--plan=` 参数 |
 | 导入 ZCode 不区分 plan | 只读 coding-plan key，start-plan 用户导入失败 | 传 `--plan=start-plan`，导入函数会读取对应 key |
 | 旧凭证无 plan 字段 | 启动时 plan 为 undefined | 自动回退 config.yaml 的全局 plan，兼容无需处理 |
-| exe 超过 50MB | GitHub 推送时警告 | 可以忽略（仅警告不拒绝），或使用 Git LFS |
+| exe 超过 50MB | GitHub 推送时警告 | 可以忽略（仅警告不拒绝），或使用 Git LFS；zip 压缩后约 38MB 不会有问题 |
+| 误把 start.bat / start.sh 当成每次重写 | release.md 旧版本让 Agent 每次重新生成脚本 | 现在脚本已在仓库内，仅格式校验，不要重写 |
 
 ---
 
-## 7. Plan 系统说明
+## 10. Plan 系统说明
 
 项目支持两种计划，决定上游请求路由：
 
