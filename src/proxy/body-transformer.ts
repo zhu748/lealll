@@ -14,9 +14,10 @@
  *      is safe and matches ZCode's `applyCacheControl: true` default.
  *   3. Anthropic format + `ctx.userId` set → inject `metadata: { user_id }`.
  *      Mirrors `user_id: B.metadata.userId` at bundle offset ~4760586.
- *   4. Anthropic format → strip fields unsupported by GLM upstream
- *      (`thinking`, `context_management`, `output_config`) and relocate
- *      `role: "system"` messages from the messages array to the `system` field.
+ *   4. Anthropic format → transform fields unsupported by GLM upstream
+ *      (convert `thinking` to GLM format, strip `context_management`,
+ *      `output_config`) and relocate `role: "system"` messages from the
+ *      messages array to the `system` field.
  *      These Claude-Code-specific fields cause upstream 3001 "parameter error".
  *
  * @see _reverse/NOTEPAD.md "How Credential is Used for LLM Calls"
@@ -57,7 +58,7 @@ export function transformRequestBody(body: string | undefined, ctx: TransformCon
     if (ctx.startPlan) {
       modified = applyStartPlanSystem(obj) || modified;
     }
-    modified = stripUnsupportedAnthropicFields(obj) || modified;
+    modified = transformUnsupportedAnthropicFields(obj) || modified;
     modified = relocateSystemMessages(obj) || modified;
     modified = applyAnthropicCacheControl(obj) || modified;
     if (ctx.userId) {
@@ -132,17 +133,35 @@ function applyAnthropicUserId(body: Record<string, unknown>, userId: string): bo
 }
 
 /**
- * Strip top-level Anthropic request fields that GLM upstream does not support.
- * These are sent by Claude Code but cause upstream 3001 "parameter error".
+ * Transform or strip top-level Anthropic request fields that GLM upstream does
+ * not support in the format sent by Claude Code.
  *
- * Removed fields:
- *   - `thinking` — extended thinking / adaptive thinking (GLM has no equivalent)
- *   - `context_management` — context window management hints (GLM-specific)
- *   - `output_config` — effort level configuration (GLM has no equivalent)
+ * Transformations:
+ *   - `thinking` — Claude Code sends `{"type":"adaptive"}` or
+ *     `{"type":"enabled","budget_tokens":N}`, but GLM only supports
+ *     `{"type":"enabled"}` (thinking on) or `{"type":"disabled"}` (thinking off).
+ *     We convert "adaptive" and "enabled" to `{"type":"enabled"}` (stripping
+ *     unsupported `budget_tokens`), and keep "disabled" as-is.
+ *   - `context_management` — removed (GLM has no equivalent)
+ *   - `output_config` — removed (GLM has no equivalent)
  */
-function stripUnsupportedAnthropicFields(body: Record<string, unknown>): boolean {
+function transformUnsupportedAnthropicFields(body: Record<string, unknown>): boolean {
   let changed = false;
-  for (const key of ["thinking", "context_management", "output_config"] as const) {
+
+  // Transform thinking: GLM only supports "enabled" / "disabled", no "adaptive" or "budget_tokens"
+  if ("thinking" in body && isPlainObject(body.thinking)) {
+    const t = body.thinking as Record<string, unknown>;
+    const type = t.type;
+    if (type === "adaptive" || type === "enabled") {
+      // Convert to GLM's format: {"type":"enabled"} — strip budget_tokens etc.
+      body.thinking = { type: "enabled" };
+      changed = true;
+    }
+    // "disabled" is passed through as-is; any other value is also left alone
+  }
+
+  // Remove fields GLM does not support at all
+  for (const key of ["context_management", "output_config"] as const) {
     if (key in body) {
       delete body[key];
       changed = true;

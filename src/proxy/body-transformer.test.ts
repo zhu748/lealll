@@ -168,8 +168,8 @@ describe("transformRequestBody — combined behavior", () => {
   });
 });
 
-describe("transformRequestBody — strip unsupported fields (Anthropic)", () => {
-  it("removes thinking field", () => {
+describe("transformRequestBody — transform unsupported fields (Anthropic)", () => {
+  it("converts thinking type 'adaptive' to 'enabled' for GLM", () => {
     const body = JSON.stringify({
       model: "glm-4.6",
       messages: [{ role: "user", content: "hi" }],
@@ -177,8 +177,29 @@ describe("transformRequestBody — strip unsupported fields (Anthropic)", () => 
     });
     const out = transformRequestBody(body, { format: "anthropic" });
     const parsed = JSON.parse(out as string);
-    expect(parsed.thinking).toBeUndefined();
+    expect(parsed.thinking).toEqual({ type: "enabled" });
     expect(parsed.model).toBe("glm-4.6");
+  });
+
+  it("converts thinking type 'enabled' with budget_tokens to simple 'enabled' for GLM", () => {
+    const body = JSON.stringify({
+      messages: [{ role: "user", content: "hi" }],
+      thinking: { type: "enabled", budget_tokens: 10000 },
+    });
+    const out = transformRequestBody(body, { format: "anthropic" });
+    const parsed = JSON.parse(out as string);
+    expect(parsed.thinking).toEqual({ type: "enabled" });
+    expect(parsed.thinking.budget_tokens).toBeUndefined();
+  });
+
+  it("passes thinking type 'disabled' through unchanged", () => {
+    const body = JSON.stringify({
+      messages: [{ role: "user", content: "hi" }],
+      thinking: { type: "disabled" },
+    });
+    const out = transformRequestBody(body, { format: "anthropic" });
+    const parsed = JSON.parse(out as string);
+    expect(parsed.thinking).toEqual({ type: "disabled" });
   });
 
   it("removes context_management field", () => {
@@ -201,23 +222,23 @@ describe("transformRequestBody — strip unsupported fields (Anthropic)", () => 
     expect(parsed.output_config).toBeUndefined();
   });
 
-  it("removes all three unsupported fields at once", () => {
+  it("handles all transformations at once", () => {
     const body = JSON.stringify({
       model: "glm-5.2",
       messages: [{ role: "user", content: "test" }],
-      thinking: { type: "enabled", budget_tokens: 10000 },
+      thinking: { type: "adaptive" },
       context_management: { edits: [] },
       output_config: { effort: "low" },
     });
     const out = transformRequestBody(body, { format: "anthropic" });
     const parsed = JSON.parse(out as string);
-    expect(parsed.thinking).toBeUndefined();
+    expect(parsed.thinking).toEqual({ type: "enabled" });
     expect(parsed.context_management).toBeUndefined();
     expect(parsed.output_config).toBeUndefined();
     expect(parsed.model).toBe("glm-5.2");
   });
 
-  it("does NOT strip unsupported fields for openai format", () => {
+  it("does NOT transform fields for openai format", () => {
     const body = JSON.stringify({
       messages: [{ role: "user", content: "hi" }],
       thinking: { type: "adaptive" },
@@ -225,7 +246,7 @@ describe("transformRequestBody — strip unsupported fields (Anthropic)", () => 
     });
     const out = transformRequestBody(body, { format: "openai" });
     const parsed = JSON.parse(out as string);
-    // thinking is not stripped for openai (though it wouldn't be sent anyway)
+    // thinking is not transformed for openai format
     expect(parsed.thinking).toEqual({ type: "adaptive" });
   });
 });
