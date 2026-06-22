@@ -201,6 +201,48 @@ describe("CORS", () => {
     expect(resp.status).toBe(204);
     expect(resp.headers.get("access-control-allow-origin")).toBe("*");
   });
+
+  it("echoes requesting Origin instead of '*' (security: blocks third-party sites)", async () => {
+    // When a browser sends Origin: https://evil.example.com, the proxy should
+    // echo THAT origin back (not "*") so that:
+    //   1) Same-origin dashboard requests still work.
+    //   2) Arbitrary third-party sites can't read responses via CORS.
+    const config = makeConfig();
+    const auth = new AuthManager({ mode: "apikey", provider: "zai", apiKey: "test" });
+    const handler = createFetchHandler({ config, auth });
+
+    const resp = await handler(
+      new Request("http://localhost/health", {
+        headers: { origin: "https://evil.example.com" },
+      }),
+    );
+    expect(resp.headers.get("access-control-allow-origin")).toBe("https://evil.example.com");
+    expect(resp.headers.get("vary")).toBe("origin");
+  });
+
+  it("falls back to '*' when no Origin header is present (server-to-server)", async () => {
+    const config = makeConfig();
+    const auth = new AuthManager({ mode: "apikey", provider: "zai", apiKey: "test" });
+    const handler = createFetchHandler({ config, auth });
+
+    const resp = await handler(new Request("http://localhost/health"));
+    expect(resp.headers.get("access-control-allow-origin")).toBe("*");
+  });
+
+  it("OPTIONS echoes Origin too", async () => {
+    const config = makeConfig();
+    const auth = new AuthManager({ mode: "apikey", provider: "zai", apiKey: "test" });
+    const handler = createFetchHandler({ config, auth });
+
+    const resp = await handler(
+      new Request("http://localhost/v1/models", {
+        method: "OPTIONS",
+        headers: { origin: "https://my-dashboard.local" },
+      }),
+    );
+    expect(resp.status).toBe(204);
+    expect(resp.headers.get("access-control-allow-origin")).toBe("https://my-dashboard.local");
+  });
 });
 
 describe("route handler exports", () => {

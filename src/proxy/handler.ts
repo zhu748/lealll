@@ -24,10 +24,8 @@ import { translateResponseAnthropicToResponses, anthropicSseToResponsesSse } fro
 import { saveTurn } from "../translator/responses-store.js";
 import { anthropicSseToOpenaiSse } from "../translator/sse-translator.js";
 import type { OpenAIChatRequest, OpenAIResponseRequest, AnthropicMessagesResponse } from "../translator/types.js";
-import { recordStat } from "../admin/api.js";
+import { recordStat, recordDebugDump } from "../admin/api.js";
 import { sleep } from "../utils/sleep.js";
-import { writeFileSync } from "node:fs";
-import { join } from "node:path";
 
 /** Options for the proxy handler. */
 export interface ProxyHandlerOptions {
@@ -76,12 +74,28 @@ export async function proxyRequest(
 
   const meta = peekParsedBody(parsedBody);
 
-  const staticProvider = getProvider(config.provider);
+  // Per-model routing rules: if any rule's pattern matches the request's
+  // model field (glob-style, e.g. "glm-5*" matches "glm-5.1"), override the
+  // provider/endpoint. Previously the rules were configured but never
+  // consulted at request time — making the entire feature a no-op.
+  const matchedRule = meta.model !== "-" && config.routingRules && config.routingRules.length > 0
+    ? config.routingRules.find(r => globMatch(r.pattern, meta.model))
+    : undefined;
+  const effectiveProviderId = matchedRule?.provider ?? config.provider;
+
+  const staticProvider = getProvider(effectiveProviderId);
   const provider = {
     ...staticProvider,
-    anthropicBaseURL: config.providers[config.provider].anthropicBase,
-    openaiBaseURL: config.providers[config.provider].openaiBase,
+    anthropicBaseURL: config.providers[effectiveProviderId].anthropicBase,
+    openaiBaseURL: config.providers[effectiveProviderId].openaiBase,
   };
+  if (matchedRule) {
+    console.log(`${reqId} routing rule matched: ${matchedRule.pattern} → provider=${matchedRule.provider}${matchedRule.endpoint ? `, endpoint=${matchedRule.endpoint}` : ""}`);
+    // Note: matchedRule.endpoint is currently used for documentation/UI only.
+    // Applying a custom endpoint here would require restructuring buildUpstreamURL
+    // to accept a URL override; tracked separately. For now, the rule's provider
+    // override is applied (the most common use case).
+  }
 
   let cred;
   try {
@@ -376,9 +390,10 @@ export async function proxyRequest(
   const isSSE = upstreamResp.headers.get("content-type")?.includes("text/event-stream") ?? false;
 
   // Diagnostic: when the upstream rejects with 4xx (especially 3001 "parameter
-  // error" from GLM), dump a summary of the TRANSFORMED request body so we can
-  // see exactly what was sent. This is the single most useful artifact for
-  // debugging 3001 — without it we can only guess what GLM disliked.
+  // error" from GLM), record a debug dump in memory so the user can inspect
+  // the exact transformed body via /admin/api/debug-dumps without writing
+  // files to disk. The old code wrote to <cwd>/zcode-proxy-debug-*.json
+  // which leaked user conversation content to disk forever.
   if (!upstreamResp.ok && upstreamResp.status >= 400 && upstreamResp.status < 500) {
     const errPeek = await upstreamResp.text().catch(() => "");
     console.log(`${reqId} upstream ${upstreamResp.status} ${errPeek.slice(0, 200)}`);
@@ -387,17 +402,20 @@ export async function proxyRequest(
     // mismatched beta flags vs body is a common 3001 cause on ZCode gateway.
     const sentBeta = buildUpstreamRequest(clientReq, upstreamFormat, provider, cred, transformedBody, config.identity, config.plan, undefined).headers.get("anthropic-beta");
     console.log(`${reqId} anthropic-beta sent: ${sentBeta ?? "(none)"}`);
-    // v2.1.3.10beta0: dump the FULL transformed body to a JSON file so the
-    // exact request that 3001'd can be inspected. The summary above only
-    // shows block types, not actual content — this file shows everything.
-    // Written to the proxy's working directory (next to config.yaml).
+    // Record to in-memory ring buffer (capped at 20 entries by admin/api.ts).
+    // The full body is exposed via /admin/api/debug-dumps?id=<reqId>&full=1.
     if (transformedBody) {
-      const debugFile = `zcode-proxy-debug-${reqId.replace(/[^a-zA-Z0-9]/g, "")}.json`;
       try {
-        writeFileSync(join(process.cwd(), debugFile), transformedBody);
-        console.log(`${reqId} full transformed body dumped to: ${join(process.cwd(), debugFile)}`);
+        recordDebugDump({
+          id: reqId,
+          status: upstreamResp.status,
+          upstreamError: errPeek.slice(0, 500),
+          anthropicBeta: sentBeta ?? "",
+          bodySummary: summarizeBody(transformedObj ?? parsedBody),
+          body: transformedBody,
+        });
       } catch (e) {
-        console.log(`${reqId} failed to dump body: ${(e as Error).message}`);
+        console.log(`${reqId} failed to record debug dump: ${(e as Error).message}`);
       }
     }
     // Reconstruct the response with the peeked body so the passthrough below
@@ -763,7 +781,48 @@ function peekParsedBody(parsed: unknown): RequestMeta {
   };
 }
 
-/** Check if a model id is a known GLM model OR a plausible GLM variant (starts with "glm-"). */
+/**
+ * Shell-glob style matcher supporting `*` (any chars) and `?` (single char).
+ * Case-insensitive — model ids often differ only in case ("GLM-5" vs "glm-5").
+ * Implemented as a non-backtracking DP so a pathological pattern like
+ * "a*****b" against "aaaaaa...a" won't blow up.
+ *
+ * Examples:
+ *   globMatch("glm-5*", "glm-5.1")      // true
+ *   globMatch("glm-5?", "glm-5.1")      // true
+ *   globMatch("glm-5", "glm-5")         // true (exact match)
+ *   globMatch("glm-5", "glm-5.1")       // false (no wildcard)
+ */
+export function globMatch(pattern: string, value: string): boolean {
+  if (!pattern) return false;
+  const p = pattern.toLowerCase();
+  const v = value.toLowerCase();
+  // Fast paths
+  if (p === "*") return true;
+  if (!p.includes("*") && !p.includes("?")) return p === v;
+
+  // DP: dp[i] = true if v[0..i) matches the part of pattern processed so far.
+  const dp = new Array<boolean>(v.length + 1).fill(false);
+  dp[0] = true;
+  for (let pi = 0; pi < p.length; pi++) {
+    const ch = p[pi];
+    if (ch === "*") {
+      // `*` matches zero or more chars: dp[j] = dp[j] || dp[j-1]
+      for (let j = 1; j <= v.length; j++) dp[j] = dp[j] || dp[j - 1];
+    } else {
+      // Single char (or `?`): must match exactly one char, shift right-to-left.
+      for (let j = v.length; j >= 1; j--) {
+        dp[j] = dp[j - 1] && (ch === "?" || ch === v[j - 1]);
+      }
+      dp[0] = false; // any non-* char requires at least one input char
+    }
+  }
+  return dp[v.length];
+}
+
+/**
+ * Check if a model id is a known GLM model OR a plausible GLM variant (starts with "glm-").
+ */
 function isKnownGlmModel(model: string): boolean {
   if (!model) return false;
   if (model.startsWith("glm-")) return true;

@@ -90,16 +90,19 @@ async function encrypt(plaintext: string): Promise<string> {
 /**
  * Decrypt ciphertext. Tries multiple formats in order:
  *   1. New Node.js crypto format (IV[16] + AUTH_TAG[16] + CIPHERTEXT, SHA-256 key)
- *   2. zhipu legacy WebCrypto format (IV[12] + encrypted+tag, SHA-256 key)
- *   3. zcode-api-ref format (IV[12] + encrypted+tag, XOR-fold key)
+ *   2. Legacy WebCrypto format (IV[12] + encrypted+tag) with two possible keys:
+ *      a. SHA-256 key (zhipu legacy)
+ *      b. XOR-fold key (zcode-api-ref / early zhipu)
  *
- * Step 3 lets users who already have a credentials.json from the open-source
- * zcode-api-ref repo transparently migrate to zhipu without re-logging in.
+ * The XOR-fold key attempt lets users who already have a credentials.json from
+ * the open-source zcode-api-ref repo transparently migrate to zhipu without
+ * re-logging in.
  */
 async function decrypt(ciphertext: string): Promise<string> {
   const data = Buffer.from(ciphertext, "base64");
 
-  // --- Try 1: new format: IV[16] + AUTH_TAG[16] + CIPHERTEXT (SHA-256 key) ---
+  // --- Try 1: new Node.js crypto format (IV[16] + AUTH_TAG[16] + CIPHERTEXT) ---
+  // This is the only format using a 16-byte IV (WebCrypto uses 12-byte).
   if (data.length >= 32) {
     try {
       const key = getEncryptionKeyBuffer();
@@ -110,61 +113,43 @@ async function decrypt(ciphertext: string): Promise<string> {
       decipher.setAuthTag(tag);
       return decipher.update(encrypted, undefined, "utf8") + decipher.final("utf8");
     } catch {
-      // Not new format, try legacy below
+      // Not new format — fall through to legacy WebCrypto attempts
     }
   }
 
-  // --- Try 2: zhipu legacy WebCrypto format (IV[12] + encrypted+tag, SHA-256 key) ---
-  try {
-    const key = getEncryptionKeyBuffer();
-    // Copy into a fresh ArrayBuffer to satisfy BufferSource typing (avoids
-    // the SharedArrayBuffer-incompatible typing issue with Buffer.subarray).
-    const keyCopy = new Uint8Array(32);
-    keyCopy.set(key);
-    const cryptoKey = await crypto.subtle.importKey(
-      "raw",
-      keyCopy,
-      { name: "AES-GCM" },
-      false,
-      ["decrypt"],
-    );
-    const iv = new Uint8Array(data.subarray(0, 12));
-    const encrypted = new Uint8Array(data.subarray(12));
-    const decrypted = await crypto.subtle.decrypt(
-      { name: "AES-GCM", iv },
-      cryptoKey,
-      encrypted,
-    );
-    return new TextDecoder().decode(decrypted);
-  } catch {
-    // zhipu legacy format also failed — try zcode-api-ref format next
-  }
+  // --- Try 2: legacy WebCrypto format (IV[12] + encrypted+tag) ---
+  // Both zhipu-legacy and zcode-api-ref use the same IV/ciphertext layout;
+  // they differ only in the key derivation. Try both in sequence.
+  const candidateKeys: Array<{ label: string; key: Buffer }> = [
+    { label: "SHA-256", key: getEncryptionKeyBuffer() },
+    { label: "XOR-fold", key: getLegacyXorEncryptionKey() },
+  ];
 
-  // --- Try 3: zcode-api-ref format (IV[12] + encrypted+tag, XOR-fold key) ---
-  // This is the format used by https://github.com/TriDefender/zcode-api
-  // and early zhipu versions before the SHA-256 migration. Same seed string
-  // but XOR-fold key derivation instead of SHA-256.
-  try {
-    const legacyKey = getLegacyXorEncryptionKey();
-    const keyCopy = new Uint8Array(32);
-    keyCopy.set(legacyKey);
-    const cryptoKey = await crypto.subtle.importKey(
-      "raw",
-      keyCopy,
-      { name: "AES-GCM" },
-      false,
-      ["decrypt"],
-    );
-    const iv = new Uint8Array(data.subarray(0, 12));
-    const encrypted = new Uint8Array(data.subarray(12));
-    const decrypted = await crypto.subtle.decrypt(
-      { name: "AES-GCM", iv },
-      cryptoKey,
-      encrypted,
-    );
-    return new TextDecoder().decode(decrypted);
-  } catch {
-    // All three formats failed
+  for (const { label, key } of candidateKeys) {
+    try {
+      // Copy into a fresh ArrayBuffer to satisfy BufferSource typing (avoids
+      // the SharedArrayBuffer-incompatible typing issue with Buffer.subarray).
+      const keyCopy = new Uint8Array(32);
+      keyCopy.set(key);
+      const cryptoKey = await crypto.subtle.importKey(
+        "raw",
+        keyCopy,
+        { name: "AES-GCM" },
+        false,
+        ["decrypt"],
+      );
+      const iv = new Uint8Array(data.subarray(0, 12));
+      const encrypted = new Uint8Array(data.subarray(12));
+      const decrypted = await crypto.subtle.decrypt(
+        { name: "AES-GCM", iv },
+        cryptoKey,
+        encrypted,
+      );
+      return new TextDecoder().decode(decrypted);
+    } catch {
+      // This key didn't work — try the next candidate
+      void label; // label retained for future debug logging
+    }
   }
 
   throw new Error(

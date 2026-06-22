@@ -16,7 +16,7 @@ import { readFileSync, existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
-const VERSION = "2.1.3.4";
+const VERSION = "2.1.3.5";
 
 main();
 
@@ -186,15 +186,38 @@ async function serve(configPath?: string): Promise<void> {
   console.log(`  auth mode: ${config.auth.mode}`);
   console.log(`  models: ${config.models.length} available`);
 
-  process.on("SIGINT", () => {
-    console.log("\nShutting down...");
-    server.stop(true);
-    process.exit(0);
-  });
-  process.on("SIGTERM", () => {
-    server.stop(true);
-    process.exit(0);
-  });
+  // Security warning: if proxyApiKey is unset, anyone on the network can
+  // call /v1/* with this proxy and burn the user's quota. Surface this
+  // prominently at startup so users don't accidentally run open.
+  if (!config.auth.proxyApiKey) {
+    console.warn("");
+    console.warn("  ⚠  WARNING: auth.proxyApiKey is NOT configured.");
+    console.warn("  ⚠  Anyone who can reach this port can use your upstream credentials.");
+    console.warn("  ⚠  Set `auth.proxyApiKey` in config.yaml or env ZCODE_PROXY_API_KEY.");
+    console.warn("");
+  }
+
+  // Graceful shutdown: stop accepting new connections, give in-flight
+  // requests up to 30s to finish (long enough for most LLM streams to
+  // complete, short enough that a stuck process won't hang forever).
+  // The old code called server.stop(true) (force=true) followed by
+  // process.exit(0) — which truncated SSE streams and long reasoning
+  // responses mid-flight.
+  let shuttingDown = false;
+  const shutdown = (signal: string) => {
+    if (shuttingDown) return; // second Ctrl+C → force exit immediately
+    shuttingDown = true;
+    console.log(`\nReceived ${signal}, shutting down gracefully...`);
+    console.log("  (press Ctrl+C again to force-exit)");
+    // server.stop(false) = wait for in-flight requests; returns Promise.
+    // We race it against a 30s timeout so we don't hang forever.
+    Promise.race([
+      server.stop(),
+      new Promise<void>(r => setTimeout(r, 30_000)),
+    ]).then(() => process.exit(0));
+  };
+  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
 }
 
 function authCommand(args: string[]): void {

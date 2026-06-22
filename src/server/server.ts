@@ -32,60 +32,64 @@ export function createFetchHandler(opts: ServerOptions): (req: Request) => Promi
     startTime: Date.now(),
   };
 
+  // Pre-compute the health response body — it only depends on config.provider,
+  // which doesn't change between requests (hot-swap of provider updates the
+  // config object in place, so we read it lazily inside the handler instead
+  // of caching the string — keeps the response correct after hot-swap).
+  const healthResponse = (): Response => new Response(
+    JSON.stringify({ status: "ok", provider: config.provider }),
+    { status: 200, headers: { "content-type": "application/json" } },
+  );
+
+  // Static route table — O(1) lookup by `${method}:${path}`.
+  // Admin routes (/admin, /admin/api/*) are handled separately because they
+  // use prefix matching rather than exact match.
+  //
+  // The Map is built ONCE when createFetchHandler is called — the closures
+  // capture `proxyOpts` (which is stable). The per-request `req` is passed as
+  // a parameter to each handler, so no mutation is needed.
+  type RouteHandler = (req: Request) => Promise<Response> | Response;
+  const routes = new Map<string, RouteHandler>([
+    ["GET:/health", (req) => addCorsHeaders(healthResponse(), req)],
+    ["GET:/", (req) => addCorsHeaders(healthResponse(), req)],
+    ["GET:/v1/models", (req) => addCorsHeaders(handleListModels(), req)],
+    ["POST:/v1/chat/completions", async (req) => addCorsHeaders(await handleChatCompletions(req, proxyOpts), req)],
+    ["POST:/v1/messages", async (req) => addCorsHeaders(await handleMessages(req, proxyOpts), req)],
+    ["POST:/v1/responses", async (req) => addCorsHeaders(await handleResponses(req, proxyOpts), req)],
+  ]);
+
   return async (req: Request): Promise<Response> => {
     const url = new URL(req.url);
     const path = url.pathname;
     const method = req.method;
 
-    // CORS preflight
+    // CORS preflight — short-circuit before auth
     if (method === "OPTIONS") {
-      return corsResponse();
+      return corsResponse(req);
     }
 
-    // Admin dashboard routes (handled before proxy API key auth)
-    // The admin page itself uses cookie/session auth; API routes use proxyApiKey
+    // Admin dashboard routes (handled before proxy API key auth).
+    // Admin page itself is open; API routes use proxyApiKey.
     if (path === "/admin" || path === "/admin/" || path.startsWith("/admin/api/")) {
       const adminResp = await handleAdminRoute(req, adminOpts);
-      if (adminResp) return adminResp;
+      if (adminResp) return addCorsHeaders(adminResp, req);
     }
 
-    // Proxy API key auth (if configured)
+    // Proxy API key auth (if configured) — applies to all non-admin routes
     if (config.auth.proxyApiKey) {
       const authHeader = req.headers.get("authorization") ?? req.headers.get("x-api-key");
       if (!authHeader || !checkProxyKey(authHeader, config.auth.proxyApiKey)) {
-        return errorResponse(401, "authentication_error", "Invalid or missing proxy API key");
+        return addCorsHeaders(errorResponse(401, "authentication_error", "Invalid or missing proxy API key"), req);
       }
     }
 
-    // --- Routing ---
-
-    // OpenAI routes
-    if (path === "/v1/chat/completions" && method === "POST") {
-      return handleChatCompletions(req, proxyOpts);
-    }
-    if (path === "/v1/models" && method === "GET") {
-      return handleListModels();
+    // --- Static route lookup (O(1)) ---
+    const handler = routes.get(`${method}:${path}`);
+    if (handler) {
+      return await handler(req);
     }
 
-    // Anthropic routes
-    if (path === "/v1/messages" && method === "POST") {
-      return handleMessages(req, proxyOpts);
-    }
-
-    // OpenAI Responses API route (used by Codex CLI when wire_api=responses)
-    if (path === "/v1/responses" && method === "POST") {
-      return handleResponses(req, proxyOpts);
-    }
-
-    // Health check
-    if (path === "/health" || path === "/") {
-      return new Response(JSON.stringify({ status: "ok", provider: config.provider }), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      });
-    }
-
-    return errorResponse(404, "not_found_error", `No route for ${method} ${path}`);
+    return addCorsHeaders(errorResponse(404, "not_found_error", `No route for ${method} ${path}`), req);
   };
 }
 
@@ -99,8 +103,9 @@ export function startServer(opts: ServerOptions): ReturnType<typeof Bun.serve> {
     hostname: host,
     idleTimeout: 0, // 自用代理：禁用空闲超时，避免长 reasoning 的 LLM 请求被杀
     fetch(req) {
-      // Add CORS headers to all responses
-      return handler(req).then((resp) => addCorsHeaders(resp));
+      // CORS headers are already added inside the handler (see
+      // createFetchHandler) — no need to add them again here.
+      return handler(req);
     },
   });
 }
@@ -137,17 +142,17 @@ function timingSafeEqual(a: string, b: string): boolean {
 }
 
 /** Build a CORS preflight response. */
-function corsResponse(): Response {
+function corsResponse(req: Request): Response {
   return new Response(null, {
     status: 204,
-    headers: corsHeaders(),
+    headers: corsHeaders(req),
   });
 }
 
 /** Add CORS headers to an existing response (non-mutating). */
-function addCorsHeaders(resp: Response): Response {
+function addCorsHeaders(resp: Response, req: Request): Response {
   const headers = new Headers(resp.headers);
-  for (const [k, v] of Object.entries(corsHeaders())) {
+  for (const [k, v] of Object.entries(corsHeaders(req))) {
     headers.set(k, v);
   }
   return new Response(resp.body, {
@@ -157,17 +162,23 @@ function addCorsHeaders(resp: Response): Response {
   });
 }
 
-function corsHeaders(): Record<string, string> {
-  // Restrictive CORS: only allow same-origin by default.
-  // The proxy is designed for local/self-hosted use; allowing "*" means
-  // any website could make requests to it. We set the origin to the
-  // requesting origin so the dashboard still works while third-party
-  // sites are blocked. Since we don't use cookies/credentials for API
-  // auth, this is safe.
+function corsHeaders(req: Request): Record<string, string> {
+  // Echo the requesting Origin instead of "*" so that:
+  //   1) The dashboard (same-origin or LAN) still works.
+  //   2) Arbitrary third-party websites cannot read responses from this proxy
+  //      via CORS ("*" would let any site call /v1/messages from a browser).
+  //
+  // We do NOT use Access-Control-Allow-Credentials, so cookies are not sent
+  // cross-origin — API auth is via Authorization header only.
+  //
+  // When no Origin header is present (server-to-server / curl), fall back to
+  // "*" for compatibility with simple clients.
+  const origin = req.headers.get("origin");
   return {
-    "access-control-allow-origin": "*",
+    "access-control-allow-origin": origin ?? "*",
     "access-control-allow-methods": "GET, POST, PUT, DELETE, OPTIONS",
     "access-control-allow-headers": "Content-Type, Authorization, x-api-key, anthropic-version, anthropic-beta",
     "access-control-max-age": "86400",
+    "vary": "origin",
   };
 }

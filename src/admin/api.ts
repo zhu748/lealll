@@ -35,12 +35,37 @@ const stats = {
   success: 0,
   failed: 0,
   retried: 0,
-  requests: [] as Array<{ id: string; time: string; model: string; status: number; ttfb: string; tokens: string }>,
+  requests: [] as Array<{ id: string; time: string; model: string; status: number; ttfb: string; tokens: string; retried?: boolean }>,
   models: {} as Record<string, { count: number; avgTtfb: number; tokens: number }>,
 };
 
-/** Record a request for stats. Called from handler.ts printRow. */
+/**
+ * Record a request for stats. Called from handler.ts printRow.
+ *
+ * Dedup: each request id is recorded at most once. Subsequent calls with
+ * the same id (e.g. when printRow fires on the retry path) only refresh
+ * the existing entry's status/tokens — they do NOT inflate the counters.
+ * This fixes the previous bug where a single 529-then-200 request would
+ * show up as 2 requests in the stats.
+ */
 export function recordStat(entry: { id: string; time: string; model: string; status: number; ttfb: string; tokens: string; retried?: boolean }) {
+  const existingIdx = stats.requests.findIndex(r => r.id === entry.id);
+  if (existingIdx >= 0) {
+    // Update the existing entry — do NOT increment counters again.
+    const old = stats.requests[existingIdx];
+    // Re-classify if the status changed (e.g. 529 → 200 after retry).
+    const wasSuccess = old.status >= 200 && old.status < 300;
+    const isSuccess = entry.status >= 200 && entry.status < 300;
+    if (wasSuccess !== isSuccess) {
+      if (isSuccess) { stats.failed--; stats.success++; }
+      else { stats.success--; stats.failed++; }
+    }
+    // Always count retry flag — the final entry wins.
+    if (entry.retried && !old.retried) stats.retried++;
+    stats.requests[existingIdx] = { ...old, ...entry, retried: entry.retried || old.retried };
+    return;
+  }
+
   stats.total++;
   if (entry.status >= 200 && entry.status < 300) stats.success++;
   else stats.failed++;
@@ -55,25 +80,111 @@ export function recordStat(entry: { id: string; time: string; model: string; sta
   stats.models[entry.model] = m;
 }
 
-// Active OAuth flows (in-memory)
-const activeFlows = new Map<string, { provider: string; flowId: string; pollToken: string; expiresAt: number; plan?: string }>();
+/**
+ * Reset the in-memory stats collector. Exposed for unit tests so they can
+ * start from a clean state without polluting each other. Not part of the
+ * public API — production callers should use `DELETE /admin/api/stats`.
+ * @internal
+ */
+export function _resetStatsForTesting(): void {
+  stats.total = 0;
+  stats.success = 0;
+  stats.failed = 0;
+  stats.retried = 0;
+  stats.requests = [];
+  stats.models = {};
+}
 
-// Log buffer for streaming — uses a fixed-size ring buffer to avoid
-// expensive splice(0, N) operations on large arrays.
+// Active OAuth flows (in-memory)
+const activeFlows = new Map<string, { provider: string; flowId: string; pollToken: string; expiresAt: number; plan?: string; status?: string; error?: string; callbackUrl?: string; state?: string }>();
+
+/**
+ * Periodic cleanup of expired OAuth flows. Without this, abandoned flows
+ * (user closed the browser without finishing auth) would accumulate in
+ * memory forever — each one carries the pollToken and callbackUrl, both
+ * sensitive-ish. Runs every 5 minutes; flows expire 5 minutes after their
+ * expiresAt timestamp to give in-flight poll requests a chance to drain.
+ */
+setInterval(() => {
+  const now = Date.now();
+  let cleaned = 0;
+  for (const [id, flow] of activeFlows) {
+    if (now > flow.expiresAt + 5 * 60_000) {
+      activeFlows.delete(id);
+      cleaned++;
+    }
+  }
+  if (cleaned > 0) {
+    appendLog("debug", `OAuth flow cleanup: removed ${cleaned} expired flow(s)`);
+  }
+}, 5 * 60_000).unref?.();
+
+// ---------------------------------------------------------------------------
+// Debug dump ring buffer (replaces the old writeFileSync-to-disk approach).
+// Upstream 4xx bodies used to be written to <cwd>/zcode-proxy-debug-*.json,
+// which leaked user conversation content to disk forever. Now we keep the
+// last 20 dumps in memory and expose them via /admin/api/debug-dumps.
+// ---------------------------------------------------------------------------
+const DEBUG_DUMP_LIMIT = 20;
+const debugDumps: Array<{
+  id: string;
+  time: string;
+  status: number;
+  upstreamError: string;
+  anthropicBeta: string;
+  bodySummary: string;
+  body: string;
+}> = [];
+
+/**
+ * Record a 4xx upstream response's transformed body for diagnostics.
+ * Called from handler.ts when upstream returns 4xx.
+ */
+export function recordDebugDump(entry: {
+  id: string;
+  status: number;
+  upstreamError: string;
+  anthropicBeta: string;
+  bodySummary: string;
+  body: string;
+}): void {
+  debugDumps.push({
+    ...entry,
+    time: new Date().toISOString().slice(11, 19),
+  });
+  if (debugDumps.length > DEBUG_DUMP_LIMIT) {
+    debugDumps.splice(0, debugDumps.length - DEBUG_DUMP_LIMIT);
+  }
+}
+
+/** Clear all debug dumps. */
+export function clearDebugDumps(): void {
+  debugDumps.length = 0;
+}
+
+// Log buffer for streaming — uses a monotonic sequence number per entry
+// so that SSE clients can track their position even when the underlying
+// array is trimmed. The old approach used array indices, which became
+// stale whenever splice() ran — causing clients to miss logs or replay
+// old ones after a trim event.
 const LOG_BUFFER_SIZE = 2000;
 const LOG_BUFFER_TRIM = 1000; // trim to this size when capacity is reached
-const logBuffer: Array<{ time: string; level: string; message: string }> = [];
-let logBufferStart = 0; // virtual start index for tracking client positions
+const logBuffer: Array<{ seq: number; time: string; level: string; message: string }> = [];
+let logSeq = 0; // monotonic, never reset — used as client cursor
 const logWaiters: Array<{ resolve: (value: unknown) => void }> = [];
 
 /** Add a log entry to the buffer (called by intercepting console.log). */
 export function appendLog(level: string, message: string) {
-  const entry = { time: new Date().toISOString().slice(11, 19), level, message: message.slice(0, 500) };
+  const entry = {
+    seq: ++logSeq,
+    time: new Date().toISOString().slice(11, 19),
+    level,
+    message: message.slice(0, 500),
+  };
   logBuffer.push(entry);
   if (logBuffer.length > LOG_BUFFER_SIZE) {
     // Efficient: remove in bulk instead of one-by-one splice
     logBuffer.splice(0, logBuffer.length - LOG_BUFFER_TRIM);
-    logBufferStart += LOG_BUFFER_SIZE - LOG_BUFFER_TRIM;
   }
   // Wake up any waiting SSE connections
   while (logWaiters.length > 0) {
@@ -117,10 +228,17 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
   // --- API Routes ---
 
   // Verify token
+  // Returns {valid: true} when the token matches. When no proxyApiKey is
+  // configured the endpoint returns {valid: true, warning: "no_auth"} so
+  // the dashboard can surface the security warning to the user instead of
+  // silently letting anyone in.
   if (path === "/admin/api/verify" && method === "GET") {
     const authHeader = req.headers.get("authorization") ?? "";
     const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : authHeader;
-    if (!opts.config.auth.proxyApiKey || token === opts.config.auth.proxyApiKey) {
+    if (!opts.config.auth.proxyApiKey) {
+      return jsonResp({ valid: true, warning: "no_auth", message: "proxyApiKey not configured — admin dashboard is open to anyone with network access" });
+    }
+    if (token === opts.config.auth.proxyApiKey) {
       return jsonResp({ valid: true });
     }
     return errorResponse(401, "authentication_error", "Invalid token");
@@ -144,6 +262,20 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
         if (authBody.apiKey === MASK || authBody.apiKey === "") delete authBody.apiKey;
         if (authBody.proxyApiKey === MASK || authBody.proxyApiKey === "") delete authBody.proxyApiKey;
       }
+
+      // Compute which fields changed in a way that requires a server restart
+      // to take effect (vs. fields that can be hot-swapped at runtime).
+      // The dashboard uses this to show "restart required" highlights.
+      const restartFields: string[] = [];
+      const oldPort = opts.config.server.port;
+      const oldHost = opts.config.server.host;
+      const newServer = body.server as Record<string, unknown> | undefined;
+      if (newServer) {
+        const newPort = typeof newServer.port === "number" ? newServer.port : parseInt(String(newServer.port), 10);
+        if (Number.isFinite(newPort) && newPort !== oldPort) restartFields.push("server.port");
+        if (typeof newServer.host === "string" && newServer.host !== oldHost) restartFields.push("server.host");
+      }
+
       const newConfig = { ...opts.config, ...body };
       // Merge auth separately to avoid losing fields not sent by the dashboard
       if (authBody) {
@@ -153,8 +285,33 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
       validateConfigForSave(newConfig);
       const yaml = configToYaml(newConfig as ProxyConfig);
       await writeFile(opts.configPath, yaml, "utf-8");
+
+      // Apply hot-swappable fields to the in-memory config so they take
+      // effect immediately. Restart-required fields (port/host) are NOT
+      // applied — they only take effect after the user restarts the process.
+      opts.config.provider = newConfig.provider;
+      opts.config.plan = newConfig.plan;
+      opts.config.defaultModel = newConfig.defaultModel;
+      opts.config.models = newConfig.models;
+      opts.config.identity = newConfig.identity;
+      opts.config.logging = newConfig.logging;
+      opts.config.retry = newConfig.retry;
+      opts.config.routingRules = newConfig.routingRules;
+      opts.config.modelMappings = newConfig.modelMappings;
+      if (authBody) opts.config.auth = newConfig.auth;
+      // providers.*.anthropicBase / openaiBase: also hot-swappable
+      if (body.providers) {
+        opts.config.providers = newConfig.providers;
+      }
+
       appendLog("info", "Configuration updated via admin dashboard");
-      return jsonResp({ ok: true });
+      return jsonResp({
+        ok: true,
+        requiresRestart: restartFields.length > 0,
+        restartFields,
+        // hotApplied: fields that were applied to the live config without restart
+        hotApplied: ["provider", "plan", "defaultModel", "models", "identity", "logging", "retry", "routingRules", "modelMappings", ...(authBody ? ["auth"] : []), ...(body.providers ? ["providers"] : [])],
+      });
     } catch (err) {
       return errorResponse(500, "save_failed", (err as Error).message);
     }
@@ -669,32 +826,49 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
   }
 
   // Log stream (SSE)
+  // Uses monotonic seq numbers instead of array indices so that clients
+  // never miss logs even when the underlying buffer is trimmed. The client
+  // cursor (lastSentSeq) is a seq value, not an array index — it stays
+  // valid across splice() calls because we look up entries by seq.
   if (path === "/admin/api/logs/stream" && method === "GET") {
-    let sentIndex = 0; // Track how many buffered entries we've already sent
+    let lastSentSeq = logSeq; // start by sending everything currently buffered
     let cleanup: (() => void) | null = null;
     const stream = new ReadableStream({
       async start(controller) {
         const encoder = new TextEncoder();
-        const send = (entry: { time: string; level: string; message: string }) => {
+        const send = (entry: { seq: number; time: string; level: string; message: string }) => {
           try {
             controller.enqueue(encoder.encode(`data: ${JSON.stringify(entry)}\n\n`));
           } catch { /* SSE controller may be closed; safe to ignore */ }
         };
 
-        // Send existing buffered logs first
-        const initial = logBuffer.slice();
-        sentIndex = logBuffer.length;
-        for (const entry of initial) send(entry);
+        // Send existing buffered logs first.
+        // Use the buffer's lowest seq (logBuffer[0].seq after a trim) as the
+        // starting point so we don't replay entries that have already been
+        // evicted. If the buffer is empty, just start from the current seq.
+        const startSeq = logBuffer.length > 0 ? logBuffer[0].seq : logSeq + 1;
+        for (let s = startSeq; s <= logSeq; s++) {
+          const entry = logBuffer.find(e => e.seq === s);
+          if (entry) send(entry);
+        }
+        lastSentSeq = logSeq;
 
         // Set up a waiter so new entries are pushed immediately
         const waiter = { resolve: (value: unknown) => void 0 };
         logWaiters.push(waiter);
 
-        // Polling fallback: check for any new entries every 500ms
+        // Polling fallback: check for any new entries every 500ms.
+        // Uses seq comparison instead of array index so it survives trims.
         const interval = setInterval(() => {
-          while (sentIndex < logBuffer.length) {
-            send(logBuffer[sentIndex]);
-            sentIndex++;
+          while (lastSentSeq < logSeq) {
+            const next = logBuffer.find(e => e.seq === lastSentSeq + 1);
+            if (next) {
+              send(next);
+              lastSentSeq = next.seq;
+            } else {
+              // Entry was evicted by a trim — skip ahead to the oldest available
+              lastSentSeq = logBuffer.length > 0 ? logBuffer[0].seq - 1 : logSeq;
+            }
           }
         }, 500);
 
@@ -732,10 +906,41 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
   if (path === "/admin/api/logs" && method === "GET") {
     const level = url.searchParams.get("level");
     const search = url.searchParams.get("search")?.toLowerCase();
+    const limit = Math.min(parseInt(url.searchParams.get("limit") ?? "200", 10) || 200, 2000);
     let logs = logBuffer;
     if (level) logs = logs.filter(l => l.level === level);
     if (search) logs = logs.filter(l => l.message.toLowerCase().includes(search));
-    return jsonResp({ logs: logs.slice(-200) });
+    return jsonResp({ logs: logs.slice(-limit), total: logBuffer.length });
+  }
+
+  // Get debug dumps (memory ring buffer of upstream 4xx transformed bodies).
+  // Replaces the old writeFileSync-to-disk approach that leaked user
+  // conversation content to <cwd>/zcode-proxy-debug-*.json forever.
+  if (path === "/admin/api/debug-dumps" && method === "GET") {
+    const limit = Math.min(parseInt(url.searchParams.get("limit") ?? "20", 10) || 20, 100);
+    // Strip the full body by default — only return it when ?full=1.
+    // Bodies can be 90KB+ and may contain user conversation content, so we
+    // hide them behind an explicit opt-in to avoid surprising the user.
+    const includeBody = url.searchParams.get("full") === "1";
+    const dumpId = url.searchParams.get("id");
+    if (dumpId) {
+      const dump = debugDumps.find(d => d.id === dumpId);
+      if (!dump) return errorResponse(404, "not_found", "Debug dump not found");
+      return jsonResp(dump);
+    }
+    return jsonResp({
+      dumps: debugDumps.slice(-limit).reverse().map(d =>
+        includeBody ? d : { ...d, body: undefined }
+      ),
+      total: debugDumps.length,
+    });
+  }
+
+  // Clear debug dumps
+  if (path === "/admin/api/debug-dumps" && method === "DELETE") {
+    clearDebugDumps();
+    appendLog("info", "Debug dumps cleared by admin");
+    return jsonResp({ ok: true });
   }
 
   return null; // Not an admin route
@@ -889,6 +1094,14 @@ function validateConfigForSave(cfg: Record<string, unknown>): void {
     if (!Number.isFinite(port) || port < 1 || port > 65535) {
       throw new Error(`server.port ${port} is out of range (1-65535)`);
     }
+    if (typeof server.host === "string" && server.host.length > 0) {
+      // Basic host validation: IPv4, IPv6, or hostname. Rejects spaces and
+      // most special chars. 0.0.0.0 is allowed (bind to all interfaces).
+      const hostRe = /^(\d{1,3}\.){3}\d{1,3}$|^[a-fA-F0-9:]+:[a-fA-F0-9:]+$|^[a-zA-Z0-9._-]+$/;
+      if (!hostRe.test(server.host)) {
+        throw new Error(`server.host "${server.host}" is not a valid IP or hostname`);
+      }
+    }
   }
   const provider = cfg.provider as string | undefined;
   if (provider && provider !== "zai" && provider !== "bigmodel") {
@@ -897,5 +1110,62 @@ function validateConfigForSave(cfg: Record<string, unknown>): void {
   const plan = cfg.plan as string | undefined;
   if (plan && plan !== "coding-plan" && plan !== "start-plan") {
     throw new Error(`Invalid plan "${plan}": must be "coding-plan" or "start-plan"`);
+  }
+
+  // Validate providers.*.anthropicBase / openaiBase are URLs (when present).
+  // Catches typos like missing https:// or trailing slashes that would 404
+  // silently on every request.
+  const providers = cfg.providers as Record<string, Record<string, unknown>> | undefined;
+  if (providers) {
+    for (const [name, p] of Object.entries(providers)) {
+      for (const field of ["anthropicBase", "openaiBase"]) {
+        const v = p?.[field];
+        if (typeof v === "string" && v.length > 0) {
+          try {
+            const u = new URL(v);
+            if (u.protocol !== "http:" && u.protocol !== "https:") {
+              throw new Error(`providers.${name}.${field} must be http(s):// URL (got ${u.protocol})`);
+            }
+          } catch (err) {
+            throw new Error(`providers.${name}.${field} is not a valid URL: ${(err as Error).message}`);
+          }
+        }
+      }
+    }
+  }
+
+  // Validate retry config bounds to prevent runaway retry loops.
+  const retry = cfg.retry as Record<string, unknown> | undefined;
+  if (retry) {
+    const maxRetries = typeof retry.maxRetries === "number" ? retry.maxRetries : parseInt(String(retry.maxRetries), 10);
+    if (Number.isFinite(maxRetries) && (maxRetries < 0 || maxRetries > 10)) {
+      throw new Error(`retry.maxRetries ${maxRetries} is out of range (0-10)`);
+    }
+    const initialDelayMs = typeof retry.initialDelayMs === "number" ? retry.initialDelayMs : parseInt(String(retry.initialDelayMs), 10);
+    if (Number.isFinite(initialDelayMs) && (initialDelayMs < 0 || initialDelayMs > 60_000)) {
+      throw new Error(`retry.initialDelayMs ${initialDelayMs} is out of range (0-60000)`);
+    }
+    const maxDelayMs = typeof retry.maxDelayMs === "number" ? retry.maxDelayMs : parseInt(String(retry.maxDelayMs), 10);
+    if (Number.isFinite(maxDelayMs) && (maxDelayMs < 0 || maxDelayMs > 300_000)) {
+      throw new Error(`retry.maxDelayMs ${maxDelayMs} is out of range (0-300000)`);
+    }
+    if (Array.isArray(retry.retryableStatuses)) {
+      for (const s of retry.retryableStatuses) {
+        const n = typeof s === "number" ? s : parseInt(String(s), 10);
+        if (!Number.isFinite(n) || n < 100 || n > 599) {
+          throw new Error(`retry.retryableStatuses contains invalid status: ${s}`);
+        }
+      }
+    }
+  }
+
+  // Validate models array is non-empty (after applying changes).
+  const models = cfg.models as unknown[] | undefined;
+  if (Array.isArray(models) && models.length === 0) {
+    throw new Error(`models must contain at least one entry (got empty array)`);
+  }
+  const defaultModel = cfg.defaultModel as string | undefined;
+  if (defaultModel !== undefined && typeof defaultModel !== "string") {
+    throw new Error(`defaultModel must be a string`);
   }
 }
