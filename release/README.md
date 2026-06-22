@@ -1,5 +1,22 @@
 # zcode-proxy 使用说明
 
+> **v2.1.3.0 / v0.1.10 — OpenAI Responses API 适配（Codex CLI 兼容）**
+> - **新增 `/v1/responses` 端点**：完整支持 OpenAI Responses API，可用于 Codex CLI（`wire_api=responses`）
+> - **完整流式事件序列**：`response.created` → `output_item.added` → `content_part.added` → `output_text.delta` * → `output_text.done` → `content_part.done` → `output_item.done` → `response.completed`
+> - **`previous_response_id` 链式续聊**：内存 LRU 存储 256 轮对话，自动重放历史 input + output
+> - **工具调用双向翻译**：Responses `function_call` / `function_call_output` ↔ Anthropic `tool_use` / `tool_result`，`call_id` 直接复用
+> - **内置工具过滤**：Codex CLI 的 `local_shell` / `web_search` 等自动过滤，只转发 `type:"function"` 工具
+> - **`reasoning.effort` 透传**：映射为 GLM `thinking: { type: "enabled" }`
+> - **零侵入**：对原有 `/v1/chat/completions` 和 `/v1/messages` 链路无影响
+> - **新增 24 个测试**：单元 + 集成 + E2E 全部通过，类型检查零错误
+>
+> **Codex CLI 接入方式**：
+> ```bash
+> export OPENAI_API_KEY="your-proxy-secret"
+> export OPENAI_BASE_URL="http://localhost:8080/v1"
+> codex --model glm-4.6
+> ```
+>
 > **v2.1.3 / v0.1.9 — 流式重试三连修复（正式版）**
 > - **修复 SSE 错误检测**：GLM 网关在流式请求失败时会返回 HTTP 200 + SSE 流，把 529 错误藏在流里。代理现在能识别这种"隐身错误"并触发重试
 > - **修复重试时 Request body 复用 bug**：之前每次重试都复用同一个 Request 对象，导致 body 已被消耗，所有重试都失败。现在每次重试都构建全新的 Request
