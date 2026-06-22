@@ -1,5 +1,18 @@
 # zcode-proxy 使用说明
 
+> **v2.1.3.5beta0 — 修复 start-plan 模式 tool_result+cache_control 触发 3001**
+> - **根因定位**：上一版 `v2.1.3.4beta0` 的诊断日志显示 start-plan 模式下第三轮请求报 3001，转换后的请求体摘要为：
+>   ```
+>   msgs[[0]user/{text,text},[1]assistant/{text},[2]user/str,[3]assistant/{text,tool_use},[4]user/{tool_result}] | system=6 blocks | tools=27
+>   ```
+>   thinking 块已正确剥离，角色交替正确，但 `[4]user/{tool_result}` 这个 tool_result 块上带着 `cache_control: {type:"ephemeral"}`（Claude Code 自动加的）。
+> - **ZCode start-plan 网关不接受 tool_result 块上的 cache_control**（只在 text 块上接受），直接返回 3001 "parameter error"。Anthropic 官方 API 接受，但 GLM 网关更严格。
+> - **修复**：
+>   1. 新增 `sanitizeContentBlocks()` — 剥离 `tool_result` 块上的 `cache_control` 字段
+>   2. 修复 `applyAnthropicCacheControl()` — 不再把 `cache_control` 加到 `tool_result` 块上；如果最后一条消息只有 tool_result 块，往前找 text 块附着；找不到就跳过（宁可不要 cache 优化也不能 3001）
+>   3. 诊断日志增强 — `transformed request summary` 现在显示每个块的 cache_control 状态（如 `tool_result+cc` 表示有 cache_control），新增 `tool_result+cache_control: N → M` 计数日志
+> - **新增 6 个测试**，包括一个完整复现 start-plan 第三轮请求结构的回归测试；全套 274 测试通过
+>
 > **v2.1.3.4beta0 — 增加 3001 诊断日志**
 > - 上一版 `v2.1.3.3beta0` 修复了 thinking 块剥离，但用户反馈第二轮仍报 3001。这次增加诊断日志，帮助定位真正原因：
 > - **启动时打印版本号**：`zcode-proxy 2.1.3.4beta0 listening on http://...`，用户可一眼确认运行的是新版

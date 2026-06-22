@@ -413,12 +413,15 @@ describe("transformRequestBody — strip thinking blocks from messages (Anthropi
     const out = transformRequestBody(body, { format: "anthropic" });
     const parsed = JSON.parse(out as string);
     // thinking block gone, tool_use preserved
-    expect(parsed.messages[0].content).toEqual([
-      { type: "tool_use", id: "t1", name: "Bash", input: { cmd: "ls" } },
-    ]);
-    // tool_result preserved (cache_control may be attached — that's a separate transform)
+    expect(parsed.messages[0].content.length).toBe(1);
+    expect(parsed.messages[0].content[0].type).toBe("tool_use");
+    expect(parsed.messages[0].content[0].id).toBe("t1");
+    expect(parsed.messages[0].content[0].name).toBe("Bash");
+    expect(parsed.messages[0].content[0].input).toEqual({ cmd: "ls" });
+    // tool_result preserved, cache_control NOT attached to it (gateway rejects)
     expect(parsed.messages[1].content[0].type).toBe("tool_result");
     expect(parsed.messages[1].content[0].tool_use_id).toBe("t1");
+    expect(parsed.messages[1].content[0].cache_control).toBeUndefined();
   });
 
   it("does NOT touch string content (no thinking blocks possible)", () => {
@@ -508,6 +511,211 @@ describe("transformRequestBody — strip thinking blocks from messages (Anthropi
     // Thinking block stripped from assistant history
     const assistant = parsed.messages.find((m: any) => m.role === "assistant");
     expect(assistant.content).toEqual([{ type: "text", text: "你好!👋 我是 ZCode..." }]);
+  });
+});
+
+describe("transformRequestBody — strip cache_control from tool_result (Anthropic)", () => {
+  it("removes cache_control from tool_result blocks", () => {
+    // Reproduces the v2.1.3.4beta0 start-plan 3001: Claude Code attaches
+    // cache_control to the last block of the last user message. When that
+    // message is a tool_result, cache_control lands ON the tool_result block,
+    // which ZCode's start-plan gateway rejects with 3001.
+    const body = JSON.stringify({
+      model: "glm-5.2",
+      messages: [
+        { role: "user", content: "你好" },
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "let me check" },
+            { type: "tool_use", id: "t1", name: "Bash", input: { cmd: "ls" } },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            {
+              tool_use_id: "t1",
+              type: "tool_result",
+              content: "file1\nfile2",
+              is_error: false,
+              cache_control: { type: "ephemeral" },  // ← Claude Code adds this
+            },
+          ],
+        },
+      ],
+    });
+    const out = transformRequestBody(body, { format: "anthropic" });
+    const parsed = JSON.parse(out as string);
+    const toolResultMsg = parsed.messages[parsed.messages.length - 1];
+    expect(toolResultMsg.content[0].type).toBe("tool_result");
+    expect(toolResultMsg.content[0].cache_control).toBeUndefined();
+    // Other fields on tool_result preserved
+    expect(toolResultMsg.content[0].tool_use_id).toBe("t1");
+    expect(toolResultMsg.content[0].content).toBe("file1\nfile2");
+    expect(toolResultMsg.content[0].is_error).toBe(false);
+  });
+
+  it("preserves cache_control on text blocks", () => {
+    const body = JSON.stringify({
+      messages: [
+        { role: "user", content: "q" },
+        { role: "assistant", content: "a" },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "follow up", cache_control: { type: "ephemeral" } },
+          ],
+        },
+      ],
+    });
+    const out = transformRequestBody(body, { format: "anthropic" });
+    const parsed = JSON.parse(out as string);
+    // text block keeps its cache_control
+    expect(parsed.messages[2].content[0].cache_control).toEqual({ type: "ephemeral" });
+  });
+
+  it("does NOT re-add cache_control to tool_result via applyAnthropicCacheControl", () => {
+    // After stripping, the proxy's applyAnthropicCacheControl runs and tries
+    // to add cache_control to the last block of the last message. If that
+    // block is a tool_result, it MUST skip it — otherwise we re-introduce
+    // the 3001. This test verifies the skip logic.
+    const body = JSON.stringify({
+      messages: [
+        { role: "user", content: "你好" },
+        {
+          role: "assistant",
+          content: [
+            { type: "tool_use", id: "t1", name: "Bash", input: { cmd: "ls" } },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            {
+              tool_use_id: "t1",
+              type: "tool_result",
+              content: "output",
+              is_error: false,
+              cache_control: { type: "ephemeral" },
+            },
+          ],
+        },
+      ],
+    });
+    const out = transformRequestBody(body, { format: "anthropic" });
+    const parsed = JSON.parse(out as string);
+    const lastMsg = parsed.messages[parsed.messages.length - 1];
+    // tool_result block must NOT have cache_control after transform
+    expect(lastMsg.content[0].type).toBe("tool_result");
+    expect(lastMsg.content[0].cache_control).toBeUndefined();
+  });
+
+  it("handles tool_result-only user message: skips cache_control, no crash", () => {
+    // If the last user message has ONLY tool_result blocks (no text), the
+    // proxy can't attach cache_control anywhere on it. Should skip gracefully
+    // and not attach to tool_result.
+    const body = JSON.stringify({
+      messages: [
+        { role: "user", content: "你好" },
+        {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "t1", name: "Bash", input: { cmd: "ls" } }],
+        },
+        {
+          role: "user",
+          content: [
+            { tool_use_id: "t1", type: "tool_result", content: "out", is_error: false },
+          ],
+        },
+      ],
+    });
+    const out = transformRequestBody(body, { format: "anthropic" });
+    const parsed = JSON.parse(out as string);
+    const lastMsg = parsed.messages[parsed.messages.length - 1];
+    expect(lastMsg.content[0].type).toBe("tool_result");
+    expect(lastMsg.content[0].cache_control).toBeUndefined();
+  });
+
+  it("start-plan full Claude Code round-3 regression (thinking + tool_result+cc)", () => {
+    // Reproduces the EXACT structure from user's v2.1.3.4beta0 diagnostic:
+    // msgs[[0]user/{text,text},[1]assistant/{text},[2]user/str,[3]assistant/{text,tool_use},[4]user/{tool_result}]
+    // where [3] had a thinking block (now stripped) and [4] had cache_control
+    // on the tool_result (now stripped).
+    const body = JSON.stringify({
+      model: "glm-5.2",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "<system-reminder>...</system-reminder>" },
+            { type: "text", text: "你好" },
+          ],
+        },
+        {
+          role: "system",
+          content: "Available agent types...",
+        },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "你好！我是 ZCode..." }],
+        },
+        { role: "user", content: "帮我看看当前项目是干嘛的" },
+        {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "用户想了解...", signature: "" },
+            { type: "text", text: "我来看看..." },
+            { type: "tool_use", id: "call_x", name: "Bash", input: { command: "ls" } },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            {
+              tool_use_id: "call_x",
+              type: "tool_result",
+              content: "total 12",
+              is_error: false,
+              cache_control: { type: "ephemeral" },
+            },
+          ],
+        },
+      ],
+      system: [{ type: "text", text: "You are Claude Code." }],
+      tools: [{ name: "Bash", description: "run bash", input_schema: { type: "object" } }],
+      thinking: { type: "adaptive" },
+      context_management: { edits: [] },
+      output_config: { effort: "max" },
+    });
+    const out = transformRequestBody(body, {
+      format: "anthropic",
+      userId: "u-123",
+      startPlan: true,
+    });
+    const parsed = JSON.parse(out as string);
+
+    // Thinking block stripped from assistant [3]
+    const assistant3 = parsed.messages.find((m: any) =>
+      m.role === "assistant" && Array.isArray(m.content) &&
+      m.content.some((b: any) => b.type === "tool_use")
+    );
+    expect(assistant3.content.some((b: any) => b.type === "thinking")).toBe(false);
+    expect(assistant3.content.map((b: any) => b.type)).toEqual(["text", "tool_use"]);
+
+    // cache_control stripped from tool_result in [4]
+    const toolResultMsg = parsed.messages[parsed.messages.length - 1];
+    expect(toolResultMsg.content[0].type).toBe("tool_result");
+    expect(toolResultMsg.content[0].cache_control).toBeUndefined();
+
+    // System message relocated, start-plan blocks prepended
+    expect(parsed.system.length).toBeGreaterThanOrEqual(3);  // 2 ZCode + 1 client
+    expect(parsed.messages.find((m: any) => m.role === "system")).toBeUndefined();
+
+    // Top-level fields normalized
+    expect(parsed.thinking).toEqual({ type: "enabled" });
+    expect(parsed.context_management).toBeUndefined();
+    expect(parsed.output_config).toBeUndefined();
   });
 });
 

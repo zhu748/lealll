@@ -78,6 +78,7 @@ export function transformRequestBodyObj(parsed: unknown, ctx: TransformContext):
     modified = transformUnsupportedAnthropicFields(obj) || modified;
     modified = relocateSystemMessages(obj) || modified;
     modified = stripThinkingBlocksFromMessages(obj) || modified;
+    modified = sanitizeContentBlocks(obj) || modified;
     modified = applyAnthropicCacheControl(obj) || modified;
     if (ctx.userId) {
       modified = applyAnthropicUserId(obj, ctx.userId) || modified;
@@ -108,6 +109,12 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
  * Anthropic: add `cache_control: { type: "ephemeral" }` to the last content
  * block of the last non-system message. Mirrors ZCode's `HLr` algorithm.
  * Idempotent — skips if any block on that message already carries cache_control.
+ *
+ * IMPORTANT: Skips `tool_result` blocks — ZCode's start-plan gateway rejects
+ * cache_control on tool_result blocks with 3001. If the last block of the
+ * last message is a tool_result, we look backwards for a text block to attach
+ * cache_control to; if none exists, we skip cache_control entirely for that
+ * message (better to miss the cache optimization than to 3001).
  */
 function applyAnthropicCacheControl(body: Record<string, unknown>): boolean {
   const messages = body.messages;
@@ -123,13 +130,30 @@ function applyAnthropicCacheControl(body: Record<string, unknown>): boolean {
       return true;
     }
     if (Array.isArray(msg.content) && msg.content.length > 0) {
-      const lastBlock = msg.content[msg.content.length - 1];
-      if (typeof lastBlock === "object" && lastBlock !== null && !lastBlock.cache_control) {
-        lastBlock.cache_control = { type: "ephemeral" };
-        return true;
+      // Find the last block that can accept cache_control.
+      // tool_result blocks cannot (ZCode gateway 3001s); text blocks can.
+      // If the message is entirely tool_result blocks (e.g. a tool-result-only
+      // user turn), skip cache_control for this message and continue to the
+      // previous message.
+      let attached = false;
+      for (let j = msg.content.length - 1; j >= 0; j--) {
+        const block = msg.content[j];
+        if (typeof block !== "object" || block === null) continue;
+        if (block.type === "tool_result") continue; // skip — gateway rejects
+        if (!block.cache_control) {
+          block.cache_control = { type: "ephemeral" };
+          attached = true;
+          break;
+        }
+        // Already has cache_control — message is fine, stop searching.
+        attached = true;
+        break;
       }
+      if (attached) return true;
+      // No attachable block on this message — fall through to previous message.
+      continue;
     }
-    return false;
+    continue;
   }
   return false;
 }
@@ -325,6 +349,49 @@ function stripThinkingBlocksFromMessages(body: Record<string, unknown>): boolean
 
   if (changed) {
     body.messages = surviving;
+  }
+  return changed;
+}
+
+/**
+ * Sanitize content blocks in `messages[].content` to remove fields that GLM
+ * upstream / ZCode gateway reject with 3001 "parameter error".
+ *
+ * Currently strips:
+ *   - `cache_control` from `tool_result` blocks.
+ *     Claude Code attaches `cache_control: {type:"ephemeral"}` to the last
+ *     block of the last user message — when that message is a tool_result
+ *     (i.e. the last turn was a tool call), the cache_control lands ON the
+ *     tool_result block. ZCode's start-plan gateway does NOT accept
+ *     cache_control on tool_result blocks (only on text blocks) and returns
+ *     3001. Anthropic's official API accepts it, but GLM's gateway is stricter.
+ *
+ *     This is the root cause of the v2.1.3.4beta0 user report: round 3
+ *     request had `msgs[..., [4]user/{tool_result}]` where the tool_result
+ *     carried cache_control from Claude Code, and the gateway 3001'd.
+ *
+ * `cache_control` on `text` blocks is preserved (ZCode gateway accepts it
+ * there — the proxy's own applyAnthropicCacheControl adds it to text blocks).
+ */
+function sanitizeContentBlocks(body: Record<string, unknown>): boolean {
+  const messages = body.messages;
+  if (!Array.isArray(messages)) return false;
+
+  let changed = false;
+  for (const msg of messages) {
+    if (!isPlainObject(msg)) continue;
+    const content = msg.content;
+    if (!Array.isArray(content)) continue;
+
+    for (const block of content) {
+      if (!isPlainObject(block)) continue;
+      // Strip cache_control from tool_result blocks only.
+      // text blocks keep their cache_control (gateway accepts it there).
+      if (block.type === "tool_result" && "cache_control" in block) {
+        delete block.cache_control;
+        changed = true;
+      }
+    }
   }
   return changed;
 }

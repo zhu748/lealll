@@ -146,6 +146,13 @@ export async function proxyRequest(
     if (before > 0 || after > 0) {
       console.log(`${reqId} thinking blocks: ${before} → ${after} (stripped ${before - after})`);
     }
+    // Also log cache_control-on-tool_result strip counts — this was the
+    // root cause of the v2.1.3.4beta0 start-plan 3001.
+    const ccBefore = countToolResultCacheControl(parsedBody);
+    const ccAfter = countToolResultCacheControl(transformedObj);
+    if (ccBefore > 0 || ccAfter > 0) {
+      console.log(`${reqId} tool_result+cache_control: ${ccBefore} → ${ccAfter} (stripped ${ccBefore - ccAfter})`);
+    }
   }
 
   let captchaHeaders: Record<string, string> | undefined;
@@ -456,6 +463,30 @@ function countThinkingBlocks(body: unknown): number {
 }
 
 /**
+ * Count `tool_result` blocks that carry a `cache_control` field. These get
+ * stripped by sanitizeContentBlocks() because ZCode's start-plan gateway
+ * rejects them with 3001. Used for diagnostic logging.
+ */
+function countToolResultCacheControl(body: unknown): number {
+  if (!body || typeof body !== "object") return 0;
+  const messages = (body as Record<string, unknown>).messages;
+  if (!Array.isArray(messages)) return 0;
+  let count = 0;
+  for (const msg of messages) {
+    if (!msg || typeof msg !== "object") continue;
+    const content = (msg as Record<string, unknown>).content;
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      if (block && typeof block === "object") {
+        const b = block as Record<string, unknown>;
+        if (b.type === "tool_result" && b.cache_control !== undefined) count++;
+      }
+    }
+  }
+  return count;
+}
+
+/**
  * Build a one-line summary of the transformed request body for diagnostic
  * logging on upstream 4xx. Shows top-level fields that GLM commonly rejects
  * (thinking, context_management, output_config), the message role/content-type
@@ -476,7 +507,9 @@ function summarizeBody(body: unknown): string {
   if (b.output_config) parts.push("output_config=present");
   if (b.metadata) parts.push(`metadata=${JSON.stringify(b.metadata).slice(0, 80)}`);
 
-  // Messages — role + content block types per message
+  // Messages — role + content block types per message, with cache_control flags
+  // so we can see if cache_control is landing on tool_result blocks (which
+  // triggers ZCode gateway 3001).
   const messages = b.messages;
   if (Array.isArray(messages)) {
     const msgSummary = messages.map((m: unknown, i: number) => {
@@ -486,9 +519,14 @@ function summarizeBody(body: unknown): string {
       const content = msg.content;
       if (typeof content === "string") return `[${i}]${role}/str`;
       if (!Array.isArray(content)) return `[${i}]${role}/?`;
-      const types = content.map((c: unknown) =>
-        (c && typeof c === "object") ? (c as Record<string, unknown>).type ?? "?" : "?"
-      );
+      const types = content.map((c: unknown) => {
+        if (!c || typeof c !== "object") return "?";
+        const blk = c as Record<string, unknown>;
+        const t = blk.type ?? "?";
+        // Annotate cache_control presence so tool_result+cache_control is visible
+        const cc = blk.cache_control ? "+cc" : "";
+        return `${t}${cc}`;
+      });
       return `[${i}]${role}/{${types.join(",")}}`;
     });
     parts.push(`msgs[${msgSummary.join(",")}]`);
