@@ -112,11 +112,35 @@ export async function proxyRequest(
     }
   }
 
-  let upstreamReq = buildUpstreamRequest(clientReq, upstreamFormat, provider, cred, transformedBody, config.identity, config.plan, captchaHeaders);
+  // Factory that builds a FRESH Request object for each fetch call.
+  // Request bodies are single-use — once fetch() consumes the body, the same
+  // Request object cannot be passed to fetch() again (throws
+  // "Request body already used"). This bit us hard on retries: the first
+  // request would succeed or fail, then every retry would throw that error,
+  // get caught by the catch block, and get converted to a synthetic 502 —
+  // making retries completely ineffective.
+  const buildUpstreamReq = (captcha?: Record<string, string>) =>
+    buildUpstreamRequest(clientReq, upstreamFormat, provider, cred, transformedBody, config.identity, config.plan, captcha);
+
+  // Fetch + SSE error detection in one shot. Used for both the initial fetch
+  // AND every retry, so SSE errors hidden in 200 streams are caught on every
+  // attempt — not just the first one.
+  const fetchUpstreamDetected = async (captcha?: Record<string, string>): Promise<Response> => {
+    const req = buildUpstreamReq(captcha);
+    let resp = await fetchImpl(req, translateMode ? {} : { decompress: false });
+    if (resp.status === 200) {
+      const originalStatus = resp.status;
+      resp = await detectSseErrorAndConvert(resp);
+      if (resp.status !== originalStatus) {
+        console.log(`${reqId} SSE error detected in 200 stream → HTTP ${resp.status}`);
+      }
+    }
+    return resp;
+  };
 
   let upstreamResp: Response;
   try {
-    upstreamResp = await fetchImpl(upstreamReq, translateMode ? {} : { decompress: false });
+    upstreamResp = await fetchUpstreamDetected(captchaHeaders);
   } catch (err) {
     printRow(reqId, format, meta, 502, started, Date.now(), 0, 0, 0);
     return errorResponse(502, "upstream_unreachable", (err as Error).message);
@@ -136,40 +160,30 @@ export async function proxyRequest(
     try {
       const fresh = await getCaptchaToken();
       console.log(`${reqId} captcha re-solved (token ${fresh.verifyParam.length} chars), retrying...`);
-      upstreamReq = buildUpstreamRequest(clientReq, upstreamFormat, provider, cred, transformedBody, config.identity, config.plan, {
+      const freshCaptcha = {
         [RETRY_HEADERS.PARAM]: fresh.verifyParam,
         [RETRY_HEADERS.REGION]: fresh.region,
-      });
-      upstreamResp = await fetchImpl(upstreamReq, translateMode ? {} : { decompress: false }).catch((err: Error) => {
-        printRow(reqId, format, meta, 502, started, Date.now(), 0, 0, 0);
-        return errorResponse(502, "upstream_unreachable", err.message);
-      });
+      };
+      upstreamResp = await fetchUpstreamDetected(freshCaptcha);
+      headersAt = Date.now();
     } catch (err) {
       printRow(reqId, format, meta, 503, started, Date.now(), 0, 0, 0);
       return errorResponse(503, "captcha_solver_failed", (err as Error).message);
     }
   }
 
-  // SSE error detection: some upstream gateways (notably GLM) return HTTP 200
-  // + text/event-stream even when the request fails, hiding the error inside
-  // the stream as an `event: error` SSE event. This bypasses the status-code-
-  // based retry logic below. Peek at the first chunk(s) of the stream; if an
-  // error is found, convert the response to a synthetic JSON response with
-  // the appropriate HTTP status code so the retry logic can handle it.
-  if (upstreamResp.status === 200) {
-    const originalStatus = upstreamResp.status;
-    upstreamResp = await detectSseErrorAndConvert(upstreamResp);
-    if (upstreamResp.status !== originalStatus) {
-      console.log(`${reqId} SSE error detected in 200 stream → HTTP ${upstreamResp.status}, will attempt retry`);
-      // Update headersAt so TTFB reflects the time we actually got a usable
-      // response (the original 200 was a phantom — the real error was hidden
-      // inside the stream and took a few ms to detect).
-      headersAt = Date.now();
-    }
-  }
+  // SSE error detection for the initial response is already handled inside
+  // fetchUpstreamDetected() above. The standalone detection block that used
+  // to live here has been removed — fetchUpstreamDetected now handles it
+  // uniformly for both the initial fetch and every retry.
 
   // Retry on retryable status codes (e.g. 529 site overloaded, 429 rate limited)
   // Uses exponential backoff with jitter, and respects Retry-After header.
+  //
+  // CRITICAL: Each retry MUST build a fresh Request via fetchUpstreamDetected().
+  // Reusing the same Request object fails with "Request body already used"
+  // because fetch() consumes the body on the first call — this was the bug
+  // where every retry after the first would silently fail with a synthetic 502.
   if (config.retry.maxRetries > 0 && config.retry.retryableStatuses.includes(upstreamResp.status)) {
     try { upstreamResp.body?.cancel(); } catch {}
 
@@ -197,17 +211,24 @@ export async function proxyRequest(
       await sleep(delayMs);
 
       try {
-        upstreamResp = await fetchImpl(upstreamReq, translateMode ? {} : { decompress: false });
+        // Build a FRESH Request for each retry — never reuse upstreamReq.
+        // fetchUpstreamDetected also runs SSE error detection so 200 streams
+        // with hidden errors get caught on every attempt.
+        upstreamResp = await fetchUpstreamDetected(captchaHeaders);
+        headersAt = Date.now();
       } catch (err) {
-        // Network error during retry — if we have retries left, keep trying; otherwise bail
+        // Network error during retry — log the ACTUAL error so users can
+        // diagnose (the old code just said "network error" with no detail).
+        const errMsg = (err as Error).message ?? String(err);
         if (attempt < config.retry.maxRetries) {
-          console.log(`${reqId} network error on retry ${attempt}, will retry again...`);
+          console.log(`${reqId} fetch failed on retry ${attempt}: ${errMsg}, will retry again...`);
           // Create a synthetic 502 response so the loop can continue checking retryableStatuses
-          upstreamResp = errorResponse(502, "upstream_unreachable", (err as Error).message);
+          upstreamResp = errorResponse(502, "upstream_unreachable", errMsg);
           continue;
         }
+        console.log(`${reqId} fetch failed on final retry ${attempt}: ${errMsg}`);
         printRow(reqId, format, meta, 502, started, Date.now(), 0, 0, 0);
-        return errorResponse(502, "upstream_unreachable", (err as Error).message);
+        return errorResponse(502, "upstream_unreachable", errMsg);
       }
 
       // If the new response is no longer a retryable status, break out
@@ -216,18 +237,18 @@ export async function proxyRequest(
         break;
       }
 
-      // Still a retryable status — cancel body and loop again
-      try { upstreamResp.body?.cancel(); } catch {}
-
-      // If this was the last retry attempt, log the exhaustion
+      // Still a retryable status — if this was the last attempt, keep the
+      // response body intact (don't cancel) so we can return it to the
+      // client with a body. Previously the code cancelled the body then
+      // refetched — but that refetch reused the consumed Request object
+      // and always failed. Keeping the body is simpler and correct.
       if (attempt === config.retry.maxRetries) {
         console.log(`${reqId} all ${config.retry.maxRetries} retries exhausted, returning ${upstreamResp.status}`);
-        // Rebuild the request one final time so we can return the response with a body
-        upstreamResp = await fetchImpl(upstreamReq, translateMode ? {} : { decompress: false }).catch((err: Error) => {
-          printRow(reqId, format, meta, 502, started, Date.now(), 0, 0, 0);
-          return errorResponse(502, "upstream_unreachable", err.message);
-        });
+        break;
       }
+
+      // More retries left — cancel the body before looping
+      try { upstreamResp.body?.cancel(); } catch {}
     }
   }
 
