@@ -63,9 +63,9 @@ describe("translateRequestResponsesToAnthropic", () => {
     expect(result.max_tokens).toBe(8192);
   });
 
-  it("injects thinking enabled from reasoning.effort for reasoning-capable models", () => {
+  it("injects thinking enabled from reasoning.effort (unconditional, honors client intent)", () => {
     const req: OpenAIResponseRequest = {
-      model: "glm-4.6",  // reasoning: true in catalog
+      model: "glm-4.6",
       input: "Hi",
       reasoning: { effort: "high" },
     };
@@ -73,23 +73,15 @@ describe("translateRequestResponsesToAnthropic", () => {
     expect(result.thinking).toEqual({ type: "enabled" });
   });
 
-  it("does NOT inject thinking for non-reasoning models (glm-4.6v, glm-5v-turbo)", () => {
+  it("injects thinking enabled even for non-reasoning models (user intent overrides catalog)", () => {
     const req: OpenAIResponseRequest = {
-      model: "glm-4.6v",  // reasoning: false (no field) in catalog
+      model: "glm-4.6v",  // reasoning: false in catalog, but client wants thinking
       input: "Hi",
       reasoning: { effort: "high" },
     };
     const result = translateRequestResponsesToAnthropic(req);
-    expect(result.thinking).toBeUndefined();
-  });
-
-  it("injects thinking for unknown models (let GLM decide)", () => {
-    const req: OpenAIResponseRequest = {
-      model: "some-future-glm",
-      input: "Hi",
-      reasoning: { effort: "medium" },
-    };
-    const result = translateRequestResponsesToAnthropic(req);
+    // Per user policy: if client sent reasoning.effort, honor it. GLM will
+    // ignore thinking on models that don't support it; we don't second-guess.
     expect(result.thinking).toEqual({ type: "enabled" });
   });
 

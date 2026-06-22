@@ -4,7 +4,7 @@
  * All routes require the proxy API key (same key used by API clients).
  * Mounted under /admin/api/* in server.ts.
  */
-import type { ProxyConfig, RoutingRule } from "../config/types.js";
+import type { ProxyConfig, RoutingRule, ModelMapping } from "../config/types.js";
 import type { AuthManager } from "../auth/manager.js";
 import type { Credential as AppCredential } from "../auth/types.js";
 import { loadCredential, saveCredential, clearCredential, listAccounts, switchAccount, removeAccount, setAccountLabel, setAccountPlan, exportAccounts, importAccounts, maskApiKey } from "../auth/store.js";
@@ -605,6 +605,49 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
     }
   }
 
+  // Get model mappings
+  if (path === "/admin/api/model-mappings" && method === "GET") {
+    return jsonResp({ mappings: opts.config.modelMappings ?? [] });
+  }
+
+  // Update model mappings (full replace)
+  if (path === "/admin/api/model-mappings" && method === "PUT") {
+    try {
+      const body = await req.json() as { mappings?: Array<{ from?: string; to?: string; note?: string }> };
+      if (!Array.isArray(body.mappings)) {
+        return errorResponse(400, "invalid_request", "mappings must be an array");
+      }
+      const cleaned: ModelMapping[] = [];
+      const seenFrom = new Set<string>();
+      for (const m of body.mappings) {
+        if (typeof m.from !== "string" || m.from.trim() === "") {
+          return errorResponse(400, "invalid_mapping", "Each mapping needs a non-empty 'from'");
+        }
+        if (typeof m.to !== "string" || m.to.trim() === "") {
+          return errorResponse(400, "invalid_mapping", `Mapping '${m.from}' has empty 'to'`);
+        }
+        const fromLower = m.from.trim().toLowerCase();
+        if (seenFrom.has(fromLower)) {
+          return errorResponse(400, "invalid_mapping", `Duplicate 'from' value: '${m.from}' (case-insensitive)`);
+        }
+        seenFrom.add(fromLower);
+        cleaned.push({
+          from: fromLower,
+          to: m.to.trim(),
+          note: typeof m.note === "string" && m.note.trim() ? m.note.trim() : undefined,
+        });
+      }
+      opts.config.modelMappings = cleaned;
+      // Persist
+      const yaml = configToYaml(opts.config);
+      await writeFile(opts.configPath, yaml, "utf-8");
+      appendLog("info", `Model mappings updated (${cleaned.length} mapping(s))`);
+      return jsonResp({ ok: true, mappings: cleaned });
+    } catch (err) {
+      return errorResponse(500, "save_failed", (err as Error).message);
+    }
+  }
+
   // Get stats
   if (path === "/admin/api/stats" && method === "GET") {
     return jsonResp({
@@ -725,6 +768,7 @@ function sanitizeConfig(config: ProxyConfig): Record<string, unknown> {
     logging: config.logging,
     retry: config.retry,
     routingRules: config.routingRules ?? [],
+    modelMappings: config.modelMappings ?? [],
   };
 }
 
@@ -766,6 +810,13 @@ function configToYaml(config: ProxyConfig): string {
           provider: r.provider,
           ...(r.endpoint ? { endpoint: r.endpoint } : {}),
           ...(r.note ? { note: r.note } : {}),
+        })) }
+      : {}),
+    ...(config.modelMappings && config.modelMappings.length > 0
+      ? { modelMappings: config.modelMappings.map(m => ({
+          from: m.from,
+          to: m.to,
+          ...(m.note ? { note: m.note } : {}),
         })) }
       : {}),
   };

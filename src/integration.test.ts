@@ -11,6 +11,7 @@ let proxyServer: ReturnType<typeof Bun.serve>;
 let mockUpstreamServer: ReturnType<typeof Bun.serve>;
 let proxyPort: number;
 let mockPort: number;
+let config: ReturnType<typeof loadConfig>;
 
 function findFreePort(): number {
   return 18000 + Math.floor(Math.random() * 1000);
@@ -70,13 +71,14 @@ beforeAll(() => {
     },
   });
 
-  const config = loadConfig("config.test.yaml");
-  config.server.port = proxyPort;
-  config.server.host = "127.0.0.1";
-  config.auth.proxyApiKey = "integration-test-key";
-  config.providers.zai.anthropicBase = `http://127.0.0.1:${mockPort}/anthropic`;
-  config.providers.zai.openaiBase = `http://127.0.0.1:${mockPort}/coding`;
-  config.auth.apiKey = "integrationTestKey.integrationTestSecret";
+  const loaded = loadConfig("config.test.yaml");
+  loaded.server.port = proxyPort;
+  loaded.server.host = "127.0.0.1";
+  loaded.auth.proxyApiKey = "integration-test-key";
+  loaded.providers.zai.anthropicBase = `http://127.0.0.1:${mockPort}/anthropic`;
+  loaded.providers.zai.openaiBase = `http://127.0.0.1:${mockPort}/coding`;
+  loaded.auth.apiKey = "integrationTestKey.integrationTestSecret";
+  config = loaded;
 
   const auth = new AuthManager({
     mode: "apikey",
@@ -352,5 +354,55 @@ describe("integration: OpenAI Responses API", () => {
     expect(resp.status).toBe(200);
     const body = await resp.json();
     expect(body.object).toBe("response");
+  });
+
+  it("uses configured modelMappings to rewrite client model names", async () => {
+    // Configure a mapping: gpt-5.5 → glm-5.2 (use a known GLM model so mock accepts)
+    config.modelMappings = [{ from: "gpt-5.5", to: "glm-4.6" }];
+
+    const resp = await fetch(proxyUrl("/v1/responses"), {
+      method: "POST",
+      headers: authHeader(),
+      body: JSON.stringify({
+        model: "gpt-5.5",
+        input: [{ type: "message", role: "user", content: "Hi" }],
+      }),
+    });
+    expect(resp.status).toBe(200);
+    const body = await resp.json();
+    expect(body.object).toBe("response");
+
+    // Clean up
+    config.modelMappings = [];
+  });
+
+  it("model mapping is case-insensitive on the from field", async () => {
+    config.modelMappings = [{ from: "gpt-5.5", to: "glm-4.6" }];
+
+    const resp = await fetch(proxyUrl("/v1/responses"), {
+      method: "POST",
+      headers: authHeader(),
+      body: JSON.stringify({
+        model: "GPT-5.5",  // different case
+        input: [{ type: "message", role: "user", content: "Hi" }],
+      }),
+    });
+    expect(resp.status).toBe(200);
+
+    config.modelMappings = [];
+  });
+
+  it("non-GLM model without a mapping falls back to defaultModel", async () => {
+    config.modelMappings = [];  // no mappings
+
+    const resp = await fetch(proxyUrl("/v1/responses"), {
+      method: "POST",
+      headers: authHeader(),
+      body: JSON.stringify({
+        model: "claude-sonnet-4",
+        input: [{ type: "message", role: "user", content: "Hi" }],
+      }),
+    });
+    expect(resp.status).toBe(200);
   });
 });

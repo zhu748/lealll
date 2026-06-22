@@ -1445,6 +1445,41 @@ td input{font-family:var(--font-mono)}
             </button>
           </div>
         </div>
+
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">
+              <span class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3h5v5"/><path d="M8 3H3v5"/><path d="M21 16v5h-5"/><path d="M3 16v5h5"/><line x1="9" y1="9" x2="15" y2="15"/><line x1="15" y1="9" x2="9" y2="15"/></svg></span>
+              模型映射 <span class="tag">Codex CLI</span>
+            </div>
+            <button class="btn btn-ghost btn-sm" onclick="addModelMapping()">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+              添加映射
+            </button>
+          </div>
+          <div class="card-body" style="padding-bottom:0">
+            <div class="hint">
+              <span class="hint-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></span>
+              <div>将客户端发送的模型名重写为 GLM 模型（大小写不敏感精确匹配）。例如 Codex CLI 默认发 <code class="code-inline">gpt-5.5</code>，可映射到 <code class="code-inline">glm-5.2</code>。未配置映射时，非 <code class="code-inline">glm-*</code> 模型会自动 fallback 到 defaultModel。</div>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>客户端模型</th><th>→</th><th>GLM 模型</th><th>备注</th><th style="text-align:right">操作</th></tr></thead>
+              <tbody id="modelMappings"><tr><td colspan="5"><div class="empty-state"><div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3h5v5"/><path d="M8 3H3v5"/><path d="M21 16v5h-5"/><path d="M3 16v5h5"/><line x1="9" y1="9" x2="15" y2="15"/><line x1="15" y1="9" x2="9" y2="15"/></svg></div><div class="empty-text">加载中...</div></div></td></tr></tbody>
+            </table>
+          </div>
+          <div class="card-actions">
+            <button class="btn btn-primary btn-sm" onclick="saveModelMappings()">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/></svg>
+              保存映射
+            </button>
+            <button class="btn btn-ghost btn-sm" onclick="loadModelMappings()">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>
+              重新加载
+            </button>
+          </div>
+        </div>
       </div>
 
       <!-- ============================================================ Statistics ============================================================ -->
@@ -1568,6 +1603,7 @@ let authToken='';
 let logLines=[];
 let statsData={total:0,success:0,failed:0,retried:0,requests:[],models:{}};
 let routingRules=[];
+let modelMappings=[];
 
 // --- Login ---
 async function doLogin(){
@@ -1651,6 +1687,7 @@ async function initDashboard(){
   await loadCredStore();
   await loadProxyEndpoints();
   await loadRoutingRules();
+  await loadModelMappings();
   await loadStats();
   connectLogStream();
 }
@@ -2130,6 +2167,62 @@ async function saveRoutingRules(){
       toast(d.error||'保存失败','error');
     }
   }catch(e){console.error('saveRoutingRules failed:',e);toast('保存失败','error')}
+}
+
+// --- Model Mappings ---
+function addModelMapping(){
+  modelMappings.push({from:'',to:'',note:''});
+  renderModelMappings();
+}
+function renderModelMappings(){
+  const tb=document.getElementById('modelMappings');
+  if(!modelMappings.length){tb.innerHTML='<tr><td colspan="5"><div class="empty-state"><div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3h5v5"/><path d="M8 3H3v5"/><path d="M21 16v5h-5"/><path d="M3 16v5h5"/><line x1="9" y1="9" x2="15" y2="15"/><line x1="15" y1="9" x2="9" y2="15"/></svg></div><div class="empty-text">暂无模型映射</div><div class="empty-hint">点击右上角"添加映射"创建，例如 gpt-5.5 → glm-5.2</div></div></td></tr>';return}
+  // Build a datalist of known GLM models for the "to" field suggestions
+  const glmOptions=(window.__config&&Array.isArray(window.__config.models)?window.__config.models:[]).map(m=>`<option value="${escapeHtml(m)}">`).join('');
+  tb.innerHTML=modelMappings.map((m,i)=>`<tr>
+    <td><input value="${escapeHtml(m.from)}" onchange="modelMappings[${i}].from=this.value" placeholder="例如 gpt-5.5" style="font-family:var(--font-mono);font-size:12px"></td>
+    <td style="text-align:center;color:var(--text-3)">→</td>
+    <td><input value="${escapeHtml(m.to)}" onchange="modelMappings[${i}].to=this.value" placeholder="例如 glm-5.2" list="glm-model-list" style="font-family:var(--font-mono);font-size:12px"></td>
+    <td><input value="${escapeHtml(m.note||'')}" onchange="modelMappings[${i}].note=this.value" placeholder="可选"></td>
+    <td class="td-actions"><button class="btn btn-danger btn-sm" onclick="modelMappings.splice(${i},1);renderModelMappings()">删除</button></td>
+  </tr>`).join('');
+  // Inject datalist once if not present
+  if(!document.getElementById('glm-model-list')){
+    const dl=document.createElement('datalist');dl.id='glm-model-list';dl.innerHTML=glmOptions;document.body.appendChild(dl);
+  }
+}
+async function loadModelMappings(){
+  try{
+    const r=await fetch(API+'/admin/api/model-mappings',{headers:authHeaders()});
+    const d=await r.json();
+    modelMappings=(d.mappings||[]).map(m=>({from:m.from,to:m.to,note:m.note||''}));
+    renderModelMappings();
+  }catch(e){console.error('loadModelMappings failed:',e);toast('加载模型映射失败','error')}
+}
+async function saveModelMappings(){
+  for(let i=0;i<modelMappings.length;i++){
+    const m=modelMappings[i];
+    if(!m.from||!m.from.trim()){toast(`第 ${i+1} 条映射缺少"客户端模型"`,'error');return}
+    if(!m.to||!m.to.trim()){toast(`第 ${i+1} 条映射缺少"GLM 模型"`,'error');return}
+  }
+  // Check for duplicate from (case-insensitive)
+  const seen=new Set();
+  for(let i=0;i<modelMappings.length;i++){
+    const f=modelMappings[i].from.trim().toLowerCase();
+    if(seen.has(f)){toast(`第 ${i+1} 条映射的"客户端模型"重复：${modelMappings[i].from}`,'error');return}
+    seen.add(f);
+  }
+  try{
+    const r=await fetch(API+'/admin/api/model-mappings',{method:'PUT',headers:authHeaders(),body:JSON.stringify({mappings:modelMappings})});
+    const d=await r.json();
+    if(r.ok){
+      modelMappings=(d.mappings||[]).map(m=>({from:m.from,to:m.to,note:m.note||''}));
+      renderModelMappings();
+      toast(`已保存 ${modelMappings.length} 条模型映射`,'success');
+    }else{
+      toast(d.error||'保存失败','error');
+    }
+  }catch(e){console.error('saveModelMappings failed:',e);toast('保存失败','error')}
 }
 
 // --- Stats ---

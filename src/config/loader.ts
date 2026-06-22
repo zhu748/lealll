@@ -4,7 +4,7 @@
  */
 import { readFileSync, existsSync } from "node:fs";
 import { parse } from "yaml";
-import type { ProxyConfig, ProviderEndpoints, ProxyIdentity, RetryConfig, RoutingRule } from "./types.js";
+import type { ProxyConfig, ProviderEndpoints, ProxyIdentity, RetryConfig, RoutingRule, ModelMapping } from "./types.js";
 
 /** Environment variable keys that override YAML values. */
 const ENV = {
@@ -107,6 +107,9 @@ export function loadConfig(path: string): ProxyConfig {
   // --- routing rules ---
   const routingRules = resolveRoutingRules(parsed?.routingRules);
 
+  // --- model mappings ---
+  const modelMappings = resolveModelMappings(parsed?.modelMappings);
+
   const config: ProxyConfig = {
     server: { port, host },
     auth: { proxyApiKey, mode, apiKey, oauthCredentialsPath },
@@ -119,6 +122,7 @@ export function loadConfig(path: string): ProxyConfig {
     logging: { level: logLevel },
     retry,
     routingRules,
+    modelMappings,
   };
 
   validate(config);
@@ -248,6 +252,24 @@ function resolveRoutingRules(raw: unknown): RoutingRule[] {
     });
   }
   return rules;
+}
+
+/** Resolve model mappings from YAML. `from` is lowercased for case-insensitive lookup. */
+function resolveModelMappings(raw: unknown): ModelMapping[] {
+  if (!Array.isArray(raw)) return [];
+  const mappings: ModelMapping[] = [];
+  for (const item of raw) {
+    if (typeof item !== "object" || item === null) continue;
+    const m = item as Record<string, unknown>;
+    if (typeof m.from !== "string" || m.from.trim() === "") continue;
+    if (typeof m.to !== "string" || m.to.trim() === "") continue;
+    mappings.push({
+      from: m.from.trim().toLowerCase(),
+      to: m.to.trim(),
+      note: typeof m.note === "string" && m.note.trim() ? m.note.trim() : undefined,
+    });
+  }
+  return mappings;
 }
 
 /** Cross-field validation after all fields are resolved. */

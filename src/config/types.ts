@@ -78,8 +78,7 @@ export interface RetryConfig {
   retryableStatuses: number[];
 }
 
-/**
- * Custom routing rule — overrides the default provider/endpoint for requests
+/** Custom routing rule — overrides the default provider/endpoint for requests
  * whose model name matches `pattern` (shell-glob style, e.g. "glm-5*").
  */
 export interface RoutingRule {
@@ -89,6 +88,24 @@ export interface RoutingRule {
   provider: "zai" | "bigmodel";
   /** Optional endpoint override (full URL). If empty, the provider's default endpoint is used. */
   endpoint?: string;
+  /** Optional note for the operator. */
+  note?: string;
+}
+
+/**
+ * Model mapping — rewrites the client-sent `model` field to a different id
+ * before forwarding upstream. Used to make non-GLM model names (e.g. Codex CLI's
+ * `gpt-5.5`) map to a real GLM model.
+ *
+ * Matching is case-insensitive exact match on `from`. The `to` value is used
+ * verbatim — no validation against the model catalog (allows future GLM models
+ * without code changes).
+ */
+export interface ModelMapping {
+  /** Client-sent model id to rewrite (case-insensitive exact match). */
+  from: string;
+  /** Target model id to forward upstream. */
+  to: string;
   /** Optional note for the operator. */
   note?: string;
 }
@@ -128,4 +145,6 @@ export interface ProxyConfig {
   retry: RetryConfig;
   /** Custom per-model routing rules. Empty by default. */
   routingRules?: RoutingRule[];
+  /** Client model id → GLM model id rewrite table. Empty by default. */
+  modelMappings?: ModelMapping[];
 }

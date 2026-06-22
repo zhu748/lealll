@@ -99,10 +99,12 @@ export async function proxyRequest(
   const translateMode = format === "openai" || format === "openai-responses";
   const upstreamFormat: Format = translateMode ? "anthropic" : format;
 
-  // Model fallback for translation modes: if the client sent a non-GLM model
-  // (e.g. Codex CLI defaults to "gpt-5.5"), substitute config.defaultModel so
-  // GLM upstream doesn't 400 with "parameter error". Original model is preserved
-  // in the response echo for client compatibility.
+  // Model rewrite for translation modes:
+  //   1. If client-sent model matches a modelMappings entry (case-insensitive),
+  //      rewrite to the mapped target.
+  //   2. Else if the model is not a known GLM model (e.g. Codex CLI's "gpt-5.5"),
+  //      fall back to config.defaultModel so GLM upstream doesn't 400.
+  // Original model is preserved in the response echo for client compatibility.
   //
   // This is only applied in translation mode because passthrough mode lets the
   // upstream decide (matches the original proxy semantics — see README: "the
@@ -110,11 +112,18 @@ export async function proxyRequest(
   if (translateMode && parsedBody && typeof parsedBody === "object") {
     const bodyObj = parsedBody as Record<string, unknown>;
     const clientModel = typeof bodyObj.model === "string" ? bodyObj.model : "";
-    if (clientModel && !isKnownGlmModel(clientModel)) {
-      const fallback = config.defaultModel || "glm-4.6";
-      console.log(`${reqId} model fallback: ${clientModel} → ${fallback} (non-GLM model not accepted upstream)`);
-      bodyObj.model = fallback;
-      meta.model = fallback;
+    if (clientModel) {
+      const mapped = lookupModelMapping(clientModel, config.modelMappings);
+      if (mapped) {
+        console.log(`${reqId} model mapping: ${clientModel} → ${mapped} (configured)`);
+        bodyObj.model = mapped;
+        meta.model = mapped;
+      } else if (!isKnownGlmModel(clientModel)) {
+        const fallback = config.defaultModel || "glm-4.6";
+        console.log(`${reqId} model fallback: ${clientModel} → ${fallback} (non-GLM model not accepted upstream)`);
+        bodyObj.model = fallback;
+        meta.model = fallback;
+      }
     }
   }
 
@@ -591,6 +600,17 @@ function isKnownGlmModel(model: string): boolean {
 }
 
 const knownGlmModelSet = new Set(listModelIds());
+
+/**
+ * Look up a model rewrite in the configured modelMappings.
+ * Case-insensitive exact match on `from` (mappings are stored lowercased).
+ * Returns the target model id, or undefined if no mapping matches.
+ */
+function lookupModelMapping(clientModel: string, mappings: { from: string; to: string }[] | undefined): string | undefined {
+  if (!mappings || mappings.length === 0) return undefined;
+  const lower = clientModel.toLowerCase();
+  return mappings.find((m) => m.from === lower)?.to;
+}
 
 /** Translate a client request body object to Anthropic JSON. Returns error Response on failure. */
 function translateClientBodyObj(parsed: unknown, format: Format): Response | unknown {

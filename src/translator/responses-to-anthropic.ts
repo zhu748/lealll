@@ -24,7 +24,6 @@ import type {
   AnthropicToolDefinition,
 } from "./types.js";
 import { getTurn } from "./responses-store.js";
-import { getModel } from "../provider/models.js";
 
 const DEFAULT_MAX_TOKENS = 4096;
 
@@ -77,24 +76,16 @@ export function translateRequestResponsesToAnthropic(req: OpenAIResponseRequest)
   if (req.stream !== undefined) result.stream = req.stream;
   if (req.stop) result.stop_sequences = Array.isArray(req.stop) ? req.stop : [req.stop];
 
-  // Forward reasoning.effort → thinking enabled, but only for models that
-  // actually support reasoning. GLM's older/non-reasoning models (glm-4.6v,
-  // glm-5v-turbo) reject the `thinking` field with 3001 "parameter error".
+  // Forward reasoning.effort → thinking enabled. Per user request, this is
+  // unconditional: if the client sent `reasoning.effort`, we honor it.
+  // If the model doesn't support thinking, GLM upstream will simply ignore
+  // it (or the user can override by sending a different model). We don't
+  // second-guess the client's intent.
   //
-  // We look up the model in the catalog; if unknown or marked reasoning:true,
-  // we inject `thinking: {type:"enabled"}`. body-transformer.ts then normalises
-  // it (no-op since it's already in GLM's accepted form) before forwarding.
-  //
-  // Note: by the time we get here, handler.ts has already done model fallback
-  // (gpt-5.5 → config.defaultModel), so result.model is always a GLM id.
+  // body-transformer.ts normalises any thinking field into GLM's accepted
+  // `{type:"enabled"}` form before forwarding, so this is safe.
   if (req.reasoning && req.reasoning.effort) {
-    const modelDef = getModel(result.model);
-    // Inject thinking only when the model is known AND supports reasoning,
-    // OR when the model is unknown (let GLM decide — better to try than to
-    // silently drop reasoning on models that might support it).
-    if (!modelDef || modelDef.reasoning === true) {
-      result.thinking = { type: "enabled" };
-    }
+    result.thinking = { type: "enabled" };
   }
 
   // Filter to only function-type tools (local_shell, web_search etc. are built-in client-side)

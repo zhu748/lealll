@@ -1,5 +1,17 @@
 # zcode-proxy 使用说明
 
+> **v2.1.3.3 / v0.1.13 — Dashboard 模型映射 + thinking 无条件注入**
+> - **管理面板新增"模型映射"配置卡片**：在 Settings → 模型路由下面，可配置客户端模型名 → GLM 模型名的重写规则
+>   - 例如 Codex CLI 默认发 `gpt-5.5`，可映射到 `glm-5.2` 或任意 GLM 模型
+>   - 大小写不敏感精确匹配，`from` 字段去重校验
+>   - 持久化到 `config.yaml` 的 `modelMappings` 字段
+>   - GLM 模型输入框带 datalist 自动补全（来自当前 models 列表）
+> - **thinking 注入改为无条件**：只要客户端发 `reasoning.effort`，就注入 `thinking: {type:"enabled"}`
+>   - 不再按模型 catalog 判断（之前 glm-4.6v / glm-5v-turbo 被跳过）
+>   - 用户要开就开，GLM 不支持时由上游自己处理
+> - **模型 rewrite 逻辑升级**：先查 modelMappings，命中就用映射；未命中且非 GLM 模型才 fallback 到 defaultModel
+> - **新增 5 个测试**：3 个 config loader 测试 + 3 个集成测试覆盖映射命中、大小写不敏感、未命中 fallback
+>
 > **v2.1.3.2 / v0.1.12 — thinking 字段重新启用（按模型能力）**
 > - **修复 thinking 注入逻辑**：v2.1.3.1 过度保守地移除了 thinking 注入，导致所有模型都不思考。现在按模型能力判断：
 >   - **支持 reasoning 的模型**（glm-4.5-air / glm-4.6 / glm-4.7 / glm-5 / glm-5-turbo / glm-5.1 / glm-5.2）：注入 `thinking: {type:"enabled"}`，启用思考
