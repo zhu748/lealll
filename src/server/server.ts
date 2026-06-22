@@ -7,6 +7,7 @@ import type { ProxyConfig } from "../config/types.js";
 import type { AuthManager } from "../auth/manager.js";
 import { handleChatCompletions, handleListModels } from "./routes-openai.js";
 import { handleMessages } from "./routes-anthropic.js";
+import { handleResponses } from "./routes-responses.js";
 import { errorResponse } from "../proxy/handler.js";
 import { handleAdminRoute, type AdminOptions } from "../admin/api.js";
 
@@ -69,6 +70,11 @@ export function createFetchHandler(opts: ServerOptions): (req: Request) => Promi
     // Anthropic routes
     if (path === "/v1/messages" && method === "POST") {
       return handleMessages(req, proxyOpts);
+    }
+
+    // OpenAI Responses API route (used by Codex CLI when wire_api=responses)
+    if (path === "/v1/responses" && method === "POST") {
+      return handleResponses(req, proxyOpts);
     }
 
     // Health check

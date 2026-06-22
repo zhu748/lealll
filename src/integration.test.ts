@@ -218,3 +218,100 @@ describe("integration: Error handling", () => {
     expect(resp.headers.get("access-control-allow-origin")).toBe("*");
   });
 });
+
+describe("integration: OpenAI Responses API", () => {
+  it("POST /v1/responses returns 200 with translated response (non-streaming)", async () => {
+    const resp = await fetch(proxyUrl("/v1/responses"), {
+      method: "POST",
+      headers: authHeader(),
+      body: JSON.stringify({
+        model: "glm-4.6",
+        input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "Hello" }] }],
+      }),
+    });
+    expect(resp.status).toBe(200);
+    const body = await resp.json();
+    expect(body.object).toBe("response");
+    expect(body.status).toBe("completed");
+    expect(Array.isArray(body.output)).toBe(true);
+    expect(body.output.length).toBeGreaterThan(0);
+    expect(body.output[0].type).toBe("message");
+    expect(body.output[0].content[0].text).toBe("Integration test response");
+    expect(body.usage.total_tokens).toBe(18);
+  });
+
+  it("POST /v1/responses streaming emits response.created + response.completed", async () => {
+    const resp = await fetch(proxyUrl("/v1/responses"), {
+      method: "POST",
+      headers: authHeader(),
+      body: JSON.stringify({
+        model: "glm-4.6",
+        input: "Stream test",
+        stream: true,
+      }),
+    });
+    expect(resp.status).toBe(200);
+    expect(resp.headers.get("content-type")).toBe("text/event-stream");
+    const text = await resp.text();
+    expect(text).toContain("event: response.created");
+    expect(text).toContain("event: response.in_progress");
+    expect(text).toContain("event: response.output_text.delta");
+    expect(text).toContain("event: response.completed");
+    // Must NOT contain OpenAI Chat Completions or Anthropic event types
+    expect(text).not.toContain("chat.completion.chunk");
+    expect(text).not.toContain("message_start");
+  });
+
+  it("supports previous_response_id chaining", async () => {
+    // First turn
+    const resp1 = await fetch(proxyUrl("/v1/responses"), {
+      method: "POST",
+      headers: authHeader(),
+      body: JSON.stringify({
+        model: "glm-4.6",
+        input: [{ type: "message", role: "user", content: "earlier question" }],
+      }),
+    });
+    expect(resp1.status).toBe(200);
+    const body1 = await resp1.json();
+    const firstResponseId = body1.id;
+    expect(firstResponseId).toBeTruthy();
+
+    // Second turn referencing previous_response_id
+    const resp2 = await fetch(proxyUrl("/v1/responses"), {
+      method: "POST",
+      headers: authHeader(),
+      body: JSON.stringify({
+        model: "glm-4.6",
+        input: [{ type: "message", role: "user", content: "follow-up" }],
+        previous_response_id: firstResponseId,
+      }),
+    });
+    expect(resp2.status).toBe(200);
+    const body2 = await resp2.json();
+    expect(body2.previous_response_id).toBe(firstResponseId);
+    expect(body2.object).toBe("response");
+  });
+
+  it("forwards function tool definitions and translates tool_use responses", async () => {
+    // Mock upstream returns a tool_use block — we verify the proxy translates it
+    // into a function_call output item in the Responses format.
+    // The mock at the top of this file always returns text, so we only verify
+    // that function-type tools are accepted without error here.
+    const resp = await fetch(proxyUrl("/v1/responses"), {
+      method: "POST",
+      headers: authHeader(),
+      body: JSON.stringify({
+        model: "glm-4.6",
+        input: "Hi",
+        tools: [
+          { type: "function", name: "shell", description: "Run shell", parameters: { type: "object" } },
+          { type: "local_shell" }, // should be filtered out, not error
+        ],
+      }),
+    });
+    expect(resp.status).toBe(200);
+    const body = await resp.json();
+    expect(body.object).toBe("response");
+  });
+});

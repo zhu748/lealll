@@ -70,6 +70,7 @@ bun run src/index.ts auth login bigmodel --import
 |--------|------|-------------|
 | `POST` | `/v1/chat/completions` | OpenAI-compatible chat completions (streaming + non-streaming) |
 | `POST` | `/v1/messages` | Anthropic-format messages (streaming + non-streaming) |
+| `POST` | `/v1/responses` | OpenAI Responses API (streaming + non-streaming, Codex CLI compatible) |
 | `GET` | `/v1/models` | List available models |
 | `GET` | `/health` | Health check |
 
@@ -113,6 +114,34 @@ curl http://localhost:8080/v1/chat/completions \
     "stream": true
   }'
 ```
+
+### OpenAI Responses API (Codex CLI)
+
+```bash
+curl http://localhost:8080/v1/responses \
+  -H "Authorization: Bearer your-proxy-secret" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "glm-4.6",
+    "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Hello!"}]}],
+    "stream": false
+  }'
+```
+
+Codex CLI integration — set these env vars before launching `codex`:
+
+```bash
+export OPENAI_API_KEY="your-proxy-secret"
+export OPENAI_BASE_URL="http://localhost:8080/v1"
+# Instruct Codex CLI to use the Responses wire format
+# (already default in recent versions; older versions may need this)
+codex --model glm-4.6
+```
+
+The proxy translates `POST /v1/responses` to Anthropic Messages upstream and back,
+emitting the full Responses streaming event sequence (`response.created` →
+`response.output_text.delta` → `response.completed`) that Codex CLI expects.
+`previous_response_id` is supported via an in-memory LRU store (256 turns).
 
 ### List Models
 
