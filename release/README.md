@@ -1,5 +1,11 @@
 # zcode-proxy 使用说明
 
+> **v0.1.1 修复版本**
+> - **修复 admin 面板 ENOENT 报错**：编译后的 exe 不再因找不到 `dashboard.html` 而崩溃
+> - **修复 start.bat 启动时变成 coding-plan 的问题**：`--config` flag 现在能正确解析
+> - **修复双击 exe 切换 start-plan 时闪退**：错误信息现在会清晰显示并暂停 15 秒
+> - **修复 dashboard 切换 plan 后重启丢失**：plan 变更会持久化到 config.yaml
+>
 > **v0.1.0 新特性**
 > - **多账号管理**：支持同时存储多套凭证（智谱 / Z.AI），运行时一键切换
 > - **OAuth 回调 URL 手动输入**：当自动轮询失败或远程服务器无浏览器时，可手动粘贴回调 URL 完成授权
