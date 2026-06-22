@@ -9,3 +9,4 @@ dist/
 /_reverse
 /zcode-proxy.exe
 *.zip
+release/zcode-proxy.exe
