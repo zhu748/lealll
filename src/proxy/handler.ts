@@ -138,8 +138,60 @@ export async function proxyRequest(
     return resp;
   };
 
+  // Refresh captcha token if we're in start-plan mode. Returns the captcha
+  // headers to use, or undefined if not in start-plan / refresh failed.
+  // Called before EVERY fetch attempt (initial + retries) to avoid using a
+  // stale token that expired during the retry backoff window.
+  //
+  // Token TTL is 45s; the first request might wait 1-8s on retry backoff,
+  // and the upstream might take another few seconds to respond — easily
+  // pushing us past the 45s mark. Using a stale token returns 403
+  // "captcha verify failed" which then leaks through to the client.
+  //
+  // getCaptchaToken() internally caches for TOKEN_TTL_MS (45s), so calling
+  // it on every retry is cheap — only re-solves when the cache expires.
+  const refreshCaptchaHeaders = async (): Promise<Record<string, string> | undefined> => {
+    if (config.plan !== "start-plan") return undefined;
+    try {
+      const token = await getCaptchaToken();
+      return { [RETRY_HEADERS.PARAM]: token.verifyParam, [RETRY_HEADERS.REGION]: token.region };
+    } catch {
+      return undefined;
+    }
+  };
+
+  // Handle a 403 captcha challenge by invalidating the cached token,
+  // re-solving, and retrying the fetch with the fresh token.
+  // Returns the new response, or the original 403 if re-solve fails.
+  // Used both for the initial fetch AND for retry-loop fetches — without
+  // this, a retry that returns 403 would leak through to the client.
+  const handleCaptchaChallenge = async (resp: Response): Promise<Response> => {
+    try { resp.body?.cancel(); } catch {}
+    console.log(`${reqId} captcha challenge (403), re-solving...`);
+    invalidateCaptchaToken();
+    try {
+      const fresh = await getCaptchaToken();
+      console.log(`${reqId} captcha re-solved (token ${fresh.verifyParam.length} chars), retrying...`);
+      const freshCaptcha = {
+        [RETRY_HEADERS.PARAM]: fresh.verifyParam,
+        [RETRY_HEADERS.REGION]: fresh.region,
+      };
+      const newResp = await fetchUpstreamDetected(freshCaptcha);
+      headersAt = Date.now();
+      return newResp;
+    } catch (err) {
+      console.log(`${reqId} captcha re-solve failed: ${(err as Error).message}`);
+      // Return a synthetic 503 so caller can decide what to do
+      return errorResponse(503, "captcha_solver_failed", (err as Error).message);
+    }
+  };
+
   let upstreamResp: Response;
   try {
+    // Always refresh captcha token right before the fetch — the token we
+    // got at the start of this function might have expired by now if there
+    // was any await in between (config loading, body parsing, etc.).
+    captchaHeaders = await refreshCaptchaHeaders();
     upstreamResp = await fetchUpstreamDetected(captchaHeaders);
   } catch (err) {
     printRow(reqId, format, meta, 502, started, Date.now(), 0, 0, 0);
@@ -152,23 +204,21 @@ export async function proxyRequest(
     return errorResponse(401, "start_plan_jwt_invalid", "Start-plan JWT was rejected. Re-run: zcode-proxy auth login");
   }
 
-  // start-plan: on 403 captcha challenge, force re-solve and retry once
+  // start-plan: on 403 captcha challenge, force re-solve and retry once.
+  // This handles the INITIAL response. Retries that return 403 are handled
+  // inside the retry loop below via the same handleCaptchaChallenge() helper.
   if (config.plan === "start-plan" && (upstreamResp.status === 403 || detectCaptchaChallenge(upstreamResp))) {
-    try { upstreamResp.body?.cancel(); } catch {}
-    console.log(`${reqId} captcha challenge, re-solving...`);
-    invalidateCaptchaToken();
-    try {
-      const fresh = await getCaptchaToken();
-      console.log(`${reqId} captcha re-solved (token ${fresh.verifyParam.length} chars), retrying...`);
-      const freshCaptcha = {
-        [RETRY_HEADERS.PARAM]: fresh.verifyParam,
-        [RETRY_HEADERS.REGION]: fresh.region,
-      };
-      upstreamResp = await fetchUpstreamDetected(freshCaptcha);
-      headersAt = Date.now();
-    } catch (err) {
-      printRow(reqId, format, meta, 503, started, Date.now(), 0, 0, 0);
-      return errorResponse(503, "captcha_solver_failed", (err as Error).message);
+    upstreamResp = await handleCaptchaChallenge(upstreamResp);
+    // If captcha re-solve itself failed, bail out
+    if (upstreamResp.status === 503 && upstreamResp.headers.get("content-type")?.includes("application/json")) {
+      try {
+        const body = await upstreamResp.text();
+        const parsed = JSON.parse(body);
+        if (parsed?.error?.type === "captcha_solver_failed") {
+          printRow(reqId, format, meta, 503, started, Date.now(), 0, 0, 0);
+          return upstreamResp;
+        }
+      } catch { /* not a captcha_solver_failed response — continue */ }
     }
   }
 
@@ -214,8 +264,24 @@ export async function proxyRequest(
         // Build a FRESH Request for each retry — never reuse upstreamReq.
         // fetchUpstreamDetected also runs SSE error detection so 200 streams
         // with hidden errors get caught on every attempt.
-        upstreamResp = await fetchUpstreamDetected(captchaHeaders);
+        //
+        // CRITICAL for start-plan: refresh captcha token before each retry.
+        // The token from the initial fetch might have expired during the
+        // backoff sleep (TTL is only 45s). Using a stale token returns 403
+        // "captcha verify failed" — which is NOT a retryable status, so it
+        // would break out of the loop and leak the 403 to the client.
+        const retryCaptcha = await refreshCaptchaHeaders();
+        upstreamResp = await fetchUpstreamDetected(retryCaptcha);
         headersAt = Date.now();
+
+        // If the retry itself returns 403 (captcha challenge), try to
+        // re-solve and retry once before giving up. This handles the case
+        // where the token expired between refreshCaptchaHeaders() and the
+        // upstream actually validating it (rare but possible under load).
+        if (config.plan === "start-plan" && (upstreamResp.status === 403 || detectCaptchaChallenge(upstreamResp))) {
+          console.log(`${reqId} retry ${attempt} got 403 captcha challenge, re-solving...`);
+          upstreamResp = await handleCaptchaChallenge(upstreamResp);
+        }
       } catch (err) {
         // Network error during retry — log the ACTUAL error so users can
         // diagnose (the old code just said "network error" with no detail).
