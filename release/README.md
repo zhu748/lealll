@@ -1,5 +1,17 @@
 # zcode-proxy 使用说明
 
+> **v2.1.3.6beta0 — 修复 tool_use 块上的 cache_control 也触发 3001**
+> - **根因定位**：v2.1.3.5beta0 修复了 tool_result 上的 cache_control，但诊断日志显示新的 3001：
+>   ```
+>   msgs[[0]user/{text,text},[1]assistant/{text},[2]user/str,[3]assistant/{tool_use,tool_use+cc},[4]user/{tool_result,tool_result}]
+>   ```
+>   `tool_result+cc` 消失了 ✅，但 `[3]assistant/{tool_use,tool_use+cc}` — 第二个 tool_use 块被加上了 cache_control！
+> - **原因**：v2.1.3.5beta0 的 `applyAnthropicCacheControl` 在最后一条消息全是 tool_result 时，往前找上一个消息，把 cache_control 加到了 tool_use 块上。但 **ZCode 网关同样不接受 tool_use 块上的 cache_control**——只接受 text 块上的。
+> - **修复**：
+>   1. `sanitizeContentBlocks()` 现在剥离**所有非 text 块**上的 cache_control（tool_use、tool_result、image 等），不管是谁加的
+>   2. `applyAnthropicCacheControl()` 现在只把 cache_control 加到 **text 块**上；如果最后几条消息都没有 text 块，就跳过 cache_control（宁可不要 cache 优化也不能 3001）
+> - **新增 3 个测试**，包括复现 v2.1.3.5beta0 回归的多 tool_use 场景；全套 277 测试通过
+>
 > **v2.1.3.5beta0 — 修复 start-plan 模式 tool_result+cache_control 触发 3001**
 > - **根因定位**：上一版 `v2.1.3.4beta0` 的诊断日志显示 start-plan 模式下第三轮请求报 3001，转换后的请求体摘要为：
 >   ```

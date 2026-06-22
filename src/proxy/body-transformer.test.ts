@@ -717,6 +717,148 @@ describe("transformRequestBody — strip cache_control from tool_result (Anthrop
     expect(parsed.context_management).toBeUndefined();
     expect(parsed.output_config).toBeUndefined();
   });
+
+  it("strips cache_control from tool_use blocks (v2.1.3.5beta0 regression)", () => {
+    // v2.1.3.5beta0 fixed tool_result+cc but applyAnthropicCacheControl then
+    // attached cc to tool_use blocks when the last user message was all
+    // tool_results. ZCode gateway ALSO rejects cc on tool_use blocks → 3001.
+    // This reproduces the user's v2.1.3.5beta0 diagnostic:
+    //   msgs[..., [3]assistant/{tool_use,tool_use+cc}, [4]user/{tool_result,tool_result}]
+    // The assistant called 2 tools; proxy walked back and put cc on 2nd tool_use.
+    const body = JSON.stringify({
+      model: "glm-5.2",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "<system-reminder>...</system-reminder>" },
+            { type: "text", text: "你好" },
+          ],
+        },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "你好！我是 ZCode..." }],
+        },
+        { role: "user", content: "帮我看看当前项目是干嘛的" },
+        {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "...", signature: "" },
+            { type: "tool_use", id: "call_1", name: "Grep", input: { pattern: "x" } },
+            { type: "tool_use", id: "call_2", name: "Bash", input: { command: "ls" } },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            { tool_use_id: "call_1", type: "tool_result", content: "result1", is_error: false },
+            { tool_use_id: "call_2", type: "tool_result", content: "result2", is_error: false },
+          ],
+        },
+      ],
+      system: [{ type: "text", text: "You are Claude Code." }],
+      tools: [],
+      thinking: { type: "adaptive" },
+      context_management: { edits: [] },
+      output_config: { effort: "max" },
+    });
+    const out = transformRequestBody(body, {
+      format: "anthropic",
+      userId: "u-123",
+      startPlan: true,
+    });
+    const parsed = JSON.parse(out as string);
+
+    // The assistant message with tool_use blocks — NO block should have cc
+    const assistantWithTools = parsed.messages.find((m: any) =>
+      m.role === "assistant" && Array.isArray(m.content) &&
+      m.content.some((b: any) => b.type === "tool_use")
+    );
+    expect(assistantWithTools).toBeDefined();
+    for (const block of assistantWithTools.content) {
+      // No tool_use block should carry cache_control
+      if (block.type === "tool_use") {
+        expect(block.cache_control).toBeUndefined();
+      }
+    }
+    // Thinking block should also be stripped
+    expect(assistantWithTools.content.some((b: any) => b.type === "thinking")).toBe(false);
+
+    // The last user message (tool_results) — NO block should have cc
+    const lastMsg = parsed.messages[parsed.messages.length - 1];
+    for (const block of lastMsg.content) {
+      expect(block.cache_control).toBeUndefined();
+    }
+  });
+
+  it("attachable text block found when last msg is all tool_results", () => {
+    // When the last user message is all tool_results and the previous
+    // assistant has a text block, cache_control should land on that text
+    // block — NOT on any tool_use block.
+    const body = JSON.stringify({
+      messages: [
+        { role: "user", content: "你好" },
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "let me check" },
+            { type: "tool_use", id: "t1", name: "Bash", input: { cmd: "ls" } },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            { tool_use_id: "t1", type: "tool_result", content: "out", is_error: false },
+          ],
+        },
+      ],
+    });
+    const out = transformRequestBody(body, { format: "anthropic" });
+    const parsed = JSON.parse(out as string);
+    const assistant = parsed.messages[1];
+    // text block should get cache_control
+    const textBlock = assistant.content.find((b: any) => b.type === "text");
+    expect(textBlock.cache_control).toEqual({ type: "ephemeral" });
+    // tool_use block should NOT have cache_control
+    const toolUseBlock = assistant.content.find((b: any) => b.type === "tool_use");
+    expect(toolUseBlock.cache_control).toBeUndefined();
+    // tool_result block should NOT have cache_control
+    const toolResultBlock = parsed.messages[2].content[0];
+    expect(toolResultBlock.cache_control).toBeUndefined();
+  });
+
+  it("skips cache_control entirely when no text block exists in any message", () => {
+    // Edge case: all messages have only tool_use / tool_result blocks, no text.
+    // Cache_control should be skipped, not forced onto a non-text block.
+    const body = JSON.stringify({
+      messages: [
+        { role: "user", content: "你好" },  // string → converted to text block
+        {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "t1", name: "Bash", input: { cmd: "ls" } }],
+        },
+        {
+          role: "user",
+          content: [
+            { tool_use_id: "t1", type: "tool_result", content: "out", is_error: false },
+          ],
+        },
+      ],
+    });
+    const out = transformRequestBody(body, { format: "anthropic" });
+    const parsed = JSON.parse(out as string);
+    // The first user message (string "你好") gets converted to a text block
+    // with cache_control — that's the only text block in the conversation.
+    const firstUser = parsed.messages[0];
+    expect(Array.isArray(firstUser.content)).toBe(true);
+    expect(firstUser.content[0].type).toBe("text");
+    expect(firstUser.content[0].cache_control).toEqual({ type: "ephemeral" });
+    // No tool_use or tool_result block should have cache_control
+    const assistant = parsed.messages[1];
+    expect(assistant.content[0].cache_control).toBeUndefined();
+    const lastUser = parsed.messages[2];
+    expect(lastUser.content[0].cache_control).toBeUndefined();
+  });
 });
 
 describe("transformRequestBody — metadata.user_id (Anthropic)", () => {

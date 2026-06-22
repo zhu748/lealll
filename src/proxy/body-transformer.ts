@@ -110,11 +110,19 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
  * block of the last non-system message. Mirrors ZCode's `HLr` algorithm.
  * Idempotent — skips if any block on that message already carries cache_control.
  *
- * IMPORTANT: Skips `tool_result` blocks — ZCode's start-plan gateway rejects
- * cache_control on tool_result blocks with 3001. If the last block of the
- * last message is a tool_result, we look backwards for a text block to attach
- * cache_control to; if none exists, we skip cache_control entirely for that
- * message (better to miss the cache optimization than to 3001).
+ * IMPORTANT: ZCode's start-plan gateway ONLY accepts `cache_control` on `text`
+ * blocks. Attaching it to `tool_use`, `tool_result`, `image`, or any other
+ * block type causes 3001 "parameter error". This function therefore ONLY
+ * attaches cache_control to `text` blocks. If the last non-system message has
+ * no text block (e.g. it's all tool_results, or all tool_use blocks), it walks
+ * backwards to previous messages looking for a text block. If none is found,
+ * cache_control is skipped entirely — better to miss the cache optimization
+ * than to 3001.
+ *
+ * The `sanitizeContentBlocks()` function runs BEFORE this and strips any
+ * cache_control that Claude Code put on non-text blocks, so even if this
+ * function somehow attached to a non-text block, sanitize would catch it.
+ * But we also guard here to avoid relying on the safety net.
  */
 function applyAnthropicCacheControl(body: Record<string, unknown>): boolean {
   const messages = body.messages;
@@ -130,27 +138,25 @@ function applyAnthropicCacheControl(body: Record<string, unknown>): boolean {
       return true;
     }
     if (Array.isArray(msg.content) && msg.content.length > 0) {
-      // Find the last block that can accept cache_control.
-      // tool_result blocks cannot (ZCode gateway 3001s); text blocks can.
-      // If the message is entirely tool_result blocks (e.g. a tool-result-only
-      // user turn), skip cache_control for this message and continue to the
-      // previous message.
+      // Walk backwards through this message's blocks looking for a `text`
+      // block to attach cache_control to. Skip tool_use / tool_result / image
+      // etc. — ZCode gateway only accepts cache_control on text blocks.
       let attached = false;
       for (let j = msg.content.length - 1; j >= 0; j--) {
         const block = msg.content[j];
         if (typeof block !== "object" || block === null) continue;
-        if (block.type === "tool_result") continue; // skip — gateway rejects
+        if (block.type !== "text") continue; // ONLY text blocks can carry cc
         if (!block.cache_control) {
           block.cache_control = { type: "ephemeral" };
           attached = true;
           break;
         }
-        // Already has cache_control — message is fine, stop searching.
+        // Already has cache_control on a text block — message is fine.
         attached = true;
         break;
       }
       if (attached) return true;
-      // No attachable block on this message — fall through to previous message.
+      // No text block on this message — fall through to previous message.
       continue;
     }
     continue;
@@ -358,20 +364,25 @@ function stripThinkingBlocksFromMessages(body: Record<string, unknown>): boolean
  * upstream / ZCode gateway reject with 3001 "parameter error".
  *
  * Currently strips:
- *   - `cache_control` from `tool_result` blocks.
- *     Claude Code attaches `cache_control: {type:"ephemeral"}` to the last
- *     block of the last user message — when that message is a tool_result
- *     (i.e. the last turn was a tool call), the cache_control lands ON the
- *     tool_result block. ZCode's start-plan gateway does NOT accept
- *     cache_control on tool_result blocks (only on text blocks) and returns
- *     3001. Anthropic's official API accepts it, but GLM's gateway is stricter.
+ *   - `cache_control` from ALL non-text blocks (tool_result, tool_use, image, etc.)
  *
- *     This is the root cause of the v2.1.3.4beta0 user report: round 3
- *     request had `msgs[..., [4]user/{tool_result}]` where the tool_result
- *     carried cache_control from Claude Code, and the gateway 3001'd.
+ * ZCode's start-plan gateway ONLY accepts `cache_control` on `text` blocks.
+ * Claude Code attaches `cache_control: {type:"ephemeral"}` to the last block
+ * of the last user message — when that block is a tool_result, it 3001s.
+ * The proxy's own `applyAnthropicCacheControl` was also attaching cache_control
+ * to `tool_use` blocks (when the last user message was all tool_results and it
+ * walked backwards) — that also 3001s.
  *
- * `cache_control` on `text` blocks is preserved (ZCode gateway accepts it
- * there — the proxy's own applyAnthropicCacheControl adds it to text blocks).
+ * This function strips cache_control from every block whose type is not "text",
+ * regardless of who put it there (Claude Code or the proxy itself). This is
+ * the safety net that guarantees no cache_control ever reaches the gateway on
+ * a non-text block.
+ *
+ * Root cause history:
+ *   - v2.1.3.3beta0: stripped thinking blocks (round-2 3001)
+ *   - v2.1.3.5beta0: stripped cache_control from tool_result (round-3 3001)
+ *   - this fix: strip cache_control from tool_use too (round-3 3001 variant
+ *     where assistant called 2 tools, proxy attached cc to tool_use)
  */
 function sanitizeContentBlocks(body: Record<string, unknown>): boolean {
   const messages = body.messages;
@@ -385,9 +396,9 @@ function sanitizeContentBlocks(body: Record<string, unknown>): boolean {
 
     for (const block of content) {
       if (!isPlainObject(block)) continue;
-      // Strip cache_control from tool_result blocks only.
-      // text blocks keep their cache_control (gateway accepts it there).
-      if (block.type === "tool_result" && "cache_control" in block) {
+      // Strip cache_control from ANY block that is not type:"text".
+      // ZCode gateway only accepts cache_control on text blocks.
+      if (block.type !== "text" && "cache_control" in block) {
         delete block.cache_control;
         changed = true;
       }
