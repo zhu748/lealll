@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>zcode-proxy Dashboard</title>
+<title>zcode-proxy 控制台</title>
 <style>
 :root{--bg:#0f172a;--surface:#1e293b;--surface2:#334155;--border:#475569;--text:#e2e8f0;--text2:#94a3b8;--primary:#3b82f6;--primary-h:#2563eb;--success:#22c55e;--warn:#f59e0b;--danger:#ef4444;--radius:8px;--shadow:0 4px 6px -1px rgba(0,0,0,.3)}
 *{margin:0;padding:0;box-sizing:border-box}
@@ -77,9 +77,9 @@ tr:hover td{background:var(--surface2)}
 <div class="login-wrap" id="loginWrap">
   <div class="login-box">
     <h1>zcode-proxy</h1>
-    <p>Enter proxy API key to access dashboard</p>
-    <input type="password" id="loginKey" placeholder="Proxy API Key" autocomplete="off">
-    <button class="btn btn-primary" style="width:100%" onclick="doLogin()">Login</button>
+    <p>请输入代理 API Key 以访问控制台</p>
+    <input type="password" id="loginKey" placeholder="代理 API Key" autocomplete="off">
+    <button class="btn btn-primary" style="width:100%" onclick="doLogin()">登录</button>
   </div>
 </div>
 
@@ -87,136 +87,136 @@ tr:hover td{background:var(--surface2)}
 <div class="app" id="app">
   <div class="sidebar">
     <h2>zcode-proxy</h2>
-    <div class="nav-item active" data-page="overview"><span class="icon">&#9776;</span> Overview</div>
-    <div class="nav-item" data-page="settings"><span class="icon">&#9881;</span> Settings</div>
-    <div class="nav-item" data-page="accounts"><span class="icon">&#128100;</span> Accounts</div>
-    <div class="nav-item" data-page="oauth"><span class="icon">&#128274;</span> OAuth</div>
-    <div class="nav-item" data-page="logs"><span class="icon">&#128220;</span> Logs</div>
-    <div class="nav-item" data-page="proxy"><span class="icon">&#127760;</span> Proxy Rules</div>
-    <div class="nav-item" data-page="stats"><span class="icon">&#128202;</span> Statistics</div>
+    <div class="nav-item active" data-page="overview"><span class="icon">&#9776;</span> 概览</div>
+    <div class="nav-item" data-page="settings"><span class="icon">&#9881;</span> 设置</div>
+    <div class="nav-item" data-page="accounts"><span class="icon">&#128100;</span> 账号管理</div>
+    <div class="nav-item" data-page="oauth"><span class="icon">&#128274;</span> OAuth 授权</div>
+    <div class="nav-item" data-page="logs"><span class="icon">&#128220;</span> 日志</div>
+    <div class="nav-item" data-page="proxy"><span class="icon">&#127760;</span> 代理规则</div>
+    <div class="nav-item" data-page="stats"><span class="icon">&#128202;</span> 统计</div>
     <div style="margin-top:auto;padding:16px 20px;border-top:1px solid var(--border);margin-top:24px">
       <div style="font-size:12px;color:var(--text2)">zcode-proxy v2.1.1</div>
-      <div style="font-size:11px;color:var(--text2);margin-top:4px;cursor:pointer" onclick="doLogout()">Logout</div>
+      <div style="font-size:11px;color:var(--text2);margin-top:4px;cursor:pointer" onclick="doLogout()">退出登录</div>
     </div>
   </div>
   <div class="main">
 
     <!-- Overview -->
     <div class="page active" id="page-overview">
-      <h2>Overview</h2>
-      <p class="subtitle">System status and quick actions</p>
+      <h2>概览</h2>
+      <p class="subtitle">系统状态与快捷操作</p>
       <div class="grid" style="margin-bottom:20px">
-        <div class="stat-card"><div class="value" id="statProvider">-</div><div class="label">Provider</div></div>
-        <div class="stat-card"><div class="value" id="statPlan">-</div><div class="label">Plan</div></div>
-        <div class="stat-card"><div class="value" id="statModels">-</div><div class="label">Models</div></div>
-        <div class="stat-card"><div class="value" id="statUptime">-</div><div class="label">Uptime</div></div>
-        <div class="stat-card"><div class="value" id="statRequests">0</div><div class="label">Total Requests</div></div>
-        <div class="stat-card"><div class="value" id="statRetries">0</div><div class="label">Total Retries</div></div>
+        <div class="stat-card"><div class="value" id="statProvider">-</div><div class="label">提供商</div></div>
+        <div class="stat-card"><div class="value" id="statPlan">-</div><div class="label">套餐</div></div>
+        <div class="stat-card"><div class="value" id="statModels">-</div><div class="label">模型数</div></div>
+        <div class="stat-card"><div class="value" id="statUptime">-</div><div class="label">运行时长</div></div>
+        <div class="stat-card"><div class="value" id="statRequests">0</div><div class="label">总请求数</div></div>
+        <div class="stat-card"><div class="value" id="statRetries">0</div><div class="label">总重试次数</div></div>
       </div>
       <div class="card">
-        <h3>Health Check</h3>
-        <div id="healthInfo">Loading...</div>
+        <h3>健康检查</h3>
+        <div id="healthInfo">加载中...</div>
       </div>
     </div>
 
     <!-- Settings -->
     <div class="page" id="page-settings">
-      <h2>Global Settings</h2>
-      <p class="subtitle">Configure proxy server behavior</p>
+      <h2>全局设置</h2>
+      <p class="subtitle">配置代理服务器行为</p>
       <div class="card">
-        <h3>Server</h3>
+        <h3>服务器</h3>
         <div class="form-row">
-          <div class="form-group"><label>Port</label><input id="cfgPort" type="number"></div>
-          <div class="form-group"><label>Host</label><input id="cfgHost"></div>
+          <div class="form-group"><label>端口</label><input id="cfgPort" type="number"></div>
+          <div class="form-group"><label>主机</label><input id="cfgHost"></div>
         </div>
       </div>
       <div class="card">
-        <h3>Provider</h3>
+        <h3>提供商</h3>
         <div class="form-row">
-          <div class="form-group"><label>Provider</label><select id="cfgProvider"><option value="zai">Z.AI</option><option value="bigmodel">Bigmodel</option></select></div>
-          <div class="form-group"><label>Plan</label><select id="cfgPlan"><option value="coding-plan">Coding Plan</option><option value="start-plan">Start Plan</option></select></div>
+          <div class="form-group"><label>提供商</label><select id="cfgProvider"><option value="zai">Z.AI</option><option value="bigmodel">Bigmodel</option></select></div>
+          <div class="form-group"><label>套餐</label><select id="cfgPlan"><option value="coding-plan">Coding 套餐</option><option value="start-plan">Start 套餐</option></select></div>
         </div>
       </div>
       <div class="card">
-        <h3>Authentication</h3>
+        <h3>认证</h3>
         <div class="form-row">
-          <div class="form-group"><label>Auth Mode</label><select id="cfgAuthMode"><option value="apikey">API Key</option><option value="oauth">OAuth</option></select></div>
+          <div class="form-group"><label>认证模式</label><select id="cfgAuthMode"><option value="apikey">API Key</option><option value="oauth">OAuth</option></select></div>
           <div class="form-group"><label>API Key</label><input id="cfgApiKey" type="password"></div>
         </div>
-        <div class="form-group"><label>Proxy API Key (client auth)</label><input id="cfgProxyApiKey" type="password" placeholder="Leave empty to disable"></div>
+        <div class="form-group"><label>代理 API Key（客户端认证）</label><input id="cfgProxyApiKey" type="password" placeholder="留空则禁用"></div>
       </div>
       <div class="card">
-        <h3>Default Model</h3>
-        <div class="form-group"><label>Default Model</label><input id="cfgDefaultModel"></div>
-        <div class="form-group"><label>Models (one per line)</label><textarea id="cfgModels" rows="6"></textarea></div>
+        <h3>默认模型</h3>
+        <div class="form-group"><label>默认模型</label><input id="cfgDefaultModel"></div>
+        <div class="form-group"><label>模型列表（每行一个）</label><textarea id="cfgModels" rows="6"></textarea></div>
       </div>
       <div class="card">
-        <h3>Retry Configuration</h3>
+        <h3>重试配置</h3>
         <div class="form-row">
-          <div class="form-group"><label>Max Retries</label><input id="cfgRetryMax" type="number"></div>
-          <div class="form-group"><label>Initial Delay (ms)</label><input id="cfgRetryDelay" type="number"></div>
+          <div class="form-group"><label>最大重试次数</label><input id="cfgRetryMax" type="number"></div>
+          <div class="form-group"><label>初始延迟（ms）</label><input id="cfgRetryDelay" type="number"></div>
         </div>
         <div class="form-row">
-          <div class="form-group"><label>Max Delay (ms)</label><input id="cfgRetryMaxDelay" type="number"></div>
-          <div class="form-group"><label>Backoff Factor</label><input id="cfgRetryBackoff" type="number" step="0.1"></div>
+          <div class="form-group"><label>最大延迟（ms）</label><input id="cfgRetryMaxDelay" type="number"></div>
+          <div class="form-group"><label>退避因子</label><input id="cfgRetryBackoff" type="number" step="0.1"></div>
         </div>
-        <div class="form-group"><label>Retryable Status Codes (comma separated)</label><input id="cfgRetryStatuses" placeholder="529,429,503"></div>
+        <div class="form-group"><label>可重试状态码（逗号分隔）</label><input id="cfgRetryStatuses" placeholder="529,429,503"></div>
       </div>
       <div class="card">
-        <h3>Identity</h3>
+        <h3>身份信息</h3>
         <div class="form-row">
-          <div class="form-group"><label>App Version</label><input id="cfgAppVer"></div>
-          <div class="form-group"><label>Source Title</label><input id="cfgSrcTitle"></div>
+          <div class="form-group"><label>应用版本</label><input id="cfgAppVer"></div>
+          <div class="form-group"><label>来源标题</label><input id="cfgSrcTitle"></div>
         </div>
         <div class="form-group"><label>Referer Origin</label><input id="cfgReferer"></div>
       </div>
       <div class="card">
-        <h3>Logging</h3>
-        <div class="form-group"><label>Log Level</label><select id="cfgLogLevel"><option value="debug">Debug</option><option value="info">Info</option><option value="warn">Warn</option><option value="error">Error</option></select></div>
+        <h3>日志</h3>
+        <div class="form-group"><label>日志级别</label><select id="cfgLogLevel"><option value="debug">Debug</option><option value="info">Info</option><option value="warn">Warn</option><option value="error">Error</option></select></div>
       </div>
-      <div class="actions"><button class="btn btn-primary" onclick="saveSettings()">Save Settings</button><button class="btn btn-ghost" onclick="loadSettings()">Reset</button></div>
+      <div class="actions"><button class="btn btn-primary" onclick="saveSettings()">保存设置</button><button class="btn btn-ghost" onclick="loadSettings()">重置</button></div>
     </div>
 
     <!-- Accounts -->
     <div class="page" id="page-accounts">
-      <h2>Account Management</h2>
-      <p class="subtitle">Manage API keys and stored credentials</p>
+      <h2>账号管理</h2>
+      <p class="subtitle">管理 API Key 与存储的凭证</p>
       <div class="card">
-        <h3>Current (Active) Credential</h3>
-        <div id="currentCred">Loading...</div>
+        <h3>当前（激活）凭证</h3>
+        <div id="currentCred">加载中...</div>
       </div>
       <div class="card">
-        <h3>Stored Accounts <span class="tag">Multi-account</span></h3>
-        <p style="font-size:13px;color:var(--text2);margin-bottom:12px">All credentials saved via OAuth or manual entry. Click <strong>Activate</strong> to switch. Click <strong>Plan</strong> to change.</p>
+        <h3>已存储账号 <span class="tag">多账号</span></h3>
+        <p style="font-size:13px;color:var(--text2);margin-bottom:12px">所有通过 OAuth 或手动输入保存的凭证。点击 <strong>激活</strong> 切换，点击 <strong>套餐</strong> 修改。</p>
         <table>
-          <thead><tr><th>Label</th><th>Provider</th><th>Plan</th><th>API Key</th><th>Created</th><th>Status</th><th>Actions</th></tr></thead>
-          <tbody id="accountsList"><tr><td colspan="7" class="empty-state">Loading...</td></tr></tbody>
+          <thead><tr><th>标签</th><th>提供商</th><th>套餐</th><th>API Key</th><th>创建时间</th><th>状态</th><th>操作</th></tr></thead>
+          <tbody id="accountsList"><tr><td colspan="7" class="empty-state">加载中...</td></tr></tbody>
         </table>
       </div>
       <div class="card">
-        <h3>Add API Key</h3>
+        <h3>添加 API Key</h3>
         <div class="form-row">
-          <div class="form-group"><label>Provider</label><select id="addKeyProvider"><option value="zai">Z.AI (apiKey.secretKey)</option><option value="bigmodel">Bigmodel (apiKey)</option></select></div>
-          <div class="form-group"><label>Plan</label><select id="addKeyPlan"><option value="coding-plan">Coding Plan</option><option value="start-plan">Start Plan</option></select></div>
+          <div class="form-group"><label>提供商</label><select id="addKeyProvider"><option value="zai">Z.AI (apiKey.secretKey)</option><option value="bigmodel">Bigmodel (apiKey)</option></select></div>
+          <div class="form-group"><label>套餐</label><select id="addKeyPlan"><option value="coding-plan">Coding 套餐</option><option value="start-plan">Start 套餐</option></select></div>
         </div>
-        <div class="form-group"><label>API Key</label><input id="addKeyValue" placeholder="Enter API key"></div>
-        <div class="actions"><button class="btn btn-primary" onclick="addApiKey()">Add Key</button></div>
+        <div class="form-group"><label>API Key</label><input id="addKeyValue" placeholder="请输入 API Key"></div>
+        <div class="actions"><button class="btn btn-primary" onclick="addApiKey()">添加 Key</button></div>
       </div>
       <div class="card">
-        <h3>Import from ZCode</h3>
-        <p style="font-size:13px;color:var(--text2);margin-bottom:12px">Import API key from ~/.zcode/v2/config.json</p>
+        <h3>从 ZCode 导入</h3>
+        <p style="font-size:13px;color:var(--text2);margin-bottom:12px">从 ~/.zcode/v2/config.json 导入 API Key</p>
         <div class="form-row">
-          <div class="form-group"><label>Provider</label><select id="importProvider"><option value="bigmodel">Bigmodel</option><option value="zai">Z.AI</option></select></div>
-          <div class="form-group"><label>Plan</label><select id="importPlan"><option value="coding-plan">Coding Plan</option><option value="start-plan">Start Plan</option></select></div>
+          <div class="form-group"><label>提供商</label><select id="importProvider"><option value="bigmodel">Bigmodel</option><option value="zai">Z.AI</option></select></div>
+          <div class="form-group"><label>套餐</label><select id="importPlan"><option value="coding-plan">Coding 套餐</option><option value="start-plan">Start 套餐</option></select></div>
         </div>
-        <div class="actions"><button class="btn btn-primary" onclick="importKey()">Import Key</button></div>
+        <div class="actions"><button class="btn btn-primary" onclick="importKey()">导入 Key</button></div>
       </div>
       <div class="card">
-        <h3>Backup & Restore <span class="tag">Import/Export</span></h3>
-        <p style="font-size:13px;color:var(--text2);margin-bottom:12px">Export all accounts to a JSON file for backup, or import from a previous export.</p>
+        <h3>备份与恢复 <span class="tag">导入/导出</span></h3>
+        <p style="font-size:13px;color:var(--text2);margin-bottom:12px">将所有账号导出为 JSON 文件备份，或从之前的导出文件导入。</p>
         <div class="actions" style="gap:12px">
-          <button class="btn btn-success" onclick="exportAccounts()">Export Accounts</button>
-          <button class="btn btn-primary" onclick="document.getElementById('importFileInput').click()">Import from File</button>
+          <button class="btn btn-success" onclick="exportAccounts()">导出账号</button>
+          <button class="btn btn-primary" onclick="document.getElementById('importFileInput').click()">从文件导入</button>
           <input type="file" id="importFileInput" accept=".json" style="display:none" onchange="importAccountsFromFile(this)">
         </div>
       </div>
@@ -224,104 +224,104 @@ tr:hover td{background:var(--surface2)}
 
     <!-- OAuth -->
     <div class="page" id="page-oauth">
-      <h2>OAuth Authorization</h2>
-      <p class="subtitle">Login via OAuth browser flow</p>
+      <h2>OAuth 授权</h2>
+      <p class="subtitle">通过浏览器 OAuth 流程登录</p>
       <div class="card">
-        <h3>OAuth Login</h3>
+        <h3>OAuth 登录</h3>
         <div class="form-row">
-          <div class="form-group"><label>Provider</label><select id="oauthProvider"><option value="bigmodel">Bigmodel</option><option value="zai">Z.AI</option></select></div>
-          <div class="form-group"><label>Plan</label><select id="oauthPlan"><option value="coding-plan">Coding Plan</option><option value="start-plan">Start Plan</option></select></div>
-          <div class="form-group" style="display:flex;align-items:flex-end"><button class="btn btn-primary" onclick="startOAuth()">Start OAuth Login</button></div>
+          <div class="form-group"><label>提供商</label><select id="oauthProvider"><option value="bigmodel">Bigmodel</option><option value="zai">Z.AI</option></select></div>
+          <div class="form-group"><label>套餐</label><select id="oauthPlan"><option value="coding-plan">Coding 套餐</option><option value="start-plan">Start 套餐</option></select></div>
+          <div class="form-group" style="display:flex;align-items:flex-end"><button class="btn btn-primary" onclick="startOAuth()">开始 OAuth 登录</button></div>
         </div>
         <div id="oauthFlowStatus" style="margin-top:12px;display:none">
-          <div class="oauth-status"><div class="oauth-dot off" id="oauthDot"></div><span id="oauthStatusText">Waiting...</span></div>
+          <div class="oauth-status"><div class="oauth-dot off" id="oauthDot"></div><span id="oauthStatusText">等待中...</span></div>
           <div id="oauthUrlBox" style="display:none;margin-top:8px">
-            <p style="font-size:13px;color:var(--text2);margin-bottom:8px">Open this URL to authorize:</p>
-            <div style="display:flex;gap:8px"><input id="oauthUrl" readonly style="flex:1;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text);font-size:12px"><button class="btn btn-ghost btn-sm" onclick="copyOauthUrl()">Copy</button><button class="btn btn-ghost btn-sm" onclick="openOauthUrl()">Open</button></div>
-            <p style="font-size:11px;color:var(--text2);margin-top:6px">Expires in <span id="oauthCountdown" style="color:var(--warn);font-weight:600">--</span></p>
+            <p style="font-size:13px;color:var(--text2);margin-bottom:8px">在浏览器中打开以下 URL 进行授权：</p>
+            <div style="display:flex;gap:8px"><input id="oauthUrl" readonly style="flex:1;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text);font-size:12px"><button class="btn btn-ghost btn-sm" onclick="copyOauthUrl()">复制</button><button class="btn btn-ghost btn-sm" onclick="openOauthUrl()">打开</button></div>
+            <p style="font-size:11px;color:var(--text2);margin-top:6px">剩余有效期：<span id="oauthCountdown" style="color:var(--warn);font-weight:600">--</span></p>
           </div>
         </div>
       </div>
       <div class="card">
-        <h3>Manual Callback URL <span class="tag">Fallback</span></h3>
+        <h3>手动回调 URL <span class="tag">备选方案</span></h3>
         <p style="font-size:13px;color:var(--text2);margin-bottom:12px">
-          After completing authorization in the browser, you'll be redirected to a URL like
-          <code style="background:var(--bg);padding:2px 6px;border-radius:4px;font-size:11px">https://zcode.z.ai/api/v1/oauth/cli/callback/zai?code=...&amp;state=...</code>.
-          Copy that full URL from your browser's address bar and paste it here to complete login (useful when auto-polling fails or running headless).
+          在浏览器中完成授权后，你将被重定向到类似下面的 URL
+          <code style="background:var(--bg);padding:2px 6px;border-radius:4px;font-size:11px">https://zcode.z.ai/api/v1/oauth/cli/callback/zai?code=...&amp;state=...</code>。
+          从浏览器地址栏复制该完整 URL 并粘贴到此处完成登录（当自动轮询失败或在无头环境下特别有用）。
         </p>
-        <div class="form-group"><label>Callback URL</label><input id="callbackUrlInput" placeholder="https://zcode.z.ai/api/v1/oauth/cli/callback/zai?code=...&state=..." style="font-family:monospace;font-size:12px"></div>
-        <div class="actions"><button class="btn btn-success" onclick="submitCallback()">Submit Callback URL</button></div>
+        <div class="form-group"><label>回调 URL</label><input id="callbackUrlInput" placeholder="https://zcode.z.ai/api/v1/oauth/cli/callback/zai?code=...&state=..." style="font-family:monospace;font-size:12px"></div>
+        <div class="actions"><button class="btn btn-success" onclick="submitCallback()">提交回调 URL</button></div>
         <div id="callbackResult" style="margin-top:12px;display:none"></div>
       </div>
       <div class="card">
-        <h3>Credential Store</h3>
-        <div id="credStoreInfo">Loading...</div>
-        <div class="actions"><button class="btn btn-danger btn-sm" onclick="clearCredentials()">Clear Credentials</button></div>
+        <h3>凭证存储</h3>
+        <div id="credStoreInfo">加载中...</div>
+        <div class="actions"><button class="btn btn-danger btn-sm" onclick="clearCredentials()">清空凭证</button></div>
       </div>
     </div>
 
     <!-- Logs -->
     <div class="page" id="page-logs">
-      <h2>Logs</h2>
-      <p class="subtitle">Real-time server logs</p>
+      <h2>日志</h2>
+      <p class="subtitle">实时服务器日志</p>
       <div class="log-controls">
-        <select id="logLevel"><option value="">All Levels</option><option value="error">Error</option><option value="warn">Warn</option><option value="info">Info</option><option value="debug">Debug</option></select>
-        <input id="logSearch" placeholder="Search logs..." style="flex:1">
-        <label class="switch"><input type="checkbox" id="logAutoScroll" checked><span class="slider"></span></label><span style="font-size:12px;color:var(--text2)">Auto-scroll</span>
-        <button class="btn btn-ghost btn-sm" onclick="clearLogs()">Clear</button>
+        <select id="logLevel"><option value="">全部级别</option><option value="error">Error</option><option value="warn">Warn</option><option value="info">Info</option><option value="debug">Debug</option></select>
+        <input id="logSearch" placeholder="搜索日志..." style="flex:1">
+        <label class="switch"><input type="checkbox" id="logAutoScroll" checked><span class="slider"></span></label><span style="font-size:12px;color:var(--text2)">自动滚动</span>
+        <button class="btn btn-ghost btn-sm" onclick="clearLogs()">清空</button>
       </div>
       <div class="log-box" id="logBox"></div>
     </div>
 
     <!-- Proxy Rules -->
     <div class="page" id="page-proxy">
-      <h2>Proxy Rules</h2>
-      <p class="subtitle">Configure per-model and per-route proxy behavior</p>
+      <h2>代理规则</h2>
+      <p class="subtitle">配置按模型与按路由的代理行为</p>
       <div class="card">
-        <h3>Provider Endpoints</h3>
+        <h3>提供商端点</h3>
         <div class="form-group"><label>Z.AI Anthropic Base</label><input id="proxyZaiAnthropic"></div>
         <div class="form-group"><label>Z.AI OpenAI Base</label><input id="proxyZaiOpenai"></div>
         <div class="form-group"><label>Bigmodel Anthropic Base</label><input id="proxyBmAnthropic"></div>
         <div class="form-group"><label>Bigmodel OpenAI Base</label><input id="proxyBmOpenai"></div>
-        <div class="actions"><button class="btn btn-primary" onclick="saveProxyEndpoints()">Save Endpoints</button></div>
+        <div class="actions"><button class="btn btn-primary" onclick="saveProxyEndpoints()">保存端点</button></div>
       </div>
       <div class="card">
-        <h3>Model Routing <span class="tag">Advanced</span></h3>
-        <p style="font-size:13px;color:var(--text2);margin-bottom:12px">Route specific models to different providers or endpoints (glob patterns supported, e.g. <code style="background:var(--bg);padding:2px 4px;border-radius:3px">glm-5*</code>)</p>
+        <h3>模型路由 <span class="tag">高级</span></h3>
+        <p style="font-size:13px;color:var(--text2);margin-bottom:12px">将特定模型路由到不同的提供商或端点（支持 glob 模式，例如 <code style="background:var(--bg);padding:2px 4px;border-radius:3px">glm-5*</code>）</p>
         <table>
-          <thead><tr><th>Model Pattern</th><th>Provider</th><th>Endpoint Override</th><th>Note</th><th>Actions</th></tr></thead>
-          <tbody id="routingRules"><tr><td colspan="5" class="empty-state">Loading...</td></tr></tbody>
+          <thead><tr><th>模型匹配规则</th><th>提供商</th><th>端点覆盖</th><th>备注</th><th>操作</th></tr></thead>
+          <tbody id="routingRules"><tr><td colspan="5" class="empty-state">加载中...</td></tr></tbody>
         </table>
         <div class="actions" style="margin-top:12px">
-          <button class="btn btn-ghost btn-sm" onclick="addRoutingRule()">+ Add Rule</button>
-          <button class="btn btn-primary btn-sm" onclick="saveRoutingRules()">Save Rules</button>
-          <button class="btn btn-ghost btn-sm" onclick="loadRoutingRules()">Reload</button>
+          <button class="btn btn-ghost btn-sm" onclick="addRoutingRule()">+ 添加规则</button>
+          <button class="btn btn-primary btn-sm" onclick="saveRoutingRules()">保存规则</button>
+          <button class="btn btn-ghost btn-sm" onclick="loadRoutingRules()">重新加载</button>
         </div>
       </div>
     </div>
 
     <!-- Statistics -->
     <div class="page" id="page-stats">
-      <h2>Statistics</h2>
-      <p class="subtitle">Request metrics and performance data</p>
+      <h2>统计</h2>
+      <p class="subtitle">请求指标与性能数据</p>
       <div class="grid" style="margin-bottom:20px">
-        <div class="stat-card"><div class="value" id="statTotal">0</div><div class="label">Total Requests</div></div>
-        <div class="stat-card"><div class="value" id="statSuccess">0</div><div class="label">Successful</div></div>
-        <div class="stat-card"><div class="value" id="statFailed">0</div><div class="label">Failed</div></div>
-        <div class="stat-card"><div class="value" id="statRetried">0</div><div class="label">Retried</div></div>
+        <div class="stat-card"><div class="value" id="statTotal">0</div><div class="label">总请求数</div></div>
+        <div class="stat-card"><div class="value" id="statSuccess">0</div><div class="label">成功</div></div>
+        <div class="stat-card"><div class="value" id="statFailed">0</div><div class="label">失败</div></div>
+        <div class="stat-card"><div class="value" id="statRetried">0</div><div class="label">重试</div></div>
       </div>
       <div class="card">
-        <h3>Recent Requests</h3>
-        <table><thead><tr><th>#</th><th>Time</th><th>Model</th><th>Status</th><th>TTFB</th><th>Tokens</th></tr></thead><tbody id="recentRequests"></tbody></table>
+        <h3>近期请求</h3>
+        <table><thead><tr><th>#</th><th>时间</th><th>模型</th><th>状态</th><th>TTFB</th><th>Tokens</th></tr></thead><tbody id="recentRequests"></tbody></table>
       </div>
       <div class="card">
-        <h3>Model Usage</h3>
-        <table><thead><tr><th>Model</th><th>Requests</th><th>Avg TTFB</th><th>Total Tokens</th></tr></thead><tbody id="modelUsage"></tbody></table>
+        <h3>模型使用情况</h3>
+        <table><thead><tr><th>模型</th><th>请求数</th><th>平均 TTFB</th><th>总 Tokens</th></tr></thead><tbody id="modelUsage"></tbody></table>
       </div>
       <div class="card">
-        <h3>Reset Statistics</h3>
-        <p style="font-size:13px;color:var(--text2);margin-bottom:12px">Clear all collected request statistics. This action cannot be undone.</p>
-        <div class="actions"><button class="btn btn-danger" onclick="resetStats()">Reset Statistics</button></div>
+        <h3>重置统计</h3>
+        <p style="font-size:13px;color:var(--text2);margin-bottom:12px">清空所有已收集的请求统计。此操作不可撤销。</p>
+        <div class="actions"><button class="btn btn-danger" onclick="resetStats()">重置统计</button></div>
       </div>
     </div>
 
@@ -338,7 +338,7 @@ let routingRules=[];
 // --- Login ---
 async function doLogin(){
   const key=document.getElementById('loginKey').value.trim();
-  if(!key)return toast('Enter API key','error');
+  if(!key)return toast('请输入 API Key','error');
   try{
     const r=await fetch(API+'/admin/api/verify',{headers:{'Authorization':'Bearer '+key}});
     if(!r.ok)throw new Error();
@@ -347,7 +347,7 @@ async function doLogin(){
     document.getElementById('loginWrap').style.display='none';
     document.getElementById('app').style.display='flex';
     initDashboard();
-  }catch{toast('Invalid API key','error')}
+  }catch{toast('API Key 无效','error')}
 }
 document.getElementById('loginKey').addEventListener('keydown',e=>{if(e.key==='Enter')doLogin()});
 
@@ -421,9 +421,9 @@ async function loadOverview(){
     document.getElementById('statModels').textContent=c.models?.length||0;
     const health=await fetch(API+'/health',{headers:authHeaders()});
     document.getElementById('healthInfo').innerHTML=health.ok
-      ?'<span class="badge badge-success">Healthy</span> Provider: '+c.provider
-      :'<span class="badge badge-danger">Unhealthy</span>';
-  }catch(e){console.error('loadOverview failed:',e);document.getElementById('healthInfo').innerHTML='<span class="badge badge-danger">Load failed</span>'}
+      ?'<span class="badge badge-success">健康</span> 提供商：'+c.provider
+      :'<span class="badge badge-danger">异常</span>';
+  }catch(e){console.error('loadOverview failed:',e);document.getElementById('healthInfo').innerHTML='<span class="badge badge-danger">加载失败</span>'}
   loadUptimeFromServer();
   setInterval(loadUptimeFromServer,1000);
 }
@@ -460,7 +460,7 @@ async function loadSettings(){
     document.getElementById('cfgSrcTitle').value=c.identity?.sourceTitle||'';
     document.getElementById('cfgReferer').value=c.identity?.refererOrigin||'';
     document.getElementById('cfgLogLevel').value=c.logging?.level||'info';
-  }catch(e){console.error('loadSettings failed:',e);toast('Failed to load settings','error')}
+  }catch(e){console.error('loadSettings failed:',e);toast('加载设置失败','error')}
 }
 async function saveSettings(){
   const cfg={
@@ -481,9 +481,9 @@ async function saveSettings(){
   if(proxyApiKey&&proxyApiKey!=='***configured***')cfg.auth.proxyApiKey=proxyApiKey;
   try{
     const r=await fetch(API+'/admin/api/config',{method:'PUT',headers:authHeaders(),body:JSON.stringify(cfg)});
-    if(r.ok)toast('Settings saved (restart required for some changes)','success');
-    else{const d=await r.json().catch(()=>({}));toast(d.message||'Save failed','error')}
-  }catch{toast('Save failed','error')}
+    if(r.ok)toast('设置已保存（部分更改需重启生效）','success');
+    else{const d=await r.json().catch(()=>({}));toast(d.message||'保存失败','error')}
+  }catch{toast('保存失败','error')}
 }
 
 // --- Accounts ---
@@ -495,29 +495,29 @@ async function loadAccountInfo(){
       const c=d.credential;
       document.getElementById('currentCred').innerHTML=`
         <div style="display:grid;grid-template-columns:120px 1fr;gap:8px;font-size:13px">
-          <span style="color:var(--text2)">Provider</span><span>${c.provider}</span>
+          <span style="color:var(--text2)">提供商</span><span>${c.provider}</span>
           <span style="color:var(--text2)">API Key</span><span style="font-family:monospace">${c.apiKeyMask}</span>
-          <span style="color:var(--text2)">Plan</span><span>${c.plan==='start-plan'?'<span class="badge badge-warn">Start Plan</span>':'<span class="badge badge-success">Coding Plan</span>'}</span>
-          <span style="color:var(--text2)">Auth Mode</span><span>${c.mode||'apikey'}</span>
-          <span style="color:var(--text2)">Has Secret</span><span>${c.hasSecret?'<span class="badge badge-success">Yes</span>':'<span class="badge badge-warn">No</span>'}</span>
-          ${c.userId?`<span style="color:var(--text2)">User ID</span><span>${c.userId}</span>`:''}
-          ${c.expiresAt?`<span style="color:var(--text2)">Expires</span><span>${new Date(c.expiresAt).toLocaleString()}</span>`:''}
+          <span style="color:var(--text2)">套餐</span><span>${c.plan==='start-plan'?'<span class="badge badge-warn">Start 套餐</span>':'<span class="badge badge-success">Coding 套餐</span>'}</span>
+          <span style="color:var(--text2)">认证模式</span><span>${c.mode||'apikey'}</span>
+          <span style="color:var(--text2)">含 Secret</span><span>${c.hasSecret?'<span class="badge badge-success">是</span>':'<span class="badge badge-warn">否</span>'}</span>
+          ${c.userId?`<span style="color:var(--text2)">用户 ID</span><span>${c.userId}</span>`:''}
+          ${c.expiresAt?`<span style="color:var(--text2)">过期时间</span><span>${new Date(c.expiresAt).toLocaleString()}</span>`:''}
         </div>`;
     }else{
-      document.getElementById('currentCred').innerHTML='<p style="color:var(--text2)">No credential configured</p>';
+      document.getElementById('currentCred').innerHTML='<p style="color:var(--text2)">未配置凭证</p>';
     }
-  }catch(e){console.error('loadAccountInfo failed:',e);document.getElementById('currentCred').innerHTML='<p style="color:var(--danger)">Failed to load</p>'}
+  }catch(e){console.error('loadAccountInfo failed:',e);document.getElementById('currentCred').innerHTML='<p style="color:var(--danger)">加载失败</p>'}
 }
 async function addApiKey(){
   const provider=document.getElementById('addKeyProvider').value;
   const plan=document.getElementById('addKeyPlan').value;
   const key=document.getElementById('addKeyValue').value.trim();
-  if(!key)return toast('Enter API key','error');
+  if(!key)return toast('请输入 API Key','error');
   try{
     const r=await fetch(API+'/admin/api/credentials',{method:'POST',headers:authHeaders(),body:JSON.stringify({provider,apiKey:key,plan})});
-    if(r.ok){toast('API key added ('+plan+')','success');loadAccountInfo();loadAccountsList();loadCredStore()}
-    else toast('Failed to add key','error');
-  }catch(e){console.error('addApiKey failed:',e);toast('Failed to add key','error')}
+    if(r.ok){toast('API Key 已添加（'+plan+'）','success');loadAccountInfo();loadAccountsList();loadCredStore()}
+    else toast('添加失败','error');
+  }catch(e){console.error('addApiKey failed:',e);toast('添加失败','error')}
 }
 async function importKey(){
   const provider=document.getElementById('importProvider').value;
@@ -525,9 +525,9 @@ async function importKey(){
   try{
     const r=await fetch(API+'/admin/api/import',{method:'POST',headers:authHeaders(),body:JSON.stringify({provider,plan})});
     const d=await r.json();
-    if(r.ok){toast('Key imported: '+d.apiKeyMask,'success');loadAccountInfo();loadAccountsList();loadCredStore()}
-    else toast(d.error||'Import failed','error');
-  }catch(e){console.error('importKey failed:',e);toast('Import failed','error')}
+    if(r.ok){toast('Key 已导入：'+d.apiKeyMask,'success');loadAccountInfo();loadAccountsList();loadCredStore()}
+    else toast(d.error||'导入失败','error');
+  }catch(e){console.error('importKey failed:',e);toast('导入失败','error')}
 }
 
 // --- Multi-account management ---
@@ -540,7 +540,7 @@ async function loadAccountsList(){
     const accounts=d.accounts||[];
     const activeId=d.activeId;
     if(!accounts.length){
-      tb.innerHTML='<tr><td colspan="7" class="empty-state">No stored accounts. Use OAuth or "Add API Key" to create one.</td></tr>';
+      tb.innerHTML='<tr><td colspan="7" class="empty-state">暂无存储的账号。请使用 OAuth 或“添加 API Key”创建。</td></tr>';
       return;
     }
     tb.innerHTML=accounts.map(a=>{
@@ -553,58 +553,58 @@ async function loadAccountsList(){
         <td><select onchange="changePlan('${a.id}',this.value)" style="padding:4px 8px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;font-size:12px"><option value="coding-plan"${planVal==='coding-plan'?' selected':''}>Coding</option><option value="start-plan"${planVal==='start-plan'?' selected':''}>Start</option></select></td>
         <td style="font-family:monospace;font-size:12px">${a.apiKeyMask}${a.hasSecret?' <span class="badge badge-success">secret</span>':''}${a.hasJwt?' <span class="badge badge-success">jwt</span>':''}</td>
         <td style="font-size:12px;color:var(--text2)">${created}</td>
-        <td>${isActive?'<span class="badge badge-success">Active</span>':'<span class="badge badge-warn">Inactive</span>'}</td>
+        <td>${isActive?'<span class="badge badge-success">已激活</span>':'<span class="badge badge-warn">未激活</span>'}</td>
         <td>
-          ${isActive?'':`<button class="btn btn-primary btn-sm" onclick="activateAccount('${a.id}')">Activate</button> `}
-          <button class="btn btn-danger btn-sm" onclick="deleteAccount('${a.id}','${escapeHtml(a.label)}')">Delete</button>
+          ${isActive?'':`<button class="btn btn-primary btn-sm" onclick="activateAccount('${a.id}')">激活</button> `}
+          <button class="btn btn-danger btn-sm" onclick="deleteAccount('${a.id}','${escapeHtml(a.label)}')">删除</button>
         </td>
       </tr>`;
     }).join('');
   }catch(e){
     console.error('loadAccountsList failed:',e);
-    tb.innerHTML='<tr><td colspan="7" class="empty-state" style="color:var(--danger)">Failed to load accounts</td></tr>';
+    tb.innerHTML='<tr><td colspan="7" class="empty-state" style="color:var(--danger)">加载账号列表失败</td></tr>';
   }
 }
 async function activateAccount(id){
   try{
     const r=await fetch(API+'/admin/api/accounts/active',{method:'PUT',headers:authHeaders(),body:JSON.stringify({id})});
-    if(r.ok){toast('Account activated','success');loadAccountInfo();loadAccountsList();loadCredStore()}
-    else toast('Activation failed','error');
-  }catch(e){console.error('activateAccount failed:',e);toast('Activation failed','error')}
+    if(r.ok){toast('账号已激活','success');loadAccountInfo();loadAccountsList();loadCredStore()}
+    else toast('激活失败','error');
+  }catch(e){console.error('activateAccount failed:',e);toast('激活失败','error')}
 }
 async function renameAccount(id,label){
   try{
     const r=await fetch(API+'/admin/api/accounts/label',{method:'PUT',headers:authHeaders(),body:JSON.stringify({id,label})});
-    if(r.ok)toast('Label updated','success');
-    else toast('Rename failed','error');
-  }catch(e){console.error('renameAccount failed:',e);toast('Rename failed','error')}
+    if(r.ok)toast('标签已更新','success');
+    else toast('重命名失败','error');
+  }catch(e){console.error('renameAccount failed:',e);toast('重命名失败','error')}
 }
 async function deleteAccount(id,label){
-  if(!confirm(`Delete account "${label}"? This cannot be undone.`))return;
+  if(!confirm(`确认删除账号“${label}”？此操作不可撤销。`))return;
   try{
     const r=await fetch(API+'/admin/api/accounts/'+id,{method:'DELETE',headers:authHeaders()});
-    if(r.ok){toast('Account deleted','success');loadAccountInfo();loadAccountsList();loadCredStore()}
-    else toast('Delete failed','error');
-  }catch(e){console.error('deleteAccount failed:',e);toast('Delete failed','error')}
+    if(r.ok){toast('账号已删除','success');loadAccountInfo();loadAccountsList();loadCredStore()}
+    else toast('删除失败','error');
+  }catch(e){console.error('deleteAccount failed:',e);toast('删除失败','error')}
 }
 async function changePlan(id,plan){
   try{
     const r=await fetch(API+'/admin/api/accounts/plan',{method:'PUT',headers:authHeaders(),body:JSON.stringify({id,plan})});
-    if(r.ok){toast('Plan updated to '+plan,'success');loadAccountInfo();loadCredStore()}
-    else toast('Plan update failed','error');
-  }catch(e){console.error('changePlan failed:',e);toast('Plan update failed','error')}
+    if(r.ok){toast('套餐已更新为 '+plan,'success');loadAccountInfo();loadCredStore()}
+    else toast('套餐更新失败','error');
+  }catch(e){console.error('changePlan failed:',e);toast('套餐更新失败','error')}
 }
 async function exportAccounts(){
   try{
     const r=await fetch(API+'/admin/api/accounts/export',{headers:authHeaders()});
-    if(!r.ok){toast('Export failed','error');return}
+    if(!r.ok){toast('导出失败','error');return}
     const d=await r.json();
     const blob=new Blob([JSON.stringify(d,null,2)],{type:'application/json'});
     const url=URL.createObjectURL(blob);
     const a=document.createElement('a');a.href=url;a.download=`zcode-proxy-accounts-${new Date().toISOString().slice(0,10)}.json`;
     document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(url);
-    toast('Accounts exported ('+d.accounts.length+' accounts)','success');
-  }catch(e){console.error('exportAccounts failed:',e);toast('Export failed','error')}
+    toast('账号已导出（'+d.accounts.length+' 个账号）','success');
+  }catch(e){console.error('exportAccounts failed:',e);toast('导出失败','error')}
 }
 async function importAccountsFromFile(input){
   if(!input.files||!input.files[0])return;
@@ -612,13 +612,13 @@ async function importAccountsFromFile(input){
   try{
     const text=await file.text();
     const data=JSON.parse(text);
-    if(!data.accounts||!Array.isArray(data.accounts)){toast('Invalid file: missing accounts array','error');return}
-    if(!confirm(`Import ${data.accounts.length} accounts from "${file.name}"?\nExisting accounts with matching IDs will be updated.`))return;
+    if(!data.accounts||!Array.isArray(data.accounts)){toast('文件无效：缺少 accounts 数组','error');return}
+    if(!confirm(`从“${file.name}”导入 ${data.accounts.length} 个账号？\nID 匹配的现有账号将被更新。`))return;
     const r=await fetch(API+'/admin/api/accounts/import',{method:'POST',headers:authHeaders(),body:JSON.stringify({accounts:data.accounts})});
     const d=await r.json();
-    if(r.ok){toast(`Imported: ${d.added} added, ${d.updated} updated`,'success');loadAccountInfo();loadAccountsList();loadCredStore()}
-    else toast(d.message||'Import failed','error');
-  }catch(e){console.error('importAccounts failed:',e);toast('Import failed: invalid file','error')}
+    if(r.ok){toast(`导入完成：新增 ${d.added}，更新 ${d.updated}`,'success');loadAccountInfo();loadAccountsList();loadCredStore()}
+    else toast(d.message||'导入失败','error');
+  }catch(e){console.error('importAccounts failed:',e);toast('导入失败：文件无效','error')}
   input.value='';
 }
 function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
@@ -632,8 +632,8 @@ async function loadCredStore(){
     const r=await fetch(API+'/admin/api/credentials',{headers:authHeaders()});
     const d=await r.json();
     document.getElementById('credStoreInfo').innerHTML=d.credential
-      ?`<span class="badge badge-success">Active</span> ${d.credential.provider} (${d.credential.apiKeyMask})`
-      :'<span class="badge badge-warn">No stored credential</span>';
+      ?`<span class="badge badge-success">活跃</span> ${d.credential.provider} (${d.credential.apiKeyMask})`
+      :'<span class="badge badge-warn">无存储凭证</span>';
   }catch(e){console.error('loadCredStore failed:',e)}
 }
 async function startOAuth(){
@@ -641,7 +641,7 @@ async function startOAuth(){
   const plan=document.getElementById('oauthPlan').value;
   document.getElementById('oauthFlowStatus').style.display='block';
   document.getElementById('oauthDot').className='oauth-dot off';
-  document.getElementById('oauthStatusText').textContent='Initializing...';
+  document.getElementById('oauthStatusText').textContent='初始化中...';
   document.getElementById('oauthUrlBox').style.display='none';
   document.getElementById('callbackResult').style.display='none';
   try{
@@ -651,21 +651,21 @@ async function startOAuth(){
     currentFlowId=d.flowId;
     sessionStorage.setItem('zcodeOAuthFlowId',d.flowId);
     document.getElementById('oauthDot').className='oauth-dot on';
-    document.getElementById('oauthStatusText').textContent='Waiting for authorization...';
+    document.getElementById('oauthStatusText').textContent='等待授权中...';
     document.getElementById('oauthUrlBox').style.display='block';
     document.getElementById('oauthUrl').value=d.authorizeUrl;
     // Use actual expiry from server if available (expiresAt in ms)
     oauthExpiresAt=d.expiresAt||0;
     startOauthCountdown();
     pollOAuth(d.flowId);
-  }catch(e){toast(e.message,'error');document.getElementById('oauthStatusText').textContent='Failed: '+e.message}
+  }catch(e){toast(e.message,'error');document.getElementById('oauthStatusText').textContent='失败：'+e.message}
 }
 function startOauthCountdown(){
   if(oauthExpiryTimer)clearInterval(oauthExpiryTimer);
   const update=()=>{
     const remainingMs=oauthExpiresAt?oauthExpiresAt-Date.now():0;
     if(remainingMs<=0){
-      document.getElementById('oauthCountdown').textContent='expired';
+      document.getElementById('oauthCountdown').textContent='已过期';
       clearInterval(oauthExpiryTimer);
       return;
     }
@@ -684,10 +684,10 @@ async function pollOAuth(flowId){
       const d=await r.json();
       if(d.status==='ready'){
         document.getElementById('oauthDot').className='oauth-dot on';
-        document.getElementById('oauthStatusText').innerHTML='<span class="badge badge-success">Authorized!</span>';
+        document.getElementById('oauthStatusText').innerHTML='<span class="badge badge-success">已授权！</span>';
         document.getElementById('oauthUrlBox').style.display='none';
         if(oauthExpiryTimer)clearInterval(oauthExpiryTimer);
-        toast('OAuth login successful','success');
+        toast('OAuth 登录成功','success');
         currentFlowId=null;
         sessionStorage.removeItem('zcodeOAuthFlowId');
         loadAccountInfo();loadCredStore();
@@ -695,24 +695,24 @@ async function pollOAuth(flowId){
       }
       if(d.status==='failed'){
         document.getElementById('oauthDot').className='oauth-dot off';
-        document.getElementById('oauthStatusText').textContent='Authorization failed';
+        document.getElementById('oauthStatusText').textContent='授权失败';
         if(oauthExpiryTimer)clearInterval(oauthExpiryTimer);
-        toast('OAuth failed','error');return;
+        toast('OAuth 失败','error');return;
       }
     }catch(e){console.error('pollOAuth fetch failed:',e)}
   }
-  document.getElementById('oauthStatusText').textContent='Timed out (you can still paste the callback URL below)';
+  document.getElementById('oauthStatusText').textContent='已超时（仍可在下方粘贴回调 URL）';
   if(oauthExpiryTimer)clearInterval(oauthExpiryTimer);
 }
-function copyOauthUrl(){navigator.clipboard.writeText(document.getElementById('oauthUrl').value);toast('URL copied','success')}
+function copyOauthUrl(){navigator.clipboard.writeText(document.getElementById('oauthUrl').value);toast('URL 已复制','success')}
 function openOauthUrl(){window.open(document.getElementById('oauthUrl').value,'_blank')}
 async function submitCallback(){
   const callbackUrl=document.getElementById('callbackUrlInput').value.trim();
-  if(!callbackUrl)return toast('Enter the callback URL','error');
-  if(!currentFlowId)return toast('Start OAuth login first (no active flow)','error');
+  if(!callbackUrl)return toast('请输入回调 URL','error');
+  if(!currentFlowId)return toast('请先开始 OAuth 登录（无活动流程）','error');
   const resultBox=document.getElementById('callbackResult');
   resultBox.style.display='block';
-  resultBox.innerHTML='<span class="badge badge-warn">Exchanging code for credentials...</span>';
+  resultBox.innerHTML='<span class="badge badge-warn">正在用 code 换取凭证...</span>';
   try{
     const r=await fetch(API+'/admin/api/oauth/callback',{
       method:'POST',
@@ -721,33 +721,33 @@ async function submitCallback(){
     });
     const d=await r.json();
     if(r.ok){
-      resultBox.innerHTML=`<div class="badge badge-success">Success!</div>
+      resultBox.innerHTML=`<div class="badge badge-success">成功！</div>
         <div style="margin-top:8px;font-size:13px">
-          <div>Provider: <strong>${d.provider}</strong></div>
-          <div>API Key: <code style="font-family:monospace">${d.apiKeyMask}</code></div>
-          ${d.userId?`<div>User ID: <code style="font-family:monospace">${d.userId}</code></div>`:''}
+          <div>提供商：<strong>${d.provider}</strong></div>
+          <div>API Key：<code style="font-family:monospace">${d.apiKeyMask}</code></div>
+          ${d.userId?`<div>用户 ID：<code style="font-family:monospace">${d.userId}</code></div>`:''}
         </div>`;
-      toast('Credentials saved successfully','success');
+      toast('凭证保存成功','success');
       if(oauthExpiryTimer)clearInterval(oauthExpiryTimer);
       document.getElementById('oauthDot').className='oauth-dot on';
-      document.getElementById('oauthStatusText').innerHTML='<span class="badge badge-success">Authorized via callback URL</span>';
+      document.getElementById('oauthStatusText').innerHTML='<span class="badge badge-success">已通过回调 URL 授权</span>';
       currentFlowId=null;
       loadAccountInfo();loadCredStore();
     }else{
-      resultBox.innerHTML=`<div class="badge badge-danger">Failed</div><div style="margin-top:8px;font-size:13px;color:var(--text2)">${d.error||'Exchange failed'}: ${d.message||''}</div>`;
-      toast(d.error||'Callback exchange failed','error');
+      resultBox.innerHTML=`<div class="badge badge-danger">失败</div><div style="margin-top:8px;font-size:13px;color:var(--text2)">${d.error||'换取失败'}：${d.message||''}</div>`;
+      toast(d.error||'回调换取失败','error');
     }
   }catch(e){
-    resultBox.innerHTML=`<div class="badge badge-danger">Error</div><div style="margin-top:8px;font-size:13px;color:var(--text2)">${e.message}</div>`;
-    toast('Callback submission failed','error');
+    resultBox.innerHTML=`<div class="badge badge-danger">错误</div><div style="margin-top:8px;font-size:13px;color:var(--text2)">${e.message}</div>`;
+    toast('回调提交失败','error');
   }
 }
 async function clearCredentials(){
-  if(!confirm('Clear ALL stored credentials? This removes every account.'))return;
+  if(!confirm('确认清空所有存储的凭证？将删除所有账号。'))return;
   try{
     await fetch(API+'/admin/api/credentials',{method:'DELETE',headers:authHeaders()});
-    toast('Credentials cleared','success');loadAccountInfo();loadAccountsList();loadCredStore();
-  }catch(e){console.error('clearCredentials failed:',e);toast('Failed','error')}
+    toast('凭证已清空','success');loadAccountInfo();loadAccountsList();loadCredStore();
+  }catch(e){console.error('clearCredentials failed:',e);toast('操作失败','error')}
 }
 
 // --- Logs ---
@@ -803,7 +803,7 @@ async function loadProxyEndpoints(){
     document.getElementById('proxyZaiOpenai').value=c.providers?.zai?.openaiBase||'';
     document.getElementById('proxyBmAnthropic').value=c.providers?.bigmodel?.anthropicBase||'';
     document.getElementById('proxyBmOpenai').value=c.providers?.bigmodel?.openaiBase||'';
-  }catch(e){console.error('loadProxyEndpoints failed:',e);toast('Failed to load endpoints','error')}
+  }catch(e){console.error('loadProxyEndpoints failed:',e);toast('加载端点失败','error')}
 }
 async function saveProxyEndpoints(){
   const endpoints={
@@ -812,8 +812,8 @@ async function saveProxyEndpoints(){
   };
   try{
     const r=await fetch(API+'/admin/api/endpoints',{method:'PUT',headers:authHeaders(),body:JSON.stringify(endpoints)});
-    if(r.ok)toast('Endpoints saved','success');else toast('Save failed','error');
-  }catch(e){console.error('saveProxyEndpoints failed:',e);toast('Save failed','error')}
+    if(r.ok)toast('端点已保存','success');else toast('保存失败','error');
+  }catch(e){console.error('saveProxyEndpoints failed:',e);toast('保存失败','error')}
 }
 function addRoutingRule(){
   routingRules.push({pattern:'',provider:'zai',endpoint:'',note:''});
@@ -821,13 +821,13 @@ function addRoutingRule(){
 }
 function renderRoutingRules(){
   const tb=document.getElementById('routingRules');
-  if(!routingRules.length){tb.innerHTML='<tr><td colspan="5" class="empty-state">No custom routing rules</td></tr>';return}
+  if(!routingRules.length){tb.innerHTML='<tr><td colspan="5" class="empty-state">暂无自定义路由规则</td></tr>';return}
   tb.innerHTML=routingRules.map((r,i)=>`<tr>
-    <td><input value="${escapeHtml(r.pattern)}" onchange="routingRules[${i}].pattern=this.value" placeholder="e.g. glm-5*" style="width:100%;padding:4px 8px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px"></td>
+    <td><input value="${escapeHtml(r.pattern)}" onchange="routingRules[${i}].pattern=this.value" placeholder="例如 glm-5*" style="width:100%;padding:4px 8px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px"></td>
     <td><select onchange="routingRules[${i}].provider=this.value" style="padding:4px 8px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px"><option value="zai"${r.provider==='zai'?' selected':''}>Z.AI</option><option value="bigmodel"${r.provider==='bigmodel'?' selected':''}>Bigmodel</option></select></td>
-    <td><input value="${escapeHtml(r.endpoint||'')}" onchange="routingRules[${i}].endpoint=this.value" placeholder="Default" style="width:100%;padding:4px 8px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px"></td>
-    <td><input value="${escapeHtml(r.note||'')}" onchange="routingRules[${i}].note=this.value" placeholder="Optional" style="width:100%;padding:4px 8px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px"></td>
-    <td><button class="btn btn-danger btn-sm" onclick="routingRules.splice(${i},1);renderRoutingRules()">Delete</button></td>
+    <td><input value="${escapeHtml(r.endpoint||'')}" onchange="routingRules[${i}].endpoint=this.value" placeholder="默认" style="width:100%;padding:4px 8px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px"></td>
+    <td><input value="${escapeHtml(r.note||'')}" onchange="routingRules[${i}].note=this.value" placeholder="可选" style="width:100%;padding:4px 8px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px"></td>
+    <td><button class="btn btn-danger btn-sm" onclick="routingRules.splice(${i},1);renderRoutingRules()">删除</button></td>
   </tr>`).join('');
 }
 async function loadRoutingRules(){
@@ -836,14 +836,14 @@ async function loadRoutingRules(){
     const d=await r.json();
     routingRules=(d.rules||[]).map(r=>({pattern:r.pattern,provider:r.provider,endpoint:r.endpoint||'',note:r.note||''}));
     renderRoutingRules();
-  }catch(e){console.error('loadRoutingRules failed:',e);toast('Failed to load routing rules','error')}
+  }catch(e){console.error('loadRoutingRules failed:',e);toast('加载路由规则失败','error')}
 }
 async function saveRoutingRules(){
   // Validate before submit
   for(let i=0;i<routingRules.length;i++){
     const r=routingRules[i];
-    if(!r.pattern||!r.pattern.trim()){toast(`Rule #${i+1} needs a pattern`,'error');return}
-    if(r.provider!=='zai'&&r.provider!=='bigmodel'){toast(`Rule #${i+1} has invalid provider`,'error');return}
+    if(!r.pattern||!r.pattern.trim()){toast(`第 ${i+1} 条规则缺少模型匹配规则`,'error');return}
+    if(r.provider!=='zai'&&r.provider!=='bigmodel'){toast(`第 ${i+1} 条规则的提供商无效`,'error');return}
   }
   try{
     const r=await fetch(API+'/admin/api/routing-rules',{method:'PUT',headers:authHeaders(),body:JSON.stringify({rules:routingRules})});
@@ -852,11 +852,11 @@ async function saveRoutingRules(){
       // Replace local rules with server-normalized version
       routingRules=(d.rules||[]).map(r=>({pattern:r.pattern,provider:r.provider,endpoint:r.endpoint||'',note:r.note||''}));
       renderRoutingRules();
-      toast(`Saved ${routingRules.length} routing rule(s)`,'success');
+      toast(`已保存 ${routingRules.length} 条路由规则`,'success');
     }else{
-      toast(d.error||'Save failed','error');
+      toast(d.error||'保存失败','error');
     }
-  }catch(e){console.error('saveRoutingRules failed:',e);toast('Save failed','error')}
+  }catch(e){console.error('saveRoutingRules failed:',e);toast('保存失败','error')}
 }
 
 // --- Stats ---
@@ -876,21 +876,21 @@ async function loadStats(){
       <td>${r.id}</td><td>${r.time}</td><td>${r.model}</td>
       <td><span class="badge ${r.status<300?'badge-success':r.status<500?'badge-warn':'badge-danger'}">${r.status}</span></td>
       <td>${r.ttfb||'-'}</td><td>${r.tokens||'-'}</td>
-    </tr>`).join('')||'<tr><td colspan="6" class="empty-state">No requests yet</td></tr>';
+    </tr>`).join('')||'<tr><td colspan="6" class="empty-state">暂无请求</td></tr>';
     const mu=document.getElementById('modelUsage');
     mu.innerHTML=Object.entries(d.models||{}).map(([m,v])=>`<tr><td>${m}</td><td>${v.count}</td><td>${v.avgTtfb}ms</td><td>${v.tokens}</td></tr>`).join('')
-      ||'<tr><td colspan="4" class="empty-state">No data</td></tr>';
+      ||'<tr><td colspan="4" class="empty-state">暂无数据</td></tr>';
   }catch(e){console.error('loadStats failed:',e)}
 }
 setInterval(()=>{if(authToken)loadStats()},10000);
 
 async function resetStats(){
-  if(!confirm('Reset ALL collected statistics? This cannot be undone.'))return;
+  if(!confirm('确认重置所有统计数据？此操作不可撤销。'))return;
   try{
     const r=await fetch(API+'/admin/api/stats',{method:'DELETE',headers:authHeaders()});
-    if(r.ok){toast('Statistics reset','success');loadStats()}
-    else toast('Reset failed','error');
-  }catch(e){console.error('resetStats failed:',e);toast('Reset failed','error')}
+    if(r.ok){toast('统计已重置','success');loadStats()}
+    else toast('重置失败','error');
+  }catch(e){console.error('resetStats failed:',e);toast('重置失败','error')}
 }
 
 // --- Toast ---
