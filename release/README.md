@@ -1,21 +1,25 @@
 # zcode-proxy 使用说明
 
-> **v2.1.3.4 — 正式版（Claude Code + Codex CLI 双客户端适配）**
+> **v2.1.3.5 — 全面优化版（安全加固 + 测试补全 + UX 提升）**
 >
-> 经过 11 个 beta 版本迭代验证，现已稳定支持 Claude Code（`/v1/messages`）和 Codex CLI（`/v1/responses`）在 start-plan 模式下多轮对话 + 工具调用。
+> 在 v2.1.3.4 稳定版基础上进行了 13 项优化，覆盖安全、内存、UX、代码质量四个维度。
 >
-> **正式版包含的关键修复**（按重要性排序）：
-> 1. **请求体 content 全标准化**：所有 string content → array `[{type:"text", text:"..."}]`，空 string → 非空 `" "` 占位
-> 2. **start-plan 模式剥离所有 cache_control**：ZCode 网关不接受任何块上的 cache_control（包括 text 块）
-> 3. **剥离 tool_result.is_error**：ZCode 网关不接受该字段
-> 4. **assistant 消息非空 text 占位**：thinking 剥离后插入 `text:" "` 而非 `text:""`
-> 5. **过滤 anthropic-beta header**：start-plan 模式只保留 `claude-code-*` flag，剥离所有其它
-> 6. **剥离 thinking 内容块**：messages[].content 里的 thinking/redacted_thinking 块全部移除
-> 7. **剥离顶层 unsupported 字段**：context_management、output_config 移除；thinking.adaptive → enabled
-> 8. **迁移 role:system 消息**：从 messages 数组移到顶层 system 字段
-> 9. **4xx 完整 body dump**：3001 时把实际请求体写入 `zcode-proxy-debug-<reqId>.json`
+> **v2.1.3.5 关键改进**（按重要性排序）：
+> 1. **调试文件泄露修复**：4xx 错误的请求快照不再写入磁盘，改为内存环形缓冲（最多 20 条），新增管理面板「调试转储」页面
+> 2. **CORS 安全加固**：从 `*` 改为 echo origin，防止第三方网站跨域读取响应
+> 3. **未配置 proxyApiKey 警告**：启动时醒目提示，避免开放代理被滥用
+> 4. **优雅关闭**：等待在途请求最长 30s 完成，不再强杀 SSE 流
+> 5. **/verify 安全语义**：未配置 proxyApiKey 时返回 `{warning: "no_auth"}`，前端展示警告横幅
+> 6. **OAuth flow 内存泄漏修复**：5 分钟定时清理过期 flow
+> 7. **统计双计数修复**：同一请求重试时不再被记录为多条
+> 8. **SSE 日志缓冲索引修复**：改用单调 seq 号，splice 后客户端不丢日志
+> 9. **前端 XSS 加固**：所有用户数据 escapeHtml；Token 改用 sessionStorage
+> 10. **配置热生效反馈**：保存返回 `{requiresRestart, restartFields, hotApplied}`
+> 11. **概览页统计自动刷新**：不再静止不动
+> 12. **路由规则 glob 匹配**：实现真正的 `*` 和 `?` 通配符（之前是隐藏 no-op）
+> 13. **代码质量优化**：服务器路由 Map O(1) 查找；加密模块 decrypt 三重尝试合并；配置验证增强
 >
-> 全套 295 测试通过，TypeScript 类型检查零错误。
+> 全套 **348 测试通过**（v2.1.3.4 是 295），TypeScript 类型检查零错误。
 
 ---
 
@@ -311,6 +315,8 @@ retry:
 ---
 
 ## 版本演进历史（精简）
+
+**v2.1.3.5** — 全面优化版：13 项改进覆盖安全/内存/UX/代码质量，测试 295→348
 
 正式版 v2.1.3.4 整合了以下 beta 版本的修复：
 
