@@ -381,6 +381,10 @@ export async function proxyRequest(
     const errPeek = await upstreamResp.text().catch(() => "");
     console.log(`${reqId} upstream ${upstreamResp.status} ${errPeek.slice(0, 200)}`);
     console.log(`${reqId} transformed request summary: ${summarizeBody(transformedObj ?? parsedBody)}`);
+    // Also log the anthropic-beta header that was actually sent upstream —
+    // mismatched beta flags vs body is a common 3001 cause on ZCode gateway.
+    const sentBeta = buildUpstreamRequest(clientReq, upstreamFormat, provider, cred, transformedBody, config.identity, config.plan, undefined).headers.get("anthropic-beta");
+    console.log(`${reqId} anthropic-beta sent: ${sentBeta ?? "(none)"}`);
     // Reconstruct the response with the peeked body so the passthrough below
     // still has something to send. upstreamResp.text() consumed the body.
     upstreamResp = new Response(errPeek, {

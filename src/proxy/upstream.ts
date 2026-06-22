@@ -92,7 +92,34 @@ function collectPassthroughHeaders(req: Request): Record<string, string> {
     const lower = key.toLowerCase();
     if (STRIP_HEADERS.has(lower)) continue;
     if (lower === "anthropic-beta") {
-      result[lower] = value;
+      // Filter out beta flags that correspond to features we strip from the
+      // request body. ZCode's start-plan gateway validates that the body
+      // matches what the beta flags declare — if we strip context_management
+      // from the body but leave the flag in the header, the gateway 3001s.
+      //
+      // Flags we strip (because we strip the corresponding body field):
+      //   - context-management-*        → we delete body.context_management
+      //   - effort-*                    → we delete body.output_config
+      //   - interleaved-thinking-*      → we strip thinking blocks from messages
+      //   - redact-thinking-*           → we strip thinking/redacted_thinking blocks
+      //   - prompt-caching-scope-*      → we sanitize cache_control on non-text blocks
+      //   - mid-conversation-system-*   → we relocate system messages to top-level system
+      //
+      // Flags we keep (body-compatible):
+      //   - claude-code-*               → client identification, no body field
+      const filtered = value
+        .split(",")
+        .map(s => s.trim())
+        .filter(flag => {
+          // Keep only claude-code-* flags; strip everything else.
+          // ZCode gateway only knows claude-code-*; other flags reference
+          // features we don't forward in the body.
+          return flag.startsWith("claude-code-");
+        })
+        .join(",");
+      if (filtered) {
+        result[lower] = filtered;
+      }
     }
   }
   return result;

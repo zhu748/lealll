@@ -136,10 +136,31 @@ describe("buildUpstreamRequest", () => {
     expect(upstream.headers.get("content-type")).toBe("application/json");
   });
 
-  it("preserves anthropic-beta header from client", () => {
-    const clientReq = makeClientReq("{}", { "anthropic-beta": "prompt-caching-2024-07-31" });
+  it("filters anthropic-beta header to keep only claude-code-* flags", () => {
+    // ZCode gateway validates that beta flags match the request body. We strip
+    // context_management, output_config, thinking blocks etc. from the body,
+    // so we must also strip the corresponding beta flags from the header.
+    // Only claude-code-* flags are kept (client identification, no body field).
+    const clientReq = makeClientReq("{}", {
+      "anthropic-beta": "claude-code-20250219,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24",
+    });
     const upstream = buildUpstreamRequest(clientReq, "anthropic", ZAI_PROVIDER, ZAI_CRED, "{}", IDENTITY);
-    expect(upstream.headers.get("anthropic-beta")).toBe("prompt-caching-2024-07-31");
+    const beta = upstream.headers.get("anthropic-beta");
+    expect(beta).toBe("claude-code-20250219");
+  });
+
+  it("drops anthropic-beta header entirely when no claude-code-* flags present", () => {
+    const clientReq = makeClientReq("{}", {
+      "anthropic-beta": "prompt-caching-2024-07-31,some-other-flag",
+    });
+    const upstream = buildUpstreamRequest(clientReq, "anthropic", ZAI_PROVIDER, ZAI_CRED, "{}", IDENTITY);
+    expect(upstream.headers.get("anthropic-beta")).toBeNull();
+  });
+
+  it("preserves claude-code-* anthropic-beta flag from client", () => {
+    const clientReq = makeClientReq("{}", { "anthropic-beta": "claude-code-20250219" });
+    const upstream = buildUpstreamRequest(clientReq, "anthropic", ZAI_PROVIDER, ZAI_CRED, "{}", IDENTITY);
+    expect(upstream.headers.get("anthropic-beta")).toBe("claude-code-20250219");
   });
 
   it("strips client Authorization header (prevents credential leak)", () => {

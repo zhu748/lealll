@@ -1,5 +1,18 @@
 # zcode-proxy 使用说明
 
+> **v2.1.3.8beta0 — 过滤 anthropic-beta header 中网关不支持的 flag**
+> - **根因定位**：v2.1.3.7beta0 诊断日志显示第二轮就 3001，请求体结构完全正确（assistant 有 text 块、cache_control 只在 text 上、角色交替正确、thinking 已剥离）。问题不在 body，在 **header**。
+> - **原因**：Claude Code 发送的 `anthropic-beta` header 包含 7 个 feature flag：
+>   ```
+>   claude-code-20250219,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,
+>   context-management-2025-06-27,prompt-caching-scope-2026-01-05,
+>   mid-conversation-system-2026-04-07,effort-2025-11-24
+>   ```
+>   代理之前原样透传这个 header，但同时从 body 里剥离了 `context_management`、`output_config`、thinking 块等。**ZCode 网关校验 header 和 body 的一致性**——header 声明支持这些 feature，但 body 里没有对应字段，网关返回 3001。
+> - **修复**：`collectPassthroughHeaders()` 现在过滤 `anthropic-beta` header，只保留 `claude-code-*` flag（客户端标识，不对应 body 字段），剥离所有其它 flag（因为对应的 body 字段已被代理剥离）。
+> - **诊断日志增强**：3001 时额外打印 `anthropic-beta sent: ...`，显示实际发送的 beta flag
+> - **新增 3 个测试**覆盖 header 过滤；全套 284 测试通过
+>
 > **v2.1.3.7beta0 — 修复 assistant 消息只有 tool_use 块（无 text）触发 3001**
 > - **根因定位**：v2.1.3.6beta0 诊断日志显示跑了 6 轮才挂，第 7 轮 3001：
 >   ```
