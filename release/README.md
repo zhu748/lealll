@@ -1,5 +1,12 @@
 # zcode-proxy 使用说明
 
+> **v2.1.3 / v0.1.9 — 流式重试三连修复（正式版）**
+> - **修复 SSE 错误检测**：GLM 网关在流式请求失败时会返回 HTTP 200 + SSE 流，把 529 错误藏在流里。代理现在能识别这种"隐身错误"并触发重试
+> - **修复重试时 Request body 复用 bug**：之前每次重试都复用同一个 Request 对象，导致 body 已被消耗，所有重试都失败。现在每次重试都构建全新的 Request
+> - **修复重试时 captcha token 过期 bug**：start-plan 模式下 captcha token 只有 45 秒有效期，重试等待期间容易过期导致 403。现在每次重试前都会刷新 token，遇到 403 自动重新求解
+> - **改进错误日志**：catch 块现在会打印实际错误信息（之前只打 "network error"）
+> - **新增 16 个单元测试**：完整测试套件 224/224 通过
+>
 > **v2.1.2 / v0.1.8 — Dashboard UI 全面重构**
 > - **设计令牌系统**：完整的 spacing / radius / shadow / typography / motion 令牌，更柔和的深色配色（4 级文本灰度）
 > - **侧边栏重构**：导航分组（监控 / 配置 / 凭证）+ SVG 图标 + 修复 footer `margin-top:auto` + `margin-top:24px` 冲突
