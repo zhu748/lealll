@@ -82,9 +82,9 @@ describe("transformRequestBody — cache_control (Anthropic)", () => {
     expect(parsed.messages[2].content).toEqual([
       { type: "text", text: "second question", cache_control: { type: "ephemeral" } },
     ]);
-    // Earlier messages untouched
-    expect(parsed.messages[0].content).toBe("first question");
-    expect(parsed.messages[1].content).toBe("answer");
+    // Earlier messages: v2.1.3.10beta0 normalizes string content to array
+    expect(parsed.messages[0].content).toEqual([{ type: "text", text: "first question" }]);
+    expect(parsed.messages[1].content).toEqual([{ type: "text", text: "answer" }]);
   });
 
   it("adds cache_control to last content block when content is already array", () => {
@@ -415,9 +415,10 @@ describe("transformRequestBody — strip thinking blocks from messages (Anthropi
     // thinking block gone, tool_use preserved
     // After v2.1.3.7beta0: empty text block inserted at front (gateway requires
     // assistant messages to have a text block)
+    // v2.1.3.10beta0: text is " " (space) instead of "" (some gateways reject empty)
     expect(parsed.messages[0].content.length).toBe(2);
     expect(parsed.messages[0].content[0].type).toBe("text");
-    expect(parsed.messages[0].content[0].text).toBe("");
+    expect(parsed.messages[0].content[0].text).toBe(" ");
     expect(parsed.messages[0].content[1].type).toBe("tool_use");
     expect(parsed.messages[0].content[1].id).toBe("t1");
     expect(parsed.messages[0].content[1].name).toBe("Bash");
@@ -438,8 +439,9 @@ describe("transformRequestBody — strip thinking blocks from messages (Anthropi
     });
     const out = transformRequestBody(body, { format: "anthropic" });
     const parsed = JSON.parse(out as string);
-    // string content on assistant untouched (cache_control lands on last user msg, not assistant)
-    expect(parsed.messages[1].content).toBe("hi there");
+    // v2.1.3.10beta0: string content normalized to array; cache_control lands
+    // on last user msg's text block, not on assistant
+    expect(parsed.messages[1].content).toEqual([{ type: "text", text: "hi there" }]);
   });
 
   it("leaves messages without thinking blocks unchanged (apart from other transformations)", () => {
@@ -859,18 +861,20 @@ describe("transformRequestBody — strip cache_control from tool_result (Anthrop
     const out = transformRequestBody(body, { format: "anthropic" });
     const parsed = JSON.parse(out as string);
 
-    // First user message: string content stays as string (cache_control did
-    // NOT land here, because the assistant's inserted text block was found first)
+    // First user message: v2.1.3.10beta0 normalizes string content to array
+    // [{type:"text", text:"你好"}] — ZCode gateway requires array format.
     const firstUser = parsed.messages[0];
-    expect(typeof firstUser.content).toBe("string");
-    expect(firstUser.content).toBe("你好");
+    expect(Array.isArray(firstUser.content)).toBe(true);
+    expect(firstUser.content[0].type).toBe("text");
+    expect(firstUser.content[0].text).toBe("你好");
 
-    // Assistant message: empty text block inserted at front, cache_control
+    // Assistant message: non-empty text block inserted at front, cache_control
     // attached to that text block
+    // v2.1.3.10beta0: text is " " (space) instead of "" (some gateways reject empty)
     const assistant = parsed.messages[1];
     expect(Array.isArray(assistant.content)).toBe(true);
     expect(assistant.content[0].type).toBe("text");
-    expect(assistant.content[0].text).toBe("");
+    expect(assistant.content[0].text).toBe(" ");
     expect(assistant.content[0].cache_control).toEqual({ type: "ephemeral" });
     // tool_use block has NO cache_control
     expect(assistant.content[1].type).toBe("tool_use");
@@ -910,10 +914,11 @@ describe("transformRequestBody — ensure assistant has text block (v2.1.3.7beta
     const parsed = JSON.parse(out as string);
     const assistant = parsed.messages[1];
     // After thinking strip + ensureAssistantTextBlock:
-    // content should be [text(""), tool_use]
+    // content should be [text(" "), tool_use]
+    // v2.1.3.10beta0: text is " " (space) instead of "" (some gateways reject empty)
     expect(assistant.content.length).toBe(2);
     expect(assistant.content[0].type).toBe("text");
-    expect(assistant.content[0].text).toBe("");
+    expect(assistant.content[0].text).toBe(" ");
     expect(assistant.content[1].type).toBe("tool_use");
     expect(assistant.content[1].id).toBe("t1");
   });
@@ -943,7 +948,7 @@ describe("transformRequestBody — ensure assistant has text block (v2.1.3.7beta
     const assistant = parsed.messages[1];
     expect(assistant.content.length).toBe(2);
     expect(assistant.content[0].type).toBe("text");
-    expect(assistant.content[0].text).toBe("");
+    expect(assistant.content[0].text).toBe(" ");
     expect(assistant.content[1].type).toBe("tool_use");
   });
 
@@ -1103,7 +1108,7 @@ describe("transformRequestBody — ensure assistant has text block (v2.1.3.7beta
     );
     expect(round3Assistant.content.length).toBe(2);
     expect(round3Assistant.content[0].type).toBe("text");
-    expect(round3Assistant.content[0].text).toBe("");
+    expect(round3Assistant.content[0].text).toBe(" ");
     expect(round3Assistant.content[1].type).toBe("tool_use");
 
     // No thinking blocks anywhere

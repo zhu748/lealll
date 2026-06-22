@@ -26,6 +26,8 @@ import { anthropicSseToOpenaiSse } from "../translator/sse-translator.js";
 import type { OpenAIChatRequest, OpenAIResponseRequest, AnthropicMessagesResponse } from "../translator/types.js";
 import { recordStat } from "../admin/api.js";
 import { sleep } from "../utils/sleep.js";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 
 /** Options for the proxy handler. */
 export interface ProxyHandlerOptions {
@@ -385,6 +387,19 @@ export async function proxyRequest(
     // mismatched beta flags vs body is a common 3001 cause on ZCode gateway.
     const sentBeta = buildUpstreamRequest(clientReq, upstreamFormat, provider, cred, transformedBody, config.identity, config.plan, undefined).headers.get("anthropic-beta");
     console.log(`${reqId} anthropic-beta sent: ${sentBeta ?? "(none)"}`);
+    // v2.1.3.10beta0: dump the FULL transformed body to a JSON file so the
+    // exact request that 3001'd can be inspected. The summary above only
+    // shows block types, not actual content — this file shows everything.
+    // Written to the proxy's working directory (next to config.yaml).
+    if (transformedBody) {
+      const debugFile = `zcode-proxy-debug-${reqId.replace(/[^a-zA-Z0-9]/g, "")}.json`;
+      try {
+        writeFileSync(join(process.cwd(), debugFile), transformedBody);
+        console.log(`${reqId} full transformed body dumped to: ${join(process.cwd(), debugFile)}`);
+      } catch (e) {
+        console.log(`${reqId} failed to dump body: ${(e as Error).message}`);
+      }
+    }
     // Reconstruct the response with the peeked body so the passthrough below
     // still has something to send. upstreamResp.text() consumed the body.
     upstreamResp = new Response(errPeek, {

@@ -79,6 +79,7 @@ export function transformRequestBodyObj(parsed: unknown, ctx: TransformContext):
     modified = relocateSystemMessages(obj) || modified;
     modified = stripThinkingBlocksFromMessages(obj) || modified;
     modified = ensureAssistantTextBlock(obj) || modified;
+    modified = normalizeAllMessageContent(obj) || modified;
     modified = normalizeToolResultContent(obj) || modified;
     modified = sanitizeContentBlocks(obj, ctx.startPlan) || modified;
     modified = applyAnthropicCacheControl(obj, ctx.startPlan) || modified;
@@ -372,12 +373,16 @@ function stripThinkingBlocksFromMessages(body: Record<string, unknown>): boolean
     // If this is an assistant message that now has ONLY non-text blocks
     // (e.g. only tool_use), insert an empty text block at the front.
     // ZCode gateway rejects assistant messages with no text block.
+    //
+    // v2.1.3.10beta0: use a single space " " instead of empty string "" —
+    // some gateways reject empty text blocks. A space renders as nothing
+    // visible but is technically non-empty.
     if (msg.role === "assistant") {
       const hasText = filtered.some((b: unknown) =>
         isPlainObject(b) && b.type === "text"
       );
       if (!hasText) {
-        msg.content = [{ type: "text", text: "" }, ...filtered];
+        msg.content = [{ type: "text", text: " " }, ...filtered];
       }
     }
 
@@ -431,9 +436,11 @@ function ensureAssistantTextBlock(body: Record<string, unknown>): boolean {
       isPlainObject(b) && b.type === "text"
     );
     if (!hasText) {
-      // Insert empty text block at the front.
-      // Using unshift on the existing array to mutate in place.
-      content.unshift({ type: "text", text: "" });
+      // Insert a single-space text block at the front.
+      // v2.1.3.10beta0: use " " instead of "" — some gateways reject
+      // empty text blocks. A space renders as nothing visible but is
+      // technically non-empty.
+      content.unshift({ type: "text", text: " " });
       changed = true;
     }
   }
@@ -542,6 +549,42 @@ function normalizeToolResultContent(body: Record<string, unknown>): boolean {
         block.content = [{ type: "text", text: block.content }];
         changed = true;
       }
+    }
+  }
+  return changed;
+}
+
+/**
+ * Normalize ALL message `content` from string to array format.
+ *
+ * Anthropic's official API accepts both formats for message content:
+ *   - string:  `{ role: "user", content: "hello" }`
+ *   - array:   `{ role: "user", content: [{ type: "text", text: "hello" }] }`
+ *
+ * Claude Code sends simple text as **string** and complex content (with tools,
+ * images, etc.) as **array**. Some Anthropic-compatible gateways (including
+ * ZCode's start-plan gateway) are stricter and ONLY accept the array format,
+ * rejecting string content with 3001 "parameter error".
+ *
+ * This function converts ALL string `content` to the array format by wrapping
+ * in a single text block. Array content is left untouched.
+ *
+ * v2.1.3.10beta0: previously only `tool_result.content` was normalized. We now
+ * normalize ALL message content (user + assistant) because the gateway's
+ * strictness may apply to all message types, not just tool_result.
+ *
+ * No-op if `messages` is missing or not an array.
+ */
+function normalizeAllMessageContent(body: Record<string, unknown>): boolean {
+  const messages = body.messages;
+  if (!Array.isArray(messages)) return false;
+
+  let changed = false;
+  for (const msg of messages) {
+    if (!isPlainObject(msg)) continue;
+    if (typeof msg.content === "string") {
+      msg.content = [{ type: "text", text: msg.content }];
+      changed = true;
     }
   }
   return changed;

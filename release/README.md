@@ -1,5 +1,28 @@
 # zcode-proxy 使用说明
 
+> **v2.1.3.10beta0 — 非空 text 占位符 + 全消息 content 标准化 + 4xx 完整 body dump**
+> - **根因定位**：v2.1.3.9beta0 已修复 text+cc / tool_result string / is_error，但用户反馈第 3 轮（首次 tool 调用后）仍报 3001：
+>   ```
+>   msgs[[0]user/{text,text},[1]assistant/{text},[2]user/str,
+>        [3]assistant/{text,tool_use},[4]user/{tool_result/arr}]
+>   ```
+>   所有之前修复的字段都正确了（text 无 cc、tool_result 是 arr、无 is_error）。#001/#002（无 tool）成功，#004（有 tool）失败——问题在 `[3]assistant/{text,tool_use}` 或 `[4]user/{tool_result/arr}`。
+> - **核心推理**：`[3]` 的 text 块是 `ensureAssistantTextBlock` 在 thinking 剥离后插入的——之前插入的是 **空字符串** `text:""`。**ZCode 网关可能不接受空 text 块**。
+> - **修复 1：空 text 块 → 非空占位符**
+>   - `ensureAssistantTextBlock()` 和 `stripThinkingBlocksFromMessages()` 现在插入 `text:" "`（单空格）而不是 `text:""`
+>   - 单空格在对话中渲染为不可见，但技术上是"非空"的，满足可能存在的"非空 text"校验
+> - **修复 2：标准化所有消息 content 为 array 格式**
+>   - 新增 `normalizeAllMessageContent()`，把所有 user/assistant 消息的 string content 转为 array `[{type:"text", text:"..."}]`
+>   - 之前只标准化了 `tool_result.content`，现在 user/assistant 的 string content 也统一转 array
+>   - 日志中 `[2]user/str` 会变成 `[2]user/{text}` — 更统一的格式
+> - **修复 3：4xx 时 dump 完整 transformed body 到文件**
+>   - 3001 时把实际发送的请求体写入 `zcode-proxy-debug-<reqId>.json`（在代理工作目录下）
+>   - 日志会打印 `full transformed body dumped to: /path/to/zcode-proxy-debug-004.json`
+>   - 用户可以把这个文件发回来，我能看到 EXACT 的请求内容（不再只是 summary）
+> - **测试更新**：5 个现有测试更新以匹配新的非空 text 和 array content 行为；全套 291 测试通过，TypeScript 类型检查零错误
+>
+> **如果 v2.1.3.10beta0 仍 3001**：请把代理目录下新生成的 `zcode-proxy-debug-XXX.json` 文件发回来——这次能看到完整请求体，精确定位是哪个字段
+>
 > **v2.1.3.9beta0 — start-plan 剥离所有 cache_control + tool_result 标准化**
 > - **根因定位**：v2.1.3.8beta0 已正确过滤 `anthropic-beta` header（只剩 `claude-code-20250219`），但用户反馈第 4 轮仍报 3001：
 >   ```
