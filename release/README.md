@@ -1,5 +1,17 @@
 # zcode-proxy 使用说明
 
+> **v2.1.3.11beta0 — 修复 Responses API (Codex CLI) 空 string content 触发 3001**
+> - **根因定位**：v2.1.3.10beta0 修复了 Claude Code 的 3001，但 Codex CLI 走 `/v1/responses` 接口仍有同样问题。Responses API 翻译层 (`responses-to-anthropic.ts`) 会在多个场景产生**空 string content**：
+>   - `translateMessageContent()` 对空/缺失 content 返回 `""`
+>   - `mergeContent()` 把全空 text 块合并成 `""`
+>   - `function_call_output` 的 output 为空时 `content: ""`
+> - **问题**：这些空 string 经 `normalizeAllMessageContent` 转成 `[{type:"text", text:""}]` — **空 text 块**！这正是 v2.1.3.10beta0 修复的同一问题，但翻译层产生的空 string **绕过了** `ensureAssistantTextBlock`（因为该函数只检查"有没有 text 块"，不检查"text 是否为空"）。
+> - **修复**：`normalizeAllMessageContent()` 和 `normalizeToolResultContent()` 现在把**空 string** 转成 `text:" "`（单空格），跟 `ensureAssistantTextBlock` 的非空占位符策略一致。
+>   - 空 string content → `[{type:"text", text:" "}]`（非空）
+>   - 非空 string content → `[{type:"text", text:"原内容"}]`（不变）
+> - **影响范围**：Claude Code 和 Codex CLI 路径都受益——任何来源的空 string content 都会被标准化为非空
+> - **新增 4 个测试**：覆盖空 user content、空 assistant content、非空 string 保留、Codex CLI 的 `function_call_output` 空输出场景；全套 295 测试通过
+>
 > **v2.1.3.10beta0 — 非空 text 占位符 + 全消息 content 标准化 + 4xx 完整 body dump**
 > - **根因定位**：v2.1.3.9beta0 已修复 text+cc / tool_result string / is_error，但用户反馈第 3 轮（首次 tool 调用后）仍报 3001：
 >   ```

@@ -1122,6 +1122,92 @@ describe("transformRequestBody — ensure assistant has text block (v2.1.3.7beta
   });
 });
 
+describe("transformRequestBody — v2.1.3.11beta0: empty string content → non-empty space (Responses API path)", () => {
+  it("converts empty string user content to non-empty text block", () => {
+    // The Responses API translator (responses-to-anthropic.ts) produces empty
+    // strings in several cases:
+    //   - translateMessageContent returns "" for empty/missing content
+    //   - mergeContent collapses all-empty-text blocks to ""
+    //   - function_call_output emits content: "" when output is empty
+    // These empty strings become [{type:"text", text:""}] after normalization
+    // — an empty text block that the ZCode gateway rejects with 3001.
+    // v2.1.3.11beta0 fix: empty string → single space " " (non-empty).
+    const body = JSON.stringify({
+      messages: [
+        { role: "user", content: "" },  // empty string from translator
+        { role: "assistant", content: "ok" },
+      ],
+    });
+    const out = transformRequestBody(body, { format: "anthropic", startPlan: true });
+    const parsed = JSON.parse(out as string);
+    // Empty string should become a non-empty text block (single space)
+    expect(Array.isArray(parsed.messages[0].content)).toBe(true);
+    expect(parsed.messages[0].content[0].type).toBe("text");
+    expect(parsed.messages[0].content[0].text).toBe(" ");
+  });
+
+  it("converts empty string assistant content to non-empty text block", () => {
+    // Same fix applies to assistant messages — empty assistant turns are
+    // produced by the translator when output_text items have no text.
+    const body = JSON.stringify({
+      messages: [
+        { role: "user", content: "hi" },
+        { role: "assistant", content: "" },  // empty string
+      ],
+    });
+    const out = transformRequestBody(body, { format: "anthropic", startPlan: true });
+    const parsed = JSON.parse(out as string);
+    expect(Array.isArray(parsed.messages[1].content)).toBe(true);
+    expect(parsed.messages[1].content[0].type).toBe("text");
+    expect(parsed.messages[1].content[0].text).toBe(" ");
+  });
+
+  it("preserves non-empty string content as-is (no space substitution)", () => {
+    // Only EMPTY strings get the space substitution. Non-empty strings pass
+    // through as their actual text value.
+    const body = JSON.stringify({
+      messages: [
+        { role: "user", content: "hello world" },
+      ],
+    });
+    const out = transformRequestBody(body, { format: "anthropic", startPlan: true });
+    const parsed = JSON.parse(out as string);
+    expect(parsed.messages[0].content).toEqual([{ type: "text", text: "hello world" }]);
+  });
+
+  it("Responses API full regression: function_call_output with empty output", () => {
+    // Reproduces a Codex CLI scenario where function_call_output has empty
+    // output. The translator produces tool_result with content: "".
+    // After body-transformer, this should become a non-empty text block
+    // inside the tool_result.
+    const body = JSON.stringify({
+      messages: [
+        { role: "user", content: "run tool" },
+        {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "call_1", name: "Shell", input: { cmd: "ls" } }],
+        },
+        {
+          role: "user",
+          content: [
+            { tool_use_id: "call_1", type: "tool_result", content: "" },
+          ],
+        },
+      ],
+    });
+    const out = transformRequestBody(body, { format: "anthropic", startPlan: true });
+    const parsed = JSON.parse(out as string);
+
+    // tool_result.content should be array with a non-empty text block
+    const toolResult = parsed.messages[2].content[0];
+    expect(toolResult.type).toBe("tool_result");
+    expect(Array.isArray(toolResult.content)).toBe(true);
+    expect(toolResult.content[0].type).toBe("text");
+    // Empty tool_result content → non-empty space (v2.1.3.11beta0 fix)
+    expect(toolResult.content[0].text).toBe(" ");
+  });
+});
+
 describe("transformRequestBody — v2.1.3.9beta0: start-plan strips ALL cache_control + tool_result normalization", () => {
   it("start-plan: strips cache_control from text blocks (v2.1.3.8beta0 regression)", () => {
     // v2.1.3.5/6/7/8beta0 assumed text-block cache_control was safe in

@@ -545,8 +545,12 @@ function normalizeToolResultContent(body: Record<string, unknown>): boolean {
 
       // Convert string content to array format.
       // Anthropic accepts both, but ZCode gateway requires array.
+      // v2.1.3.11beta0: empty string → single space (non-empty placeholder),
+      // matching normalizeAllMessageContent's behavior. ZCode gateway rejects
+      // empty text blocks.
       if (typeof block.content === "string") {
-        block.content = [{ type: "text", text: block.content }];
+        const text = block.content.length > 0 ? block.content : " ";
+        block.content = [{ type: "text", text }];
         changed = true;
       }
     }
@@ -573,6 +577,20 @@ function normalizeToolResultContent(body: Record<string, unknown>): boolean {
  * normalize ALL message content (user + assistant) because the gateway's
  * strictness may apply to all message types, not just tool_result.
  *
+ * v2.1.3.11beta0: **empty string content** is converted to `[{type:"text",
+ * text:" "}]` (single space) instead of `[{type:"text", text:""}]` (empty).
+ * This is the same fix as `ensureAssistantTextBlock`'s non-empty placeholder,
+ * but applied at the normalize layer so it catches empty strings produced by
+ * the Responses API translator (which `ensureAssistantTextBlock` cannot see,
+ * because the translator emits `""` as a *string*, not as a missing-text-block
+ * scenario). The Responses API translator produces empty strings in several
+ * cases:
+ *   - `translateMessageContent` returns `""` for empty/missing content
+ *   - `mergeContent` collapses all-empty-text blocks to `""`
+ *   - `function_call_output` emits `content: ""` when output is empty
+ * Without this fix, these empty strings become `[{type:"text", text:""}]`
+ * after normalization — an empty text block that the ZCode gateway rejects.
+ *
  * No-op if `messages` is missing or not an array.
  */
 function normalizeAllMessageContent(body: Record<string, unknown>): boolean {
@@ -583,7 +601,11 @@ function normalizeAllMessageContent(body: Record<string, unknown>): boolean {
   for (const msg of messages) {
     if (!isPlainObject(msg)) continue;
     if (typeof msg.content === "string") {
-      msg.content = [{ type: "text", text: msg.content }];
+      // v2.1.3.11beta0: empty string → single space (non-empty placeholder).
+      // ZCode gateway rejects empty text blocks; a space is invisible but
+      // technically non-empty.
+      const text = msg.content.length > 0 ? msg.content : " ";
+      msg.content = [{ type: "text", text }];
       changed = true;
     }
   }
