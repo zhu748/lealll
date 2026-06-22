@@ -16,6 +16,7 @@ import { getProvider } from "../provider/providers.js";
 import { buildUpstreamRequest } from "./upstream.js";
 import { transformRequestBody, transformRequestBodyObj } from "./body-transformer.js";
 import { detectCaptchaChallenge, getCaptchaToken, invalidateCaptchaToken, RETRY_HEADERS } from "./captcha.js";
+import { detectSseErrorAndConvert } from "./sse-error-detector.js";
 import { translateRequestOpenAIToAnthropic, translateResponseAnthropicToOpenAI } from "../translator/openai-to-anthropic.js";
 import { anthropicSseToOpenaiSse } from "../translator/sse-translator.js";
 import type { OpenAIChatRequest, AnthropicMessagesResponse } from "../translator/types.js";
@@ -120,7 +121,7 @@ export async function proxyRequest(
     printRow(reqId, format, meta, 502, started, Date.now(), 0, 0, 0);
     return errorResponse(502, "upstream_unreachable", (err as Error).message);
   }
-  const headersAt = Date.now();
+  let headersAt = Date.now();
 
   if (upstreamResp.status === 401 && config.plan === "start-plan") {
     printRow(reqId, format, meta, 401, started, headersAt, 0, 0, 0);
@@ -146,6 +147,24 @@ export async function proxyRequest(
     } catch (err) {
       printRow(reqId, format, meta, 503, started, Date.now(), 0, 0, 0);
       return errorResponse(503, "captcha_solver_failed", (err as Error).message);
+    }
+  }
+
+  // SSE error detection: some upstream gateways (notably GLM) return HTTP 200
+  // + text/event-stream even when the request fails, hiding the error inside
+  // the stream as an `event: error` SSE event. This bypasses the status-code-
+  // based retry logic below. Peek at the first chunk(s) of the stream; if an
+  // error is found, convert the response to a synthetic JSON response with
+  // the appropriate HTTP status code so the retry logic can handle it.
+  if (upstreamResp.status === 200) {
+    const originalStatus = upstreamResp.status;
+    upstreamResp = await detectSseErrorAndConvert(upstreamResp);
+    if (upstreamResp.status !== originalStatus) {
+      console.log(`${reqId} SSE error detected in 200 stream → HTTP ${upstreamResp.status}, will attempt retry`);
+      // Update headersAt so TTFB reflects the time we actually got a usable
+      // response (the original 200 was a phantom — the real error was hidden
+      // inside the stream and took a few ms to detect).
+      headersAt = Date.now();
     }
   }
 
