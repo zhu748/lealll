@@ -690,13 +690,29 @@ function importFromZCodeConfig(provider: string, plan: "coding-plan" | "start-pl
   const config = JSON.parse(raw) as {
     provider?: Record<string, { options?: { apiKey?: string }; enabled?: boolean }>;
   };
-  const providerKey = `builtin:${provider}-coding-plan`;
-  const entry = config.provider?.[providerKey];
-  const apiKey = entry?.options?.apiKey?.trim();
-  if (!apiKey) throw new Error(`No API key for ${providerKey} in ZCode config`);
+
+  // Read both plan keys from ZCode config
+  const codingPlanKey = `builtin:${provider}-coding-plan`;
   const startPlanKey = `builtin:${provider}-start-plan`;
-  const jwt = config.provider?.[startPlanKey]?.options?.apiKey?.trim() || undefined;
-  return { apiKey, provider: provider as "zai" | "bigmodel", plan, jwt };
+  const codingPlanApiKey = config.provider?.[codingPlanKey]?.options?.apiKey?.trim() || "";
+  const startPlanToken = config.provider?.[startPlanKey]?.options?.apiKey?.trim() || "";
+
+  if (plan === "start-plan") {
+    if (!startPlanToken && !codingPlanApiKey) {
+      throw new Error(`No credential found for ${provider} in ZCode config. Tried: ${codingPlanKey}, ${startPlanKey}`);
+    }
+    const apiKey = codingPlanApiKey || startPlanToken;
+    const jwt = startPlanToken || undefined;
+    return { apiKey, provider: provider as "zai" | "bigmodel", plan, jwt };
+  }
+
+  // coding-plan: primary credential is the API key
+  if (!codingPlanApiKey) {
+    const hint = startPlanToken ? ` Found a start-plan token — import with plan=start-plan instead.` : "";
+    throw new Error(`No API key for ${codingPlanKey} in ZCode config.${hint}`);
+  }
+  const jwt = startPlanToken || undefined;
+  return { apiKey: codingPlanApiKey, provider: provider as "zai" | "bigmodel", plan, jwt };
 }
 
 /** Basic validation for config saves from the dashboard. Throws on invalid input. */

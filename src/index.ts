@@ -190,6 +190,9 @@ async function authStatus(): Promise<void> {
   }
   console.log(`Logged in: ${cred.provider}`);
   console.log(`  API Key: ${cred.apiKey.substring(0, 12)}...`);
+  console.log(`  Plan:    ${cred.plan || "(not set — uses config.yaml)"}`);
+  if (cred.jwt) console.log(`  JWT:     ${cred.jwt.substring(0, 12)}...`);
+  if (cred.userId) console.log(`  User ID: ${cred.userId}`);
   console.log(`  Store:   ${getStorePath()}`);
 }
 
@@ -233,21 +236,42 @@ function importFromZCodeConfig(provider: ProviderId, plan: PlanId = "coding-plan
     provider?: Record<string, { options?: { apiKey?: string }; enabled?: boolean }>;
   };
 
-  const providerKey = `builtin:${provider}-coding-plan`;
-  const entry = config.provider?.[providerKey];
-  const apiKey = entry?.options?.apiKey?.trim();
+  // Read both plan keys from ZCode config
+  const codingPlanKey = `builtin:${provider}-coding-plan`;
+  const startPlanKey = `builtin:${provider}-start-plan`;
+  const codingPlanApiKey = config.provider?.[codingPlanKey]?.options?.apiKey?.trim() || "";
+  const startPlanToken = config.provider?.[startPlanKey]?.options?.apiKey?.trim() || "";
 
-  if (!apiKey) {
-    console.error(`No API key for ${providerKey} in ZCode config.`);
+  if (plan === "start-plan") {
+    // For start-plan: the primary credential is the JWT from start-plan key.
+    // The coding-plan API key is still useful as a fallback identifier.
+    if (!startPlanToken && !codingPlanApiKey) {
+      console.error(`No credential found for ${provider} in ZCode config.`);
+      console.error(`Tried: ${codingPlanKey}, ${startPlanKey}`);
+      process.exit(1);
+    }
+    const apiKey = codingPlanApiKey || startPlanToken; // fallback if no coding-plan key
+    const jwt = startPlanToken || undefined;
+    console.log(`Imported from ${configPath} (start-plan)`);
+    if (jwt) console.log(`  Start-plan JWT: ${jwt.slice(0, 12)}...`);
+    if (codingPlanApiKey) console.log(`  Coding-plan API Key: ${codingPlanApiKey.slice(0, 8)}...`);
+    return { apiKey, provider, plan, jwt };
+  }
+
+  // For coding-plan: the primary credential is the API key.
+  // Also capture start-plan JWT if available (stored for potential plan switch later).
+  if (!codingPlanApiKey) {
+    console.error(`No API key for ${codingPlanKey} in ZCode config.`);
+    if (startPlanToken) {
+      console.error(`Hint: Found a start-plan token. Use --plan=start-plan to import it instead.`);
+    }
     process.exit(1);
   }
 
-  const startPlanKey = `builtin:${provider}-start-plan`;
-  const jwt = config.provider?.[startPlanKey]?.options?.apiKey?.trim() || undefined;
-
-  console.log(`Imported from ${configPath} (${plan})`);
-  if (jwt) console.log(`  Start-plan JWT: ${jwt.slice(0, 12)}...`);
-  return { apiKey, provider, plan, jwt };
+  const jwt = startPlanToken || undefined;
+  console.log(`Imported from ${configPath} (coding-plan)`);
+  if (jwt) console.log(`  Start-plan JWT also captured: ${jwt.slice(0, 12)}...`);
+  return { apiKey: codingPlanApiKey, provider, plan, jwt };
 }
 
 function openBrowser(url: string): void {
