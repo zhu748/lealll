@@ -1,5 +1,33 @@
 # zcode-proxy 使用说明
 
+> **v2.1.4.1test5 — 账号级出口代理（per-account HTTP proxy）**
+>
+> 新增**账号级出口代理**功能：在 dashboard 账号管理页面，可以为每个账号单独配置 HTTP / HTTPS / SOCKS5 出口代理，让不同账号走不同的网络出口（例如让 A 账号走日本节点、B 账号直连、C 账号走 SOCKS5）。代理在请求时动态读取，多账号 retry 切换凭证时新账号的代理会自动生效。
+>
+> **v2.1.4.1test5 关键改进**：
+> 1. **`Credential` 接口新增 `proxy?: string` 字段**：可选字段，留空 = 直连；设置 = 所有上游请求走该代理
+> 2. **`fetchUpstreamDetected` 动态注入代理**：在每次上游 fetch 时读取 `cred.proxy`，通过 Bun 原生 `fetch(url, { proxy })` 选项路由请求。**关键设计**：每次调用都重新读取 `cred.proxy`，所以 retry 时凭证自动切换（key-AAA → key-BBB）会立即应用新账号的代理设置，不会缓存旧代理
+> 3. **`setAccountProxy(id, proxy)` 存储函数**：持久化代理设置到加密的 `credentials.json`；空字符串清除代理，回到直连
+> 4. **`PUT /admin/api/accounts/proxy` 新 API 端点**：dashboard 编辑代理的后端，支持 scheme 校验（`http(s)://` / `socks5(h)://`），更新激活账号时自动热替换内存凭证（无需重启）
+> 5. **`POST /admin/api/credentials` 接受 `proxy` 字段**：手动添加 API Key 时可直接指定代理
+> 6. **Dashboard UI 增强**：
+>    - 账号表格新增「代理」列，每行带独立输入框，失焦即保存
+>    - 添加 API Key 表单新增「出口代理」可选输入
+>    - 客户端轻量 scheme 校验 + 失败时回滚输入框
+>    - 表格 `colspan` 同步从 7 调整为 8
+> 7. **代理设置随凭证导出**：`exportAccounts` / `exportStore` / Render 凭证导出都会带上 `proxy` 字段，云端部署时各账号的代理配置完整保留
+> 8. **新增 18 个回归测试**（共 399 测试通过）：
+>    - `setAccountProxy` 存储层 5 个：持久化 / 清除 / 未知 ID / 字段保留 / listAccounts 暴露
+>    - `accounts/proxy` API 9 个：参数校验 / scheme 校验 / 404 / 设置 / 清除 / 热替换 / socks5 / trim
+>    - 代理路由 handler 4 个：proxy 传递 / 不传 / socks5 / decompress 共存
+>
+> **影响范围**：
+> - **多账号 + 多网络出口用户**：可以为不同账号配置不同代理，灵活组合（如某账号被风控时切到代理出口）
+> - **单账号用户**：留空代理字段，行为与 v2.1.4.1test4 完全一致
+> - **retry 凭证切换**：从有代理的账号切到无代理账号会自动停止使用代理，反之亦然
+>
+> ---
+
 > **v2.1.4.1test4 — Docker 部署修复（bun 1.2 lockfile 兼容）**
 >
 > 修复 v2.1.4.1test3 在 Render / Docker 部署时的构建失败问题：`bun.lock` 使用 Bun 1.2+ 引入的新 JSON 格式（`lockfileVersion: 1`），而 Dockerfile 的 base image 仍是 `oven/bun:1.1-debian`，Bun 1.1.45 无法解析该格式，导致 `bun install --frozen-lockfile` 在容器构建阶段报 `InvalidLockfileVersion` 错误。

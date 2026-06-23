@@ -411,6 +411,8 @@ export async function listAccounts(): Promise<{
     expiresAt?: number;
     hasJwt: boolean;
     plan: string;
+    /** Outbound HTTP proxy URL configured for this account (empty string if none). */
+    proxy: string;
   }>;
   activeId: string | null;
 }> {
@@ -434,6 +436,10 @@ export async function listAccounts(): Promise<{
       // is present. This keeps the dashboard dropdown in sync with what
       // serve() will actually do at startup.
       plan: inferPlan(a.credential),
+      // Per-account outbound proxy (v2.1.4.1test5+). Empty string means
+      // direct connection — surfaced as "" rather than undefined so the
+      // dashboard can always render the input with the current value.
+      proxy: a.credential.proxy ?? "",
     })),
   };
 }
@@ -493,6 +499,33 @@ export async function setAccountPlan(id: string, plan: "coding-plan" | "start-pl
   const account = store.accounts.find(a => a.id === id);
   if (!account) return false;
   account.credential.plan = plan;
+  await writeStore(store);
+  return true;
+}
+
+/**
+ * Update an account's outbound HTTP proxy URL.
+ *
+ * Pass an empty string (or undefined) to clear the override — the account
+ * will fall back to a direct connection. No URL validation is performed
+ * here; the dashboard is expected to send a syntactically valid URL
+ * (`http://`, `https://`, or `socks5://` scheme). Invalid URLs surface as
+ * fetch-time errors at request time, which is more useful to the user
+ * than a silent rejection at config time.
+ */
+export async function setAccountProxy(id: string, proxy: string): Promise<boolean> {
+  const store = await readStore();
+  if (!store) return false;
+  const account = store.accounts.find(a => a.id === id);
+  if (!account) return false;
+  const trimmed = (proxy ?? "").trim();
+  if (trimmed) {
+    account.credential.proxy = trimmed;
+  } else {
+    // Clear the field entirely so the serialized credential stays clean
+    // rather than accumulating empty strings across versions.
+    delete account.credential.proxy;
+  }
   await writeStore(store);
   return true;
 }

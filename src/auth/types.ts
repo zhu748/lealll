@@ -27,6 +27,17 @@ export interface Credential {
   userId?: string;
   /** JWT token for start-plan (zcode.z.ai). Present when login captured the ZCode plan token. */
   jwt?: string;
+  /**
+   * Outbound HTTP proxy URL (per-account override).
+   *
+   * When set, all upstream requests made under this credential are routed
+   * through this proxy via Bun's native `fetch(url, { proxy })` option.
+   * Supported schemes: `http://`, `https://`, `socks5://` (Bun native).
+   * Empty string clears the override (falls back to direct connection).
+   *
+   * Introduced in v2.1.4.1test5 for per-account proxy support.
+   */
+  proxy?: string;
 }
 
 /**

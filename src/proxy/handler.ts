@@ -217,18 +217,32 @@ export async function proxyRequest(
   // An AbortController applies an upstream timeout: 10 min for streaming
   // requests (LLM thinking traces can be long), 5 min for batch. Prevents a
   // hung upstream TCP connection from pinning a Bun worker forever.
+  //
+  // Per-account outbound proxy (v2.1.4.1test5+): if `cred.proxy` is set,
+  // route the upstream fetch through that proxy via Bun's native
+  // `{ proxy: url }` RequestInit option. We re-read `cred.proxy` on EVERY
+  // call (not captured in a closure) so a credential switch mid-retry picks
+  // up the new account's proxy automatically — without this, switching from
+  // a proxied account to a direct one would keep using the old proxy.
   const fetchUpstreamDetected = async (captcha?: Record<string, string>): Promise<Response> => {
     const req = buildUpstreamReq(captcha);
     lastSentBeta = req.headers.get("anthropic-beta");
     const timeoutMs = meta.stream ? UPSTREAM_TIMEOUT_STREAM_MS : UPSTREAM_TIMEOUT_BATCH_MS;
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    // Bun's native fetch accepts `{ proxy: "http://..." }` / `socks5://...`
+    // Cast through `any` because the option is Bun-specific and not in the
+    // standard TypeScript DOM RequestInit type.
+    const fetchOpts: any = {
+      ...(translateMode ? {} : { decompress: false }),
+      signal: ctrl.signal,
+    };
+    if (cred.proxy) {
+      fetchOpts.proxy = cred.proxy;
+    }
     let resp: Response;
     try {
-      resp = await fetchImpl(req, {
-        ...(translateMode ? {} : { decompress: false }),
-        signal: ctrl.signal,
-      });
+      resp = await fetchImpl(req, fetchOpts);
     } catch (err) {
       clearTimeout(timer);
       // Distinguish abort (timeout) from real network errors so the error

@@ -11,6 +11,7 @@ import {
   switchAccount,
   removeAccount,
   setAccountLabel,
+  setAccountProxy,
   maskApiKey,
 } from "./store.js";
 import type { Credential } from "./types.js";
@@ -179,5 +180,74 @@ describe("multi-account store", () => {
     expect(maskApiKey("abcdefgh12345678wxyz")).toBe("abcdefgh...wxyz");
     expect(maskApiKey("short")).toBe("short");
     expect(maskApiKey("")).toBe("");
+  });
+
+  // --- v2.1.4.1test5: per-account proxy ---
+
+  it("setAccountProxy persists proxy on the credential", async () => {
+    await saveCredential({ apiKey: "k", provider: "zai" });
+    const list = await listAccounts();
+    const id = list.accounts[0].id;
+    expect(list.accounts[0].proxy).toBe("");
+
+    const ok = await setAccountProxy(id, "http://127.0.0.1:7890");
+    expect(ok).toBe(true);
+
+    const list2 = await listAccounts();
+    expect(list2.accounts[0].proxy).toBe("http://127.0.0.1:7890");
+
+    // The actual credential (loaded via loadCredential) should also carry it
+    const cred = await loadCredential();
+    expect(cred!.proxy).toBe("http://127.0.0.1:7890");
+  });
+
+  it("setAccountProxy with empty string clears the override", async () => {
+    await saveCredential({ apiKey: "k", provider: "zai", proxy: "socks5://10.0.0.1:1080" } as Credential);
+    const list = await listAccounts();
+    expect(list.accounts[0].proxy).toBe("socks5://10.0.0.1:1080");
+
+    const id = list.accounts[0].id;
+    const ok = await setAccountProxy(id, "   ");
+    expect(ok).toBe(true);
+
+    const list2 = await listAccounts();
+    expect(list2.accounts[0].proxy).toBe("");
+
+    const cred = await loadCredential();
+    expect(cred!.proxy).toBeUndefined();
+  });
+
+  it("setAccountProxy returns false for unknown account id", async () => {
+    await saveCredential({ apiKey: "k", provider: "zai" });
+    const ok = await setAccountProxy("nonexistent-id", "http://localhost:1");
+    expect(ok).toBe(false);
+  });
+
+  it("setAccountProxy preserves other credential fields", async () => {
+    await saveCredential({ apiKey: "k", provider: "zai", plan: "coding-plan", userId: "u1", jwt: "jwttoken" });
+    const list = await listAccounts();
+    const id = list.accounts[0].id;
+
+    await setAccountProxy(id, "http://proxy:8080");
+
+    const cred = await loadCredential();
+    expect(cred!.apiKey).toBe("k");
+    expect(cred!.provider).toBe("zai");
+    expect(cred!.plan).toBe("coding-plan");
+    expect(cred!.userId).toBe("u1");
+    expect(cred!.jwt).toBe("jwttoken");
+    expect(cred!.proxy).toBe("http://proxy:8080");
+  });
+
+  it("listAccounts exposes proxy field for all accounts (empty string when unset)", async () => {
+    await saveCredential({ apiKey: "k1", provider: "zai" });
+    await saveCredential({ apiKey: "k2", provider: "bigmodel", proxy: "http://p:8080" } as Credential);
+
+    const list = await listAccounts();
+    expect(list.accounts).toHaveLength(2);
+    const zaiAcc = list.accounts.find(a => a.provider === "zai")!;
+    const bigAcc = list.accounts.find(a => a.provider === "bigmodel")!;
+    expect(zaiAcc.proxy).toBe("");
+    expect(bigAcc.proxy).toBe("http://p:8080");
   });
 });

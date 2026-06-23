@@ -638,6 +638,125 @@ describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
   });
 });
 
+describe("proxyRequest — per-account outbound proxy (v2.1.4.1test5)", () => {
+  const testConfig: ProxyConfig = {
+    server: { port: 8080, host: "0.0.0.0" },
+    auth: { mode: "apikey", apiKey: "testkey.testsecret" },
+    provider: "zai",
+    plan: "coding-plan",
+    providers: {
+      zai: { anthropicBase: "https://api.z.ai/api/anthropic", openaiBase: "https://api.z.ai/api/coding/paas/v4" },
+      bigmodel: { anthropicBase: "https://open.bigmodel.cn/api/anthropic", openaiBase: "https://open.bigmodel.cn/api/coding/paas/v4" },
+    },
+    defaultModel: "glm-4.6",
+    models: ["glm-4.6"],
+    identity: IDENTITY,
+    logging: { level: "info" },
+    retry: { maxRetries: 0, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0 },
+  };
+
+  const successBody = JSON.stringify({
+    id: "msg_1", type: "message", role: "assistant",
+    content: [{ type: "text", text: "Hello" }],
+    model: "glm-4.6", stop_reason: "end_turn", stop_sequence: null,
+    usage: { input_tokens: 10, output_tokens: 5 },
+  });
+
+  it("passes cred.proxy as { proxy } option to fetch when set", async () => {
+    let receivedProxy: string | undefined;
+    const fetchMock = mock(async (req: Request, init?: any): Promise<Response> => {
+      receivedProxy = init?.proxy;
+      return new Response(successBody, {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+
+    const auth = new AuthManager({ mode: "oauth", provider: "zai" });
+    auth.setOAuthCredential({
+      apiKey: "testkey", secret: "testsecret", provider: "zai",
+      proxy: "http://127.0.0.1:7890",
+    });
+
+    const clientReq = makeClientReq('{"model":"glm-4.6","messages":[{"role":"user","content":"Hi"}]}');
+    const resp = await proxyRequest(clientReq, "anthropic", { config: testConfig, auth, fetchImpl: fetchMock as any });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(resp.status).toBe(200);
+    expect(receivedProxy).toBe("http://127.0.0.1:7890");
+  });
+
+  it("does NOT pass proxy option when cred.proxy is unset", async () => {
+    let receivedProxy: unknown = "sentinel";
+    let initKeys: string[] | undefined;
+    const fetchMock = mock(async (req: Request, init?: any): Promise<Response> => {
+      receivedProxy = init?.proxy;
+      initKeys = init ? Object.keys(init) : undefined;
+      return new Response(successBody, {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+
+    const auth = new AuthManager({ mode: "apikey", provider: "zai", apiKey: "testkey.testsecret" });
+    const clientReq = makeClientReq('{"model":"glm-4.6","messages":[{"role":"user","content":"Hi"}]}');
+    await proxyRequest(clientReq, "anthropic", { config: testConfig, auth, fetchImpl: fetchMock as any });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(receivedProxy).toBeUndefined();
+    expect(initKeys).not.toContain("proxy");
+  });
+
+  it("passes socks5:// proxy URL through unchanged", async () => {
+    let receivedProxy: string | undefined;
+    const fetchMock = mock(async (_req: Request, init?: any): Promise<Response> => {
+      receivedProxy = init?.proxy;
+      return new Response(successBody, {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+
+    const auth = new AuthManager({ mode: "oauth", provider: "zai" });
+    auth.setOAuthCredential({
+      apiKey: "testkey", secret: "testsecret", provider: "zai",
+      proxy: "socks5://10.0.0.1:1080",
+    });
+
+    const clientReq = makeClientReq('{"model":"glm-4.6","messages":[{"role":"user","content":"Hi"}]}');
+    await proxyRequest(clientReq, "anthropic", { config: testConfig, auth, fetchImpl: fetchMock as any });
+
+    expect(receivedProxy).toBe("socks5://10.0.0.1:1080");
+  });
+
+  it("preserves decompress: false alongside proxy for Anthropic format", async () => {
+    let receivedDecompress: unknown = "sentinel";
+    let receivedProxy: string | undefined;
+    const fetchMock = mock(async (_req: Request, init?: any): Promise<Response> => {
+      receivedDecompress = init?.decompress;
+      receivedProxy = init?.proxy;
+      return new Response(successBody, {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+
+    const auth = new AuthManager({ mode: "oauth", provider: "zai" });
+    auth.setOAuthCredential({
+      apiKey: "testkey", secret: "testsecret", provider: "zai",
+      proxy: "http://proxy:8080",
+    });
+
+    const clientReq = makeClientReq('{"model":"glm-4.6","messages":[{"role":"user","content":"Hi"}]}');
+    await proxyRequest(clientReq, "anthropic", { config: testConfig, auth, fetchImpl: fetchMock as any });
+
+    // Anthropic format is NOT translation mode, so decompress: false should
+    // be passed alongside proxy.
+    expect(receivedDecompress).toBe(false);
+    expect(receivedProxy).toBe("http://proxy:8080");
+  });
+});
+
 describe("errorResponse", () => {
   it("builds JSON error with correct status", () => {
     const resp = errorResponse(401, "auth_error", "Invalid API key");

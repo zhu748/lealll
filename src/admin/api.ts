@@ -7,7 +7,7 @@
 import type { ProxyConfig, RoutingRule, ModelMapping, ResponsesThinkingConfig } from "../config/types.js";
 import type { AuthManager } from "../auth/manager.js";
 import type { Credential as AppCredential } from "../auth/types.js";
-import { loadCredential, saveCredential, clearCredential, listAccounts, switchAccount, removeAccount, setAccountLabel, setAccountPlan, exportAccounts, exportStore, importAccounts, maskApiKey } from "../auth/store.js";
+import { loadCredential, saveCredential, clearCredential, listAccounts, switchAccount, removeAccount, setAccountLabel, setAccountPlan, setAccountProxy, exportAccounts, exportStore, importAccounts, maskApiKey } from "../auth/store.js";
 import { ZaiOAuthClient, BigmodelOAuthClient } from "../auth/oauth.js";
 import { KeyResolver } from "../auth/resolver.js";
 import { errorResponse } from "../proxy/handler.js";
@@ -372,9 +372,16 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
   // Add API key
   if (path === "/admin/api/credentials" && method === "POST") {
     try {
-      const body = await req.json() as { provider: string; apiKey: string; plan?: string };
+      const body = await req.json() as { provider: string; apiKey: string; plan?: string; proxy?: string };
       const plan = (body.plan === "start-plan" ? "start-plan" : "coding-plan") as "coding-plan" | "start-plan";
-      const cred = { apiKey: body.apiKey, provider: body.provider as "zai" | "bigmodel", plan } as AppCredential;
+      const cred = {
+        apiKey: body.apiKey,
+        provider: body.provider as "zai" | "bigmodel",
+        plan,
+        // Per-account proxy (v2.1.4.1test5+). Trim; empty/whitespace → undefined
+        // so the field is omitted from the serialized credential entirely.
+        ...(body.proxy && body.proxy.trim() ? { proxy: body.proxy.trim() } : {}),
+      } as AppCredential;
       await saveCredential(cred);
       return jsonResp({ ok: true });
     } catch (err) {
@@ -486,6 +493,52 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
         appendLog("error", `Failed to persist plan to config: ${(e as Error).message}`);
       }
       return jsonResp({ ok: true, plan: body.plan });
+    } catch (err) {
+      return errorResponse(500, "update_failed", (err as Error).message);
+    }
+  }
+
+  // Update account outbound proxy (v2.1.4.1test5+)
+  // Accepts an empty/whitespace string to clear the override.
+  if (path === "/admin/api/accounts/proxy" && method === "PUT") {
+    try {
+      const body = await req.json() as { id?: string; proxy?: string };
+      if (!body.id || typeof body.id !== "string") {
+        return errorResponse(400, "missing_param", "id is required");
+      }
+      if (typeof body.proxy !== "string") {
+        return errorResponse(400, "missing_param", "proxy is required (use empty string to clear)");
+      }
+      // Basic scheme validation. We accept http://, https://, socks5://,
+      // and socks5h:// (Bun supports both). Empty string clears the override.
+      const trimmed = body.proxy.trim();
+      if (trimmed) {
+        const ok = /^(https?|socks5h?):\/\/[^\s]+$/i.test(trimmed);
+        if (!ok) {
+          return errorResponse(
+            400,
+            "invalid_param",
+            "proxy must be a valid URL with scheme http://, https://, socks5://, or socks5h://",
+          );
+        }
+      }
+      const success = await setAccountProxy(body.id, body.proxy);
+      if (!success) return errorResponse(404, "not_found", "Account not found");
+
+      // If the updated account is the currently active one, hot-swap the
+      // in-memory credential so running requests immediately use (or stop
+      // using) the new proxy. Without this, the proxy change would only
+      // take effect after a server restart — defeating the purpose of the
+      // dashboard edit.
+      const cred = await loadCredential();
+      if (cred) {
+        opts.auth.setOAuthCredential(cred);
+      }
+      appendLog(
+        "info",
+        `Account ${body.id} proxy ${trimmed ? `set to ${trimmed}` : "cleared"}`,
+      );
+      return jsonResp({ ok: true, proxy: trimmed });
     } catch (err) {
       return errorResponse(500, "update_failed", (err as Error).message);
     }

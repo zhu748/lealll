@@ -888,7 +888,7 @@ td input{font-family:var(--font-mono)}
     <div class="sidebar-footer">
       <div class="version">
         <span class="dot"></span>
-        <span>v2.1.4.1test4</span>
+        <span>v2.1.4.1test5</span>
       </div>
       <div class="logout-btn" onclick="doLogout()">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
@@ -1197,12 +1197,12 @@ td input{font-family:var(--font-mono)}
             </div>
           </div>
           <div class="card-body" style="padding-bottom:0">
-            <p style="font-size:12px;color:var(--text-2);margin-bottom:var(--s-4)">所有通过 OAuth 或手动输入保存的凭证。点击 <strong style="color:var(--text)">激活</strong> 切换，点击 <strong style="color:var(--text)">套餐</strong> 修改。</p>
+            <p style="font-size:12px;color:var(--text-2);margin-bottom:var(--s-4)">所有通过 OAuth 或手动输入保存的凭证。点击 <strong style="color:var(--text)">激活</strong> 切换，点击 <strong style="color:var(--text)">套餐</strong> 修改，<strong style="color:var(--text)">代理</strong> 列可为每个账号单独配置 HTTP/SOCKS5 出口代理（留空=直连）。</p>
           </div>
           <div class="table-wrap">
             <table>
-              <thead><tr><th>标签</th><th>提供商</th><th>套餐</th><th>API Key</th><th>创建时间</th><th>状态</th><th style="text-align:right">操作</th></tr></thead>
-              <tbody id="accountsList"><tr><td colspan="7"><div class="empty-state"><div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg></div><div class="empty-text">加载中...</div></div></td></tr></tbody>
+              <thead><tr><th>标签</th><th>提供商</th><th>套餐</th><th>API Key</th><th>代理</th><th>创建时间</th><th>状态</th><th style="text-align:right">操作</th></tr></thead>
+              <tbody id="accountsList"><tr><td colspan="8"><div class="empty-state"><div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg></div><div class="empty-text">加载中...</div></div></td></tr></tbody>
             </table>
           </div>
         </div>
@@ -1218,6 +1218,7 @@ td input{font-family:var(--font-mono)}
                 <div class="form-group"><label class="form-label">套餐</label><select id="addKeyPlan"><option value="coding-plan">Coding 套餐</option><option value="start-plan">Start 套餐</option></select></div>
               </div>
               <div class="form-group"><label class="form-label">API Key <span class="required">*</span></label><input id="addKeyValue" placeholder="请输入 API Key" style="font-family:var(--font-mono);font-size:12px"></div>
+              <div class="form-group"><label class="form-label">出口代理 <span style="color:var(--text-3);font-weight:normal">（可选，留空=直连）</span></label><input id="addKeyProxy" placeholder="http://host:port  或  socks5://host:port" style="font-family:var(--font-mono);font-size:12px"></div>
             </div>
             <div class="card-actions">
               <button class="btn btn-primary" onclick="addApiKey()">
@@ -2004,10 +2005,13 @@ async function addApiKey(){
   const provider=document.getElementById('addKeyProvider').value;
   const plan=document.getElementById('addKeyPlan').value;
   const key=document.getElementById('addKeyValue').value.trim();
+  const proxy=document.getElementById('addKeyProxy').value.trim();
   if(!key)return toast('请输入 API Key','error');
   try{
-    const r=await fetch(API+'/admin/api/credentials',{method:'POST',headers:authHeaders(),body:JSON.stringify({provider,apiKey:key,plan})});
-    if(r.ok){toast('API Key 已添加（'+plan+'）','success');loadAccountInfo();loadAccountsList();loadCredStore();document.getElementById('addKeyValue').value=''}
+    const payload={provider,apiKey:key,plan};
+    if(proxy)payload.proxy=proxy;
+    const r=await fetch(API+'/admin/api/credentials',{method:'POST',headers:authHeaders(),body:JSON.stringify(payload)});
+    if(r.ok){toast('API Key 已添加（'+plan+(proxy?'，代理已配置':'')+'）','success');loadAccountInfo();loadAccountsList();loadCredStore();document.getElementById('addKeyValue').value='';document.getElementById('addKeyProxy').value=''}
     else toast('添加失败','error');
   }catch(e){console.error('addApiKey failed:',e);toast('添加失败','error')}
 }
@@ -2032,18 +2036,20 @@ async function loadAccountsList(){
     const accounts=d.accounts||[];
     const activeId=d.activeId;
     if(!accounts.length){
-      tb.innerHTML='<tr><td colspan="7"><div class="empty-state"><div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg></div><div class="empty-text">暂无存储的账号</div><div class="empty-hint">请使用 OAuth 或"添加 API Key"创建</div></div></td></tr>';
+      tb.innerHTML='<tr><td colspan="8"><div class="empty-state"><div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg></div><div class="empty-text">暂无存储的账号</div><div class="empty-hint">请使用 OAuth 或"添加 API Key"创建</div></div></td></tr>';
       return;
     }
     tb.innerHTML=accounts.map(a=>{
       const isActive=a.id===activeId;
       const created=new Date(a.createdAt).toLocaleString();
       const planVal=a.plan||'coding-plan';
+      const proxyVal=a.proxy||'';
       return `<tr>
         <td><input value="${escapeHtml(a.label)}" onchange="renameAccount('${escapeHtml(a.id)}',this.value)"></td>
         <td><span class="badge badge-info">${escapeHtml(a.provider)}</span></td>
         <td><select onchange="changePlan('${escapeHtml(a.id)}',this.value)"><option value="coding-plan"${planVal==='coding-plan'?' selected':''}>Coding</option><option value="start-plan"${planVal==='start-plan'?' selected':''}>Start</option></select></td>
         <td class="td-mono">${escapeHtml(a.apiKeyMask)}${a.hasSecret?' <span class="badge badge-success">secret</span>':''}${a.hasJwt?' <span class="badge badge-success">jwt</span>':''}</td>
+        <td><input class="td-mono" style="font-size:11px;min-width:200px" value="${escapeHtml(proxyVal)}" placeholder="留空=直连" onchange="changeProxy('${escapeHtml(a.id)}',this.value)"></td>
         <td class="td-mute">${escapeHtml(created)}</td>
         <td>${isActive?'<span class="badge badge-success"><span class="badge-dot"></span>已激活</span>':'<span class="badge badge-muted">未激活</span>'}</td>
         <td class="td-actions">
@@ -2054,7 +2060,7 @@ async function loadAccountsList(){
     }).join('');
   }catch(e){
     console.error('loadAccountsList failed:',e);
-    tb.innerHTML='<tr><td colspan="7"><div class="empty-state" style="color:var(--danger)">加载账号列表失败</div></td></tr>';
+    tb.innerHTML='<tr><td colspan="8"><div class="empty-state" style="color:var(--danger)">加载账号列表失败</div></td></tr>';
   }
 }
 async function activateAccount(id){
@@ -2085,6 +2091,27 @@ async function changePlan(id,plan){
     if(r.ok){toast('套餐已更新为 '+plan,'success');loadAccountInfo();loadCredStore()}
     else toast('套餐更新失败','error');
   }catch(e){console.error('changePlan failed:',e);toast('套餐更新失败','error')}
+}
+async function changeProxy(id,proxy){
+  const trimmed=(proxy||'').trim();
+  // 客户端轻量校验：非空时必须有有效 scheme
+  if(trimmed && !/^(https?|socks5h?):\/\/[^\s]+$/i.test(trimmed)){
+    toast('代理格式无效，需为 http(s):// 或 socks5:// 开头','error');
+    loadAccountsList(); // 重置输入框为服务端值
+    return;
+  }
+  try{
+    const r=await fetch(API+'/admin/api/accounts/proxy',{method:'PUT',headers:authHeaders(),body:JSON.stringify({id,proxy:trimmed})});
+    if(r.ok){
+      const d=await r.json();
+      toast(d.proxy?('代理已设置：'+d.proxy):'代理已清除','success');
+      loadAccountInfo();loadCredStore();
+    }else{
+      const d=await r.json().catch(()=>({}));
+      toast(d.error||'代理更新失败','error');
+      loadAccountsList(); // 重置输入框
+    }
+  }catch(e){console.error('changeProxy failed:',e);toast('代理更新失败','error');loadAccountsList()}
 }
 async function exportAccounts(){
   try{

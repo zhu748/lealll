@@ -689,3 +689,207 @@ describe("/admin/api/accounts/render-export — multi-account export", () => {
     expect(body.json).toContain("key-B");
   });
 });
+
+// ---------------------------------------------------------------------------
+// /admin/api/accounts/proxy — per-account outbound HTTP proxy (v2.1.4.1test5)
+// ---------------------------------------------------------------------------
+
+describe("/admin/api/accounts/proxy — per-account proxy CRUD", () => {
+  const TEST_SECRET = "test-encryption-secret-for-proxy-tests";
+
+  beforeEach(() => {
+    process.env.ZCODE_PROXY_CREDENTIAL_SECRET = TEST_SECRET;
+    clearCredential();
+  });
+
+  afterEach(() => {
+    clearCredential();
+    delete process.env.ZCODE_PROXY_CREDENTIAL_SECRET;
+  });
+
+  it("returns 400 when id is missing", async () => {
+    const opts = makeAdminOpts();
+    const resp = await callAdmin(
+      authedReq("/admin/api/accounts/proxy", {
+        method: "PUT",
+        body: JSON.stringify({ proxy: "http://p:8080" }),
+      }),
+      opts,
+    );
+    expect(resp!.status).toBe(400);
+    const body = await resp!.json();
+    expect(body.error.type).toBe("missing_param");
+  });
+
+  it("returns 400 when proxy field is missing", async () => {
+    await saveCredential({ apiKey: "k", provider: "zai" });
+    const list = await import("../auth/store.js").then(m => m.listAccounts());
+    const id = list.accounts[0].id;
+
+    const opts = makeAdminOpts();
+    const resp = await callAdmin(
+      authedReq("/admin/api/accounts/proxy", {
+        method: "PUT",
+        body: JSON.stringify({ id }),
+      }),
+      opts,
+    );
+    expect(resp!.status).toBe(400);
+    const body = await resp!.json();
+    expect(body.error.type).toBe("missing_param");
+  });
+
+  it("returns 400 for invalid proxy scheme", async () => {
+    await saveCredential({ apiKey: "k", provider: "zai" });
+    const list = await import("../auth/store.js").then(m => m.listAccounts());
+    const id = list.accounts[0].id;
+
+    const opts = makeAdminOpts();
+    const resp = await callAdmin(
+      authedReq("/admin/api/accounts/proxy", {
+        method: "PUT",
+        body: JSON.stringify({ id, proxy: "ftp://not-a-valid-scheme:21" }),
+      }),
+      opts,
+    );
+    expect(resp!.status).toBe(400);
+    const body = await resp!.json();
+    expect(body.error.type).toBe("invalid_param");
+    expect(body.error.message).toContain("http://");
+  });
+
+  it("returns 404 when account id does not exist", async () => {
+    const opts = makeAdminOpts();
+    const resp = await callAdmin(
+      authedReq("/admin/api/accounts/proxy", {
+        method: "PUT",
+        body: JSON.stringify({ id: "nonexistent", proxy: "http://p:8080" }),
+      }),
+      opts,
+    );
+    expect(resp!.status).toBe(404);
+  });
+
+  it("sets a valid http proxy on an existing account", async () => {
+    await saveCredential({ apiKey: "k", provider: "zai" });
+    const store = await import("../auth/store.js");
+    const list = await store.listAccounts();
+    const id = list.accounts[0].id;
+    expect(list.accounts[0].proxy).toBe("");
+
+    const opts = makeAdminOpts();
+    const resp = await callAdmin(
+      authedReq("/admin/api/accounts/proxy", {
+        method: "PUT",
+        body: JSON.stringify({ id, proxy: "http://127.0.0.1:7890" }),
+      }),
+      opts,
+    );
+    expect(resp!.status).toBe(200);
+    const body = await resp!.json();
+    expect(body.ok).toBe(true);
+    expect(body.proxy).toBe("http://127.0.0.1:7890");
+
+    // Verify it persisted
+    const list2 = await store.listAccounts();
+    expect(list2.accounts[0].proxy).toBe("http://127.0.0.1:7890");
+  });
+
+  it("accepts socks5:// proxy scheme", async () => {
+    await saveCredential({ apiKey: "k", provider: "zai" });
+    const store = await import("../auth/store.js");
+    const list = await store.listAccounts();
+    const id = list.accounts[0].id;
+
+    const opts = makeAdminOpts();
+    const resp = await callAdmin(
+      authedReq("/admin/api/accounts/proxy", {
+        method: "PUT",
+        body: JSON.stringify({ id, proxy: "socks5://10.0.0.1:1080" }),
+      }),
+      opts,
+    );
+    expect(resp!.status).toBe(200);
+    expect((await resp!.json()).proxy).toBe("socks5://10.0.0.1:1080");
+  });
+
+  it("clears the proxy when empty string is sent", async () => {
+    // Start with a proxy set
+    await saveCredential({ apiKey: "k", provider: "zai", proxy: "http://existing:8080" } as any);
+    const store = await import("../auth/store.js");
+    const list = await store.listAccounts();
+    const id = list.accounts[0].id;
+    expect(list.accounts[0].proxy).toBe("http://existing:8080");
+
+    const opts = makeAdminOpts();
+    const resp = await callAdmin(
+      authedReq("/admin/api/accounts/proxy", {
+        method: "PUT",
+        body: JSON.stringify({ id, proxy: "   " }),
+      }),
+      opts,
+    );
+    expect(resp!.status).toBe(200);
+    const body = await resp!.json();
+    expect(body.ok).toBe(true);
+    expect(body.proxy).toBe("");
+
+    // Verify it was cleared in the store
+    const list2 = await store.listAccounts();
+    expect(list2.accounts[0].proxy).toBe("");
+    const cred = await store.loadCredential();
+    expect(cred!.proxy).toBeUndefined();
+  });
+
+  it("hot-swaps the in-memory credential when the active account is updated (oauth mode)", async () => {
+    await saveCredential({ apiKey: "k-active", provider: "zai" });
+    const store = await import("../auth/store.js");
+    const list = await store.listAccounts();
+    const id = list.accounts[0].id;
+
+    // Use oauth mode so setOAuthCredential is the active code path (apikey
+    // mode keeps the credential constructed at AuthManager init time and
+    // never re-reads the store). In oauth mode, setOAuthCredential swaps the
+    // in-memory cred, which is what the dashboard's hot-swap relies on.
+    const opts = makeAdminOpts({
+      auth: new AuthManager({ mode: "oauth", provider: "zai" }),
+    });
+    // Seed the in-memory credential with the stored one (no proxy yet)
+    const credBefore = await store.loadCredential();
+    opts.auth.setOAuthCredential(credBefore!);
+    const baselineCred = await opts.auth.getCredential();
+    expect(baselineCred.proxy).toBeUndefined();
+
+    // Update proxy via API — handler should call setOAuthCredential with the
+    // freshly loaded credential (which now includes proxy).
+    await callAdmin(
+      authedReq("/admin/api/accounts/proxy", {
+        method: "PUT",
+        body: JSON.stringify({ id, proxy: "http://hot-swap:9999" }),
+      }),
+      opts,
+    );
+
+    // The AuthManager's in-memory credential should now reflect the proxy
+    const credAfter = await opts.auth.getCredential();
+    expect(credAfter.proxy).toBe("http://hot-swap:9999");
+  });
+
+  it("trims whitespace from proxy URL", async () => {
+    await saveCredential({ apiKey: "k", provider: "zai" });
+    const store = await import("../auth/store.js");
+    const list = await store.listAccounts();
+    const id = list.accounts[0].id;
+
+    const opts = makeAdminOpts();
+    const resp = await callAdmin(
+      authedReq("/admin/api/accounts/proxy", {
+        method: "PUT",
+        body: JSON.stringify({ id, proxy: "  http://spaced:1234  " }),
+      }),
+      opts,
+    );
+    expect(resp!.status).toBe(200);
+    expect((await resp!.json()).proxy).toBe("http://spaced:1234");
+  });
+});
