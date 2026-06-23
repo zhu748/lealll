@@ -155,7 +155,10 @@ export async function proxyRequest(
 
   let upstreamBodyObj: unknown = parsedBody;
   if (translateMode) {
-    const translated = translateClientBodyObj(parsedBody, format);
+    const forceThinkingModels = format === "openai-responses"
+      ? config.responsesThinking?.models
+      : undefined;
+    const translated = translateClientBodyObj(parsedBody, format, forceThinkingModels ? { forceThinkingModels } : undefined);
     if (translated instanceof Response) return translated;
     upstreamBodyObj = translated;
   }
@@ -976,13 +979,13 @@ function lookupModelMapping(clientModel: string, mappings: { from: string; to: s
 }
 
 /** Translate a client request body object to Anthropic JSON. Returns error Response on failure. */
-function translateClientBodyObj(parsed: unknown, format: Format): Response | unknown {
+function translateClientBodyObj(parsed: unknown, format: Format, opts?: { forceThinkingModels?: string[] }): Response | unknown {
   if (parsed === undefined || parsed === null) {
     return errorResponse(400, "translation_failed", `${format} request body is empty; cannot translate.`);
   }
   try {
     if (format === "openai-responses") {
-      return translateRequestResponsesToAnthropic(parsed as OpenAIResponseRequest);
+      return translateRequestResponsesToAnthropic(parsed as OpenAIResponseRequest, opts?.forceThinkingModels ? { forceThinkingModels: opts.forceThinkingModels } : undefined);
     }
     return translateRequestOpenAIToAnthropic(parsed as OpenAIChatRequest);
   } catch (err) {

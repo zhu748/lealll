@@ -1491,6 +1491,40 @@ td input{font-family:var(--font-mono)}
             </button>
           </div>
         </div>
+
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">
+              <span class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z"/></svg></span>
+              Responses 思考管理 <span class="tag">Codex CLI</span>
+            </div>
+            <button class="btn btn-ghost btn-sm" onclick="loadResponsesThinking()">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>
+              重新加载
+            </button>
+          </div>
+          <div class="card-body" style="padding-bottom:0">
+            <div class="hint">
+              <span class="hint-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></span>
+              <div>为指定模型在 <code class="code-inline">/v1/responses</code> 接口下<strong>强制开启思考</strong>。Codex CLI 经常在 wire payload 中把 <code class="code-inline">reasoning</code> 字段传成 <code class="code-inline">null</code>（即使本地配置开了 reasoning），导致思考参数丢光。在这里勾选的模型，无论客户端发什么，都会注入 <code class="code-inline">thinking:&#123;type:"enabled"&#125;</code>。<strong>匹配规则</strong>：按映射后的最终 GLM 模型 id 匹配（大小写不敏感）。带 <span class="badge badge-info">reasoning</span> 标记的模型原生支持思考，建议优先勾选。</div>
+            </div>
+          </div>
+          <div class="card-body">
+            <div id="responsesThinkingChips" style="display:flex;flex-wrap:wrap;gap:8px;">
+              <span class="empty-text" style="color:var(--text-3);font-size:13px;">加载中...</span>
+            </div>
+            <div id="responsesThinkingCustom" style="margin-top:12px;">
+              <label class="form-label" style="font-size:12px;color:var(--text-2);">自定义模型 id（不在上面列表中时手动添加，逗号分隔）</label>
+              <input id="responsesThinkingCustomInput" placeholder="例如 my-custom-glm-model" style="width:100%;font-family:var(--font-mono);font-size:12px;margin-top:4px;">
+            </div>
+          </div>
+          <div class="card-actions">
+            <button class="btn btn-primary btn-sm" onclick="saveResponsesThinking()">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/></svg>
+              保存配置
+            </button>
+          </div>
+        </div>
       </div>
 
       <!-- ============================================================ Debug Dumps ============================================================ -->
@@ -1673,6 +1707,12 @@ let logLines=[];
 let statsData={total:0,success:0,failed:0,retried:0,requests:[],models:{}};
 let routingRules=[];
 let modelMappings=[];
+// Full GLM model catalog (from /admin/api/glm-models). Used for dropdowns
+// in model mappings ("to" field) and responses-thinking chip selectors.
+// Each entry: {id,name,contextWindow,maxOutputTokens,reasoning}
+let glmCatalog=[];
+// Set of model ids (lowercased) for which thinking is force-enabled on /v1/responses.
+let responsesThinkingModels=new Set();
 
 // --- Login ---
 async function doLogin(){
@@ -1775,7 +1815,9 @@ async function initDashboard(){
   await loadCredStore();
   await loadProxyEndpoints();
   await loadRoutingRules();
+  await loadGlmCatalog();
   await loadModelMappings();
+  await loadResponsesThinking();
   await loadStats();
   await loadDebugDumps();
   connectLogStream();
@@ -2328,8 +2370,22 @@ function addModelMapping(){
 function renderModelMappings(){
   const tb=document.getElementById('modelMappings');
   if(!modelMappings.length){tb.innerHTML='<tr><td colspan="5"><div class="empty-state"><div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3h5v5"/><path d="M8 3H3v5"/><path d="M21 16v5h-5"/><path d="M3 16v5h5"/><line x1="9" y1="9" x2="15" y2="15"/><line x1="15" y1="9" x2="9" y2="15"/></svg></div><div class="empty-text">暂无模型映射</div><div class="empty-hint">点击右上角"添加映射"创建，例如 gpt-5.5 → glm-5.2</div></div></td></tr>';return}
-  // Build a datalist of known GLM models for the "to" field suggestions
-  const glmOptions=(window.__config&&Array.isArray(window.__config.models)?window.__config.models:[]).map(m=>`<option value="${escapeHtml(m)}">`).join('');
+  // Build datalist from the FULL GLM catalog (provider/models.ts), not just
+  // the whitelist — operators may whitelist a subset but still want to
+  // map to any catalog model. Also include any whitelisted ids that aren't
+  // in the catalog (forward-compat for unreleased models).
+  const whitelist=window.__config&&Array.isArray(window.__config.models)?window.__config.models:[];
+  const seenIds=new Set();
+  const datalistOptions=[];
+  for(const m of glmCatalog){
+    const k=m.id.toLowerCase();
+    if(!seenIds.has(k)){seenIds.add(k);datalistOptions.push(`<option value="${escapeHtml(m.id)}">`);}
+  }
+  for(const id of whitelist){
+    const k=String(id).toLowerCase();
+    if(!seenIds.has(k)){seenIds.add(k);datalistOptions.push(`<option value="${escapeHtml(id)}">`);}
+  }
+  const glmOptions=datalistOptions.join('');
   tb.innerHTML=modelMappings.map((m,i)=>`<tr>
     <td><input value="${escapeHtml(m.from)}" onchange="modelMappings[${i}].from=this.value" placeholder="例如 gpt-5.5" style="font-family:var(--font-mono);font-size:12px"></td>
     <td style="text-align:center;color:var(--text-3)">→</td>
@@ -2337,10 +2393,12 @@ function renderModelMappings(){
     <td><input value="${escapeHtml(m.note||'')}" onchange="modelMappings[${i}].note=this.value" placeholder="可选"></td>
     <td class="td-actions"><button class="btn btn-danger btn-sm" onclick="modelMappings.splice(${i},1);renderModelMappings()">删除</button></td>
   </tr>`).join('');
-  // Inject datalist once if not present
-  if(!document.getElementById('glm-model-list')){
-    const dl=document.createElement('datalist');dl.id='glm-model-list';dl.innerHTML=glmOptions;document.body.appendChild(dl);
+  // Inject/refresh datalist once if not present, or update its contents
+  let dl=document.getElementById('glm-model-list');
+  if(!dl){
+    dl=document.createElement('datalist');dl.id='glm-model-list';document.body.appendChild(dl);
   }
+  dl.innerHTML=glmOptions;
 }
 async function loadModelMappings(){
   try{
@@ -2374,6 +2432,81 @@ async function saveModelMappings(){
       toast(d.error||'保存失败','error');
     }
   }catch(e){console.error('saveModelMappings failed:',e);toast('保存失败','error')}
+}
+
+// --- GLM Catalog & Responses Thinking ---
+async function loadGlmCatalog(){
+  try{
+    const r=await fetch(API+'/admin/api/glm-models',{headers:authHeaders()});
+    const d=await r.json();
+    glmCatalog=Array.isArray(d.models)?d.models:[];
+    // Refresh dependent UIs that use the catalog as a dropdown source.
+    renderModelMappings();
+    renderResponsesThinkingChips();
+  }catch(e){console.error('loadGlmCatalog failed:',e);toast('加载 GLM 模型目录失败','error')}
+}
+async function loadResponsesThinking(){
+  try{
+    const r=await fetch(API+'/admin/api/responses-thinking',{headers:authHeaders()});
+    const d=await r.json();
+    responsesThinkingModels=new Set((d.models||[]).map(m=>String(m).toLowerCase()));
+    renderResponsesThinkingChips();
+    // Sync the custom-input box with any model ids that aren't in the catalog
+    // (e.g. operator-added custom ids). Catalog ids are rendered as chips;
+    // non-catalog ids appear in the custom input.
+    const custom=(d.models||[]).filter(m=>!glmCatalog.some(c=>c.id.toLowerCase()===String(m).toLowerCase()));
+    document.getElementById('responsesThinkingCustomInput').value=custom.join(', ');
+  }catch(e){console.error('loadResponsesThinking failed:',e);toast('加载 Responses 思考配置失败','error')}
+}
+function renderResponsesThinkingChips(){
+  const wrap=document.getElementById('responsesThinkingChips');
+  if(!wrap)return;
+  if(!glmCatalog.length){
+    wrap.innerHTML='<span class="empty-text" style="color:var(--text-3);font-size:13px;">未加载到 GLM 模型目录，请检查 /admin/api/glm-models 接口</span>';
+    return;
+  }
+  wrap.innerHTML=glmCatalog.map(m=>{
+    const on=responsesThinkingModels.has(m.id.toLowerCase());
+    const reasoningTag=m.reasoning?'<span class="badge badge-info" style="margin-left:6px;font-size:9px;padding:1px 5px;">reasoning</span>':'';
+    const cls=on?'btn btn-success btn-sm':'btn btn-ghost btn-sm';
+    const check=on?'<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" style="margin-right:4px;"><polyline points="20 6 9 17 4 12"/></svg>':'';
+    return `<button type="button" class="${cls}" onclick="toggleResponsesThinking('${escapeHtml(m.id)}')" style="font-family:var(--font-mono);font-size:12px;">${check}${escapeHtml(m.id)}${reasoningTag}</button>`;
+  }).join('');
+}
+function toggleResponsesThinking(modelId){
+  const key=modelId.toLowerCase();
+  if(responsesThinkingModels.has(key)){
+    responsesThinkingModels.delete(key);
+  }else{
+    responsesThinkingModels.add(key);
+  }
+  renderResponsesThinkingChips();
+}
+async function saveResponsesThinking(){
+  // Collect: chip-selected ids + custom-input ids (comma-separated).
+  const selected=new Set(responsesThinkingModels);
+  const customStr=(document.getElementById('responsesThinkingCustomInput').value||'').trim();
+  if(customStr){
+    for(const part of customStr.split(',')){
+      const id=part.trim();
+      if(id)selected.add(id.toLowerCase());
+    }
+  }
+  const models=Array.from(selected);
+  try{
+    const r=await fetch(API+'/admin/api/responses-thinking',{method:'PUT',headers:authHeaders(),body:JSON.stringify({models})});
+    const d=await r.json();
+    if(r.ok){
+      responsesThinkingModels=new Set((d.models||[]).map(m=>String(m).toLowerCase()));
+      // Re-sync custom input to only show non-catalog ids
+      const custom=(d.models||[]).filter(m=>!glmCatalog.some(c=>c.id.toLowerCase()===String(m).toLowerCase()));
+      document.getElementById('responsesThinkingCustomInput').value=custom.join(', ');
+      renderResponsesThinkingChips();
+      toast(`已保存 Responses 思考配置（${(d.models||[]).length} 个模型）`,'success');
+    }else{
+      toast(d.error||'保存失败','error');
+    }
+  }catch(e){console.error('saveResponsesThinking failed:',e);toast('保存失败','error')}
 }
 
 // --- Stats ---

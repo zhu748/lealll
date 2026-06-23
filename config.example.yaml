@@ -107,3 +107,31 @@ retry:
   #      `zcode-proxy auth login`).
   #   2. maxRetries >= this threshold (otherwise the retry loop exhausts first).
   credentialSwitchThreshold: 5
+
+# --- Responses thinking override (Codex CLI workaround) ---
+# Codex CLI frequently sends `reasoning: null` in the /v1/responses wire
+# payload (the CLI only populates it when an explicit effort level is forced
+# via local config), so the translator's "honor reasoning.effort" branch
+# never fires and the upstream GLM request goes out without `thinking`.
+#
+# This section lets the operator force-enable thinking for specific models
+# regardless of what the client sent. Matching is case-insensitive exact
+# match on the *post-mapping* request model (i.e. the final GLM model id
+# after modelMappings is applied).
+#
+# Empty array / omitted = disabled (default). Two equivalent shapes:
+#
+#   responsesThinking:
+#     models:
+#       - glm-5.2
+#       - glm-4.6
+#
+#   # or shorthand:
+#   responsesThinking:
+#     - glm-5.2
+#     - glm-4.6
+#
+# The dashboard also exposes this as a chip-style multi-select under
+# 代理规则 → Responses 思考管理.
+responsesThinking:
+  models: []

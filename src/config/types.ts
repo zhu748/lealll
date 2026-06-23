@@ -125,6 +125,24 @@ export interface ModelMapping {
   note?: string;
 }
 
+/**
+ * Responses-API thinking override.
+ *
+ * Codex CLI's `reasoning` field is frequently `null` in the wire payload
+ * (the CLI drops it when local config doesn't force an effort level), so
+ * the translator's "honor reasoning.effort" branch never fires and the
+ * upstream GLM request goes out without `thinking`. This config lets the
+ * operator force-enable thinking on `/v1/responses` for specific models
+ * (matched against the *post-mapping* request model, i.e. the final GLM
+ * model id) regardless of what the client sent.
+ *
+ * Matching is case-insensitive exact match. Empty array = disabled.
+ */
+export interface ResponsesThinkingConfig {
+  /** Model ids (post-mapping) for which thinking is force-enabled on /v1/responses. */
+  models: string[];
+}
+
 /** Top-level proxy configuration. */
 export interface ProxyConfig {
   server: {
@@ -162,4 +180,9 @@ export interface ProxyConfig {
   routingRules?: RoutingRule[];
   /** Client model id → GLM model id rewrite table. Empty by default. */
   modelMappings?: ModelMapping[];
+  /**
+   * Force-enable thinking on /v1/responses for specific models. Empty by default.
+   * @see ResponsesThinkingConfig
+   */
+  responsesThinking?: ResponsesThinkingConfig;
 }

@@ -4,7 +4,7 @@
  */
 import { readFileSync, existsSync } from "node:fs";
 import { parse } from "yaml";
-import type { ProxyConfig, ProviderEndpoints, ProxyIdentity, RetryConfig, RoutingRule, ModelMapping } from "./types.js";
+import type { ProxyConfig, ProviderEndpoints, ProxyIdentity, RetryConfig, RoutingRule, ModelMapping, ResponsesThinkingConfig } from "./types.js";
 
 /** Environment variable keys that override YAML values. */
 const ENV = {
@@ -112,6 +112,9 @@ export function loadConfig(path: string): ProxyConfig {
   // --- model mappings ---
   const modelMappings = resolveModelMappings(parsed?.modelMappings);
 
+  // --- responses thinking override ---
+  const responsesThinking = resolveResponsesThinking(parsed?.responsesThinking);
+
   const config: ProxyConfig = {
     server: { port, host },
     auth: { proxyApiKey, mode, apiKey, oauthCredentialsPath },
@@ -125,6 +128,7 @@ export function loadConfig(path: string): ProxyConfig {
     retry,
     routingRules,
     modelMappings,
+    responsesThinking,
   };
 
   validate(config);
@@ -284,6 +288,39 @@ function resolveModelMappings(raw: unknown): ModelMapping[] {
     });
   }
   return mappings;
+}
+
+/**
+ * Resolve responses-thinking override from YAML.
+ *
+ * Accepts either:
+ *   - `{ models: ["glm-5.2", ...] }`  (canonical shape)
+ *   - `["glm-5.2", ...]`               (shorthand array of model ids)
+ *
+ * Model ids are trimmed but kept as-is (case preserved for display;
+ * matching at request time is case-insensitive). Duplicates are dropped.
+ * Always returns a non-undefined object so downstream code can do
+ * `config.responsesThinking?.models` without null-checking.
+ */
+function resolveResponsesThinking(raw: unknown): ResponsesThinkingConfig {
+  const arr: unknown = Array.isArray(raw)
+    ? raw
+    : (typeof raw === "object" && raw !== null)
+      ? (raw as Record<string, unknown>).models
+      : undefined;
+  if (!Array.isArray(arr)) return { models: [] };
+  const seen = new Set<string>();
+  const models: string[] = [];
+  for (const item of arr) {
+    if (typeof item !== "string") continue;
+    const id = item.trim();
+    if (!id) continue;
+    const key = id.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    models.push(id);
+  }
+  return { models };
 }
 
 /** Cross-field validation after all fields are resolved. */

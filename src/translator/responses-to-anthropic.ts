@@ -27,8 +27,26 @@ import { getTurn } from "./responses-store.js";
 
 const DEFAULT_MAX_TOKENS = 4096;
 
+/** Options for translating a Responses request. */
+export interface TranslateResponsesOptions {
+  /**
+   * Model ids (matched case-insensitively against `req.model`, which is the
+   * *post-mapping* GLM model id) for which thinking should be force-enabled
+   * even when the client did not send `reasoning.effort`.
+   *
+   * This exists because Codex CLI frequently sends `reasoning: null` in the
+   * wire payload (the CLI only populates it when local config forces an
+   * effort level). Without this override, the upstream GLM request goes out
+   * without `thinking` and the model never actually reasons.
+   */
+  forceThinkingModels?: string[];
+}
+
 /** Translate an OpenAI Responses request into an Anthropic messages request. */
-export function translateRequestResponsesToAnthropic(req: OpenAIResponseRequest): AnthropicMessagesRequest {
+export function translateRequestResponsesToAnthropic(
+  req: OpenAIResponseRequest,
+  opts?: TranslateResponsesOptions,
+): AnthropicMessagesRequest {
   // Flatten previous_response_id history + current input into a single input array.
   const inputItems = resolveInputItems(req);
 
@@ -84,7 +102,21 @@ export function translateRequestResponsesToAnthropic(req: OpenAIResponseRequest)
   //
   // body-transformer.ts normalises any thinking field into GLM's accepted
   // `{type:"enabled"}` form before forwarding, so this is safe.
-  if (req.reasoning && req.reasoning.effort) {
+  //
+  // --- Codex fallback ---
+  // Codex CLI frequently sends `reasoning: null` even when the user enabled
+  // reasoning in the CLI config (the wire payload only carries reasoning
+  // when an explicit effort level is forced). To keep thinking actually
+  // active for Codex users, we fall back to `opts.forceThinkingModels`:
+  // if the post-mapping request model matches one of the configured ids,
+  // we inject `thinking: {type:"enabled"}` even though the client didn't
+  // ask for it. The operator opts in via the dashboard.
+  const forceThinkingSet = opts?.forceThinkingModels && opts.forceThinkingModels.length > 0
+    ? new Set(opts.forceThinkingModels.map(m => m.toLowerCase()))
+    : null;
+  const wantsThinking = (req.reasoning && req.reasoning.effort)
+    || (forceThinkingSet !== null && typeof req.model === "string" && forceThinkingSet.has(req.model.toLowerCase()));
+  if (wantsThinking) {
     result.thinking = { type: "enabled" };
   }
 

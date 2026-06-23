@@ -276,4 +276,74 @@ retry:
     const cfg = loadConfig(path);
     expect(cfg.retry.maxRetries).toBe(0);
   });
+
+  // --- responsesThinking ---
+  it("responsesThinking: defaults to empty models array when absent", () => {
+    const path = writeYaml(`
+auth:
+  mode: apikey
+  apiKey: "abc"
+`);
+    const cfg = loadConfig(path);
+    expect(cfg.responsesThinking).toBeDefined();
+    expect(cfg.responsesThinking!.models).toEqual([]);
+  });
+
+  it("responsesThinking: loads canonical {models: [...]} shape", () => {
+    const path = writeYaml(`
+auth:
+  mode: apikey
+  apiKey: "abc"
+responsesThinking:
+  models:
+    - glm-5.2
+    - glm-4.6
+`);
+    const cfg = loadConfig(path);
+    expect(cfg.responsesThinking!.models).toEqual(["glm-5.2", "glm-4.6"]);
+  });
+
+  it("responsesThinking: accepts shorthand array form", () => {
+    const path = writeYaml(`
+auth:
+  mode: apikey
+  apiKey: "abc"
+responsesThinking:
+  - glm-5.2
+  - glm-4.6
+`);
+    const cfg = loadConfig(path);
+    expect(cfg.responsesThinking!.models).toEqual(["glm-5.2", "glm-4.6"]);
+  });
+
+  it("responsesThinking: trims, dedupes case-insensitively, drops empty", () => {
+    const path = writeYaml(`
+auth:
+  mode: apikey
+  apiKey: "abc"
+responsesThinking:
+  models:
+    - "  glm-5.2  "
+    - "GLM-5.2"
+    - ""
+    - "glm-4.6"
+`);
+    const cfg = loadConfig(path);
+    expect(cfg.responsesThinking!.models).toEqual(["glm-5.2", "glm-4.6"]);
+  });
+
+  it("responsesThinking: ignores non-string entries gracefully", () => {
+    const path = writeYaml(`
+auth:
+  mode: apikey
+  apiKey: "abc"
+responsesThinking:
+  models:
+    - glm-5.2
+    - 123
+    - glm-4.6
+`);
+    const cfg = loadConfig(path);
+    expect(cfg.responsesThinking!.models).toEqual(["glm-5.2", "glm-4.6"]);
+  });
 });

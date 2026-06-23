@@ -4,7 +4,7 @@
  * All routes require the proxy API key (same key used by API clients).
  * Mounted under /admin/api/* in server.ts.
  */
-import type { ProxyConfig, RoutingRule, ModelMapping } from "../config/types.js";
+import type { ProxyConfig, RoutingRule, ModelMapping, ResponsesThinkingConfig } from "../config/types.js";
 import type { AuthManager } from "../auth/manager.js";
 import type { Credential as AppCredential } from "../auth/types.js";
 import { loadCredential, saveCredential, clearCredential, listAccounts, switchAccount, removeAccount, setAccountLabel, setAccountPlan, exportAccounts, importAccounts, maskApiKey } from "../auth/store.js";
@@ -13,6 +13,7 @@ import { KeyResolver } from "../auth/resolver.js";
 import { errorResponse } from "../proxy/handler.js";
 import { timingSafeEqual } from "../utils/crypto.js";
 import { atomicWriteFile, createMutex } from "../utils/fs.js";
+import { MODELS as GLM_CATALOG } from "../provider/models.js";
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -331,6 +332,7 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
       opts.config.retry = newConfig.retry;
       opts.config.routingRules = newConfig.routingRules;
       opts.config.modelMappings = newConfig.modelMappings;
+      if (newConfig.responsesThinking) opts.config.responsesThinking = newConfig.responsesThinking;
       if (authBody) opts.config.auth = newConfig.auth;
       // providers.*.anthropicBase / openaiBase: also hot-swappable
       if (body.providers) {
@@ -343,7 +345,7 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
         requiresRestart: restartFields.length > 0,
         restartFields,
         // hotApplied: fields that were applied to the live config without restart
-        hotApplied: ["provider", "plan", "defaultModel", "models", "identity", "logging", "retry", "routingRules", "modelMappings", ...(authBody ? ["auth"] : []), ...(body.providers ? ["providers"] : [])],
+        hotApplied: ["provider", "plan", "defaultModel", "models", "identity", "logging", "retry", "routingRules", "modelMappings", "responsesThinking", ...(authBody ? ["auth"] : []), ...(body.providers ? ["providers"] : [])],
       });
     } catch (err) {
       return errorResponse(500, "save_failed", (err as Error).message);
@@ -844,6 +846,56 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
     }
   }
 
+  // Get GLM model catalog (full pinned list from provider/models.ts).
+  // Used by the dashboard for "pull current model list for quick selection"
+  // dropdowns in model mappings and responses-thinking config.
+  if (path === "/admin/api/glm-models" && method === "GET") {
+    return jsonResp({
+      models: GLM_CATALOG.map(m => ({
+        id: m.id,
+        name: m.name,
+        contextWindow: m.contextWindow,
+        maxOutputTokens: m.maxOutputTokens,
+        reasoning: !!m.reasoning,
+      })),
+    });
+  }
+
+  // Get responses-thinking config
+  if (path === "/admin/api/responses-thinking" && method === "GET") {
+    return jsonResp({ models: opts.config.responsesThinking?.models ?? [] });
+  }
+
+  // Update responses-thinking config (full replace)
+  if (path === "/admin/api/responses-thinking" && method === "PUT") {
+    try {
+      const body = await req.json() as { models?: unknown };
+      if (!Array.isArray(body.models)) {
+        return errorResponse(400, "invalid_request", "models must be an array of strings");
+      }
+      const seen = new Set<string>();
+      const cleaned: string[] = [];
+      for (const item of body.models) {
+        if (typeof item !== "string") {
+          return errorResponse(400, "invalid_model", `Each model must be a string (got ${typeof item})`);
+        }
+        const id = item.trim();
+        if (!id) continue;
+        const key = id.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        cleaned.push(id);
+      }
+      const cfg: ResponsesThinkingConfig = { models: cleaned };
+      opts.config.responsesThinking = cfg;
+      await persistConfig(opts.config, opts.configPath);
+      appendLog("info", `Responses thinking override updated (${cleaned.length} model(s))`);
+      return jsonResp({ ok: true, models: cleaned });
+    } catch (err) {
+      return errorResponse(500, "save_failed", (err as Error).message);
+    }
+  }
+
   // Get stats
   if (path === "/admin/api/stats" && method === "GET") {
     return jsonResp({
@@ -1023,6 +1075,7 @@ function sanitizeConfig(config: ProxyConfig): Record<string, unknown> {
     retry: config.retry,
     routingRules: config.routingRules ?? [],
     modelMappings: config.modelMappings ?? [],
+    responsesThinking: config.responsesThinking ?? { models: [] },
   };
 }
 
@@ -1072,6 +1125,9 @@ function configToYaml(config: ProxyConfig): string {
           to: m.to,
           ...(m.note ? { note: m.note } : {}),
         })) }
+      : {}),
+    ...(config.responsesThinking && config.responsesThinking.models.length > 0
+      ? { responsesThinking: { models: [...config.responsesThinking.models] } }
       : {}),
   };
 

@@ -94,6 +94,76 @@ describe("translateRequestResponsesToAnthropic", () => {
     expect(result.thinking).toBeUndefined();
   });
 
+  // --- Codex fallback: forceThinkingModels ---
+  it("forceThinkingModels: injects thinking when model matches (even without reasoning.effort)", () => {
+    const req: OpenAIResponseRequest = {
+      model: "glm-5.2",
+      input: "Hi",
+      // Codex CLI sends reasoning: null in the wire payload
+    };
+    const result = translateRequestResponsesToAnthropic(req, {
+      forceThinkingModels: ["glm-5.2", "glm-4.6"],
+    });
+    expect(result.thinking).toEqual({ type: "enabled" });
+  });
+
+  it("forceThinkingModels: matches case-insensitively", () => {
+    const req: OpenAIResponseRequest = {
+      model: "GLM-5.2",
+      input: "Hi",
+    };
+    const result = translateRequestResponsesToAnthropic(req, {
+      forceThinkingModels: ["glm-5.2"],
+    });
+    expect(result.thinking).toEqual({ type: "enabled" });
+  });
+
+  it("forceThinkingModels: does NOT inject thinking when model is not in the list", () => {
+    const req: OpenAIResponseRequest = {
+      model: "glm-4.5-air",
+      input: "Hi",
+    };
+    const result = translateRequestResponsesToAnthropic(req, {
+      forceThinkingModels: ["glm-5.2"],
+    });
+    expect(result.thinking).toBeUndefined();
+  });
+
+  it("forceThinkingModels: empty/undefined list does not inject thinking", () => {
+    const req: OpenAIResponseRequest = {
+      model: "glm-5.2",
+      input: "Hi",
+    };
+    expect(translateRequestResponsesToAnthropic(req).thinking).toBeUndefined();
+    expect(translateRequestResponsesToAnthropic(req, {}).thinking).toBeUndefined();
+    expect(translateRequestResponsesToAnthropic(req, { forceThinkingModels: [] }).thinking).toBeUndefined();
+  });
+
+  it("forceThinkingModels: reasoning.effort still wins even when model is NOT in the list", () => {
+    // Client explicitly requested reasoning → always honor, regardless of force-list.
+    const req: OpenAIResponseRequest = {
+      model: "glm-4.5-air",
+      input: "Hi",
+      reasoning: { effort: "medium" },
+    };
+    const result = translateRequestResponsesToAnthropic(req, {
+      forceThinkingModels: ["glm-5.2"],
+    });
+    expect(result.thinking).toEqual({ type: "enabled" });
+  });
+
+  it("forceThinkingModels: reasoning.effort + matching model both produce thinking", () => {
+    const req: OpenAIResponseRequest = {
+      model: "glm-5.2",
+      input: "Hi",
+      reasoning: { effort: "high" },
+    };
+    const result = translateRequestResponsesToAnthropic(req, {
+      forceThinkingModels: ["glm-5.2"],
+    });
+    expect(result.thinking).toEqual({ type: "enabled" });
+  });
+
   it("filters to only function-type tools, dropping built-ins", () => {
     const req: OpenAIResponseRequest = {
       model: "glm-4.6",
