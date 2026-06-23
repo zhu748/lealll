@@ -12,3 +12,5 @@ dist/
 *.zip
 release/zcode-proxy.exe
 zcode-proxy-debug-*.json
+# Render: local data dir (only relevant if you `docker run` with a bind mount)
+/data/

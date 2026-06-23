@@ -1,5 +1,33 @@
 # zcode-proxy 使用说明
 
+> **v2.1.4.1test2 — Render 云部署支持 + dashboard 一键导出环境变量**
+>
+> 新增 Render / Fly.io / K8s 等云平台一键部署能力，dashboard 增加导出环境变量格式的凭证。
+>
+> **v2.1.4.1test2 关键改进**：
+> 1. **Render Blueprint 一键部署**：新增 `render.yaml` Blueprint 配置文件，连接 GitHub 仓库即可一键部署到 Render，无需手动配置 Docker
+> 2. **Dockerfile 支持**：基于 `oven/bun:1.1-debian` 镜像，内置 `/healthz` 健康检查，适配 Render / Fly.io / Cloud Run / K8s 等所有支持 Docker 的云平台
+> 3. **render-start.sh 智能启动脚本**：自动映射 Render 的 `$PORT` → `ZCODE_PROXY_PORT`；自动探测 `/data` 可写性，不可写时降级到 `/tmp/zcode-proxy`；自动从 `config.example.yaml` 种子化 `config.yaml`
+> 4. **`/healthz` 健康检查端点**：新增 K8s 约定的 `/healthz` 路径（同时保留 `/health` 和 `/`），且 `/healthz`、`/health`、`/` 三个端点免 `proxyApiKey` 认证，确保 Render 探针无需 Authorization 头即可通过
+> 5. **`ZCODE_AUTH_MODE` 环境变量**：支持通过环境变量覆盖 `auth.mode` 配置，Render 用户无需编辑 yaml 即可在 apikey 和 oauth 模式间切换
+> 6. **`ZCODE_OAUTH_CREDENTIAL` 环境变量**：OAuth 模式下，支持通过 base64 编码的 JSON 凭证注入。本地用 `zcode-proxy auth export` 导出后粘贴到 Render 环境变量，无需在云端重复 OAuth 流程
+> 7. **`auth export` CLI 子命令**：本地登录后执行 `zcode-proxy auth export`，输出可直接填入 `ZCODE_OAUTH_CREDENTIAL` 的 base64 blob
+> 8. **dashboard "导出 Render 凭证" 按钮**：在 dashboard 账号管理页面新增按钮，点击后弹窗展示 `ZCODE_AUTH_MODE` 和 `ZCODE_OAUTH_CREDENTIAL` 两个环境变量值，附带一键复制按钮和详细操作说明
+> 9. **`/admin/api/accounts/render-export` 接口**：dashboard 后端接口，返回当前激活凭证的 base64 编码 + 环境变量格式 + 操作指引
+> 10. **凭证存储路径可配置**：`ZCODE_PROXY_STORE_DIR` 环境变量支持自定义凭证存储目录，适配 Render 只读文件系统（默认 `~/.zcode-proxy`，Render 上自动降级到 `/data/.zcode-proxy` 或 `/tmp/zcode-proxy/.zcode-proxy`）
+> 11. **`writeStore` 优雅降级**：只读文件系统下写入失败不再崩溃，仅警告日志，保留内存中的副本让当前请求继续完成
+> 12. **`.dockerignore` 优化**：排除 node_modules / 二进制文件 / 本地 config.yaml / 测试配置，加速 Docker 构建
+> 13. **README 完整部署文档**：新增 Render 部署章节，含 Blueprint / 手动两种方式、两种认证模式（apikey / oauth）详细说明、完整环境变量参考表、客户端接入示例（OpenAI SDK / Anthropic SDK / Codex CLI / curl）、常见问题排查
+> 14. **测试覆盖**：全套 378 测试通过，TypeScript 类型检查零错误
+>
+> **Render 部署两种模式**：
+> - **Mode A (apikey)**：设置 `ZCODE_API_KEY` 即可，最简单
+> - **Mode B (oauth)**：本地 `zcode-proxy auth login` → `zcode-proxy auth export` → 把 base64 blob 填入 `ZCODE_OAUTH_CREDENTIAL`
+>
+> **必填环境变量**：仅 `ZCODE_PROXY_API_KEY`（客户端访问代理的密钥）。上游认证二选一。
+>
+> ---
+
 > **v2.1.4.1test1 — Responses 思考管理 + GLM 模型目录接口**
 >
 > 修复 Codex CLI 在 `/v1/responses` 接口下思考参数丢失的问题，并新增管理面板配置入口。

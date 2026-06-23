@@ -16,6 +16,7 @@ echo "  8. Import key from ZCode (Bigmodel) - Start Plan"
 echo "  9. Import key from ZCode (Z.AI) - Start Plan"
 echo "  a. Check login status"
 echo "  b. Logout"
+echo "  c. Export credential for Render/cloud deploy"
 echo "  0. Exit"
 echo ""
 read -p "Select: " choice
@@ -87,6 +88,13 @@ case $choice in
   b)
     echo ""
     ./zcode-proxy.exe auth logout
+    ;;
+  c)
+    echo ""
+    echo "Exporting credential as base64 for ZCODE_OAUTH_CREDENTIAL env var..."
+    echo "(Used for Render / Fly.io / K8s deployment in oauth mode)"
+    echo ""
+    ./zcode-proxy.exe auth export
     ;;
   0)
     exit 0

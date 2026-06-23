@@ -15,7 +15,20 @@ import { homedir } from "node:os";
 import { randomBytes, createCipheriv, createDecipheriv, createHash } from "node:crypto";
 import type { Credential } from "./types.js";
 
-const STORE_DIR = join(homedir(), ".zcode-proxy");
+/**
+ * Store directory.
+ *
+ * Defaults to `~/.zcode-proxy` for local desktop use (ZCode-import flow,
+ * OAuth multi-account). On read-only filesystems (e.g. Render containers),
+ * set `ZCODE_PROXY_STORE_DIR` to a writable path such as `/data/.zcode-proxy`
+ * (persistent disk) or `/tmp/zcode-proxy/.zcode-proxy` (ephemeral).
+ *
+ * In `auth.mode: apikey` the store is only used by the dashboard's
+ * multi-account UI — if you never use that UI, an empty/unwritable store
+ * is harmless (reads return null, writes are silently no-oped by the upper
+ * layer's try/catch).
+ */
+const STORE_DIR = process.env.ZCODE_PROXY_STORE_DIR ?? join(homedir(), ".zcode-proxy");
 const STORE_FILE = join(STORE_DIR, "credentials.json");
 const ENV_SECRET = "ZCODE_PROXY_CREDENTIAL_SECRET";
 
@@ -302,11 +315,20 @@ function backupCorruptedStore(originalContent: string): void {
 }
 
 async function writeStore(store: StoreV2): Promise<void> {
-  mkdirSync(dirname(STORE_FILE), { recursive: true });
-  const json = JSON.stringify(store);
-  const encrypted = await encrypt(json);
-  writeFileSync(STORE_FILE, JSON.stringify({ version: 2, encrypted }), { mode: 0o600 });
-  cachedStore = store; // keep cache in sync with disk
+  try {
+    mkdirSync(dirname(STORE_FILE), { recursive: true });
+    const json = JSON.stringify(store);
+    const encrypted = await encrypt(json);
+    writeFileSync(STORE_FILE, JSON.stringify({ version: 2, encrypted }), { mode: 0o600 });
+  } catch (err) {
+    // Read-only filesystem (e.g. Render container without a persistent disk
+    // mounted at STORE_DIR). Don't crash the process — just log and keep the
+    // in-memory copy so the current request can still complete. The next
+    // restart will start with an empty store anyway.
+    console.warn(`[store] Could not persist credentials to ${STORE_FILE}: ${(err as Error).message}`);
+    console.warn(`[store] Set ZCODE_PROXY_STORE_DIR to a writable path (e.g. /data/.zcode-proxy on Render with a disk, or /tmp/.zcode-proxy for ephemeral storage).`);
+  }
+  cachedStore = store; // keep cache in sync with what we intended to write
 }
 
 // ---------------------------------------------------------------------------

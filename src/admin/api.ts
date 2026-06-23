@@ -528,6 +528,49 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
     }
   }
 
+  // Export the ACTIVE account as a base64 blob suitable for the
+  // ZCODE_OAUTH_CREDENTIAL env var on Render / Fly.io / K8s.
+  //
+  // This is the dashboard equivalent of `zcode-proxy auth export` on the CLI.
+  // Use case: you logged in via the dashboard (or imported from ZCode), and
+  // now want to deploy to Render without re-doing the OAuth flow there.
+  //
+  // Returns:
+  //   { credential: <base64>, json: <pretty JSON>, instructions: <string> }
+  // The `credential` field is what you paste into Render's ZCODE_OAUTH_CREDENTIAL.
+  // The `json` field is the decoded credential for human inspection.
+  if (path === "/admin/api/accounts/render-export" && method === "GET") {
+    try {
+      const cred = await loadCredential();
+      if (!cred) {
+        return errorResponse(404, "not_logged_in", "No active credential. Login or import first.");
+      }
+      const json = JSON.stringify(cred);
+      const b64 = Buffer.from(json, "utf8").toString("base64");
+      return jsonResp({
+        credential: b64,
+        json: JSON.stringify(cred, null, 2),
+        envVars: {
+          ZCODE_AUTH_MODE: "oauth",
+          ZCODE_OAUTH_CREDENTIAL: b64,
+        },
+        instructions: [
+          "1. Copy the value of ZCODE_OAUTH_CREDENTIAL below.",
+          "2. On Render, go to your service → Environment → add/edit:",
+          "   - ZCODE_AUTH_MODE = oauth",
+          "   - ZCODE_OAUTH_CREDENTIAL = <paste the base64 blob>",
+          "3. Make sure ZCODE_API_KEY is UNSET (otherwise the proxy uses apikey mode).",
+          "4. Save and let Render redeploy.",
+          "",
+          "WARNING: This blob contains your upstream credential in plaintext.",
+          "Treat it like a password. On Render, mark the env var as Secret.",
+        ].join("\n"),
+      });
+    } catch (err) {
+      return errorResponse(500, "render_export_failed", (err as Error).message);
+    }
+  }
+
   // Import accounts from backup
   if (path === "/admin/api/accounts/import" && method === "POST") {
     try {

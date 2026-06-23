@@ -16,7 +16,7 @@ import { readFileSync, existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
-const VERSION = "2.1.4.1test1";
+const VERSION = "2.1.4.1test2";
 
 main();
 
@@ -86,6 +86,7 @@ Usage:
                                     Import API key from ~/.zcode/v2/config.json
   zcode-proxy auth logout           Clear stored credentials
   zcode-proxy auth status           Show current authentication state
+  zcode-proxy auth export           Print base64 credential for remote deploy
   zcode-proxy version               Show version
   zcode-proxy help                  Show this help
 
@@ -95,6 +96,7 @@ Examples:
   zcode-proxy auth login bigmodel --import
                                     Import existing key from ZCode config
   zcode-proxy auth status           Check if logged in
+  zcode-proxy auth export           Print ZCODE_OAUTH_CREDENTIAL value for Render
 `);
 }
 
@@ -308,8 +310,10 @@ function authCommand(args: string[]): void {
     authLogout();
   } else if (sub === "status") {
     authStatus().catch(fatalError);
+  } else if (sub === "export") {
+    authExport().catch(fatalError);
   } else {
-    console.error("Usage: zcode-proxy auth <login|logout|status>");
+    console.error("Usage: zcode-proxy auth <login|logout|status|export>");
     process.exit(1);
   }
 }
@@ -385,6 +389,54 @@ async function authStatus(): Promise<void> {
   if (cred.jwt) console.log(`  JWT:     ${cred.jwt.substring(0, 12)}...`);
   if (cred.userId) console.log(`  User ID: ${cred.userId}`);
   console.log(`  Store:   ${getStorePath()}`);
+}
+
+/**
+ * Export the currently active credential as a base64-encoded JSON blob.
+ *
+ * Purpose: lets users who logged in locally (via `zcode-proxy auth login`)
+ * reuse that credential on a remote host (Render, Fly.io, K8s, etc.) where
+ * browser-based OAuth isn't possible.
+ *
+ * Usage:
+ *   1. Locally:   zcode-proxy auth login zai
+ *   2. Locally:   zcode-proxy auth export   # prints base64 blob
+ *   3. Remotely:  set ZCODE_AUTH_MODE=oauth
+ *                 set ZCODE_OAUTH_CREDENTIAL=<base64 blob from step 2>
+ *
+ * The blob contains the credential in plaintext (apiKey, optional secret,
+ * JWT, userId, plan). Treat it like a password — never commit it to git.
+ * On Render, mark the env var as "Secret" so it's masked in the dashboard.
+ *
+ * Optionally pass --accounts to export ALL stored accounts (multi-account
+ * setup) instead of just the active one. The remote host's render-start.sh
+ * currently only consumes the single-credential form; --accounts is for
+ * custom deployment scripts that import via the dashboard's import endpoint.
+ */
+async function authExport(): Promise<void> {
+  const cred = await loadCredential();
+  if (!cred) {
+    console.error("Not logged in. Run: zcode-proxy auth login <zai|bigmodel>");
+    process.exit(1);
+  }
+
+  const json = JSON.stringify(cred);
+  const b64 = Buffer.from(json, "utf8").toString("base64");
+
+  console.log("=== ZCODE_OAUTH_CREDENTIAL (base64) ===");
+  console.log(b64);
+  console.log("=== END ===");
+  console.log("");
+  console.log("To use on Render / Fly.io / K8s:");
+  console.log("  1. Copy the base64 blob above (between the === markers).");
+  console.log("  2. On your host, set these environment variables:");
+  console.log("       ZCODE_AUTH_MODE=oauth");
+  console.log("       ZCODE_OAUTH_CREDENTIAL=<paste blob here>");
+  console.log("  3. Restart the service.");
+  console.log("");
+  console.log("⚠  This blob contains your upstream credential in plaintext.");
+  console.log("⚠  Treat it like a password. Never commit it to git.");
+  console.log("⚠  On Render, mark the env var as Secret so it's masked in logs.");
 }
 
 async function runOAuth(provider: ProviderId): Promise<{ accessToken: string; userId?: string; jwt?: string }> {

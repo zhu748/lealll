@@ -52,6 +52,7 @@ export function createFetchHandler(opts: ServerOptions): (req: Request) => Promi
   type RouteHandler = (req: Request) => Promise<Response> | Response;
   const routes = new Map<string, RouteHandler>([
     ["GET:/health", (req) => addCorsHeaders(healthResponse(), req)],
+    ["GET:/healthz", (req) => addCorsHeaders(healthResponse(), req)],
     ["GET:/", (req) => addCorsHeaders(healthResponse(), req)],
     ["GET:/v1/models", (req) => addCorsHeaders(handleListModels(), req)],
     ["POST:/v1/chat/completions", async (req) => addCorsHeaders(await handleChatCompletions(req, proxyOpts), req)],
@@ -76,7 +77,16 @@ export function createFetchHandler(opts: ServerOptions): (req: Request) => Promi
       if (adminResp) return addCorsHeaders(adminResp, req);
     }
 
-    // Proxy API key auth (if configured) — applies to all non-admin routes
+    // Health checks are ALWAYS open — Render/Fly/Cloud Run/K8s probes don't
+    // send Authorization headers, and returning 401 here causes the platform
+    // to mark the service as unhealthy and restart it in a loop. The health
+    // response leaks no sensitive info (just `{status:"ok", provider}`).
+    // Both `/health` (legacy) and `/healthz` (K8s convention) work.
+    if (path === "/health" || path === "/healthz" || path === "/") {
+      return addCorsHeaders(healthResponse(), req);
+    }
+
+    // Proxy API key auth (if configured) — applies to all non-admin, non-health routes
     if (config.auth.proxyApiKey) {
       const authHeader = req.headers.get("authorization") ?? req.headers.get("x-api-key");
       if (!authHeader || !checkProxyKey(authHeader, config.auth.proxyApiKey)) {

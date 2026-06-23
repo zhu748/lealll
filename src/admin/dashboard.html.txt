@@ -888,7 +888,7 @@ td input{font-family:var(--font-mono)}
     <div class="sidebar-footer">
       <div class="version">
         <span class="dot"></span>
-        <span>v2.1.4.1test1</span>
+        <span>v2.1.4.1test2</span>
       </div>
       <div class="logout-btn" onclick="doLogout()">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
@@ -1256,11 +1256,18 @@ td input{font-family:var(--font-mono)}
           </div>
           <div class="card-body">
             <p style="font-size:12px;color:var(--text-2);margin-bottom:var(--s-4)">将所有账号导出为 JSON 文件备份，或从之前的导出文件导入。ID 匹配的现有账号将被更新。</p>
+            <p style="font-size:12px;color:var(--text-2);margin-bottom:var(--s-4);padding:8px 12px;background:var(--bg-2);border-left:3px solid var(--primary);border-radius:4px;">
+              <strong>部署到 Render / Fly.io / K8s？</strong>点击"导出 Render 凭证"获取可直接填入 <code style="background:var(--bg-1);padding:1px 4px;border-radius:2px;">ZCODE_OAUTH_CREDENTIAL</code> 环境变量的 base64 字符串。
+            </p>
           </div>
           <div class="card-actions">
             <button class="btn btn-success" onclick="exportAccounts()">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
               导出账号
+            </button>
+            <button class="btn btn-warning" onclick="exportRenderCredential()">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"/><polyline points="9 12 12 15 15 12" transform="translate(0,-2)"/></svg>
+              导出 Render 凭证
             </button>
             <button class="btn btn-primary" onclick="document.getElementById('importFileInput').click()">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
@@ -2090,6 +2097,57 @@ async function exportAccounts(){
     document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(url);
     toast('账号已导出（'+d.accounts.length+' 个账号）','success');
   }catch(e){console.error('exportAccounts failed:',e);toast('导出失败','error')}
+}
+async function exportRenderCredential(){
+  try{
+    const r=await fetch(API+'/admin/api/accounts/render-export',{headers:authHeaders()});
+    if(!r.ok){
+      const d=await r.json().catch(()=>({}));
+      toast(d.message||d.error?.message||'导出失败：请先登录或导入凭证','error');
+      return;
+    }
+    const d=await r.json();
+    // Build a modal dialog showing the base64 blob, env vars, and instructions.
+    const modal=document.createElement('div');
+    modal.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;z-index:1000;padding:20px;';
+    modal.innerHTML=`
+      <div style="background:var(--bg-0);border-radius:12px;max-width:720px;width:100%;max-height:90vh;overflow:auto;box-shadow:0 20px 60px rgba(0,0,0,0.3);">
+        <div style="padding:20px 24px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;">
+          <h3 style="margin:0;font-size:18px;color:var(--text-0);">部署到 Render / Fly.io / K8s</h3>
+          <button onclick="this.closest('div[style*=fixed]').remove()" style="background:none;border:none;font-size:24px;color:var(--text-2);cursor:pointer;line-height:1;">×</button>
+        </div>
+        <div style="padding:20px 24px;">
+          <div style="background:var(--warning-bg,rgba(255,193,7,0.1));border-left:3px solid var(--warning,#ffc107);padding:10px 14px;border-radius:4px;margin-bottom:16px;font-size:12px;color:var(--text-1);">
+            <strong>⚠ 安全提示：</strong>该凭证包含明文 API Key。请像对待密码一样处理，在 Render 上标记为 Secret。
+          </div>
+          <div style="margin-bottom:16px;">
+            <div style="font-size:12px;color:var(--text-2);margin-bottom:6px;font-weight:600;">在 Render Environment 中设置以下变量：</div>
+            <div style="background:var(--bg-1);border-radius:6px;padding:12px;font-family:monospace;font-size:12px;line-height:1.8;">
+              <div><span style="color:var(--primary);">ZCODE_AUTH_MODE</span>=<span style="color:var(--success,#10b981);">oauth</span></div>
+              <div><span style="color:var(--primary);">ZCODE_OAUTH_CREDENTIAL</span>=<span style="color:var(--success,#10b981);word-break:break-all;">${escapeHtml(d.credential)}</span></div>
+            </div>
+          </div>
+          <div style="margin-bottom:16px;">
+            <div style="font-size:12px;color:var(--text-2);margin-bottom:6px;font-weight:600;">原始凭证 JSON（仅供查看）：</div>
+            <pre style="background:var(--bg-1);border-radius:6px;padding:12px;font-family:monospace;font-size:11px;line-height:1.6;overflow:auto;max-height:180px;margin:0;color:var(--text-1);">${escapeHtml(d.json)}</pre>
+          </div>
+          <div style="display:flex;gap:8px;">
+            <button onclick="navigator.clipboard.writeText('${d.credential}').then(()=>toast('已复制 base64 凭证到剪贴板','success')).catch(()=>toast('复制失败，请手动选择','error'))" style="background:var(--primary);color:white;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500;">
+              📋 复制 ZCODE_OAUTH_CREDENTIAL
+            </button>
+            <button onclick="this.closest('div[style*=fixed]').remove()" style="background:var(--bg-2);color:var(--text-1);border:1px solid var(--border);padding:8px 16px;border-radius:6px;cursor:pointer;font-size:13px;">
+              关闭
+            </button>
+          </div>
+          <div style="margin-top:14px;font-size:11px;color:var(--text-2);line-height:1.6;">
+            ${d.instructions.split('\n').map(l=>escapeHtml(l)).join('<br>')}
+          </div>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(modal);
+    modal.addEventListener('click',e=>{if(e.target===modal)modal.remove()});
+  }catch(e){console.error('exportRenderCredential failed:',e);toast('导出失败','error')}
 }
 async function importAccountsFromFile(input){
   if(!input.files||!input.files[0])return;

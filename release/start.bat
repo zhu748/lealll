@@ -15,9 +15,10 @@ echo   8. Import key from ZCode (Bigmodel) - Start Plan
 echo   9. Import key from ZCode (Z.AI) - Start Plan
 echo   a. Check login status
 echo   b. Logout
+echo   c. Export credential for Render/cloud deploy
 echo   0. Exit
 echo.
-set /p choice=Select: 
+set /p choice=Select:
 
 if "%choice%"=="1" goto serve
 if "%choice%"=="2" goto login_bigmodel_cp
@@ -30,6 +31,7 @@ if "%choice%"=="8" goto import_bigmodel_sp
 if "%choice%"=="9" goto import_zai_sp
 if "%choice%"=="a" goto status
 if "%choice%"=="b" goto logout
+if "%choice%"=="c" goto export
 if "%choice%"=="0" exit
 goto end
 
@@ -105,6 +107,15 @@ goto end
 :logout
 echo.
 zcode-proxy.exe auth logout
+pause
+goto end
+
+:export
+echo.
+echo Exporting credential as base64 for ZCODE_OAUTH_CREDENTIAL env var...
+echo (Used for Render / Fly.io / K8s deployment in oauth mode)
+echo.
+zcode-proxy.exe auth export
 pause
 goto end
 

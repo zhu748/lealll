@@ -12,6 +12,7 @@ const ENV = {
   PROXY_API_KEY: "ZCODE_PROXY_API_KEY",
   PROVIDER: "ZCODE_PROVIDER",
   API_KEY: "ZCODE_API_KEY",
+  AUTH_MODE: "ZCODE_AUTH_MODE",
   APP_VERSION: "ZCODE_APP_VERSION",
   SOURCE_TITLE: "ZCODE_SOURCE_TITLE",
   REFERER_ORIGIN: "ZCODE_REFERER_ORIGIN",
@@ -66,7 +67,14 @@ export function loadConfig(path: string): ProxyConfig {
 
   // --- auth ---
   const proxyApiKey = process.env[ENV.PROXY_API_KEY] ?? parsed?.auth?.proxyApiKey;
-  const mode = parsed?.auth?.mode === "oauth" ? "oauth" : "apikey";
+  // ZCODE_AUTH_MODE env var overrides YAML. Lets Render users pick between
+  // apikey and oauth modes without editing the bundled config.yaml.
+  // Accepted values: "apikey" (default) | "oauth"
+  const modeEnv = process.env[ENV.AUTH_MODE]?.toLowerCase().trim();
+  const mode: "apikey" | "oauth" =
+    modeEnv === "oauth" ? "oauth"
+    : modeEnv === "apikey" ? "apikey"
+    : (parsed?.auth?.mode === "oauth" ? "oauth" : "apikey");
   const apiKey = process.env[ENV.API_KEY] ?? parsed?.auth?.apiKey;
   const oauthCredentialsPath = parsed?.auth?.oauthCredentialsPath;
 
