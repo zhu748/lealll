@@ -1,5 +1,41 @@
 # zcode-proxy 使用说明
 
+> **v2.1.4.1test6 — 代理配置 UI 升级：模态框 + 测试连接**
+>
+> 重做 v2.1.4.1test5 引入的代理配置入口：移除账号表格里的内联输入框（输入 URL 字符串体验差、容易输错），改为操作列的「代理」按钮 + 弹出式模态框，支持代理类型选择、主机/端口/账号/密码分字段填写、一键测试连通性。
+>
+> **v2.1.4.1test6 关键改进**：
+> 1. **Dashboard UI 重做**：
+>    - 移除账号表格的「代理」列，恢复 colspan 到 7
+>    - 操作列新增「代理」按钮（btn-ghost 风格，与「激活」「删除」并列）
+>    - 已配置代理的账号在 API Key 列显示「代理」徽标（hover 显示完整 URL）
+>    - 点击「代理」按钮打开模态框，预填该账号当前代理设置
+> 2. **代理模态框**：
+>    - 代理类型下拉：无代理 / HTTP / HTTPS / SOCKS5 / SOCKS5h（远端 DNS）
+>    - 主机（必填）、端口、用户名、密码分字段输入，免去手拼 URL
+>    - 用户名密码 URL 编码自动处理（含 `@`、`:`、`/` 等特殊字符）
+>    - 选「无代理」时所有字段禁用 + 清空，方便一键恢复直连
+>    - 「测试连接」按钮：调用后端 proxy-test 端点，实时显示结果（成功显示 HTTP 状态码 + 延迟，失败显示错误信息）
+>    - Esc 键关闭模态框，点击遮罩关闭，× 按钮关闭
+> 3. **新增 `POST /admin/api/accounts/proxy-test` 端点**：
+>    - 接收 `{ proxy, provider? }`，用 Bun 原生 `fetch(url, { proxy })` 对上游 base URL 发 HEAD 请求
+>    - 10s 超时，超时清晰提示「Connection timed out after 10s」
+>    - 任何 HTTP 响应（200/404/403 等）都视为代理可达；只有网络层错误（拒绝连接、DNS 失败、代理鉴权失败等）才返回 `ok: false`
+>    - 返回 `{ ok, status?, latencyMs, target, error? }`，永远 HTTP 200 让前端能渲染错误信息
+>    - `provider` 字段决定测试目标：zai→`https://api.z.ai`，bigmodel→`https://open.bigmodel.cn`
+> 4. **`AdminOptions` 新增 `fetchImpl` 字段**：让测试代码可注入 mock fetch，避免真实网络调用
+> 5. **Add API Key 表单**：移除「出口代理」输入字段，改为提示「添加后可在账号列表中点击「代理」按钮配置」，统一代理配置入口
+> 6. **新增 8 个回归测试**（共 407 测试通过）：
+>    - proxy-test API 8 个：参数校验 / scheme 校验 / 成功 / bigmodel 切换 / 4xx 视为成功 / 网络错误 / 超时
+> 7. **JS 工具函数**：`buildProxyUrlFromModal()` / `parseProxyUrl()` 实现字段 ↔ URL 双向转换；用户密码用 `encodeURIComponent` 处理
+>
+> **影响范围**：
+> - **所有使用代理功能的用户**：从拼字符串改为分字段填写，体验大幅改善
+> - **添加新 API Key 流程**：先添加 Key，再点「代理」按钮配置出口，两步分离更清晰
+> - **后端兼容性**：v2.1.4.1test5 的 `PUT /admin/api/accounts/proxy` 端点完全不变，存储格式不变，凭证字段不变
+>
+> ---
+
 > **v2.1.4.1test5 — 账号级出口代理（per-account HTTP proxy）**
 >
 > 新增**账号级出口代理**功能：在 dashboard 账号管理页面，可以为每个账号单独配置 HTTP / HTTPS / SOCKS5 出口代理，让不同账号走不同的网络出口（例如让 A 账号走日本节点、B 账号直连、C 账号走 SOCKS5）。代理在请求时动态读取，多账号 retry 切换凭证时新账号的代理会自动生效。

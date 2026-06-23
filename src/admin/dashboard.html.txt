@@ -888,7 +888,7 @@ td input{font-family:var(--font-mono)}
     <div class="sidebar-footer">
       <div class="version">
         <span class="dot"></span>
-        <span>v2.1.4.1test5</span>
+        <span>v2.1.4.1test6</span>
       </div>
       <div class="logout-btn" onclick="doLogout()">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
@@ -1197,12 +1197,12 @@ td input{font-family:var(--font-mono)}
             </div>
           </div>
           <div class="card-body" style="padding-bottom:0">
-            <p style="font-size:12px;color:var(--text-2);margin-bottom:var(--s-4)">所有通过 OAuth 或手动输入保存的凭证。点击 <strong style="color:var(--text)">激活</strong> 切换，点击 <strong style="color:var(--text)">套餐</strong> 修改，<strong style="color:var(--text)">代理</strong> 列可为每个账号单独配置 HTTP/SOCKS5 出口代理（留空=直连）。</p>
+            <p style="font-size:12px;color:var(--text-2);margin-bottom:var(--s-4)">所有通过 OAuth 或手动输入保存的凭证。点击 <strong style="color:var(--text)">激活</strong> 切换，点击 <strong style="color:var(--text)">套餐</strong> 修改，点击 <strong style="color:var(--text)">代理</strong> 为该账号单独配置 HTTP/SOCKS5 出口代理。</p>
           </div>
           <div class="table-wrap">
             <table>
-              <thead><tr><th>标签</th><th>提供商</th><th>套餐</th><th>API Key</th><th>代理</th><th>创建时间</th><th>状态</th><th style="text-align:right">操作</th></tr></thead>
-              <tbody id="accountsList"><tr><td colspan="8"><div class="empty-state"><div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg></div><div class="empty-text">加载中...</div></div></td></tr></tbody>
+              <thead><tr><th>标签</th><th>提供商</th><th>套餐</th><th>API Key</th><th>创建时间</th><th>状态</th><th style="text-align:right">操作</th></tr></thead>
+              <tbody id="accountsList"><tr><td colspan="7"><div class="empty-state"><div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg></div><div class="empty-text">加载中...</div></div></td></tr></tbody>
             </table>
           </div>
         </div>
@@ -1218,7 +1218,7 @@ td input{font-family:var(--font-mono)}
                 <div class="form-group"><label class="form-label">套餐</label><select id="addKeyPlan"><option value="coding-plan">Coding 套餐</option><option value="start-plan">Start 套餐</option></select></div>
               </div>
               <div class="form-group"><label class="form-label">API Key <span class="required">*</span></label><input id="addKeyValue" placeholder="请输入 API Key" style="font-family:var(--font-mono);font-size:12px"></div>
-              <div class="form-group"><label class="form-label">出口代理 <span style="color:var(--text-3);font-weight:normal">（可选，留空=直连）</span></label><input id="addKeyProxy" placeholder="http://host:port  或  socks5://host:port" style="font-family:var(--font-mono);font-size:12px"></div>
+              <div class="form-help">添加后可在账号列表中点击「代理」按钮为该账号配置出口代理。</div>
             </div>
             <div class="card-actions">
               <button class="btn btn-primary" onclick="addApiKey()">
@@ -2005,13 +2005,10 @@ async function addApiKey(){
   const provider=document.getElementById('addKeyProvider').value;
   const plan=document.getElementById('addKeyPlan').value;
   const key=document.getElementById('addKeyValue').value.trim();
-  const proxy=document.getElementById('addKeyProxy').value.trim();
   if(!key)return toast('请输入 API Key','error');
   try{
-    const payload={provider,apiKey:key,plan};
-    if(proxy)payload.proxy=proxy;
-    const r=await fetch(API+'/admin/api/credentials',{method:'POST',headers:authHeaders(),body:JSON.stringify(payload)});
-    if(r.ok){toast('API Key 已添加（'+plan+(proxy?'，代理已配置':'')+'）','success');loadAccountInfo();loadAccountsList();loadCredStore();document.getElementById('addKeyValue').value='';document.getElementById('addKeyProxy').value=''}
+    const r=await fetch(API+'/admin/api/credentials',{method:'POST',headers:authHeaders(),body:JSON.stringify({provider,apiKey:key,plan})});
+    if(r.ok){toast('API Key 已添加（'+plan+'）','success');loadAccountInfo();loadAccountsList();loadCredStore();document.getElementById('addKeyValue').value=''}
     else toast('添加失败','error');
   }catch(e){console.error('addApiKey failed:',e);toast('添加失败','error')}
 }
@@ -2036,23 +2033,24 @@ async function loadAccountsList(){
     const accounts=d.accounts||[];
     const activeId=d.activeId;
     if(!accounts.length){
-      tb.innerHTML='<tr><td colspan="8"><div class="empty-state"><div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg></div><div class="empty-text">暂无存储的账号</div><div class="empty-hint">请使用 OAuth 或"添加 API Key"创建</div></div></td></tr>';
+      tb.innerHTML='<tr><td colspan="7"><div class="empty-state"><div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg></div><div class="empty-text">暂无存储的账号</div><div class="empty-hint">请使用 OAuth 或"添加 API Key"创建</div></div></td></tr>';
       return;
     }
     tb.innerHTML=accounts.map(a=>{
       const isActive=a.id===activeId;
       const created=new Date(a.createdAt).toLocaleString();
       const planVal=a.plan||'coding-plan';
-      const proxyVal=a.proxy||'';
+      const hasProxy=!!(a.proxy&&a.proxy.trim());
+      const proxyBadge=hasProxy?`<span class="badge badge-info" title="${escapeHtml(a.proxy)}">代理</span> `:'';
       return `<tr>
         <td><input value="${escapeHtml(a.label)}" onchange="renameAccount('${escapeHtml(a.id)}',this.value)"></td>
         <td><span class="badge badge-info">${escapeHtml(a.provider)}</span></td>
         <td><select onchange="changePlan('${escapeHtml(a.id)}',this.value)"><option value="coding-plan"${planVal==='coding-plan'?' selected':''}>Coding</option><option value="start-plan"${planVal==='start-plan'?' selected':''}>Start</option></select></td>
-        <td class="td-mono">${escapeHtml(a.apiKeyMask)}${a.hasSecret?' <span class="badge badge-success">secret</span>':''}${a.hasJwt?' <span class="badge badge-success">jwt</span>':''}</td>
-        <td><input class="td-mono" style="font-size:11px;min-width:200px" value="${escapeHtml(proxyVal)}" placeholder="留空=直连" onchange="changeProxy('${escapeHtml(a.id)}',this.value)"></td>
+        <td class="td-mono">${proxyBadge}${escapeHtml(a.apiKeyMask)}${a.hasSecret?' <span class="badge badge-success">secret</span>':''}${a.hasJwt?' <span class="badge badge-success">jwt</span>':''}</td>
         <td class="td-mute">${escapeHtml(created)}</td>
         <td>${isActive?'<span class="badge badge-success"><span class="badge-dot"></span>已激活</span>':'<span class="badge badge-muted">未激活</span>'}</td>
         <td class="td-actions">
+          <button class="btn btn-ghost btn-sm" onclick="openProxyModal('${escapeHtml(a.id)}','${escapeHtml(a.proxy||'')}',this.getAttribute('data-provider'))" data-provider="${escapeHtml(a.provider)}" title="配置代理">代理</button>
           ${isActive?'':`<button class="btn btn-primary btn-sm" onclick="activateAccount('${escapeHtml(a.id)}')">激活</button> `}
           <button class="btn btn-danger btn-sm" onclick="deleteAccount('${escapeHtml(a.id)}','${escapeHtml(a.label).replace(/'/g,'\\\'')}')">删除</button>
         </td>
@@ -2060,7 +2058,7 @@ async function loadAccountsList(){
     }).join('');
   }catch(e){
     console.error('loadAccountsList failed:',e);
-    tb.innerHTML='<tr><td colspan="8"><div class="empty-state" style="color:var(--danger)">加载账号列表失败</div></td></tr>';
+    tb.innerHTML='<tr><td colspan="7"><div class="empty-state" style="color:var(--danger)">加载账号列表失败</div></td></tr>';
   }
 }
 async function activateAccount(id){
@@ -2093,11 +2091,12 @@ async function changePlan(id,plan){
   }catch(e){console.error('changePlan failed:',e);toast('套餐更新失败','error')}
 }
 async function changeProxy(id,proxy){
+  // Legacy inline-edit path — kept for backward compat but no longer wired up
+  // to any UI element. New dashboard uses openProxyModal() instead.
   const trimmed=(proxy||'').trim();
-  // 客户端轻量校验：非空时必须有有效 scheme
   if(trimmed && !/^(https?|socks5h?):\/\/[^\s]+$/i.test(trimmed)){
     toast('代理格式无效，需为 http(s):// 或 socks5:// 开头','error');
-    loadAccountsList(); // 重置输入框为服务端值
+    loadAccountsList();
     return;
   }
   try{
@@ -2109,9 +2108,209 @@ async function changeProxy(id,proxy){
     }else{
       const d=await r.json().catch(()=>({}));
       toast(d.error||'代理更新失败','error');
-      loadAccountsList(); // 重置输入框
+      loadAccountsList();
     }
   }catch(e){console.error('changeProxy failed:',e);toast('代理更新失败','error');loadAccountsList()}
+}
+
+// ============================================================
+// Per-account proxy modal (v2.1.4.1test6+)
+// ============================================================
+// Replaces the inline proxy input with a full modal dialog. The modal lets
+// users pick proxy type (none/http/https/socks5/socks5h), enter host/port/
+// user/pass separately, test connectivity, and save. Internally we still
+// store a single URL string on Credential.proxy — the modal just parses
+// and assembles that URL for the user.
+
+/** Currently focused account id in the proxy modal. */
+let proxyModalAccountId=null;
+let proxyModalProvider=null;
+
+/**
+ * Build a proxy URL string from individual modal fields.
+ * Returns "" when type is "none" (meaning "direct connection, no proxy").
+ * Returns the assembled URL otherwise.
+ */
+function buildProxyUrlFromModal(){
+  const type=document.getElementById('proxyType').value;
+  if(type==='none')return '';
+  const host=document.getElementById('proxyHost').value.trim();
+  const port=document.getElementById('proxyPort').value.trim();
+  const user=document.getElementById('proxyUser').value.trim();
+  const pass=document.getElementById('proxyPass').value;
+  if(!host){
+    // Caller (test/save) is expected to validate; return empty so the
+    // validation message is consistent ("host is required").
+    return '';
+  }
+  let auth='';
+  if(user||pass){
+    // URL-encode user/pass to handle special chars (@, :, /, etc.)
+    auth=encodeURIComponent(user)+(pass?(':'+encodeURIComponent(pass)):'')+'@';
+  }
+  // Default port hints: http(s)→80/443 typically omitted; socks5→1080.
+  // We don't auto-fill — let the user specify. Empty port is allowed.
+  const portPart=port?(':'+port):'';
+  return `${type}://${auth}${host}${portPart}`;
+}
+
+/**
+ * Parse a stored proxy URL back into {type, host, port, user, pass}.
+ * Used when opening the modal to populate fields with the current value.
+ * Returns {type:'none'} for empty/invalid URLs.
+ */
+function parseProxyUrl(url){
+  const empty={type:'none',host:'',port:'',user:'',pass:''};
+  if(!url||!url.trim())return empty;
+  const trimmed=url.trim();
+  const m=/^(https?|socks5h?):\/\/(?:([^:@/]+)(?::([^@/]*))?@)?([^:/]+)(?::(\d+))?\/?$/i.exec(trimmed);
+  if(!m)return empty; // unrecognized format → reset to none
+  return {
+    type:m[1].toLowerCase(),
+    user:decodeURIComponent(m[2]||''),
+    pass:decodeURIComponent(m[3]||''),
+    host:m[4]||'',
+    port:m[5]||'',
+  };
+}
+
+/** Open the proxy modal for a given account. */
+function openProxyModal(id,currentProxy,provider){
+  proxyModalAccountId=id;
+  proxyModalProvider=(provider==='bigmodel')?'bigmodel':'zai';
+  const parsed=parseProxyUrl(currentProxy);
+  document.getElementById('proxyType').value=parsed.type;
+  document.getElementById('proxyHost').value=parsed.host;
+  document.getElementById('proxyPort').value=parsed.port;
+  document.getElementById('proxyUser').value=parsed.user;
+  document.getElementById('proxyPass').value=parsed.pass;
+  // Reset test result
+  const result=document.getElementById('proxyTestResult');
+  result.innerHTML='';
+  result.style.display='none';
+  // Toggle field enablement based on type
+  updateProxyFieldState();
+  // Show modal
+  document.getElementById('proxyModal').style.display='flex';
+}
+
+/** Close the proxy modal without saving. */
+function closeProxyModal(){
+  document.getElementById('proxyModal').style.display='none';
+  proxyModalAccountId=null;
+  proxyModalProvider=null;
+}
+
+/** Enable/disable host/port/user/pass fields based on selected proxy type. */
+function updateProxyFieldState(){
+  const type=document.getElementById('proxyType').value;
+  const disabled=(type==='none');
+  ['proxyHost','proxyPort','proxyUser','proxyPass'].forEach(fid=>{
+    const el=document.getElementById(fid);
+    el.disabled=disabled;
+    if(disabled){el.value=''}
+  });
+  // Toggle the "test connection" button too
+  document.getElementById('proxyTestBtn').disabled=disabled;
+  // Save always enabled (allows clearing the proxy by selecting "none")
+  document.getElementById('proxySaveBtn').disabled=false;
+}
+
+/** Test the proxy connection by calling the backend proxy-test endpoint. */
+async function testProxyConnection(){
+  if(!proxyModalAccountId){
+    toast('未选择账号','error');
+    return;
+  }
+  const proxyUrl=buildProxyUrlFromModal();
+  if(!proxyUrl){
+    // "none" — can't test "no proxy"; show a friendly message instead
+    const result=document.getElementById('proxyTestResult');
+    result.style.display='block';
+    result.style.background='var(--warn-soft)';
+    result.style.color='var(--warn)';
+    result.innerHTML='选择了「无代理」，无需测试连通性。';
+    return;
+  }
+  // Validate host is filled
+  const host=document.getElementById('proxyHost').value.trim();
+  if(!host){
+    const result=document.getElementById('proxyTestResult');
+    result.style.display='block';
+    result.style.background='var(--danger-soft)';
+    result.style.color='var(--danger)';
+    result.innerHTML='请填写主机地址';
+    return;
+  }
+  // Show testing state
+  const btn=document.getElementById('proxyTestBtn');
+  const originalText=btn.textContent;
+  btn.disabled=true;
+  btn.textContent='测试中…';
+  const result=document.getElementById('proxyTestResult');
+  result.style.display='block';
+  result.style.background='var(--info-soft)';
+  result.style.color='var(--info)';
+  result.innerHTML='正在通过代理连接上游…';
+  try{
+    const r=await fetch(API+'/admin/api/accounts/proxy-test',{
+      method:'POST',
+      headers:authHeaders(),
+      body:JSON.stringify({proxy:proxyUrl,provider:proxyModalProvider}),
+    });
+    const d=await r.json();
+    if(d.ok){
+      result.style.background='var(--success-soft)';
+      result.style.color='var(--success)';
+      result.innerHTML=`✓ 连接成功（HTTP ${d.status}，${d.latencyMs}ms，目标 ${escapeHtml(d.target)}）`;
+    }else{
+      result.style.background='var(--danger-soft)';
+      result.style.color='var(--danger)';
+      result.innerHTML=`✗ 连接失败：${escapeHtml(d.error||'未知错误')}（${d.latencyMs}ms）`;
+    }
+  }catch(e){
+    result.style.background='var(--danger-soft)';
+    result.style.color='var(--danger)';
+    result.innerHTML=`✗ 请求失败：${escapeHtml((e&&e.message)||String(e))}`;
+  }finally{
+    btn.disabled=false;
+    btn.textContent=originalText;
+  }
+}
+
+/** Save the proxy configuration from the modal to the backend. */
+async function saveProxyFromModal(){
+  if(!proxyModalAccountId){
+    toast('未选择账号','error');
+    return;
+  }
+  const proxyUrl=buildProxyUrlFromModal();
+  const type=document.getElementById('proxyType').value;
+  // Validate: if a non-none type is selected, host is required
+  if(type!=='none'&&!document.getElementById('proxyHost').value.trim()){
+    toast('请填写主机地址，或选择「无代理」','error');
+    return;
+  }
+  const id=proxyModalAccountId;
+  try{
+    const r=await fetch(API+'/admin/api/accounts/proxy',{
+      method:'PUT',
+      headers:authHeaders(),
+      body:JSON.stringify({id,proxy:proxyUrl}),
+    });
+    if(r.ok){
+      const d=await r.json();
+      toast(d.proxy?('代理已设置：'+d.proxy):'代理已清除，恢复直连','success');
+      closeProxyModal();
+      loadAccountInfo();loadAccountsList();loadCredStore();
+    }else{
+      const d=await r.json().catch(()=>({}));
+      toast(d.error?.message||d.error||'代理保存失败','error');
+    }
+  }catch(e){
+    console.error('saveProxyFromModal failed:',e);
+    toast('代理保存失败','error');
+  }
 }
 async function exportAccounts(){
   try{
@@ -2722,6 +2921,80 @@ function toast(msg,type='success'){
     }
   },3000);
 }
+</script>
+
+<!-- ============================================================ -->
+<!-- Per-account proxy modal (v2.1.4.1test6+)                     -->
+<!-- ============================================================ -->
+<div id="proxyModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.55);backdrop-filter:blur(2px);align-items:center;justify-content:center;z-index:1100;padding:20px;">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--r-xl);max-width:520px;width:100%;box-shadow:var(--shadow-lg);">
+    <!-- Header -->
+    <div style="padding:var(--s-5) var(--s-6);border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;">
+      <h3 style="margin:0;font-size:16px;font-weight:600;color:var(--text);display:flex;align-items:center;gap:var(--s-2);">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--primary);"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+        配置出口代理
+      </h3>
+      <button onclick="closeProxyModal()" style="background:none;border:none;font-size:22px;color:var(--text-2);cursor:pointer;line-height:1;padding:0 4px;">×</button>
+    </div>
+    <!-- Body -->
+    <div style="padding:var(--s-6);">
+      <div class="form-group">
+        <label class="form-label">代理类型</label>
+        <select id="proxyType" onchange="updateProxyFieldState()" style="width:100%;">
+          <option value="none">无代理（直连）</option>
+          <option value="http">HTTP</option>
+          <option value="https">HTTPS</option>
+          <option value="socks5">SOCKS5</option>
+          <option value="socks5h">SOCKS5h（远端 DNS）</option>
+        </select>
+        <div class="form-help">选择「无代理」可清除该账号的代理配置，恢复直连。</div>
+      </div>
+      <div class="form-row">
+        <div class="form-group" style="grid-column:span 2;">
+          <label class="form-label">主机 <span class="required">*</span></label>
+          <input id="proxyHost" placeholder="例如 127.0.0.1 或 proxy.example.com" style="font-family:var(--font-mono);font-size:12px;">
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label">端口</label>
+          <input id="proxyPort" type="number" min="1" max="65535" placeholder="如 7890、1080" style="font-family:var(--font-mono);font-size:12px;">
+        </div>
+        <div class="form-group">
+          <label class="form-label">用户名 <span style="color:var(--text-3);font-weight:normal">（可选）</span></label>
+          <input id="proxyUser" placeholder="如需鉴权填写" autocomplete="off" style="font-family:var(--font-mono);font-size:12px;">
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label">密码 <span style="color:var(--text-3);font-weight:normal">（可选）</span></label>
+          <input id="proxyPass" type="password" placeholder="如需鉴权填写" autocomplete="new-password" style="font-family:var(--font-mono);font-size:12px;">
+        </div>
+        <div class="form-group" style="display:flex;align-items:flex-end;">
+          <button id="proxyTestBtn" class="btn btn-ghost" style="width:100%;" onclick="testProxyConnection()">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right:6px;vertical-align:-2px;"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+            测试连接
+          </button>
+        </div>
+      </div>
+      <div id="proxyTestResult" style="display:none;padding:10px 12px;border-radius:var(--r-md);font-size:12px;line-height:1.5;margin-bottom:var(--s-4);word-break:break-all;"></div>
+    </div>
+    <!-- Footer -->
+    <div style="padding:var(--s-4) var(--s-6);border-top:1px solid var(--border);display:flex;justify-content:flex-end;gap:var(--s-2);background:var(--bg-elev);border-radius:0 0 var(--r-xl) var(--r-xl);">
+      <button class="btn btn-ghost" onclick="closeProxyModal()">取消</button>
+      <button id="proxySaveBtn" class="btn btn-primary" onclick="saveProxyFromModal()">保存</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// Escape key closes the proxy modal
+document.addEventListener('keydown',e=>{
+  if(e.key==='Escape'){
+    const m=document.getElementById('proxyModal');
+    if(m&&m.style.display==='flex'){closeProxyModal()}
+  }
+});
 </script>
 </body>
 </html>

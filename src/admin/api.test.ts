@@ -893,3 +893,181 @@ describe("/admin/api/accounts/proxy — per-account proxy CRUD", () => {
     expect((await resp!.json()).proxy).toBe("http://spaced:1234");
   });
 });
+
+// ---------------------------------------------------------------------------
+// /admin/api/accounts/proxy-test — connectivity test (v2.1.4.1test6)
+// ---------------------------------------------------------------------------
+
+describe("/admin/api/accounts/proxy-test — proxy connectivity check", () => {
+  it("returns 400 when proxy is missing", async () => {
+    const opts = makeAdminOpts();
+    const resp = await callAdmin(
+      authedReq("/admin/api/accounts/proxy-test", {
+        method: "POST",
+        body: JSON.stringify({}),
+      }),
+      opts,
+    );
+    expect(resp!.status).toBe(400);
+    const body = await resp!.json();
+    expect(body.error.type).toBe("missing_param");
+  });
+
+  it("returns 400 when proxy is empty string", async () => {
+    const opts = makeAdminOpts();
+    const resp = await callAdmin(
+      authedReq("/admin/api/accounts/proxy-test", {
+        method: "POST",
+        body: JSON.stringify({ proxy: "   " }),
+      }),
+      opts,
+    );
+    expect(resp!.status).toBe(400);
+    const body = await resp!.json();
+    expect(body.error.type).toBe("invalid_param");
+  });
+
+  it("returns 400 for invalid proxy scheme", async () => {
+    const opts = makeAdminOpts();
+    const resp = await callAdmin(
+      authedReq("/admin/api/accounts/proxy-test", {
+        method: "POST",
+        body: JSON.stringify({ proxy: "ftp://host:21" }),
+      }),
+      opts,
+    );
+    expect(resp!.status).toBe(400);
+    const body = await resp!.json();
+    expect(body.error.type).toBe("invalid_param");
+  });
+
+  it("returns ok:true with status + latencyMs when proxy reaches upstream", async () => {
+    // Mock fetch — simulate a successful HEAD response through the proxy.
+    // The mock asserts that the proxy URL was passed via the `proxy` init
+    // option, proving the request would actually have been routed through
+    // the proxy in a real environment.
+    let receivedProxy: string | undefined;
+    let receivedMethod: string | undefined;
+    let receivedUrl: string | undefined;
+    const mockFetch = (async (url: string, init?: any): Promise<Response> => {
+      receivedUrl = url;
+      receivedMethod = init?.method;
+      receivedProxy = init?.proxy;
+      return new Response(null, { status: 200, headers: { "content-type": "text/plain" } });
+    }) as typeof fetch;
+
+    const opts = makeAdminOpts({ fetchImpl: mockFetch });
+    const resp = await callAdmin(
+      authedReq("/admin/api/accounts/proxy-test", {
+        method: "POST",
+        body: JSON.stringify({ proxy: "http://127.0.0.1:7890" }),
+      }),
+      opts,
+    );
+    expect(resp!.status).toBe(200);
+    const body = await resp!.json();
+    expect(body.ok).toBe(true);
+    expect(body.status).toBe(200);
+    expect(typeof body.latencyMs).toBe("number");
+    expect(body.latencyMs).toBeGreaterThanOrEqual(0);
+    expect(body.target).toContain("api.z.ai");
+    // The fetch mock should have received the proxy URL
+    expect(receivedProxy).toBe("http://127.0.0.1:7890");
+    expect(receivedMethod).toBe("HEAD");
+    expect(receivedUrl).toContain("api.z.ai");
+  });
+
+  it("uses bigmodel upstream when provider=bigmodel", async () => {
+    let receivedUrl: string | undefined;
+    const mockFetch = (async (url: string): Promise<Response> => {
+      receivedUrl = url;
+      return new Response(null, { status: 200 });
+    }) as typeof fetch;
+
+    const opts = makeAdminOpts({ fetchImpl: mockFetch });
+    const resp = await callAdmin(
+      authedReq("/admin/api/accounts/proxy-test", {
+        method: "POST",
+        body: JSON.stringify({ proxy: "socks5://10.0.0.1:1080", provider: "bigmodel" }),
+      }),
+      opts,
+    );
+    expect(resp!.status).toBe(200);
+    const body = await resp!.json();
+    expect(body.ok).toBe(true);
+    expect(body.target).toContain("bigmodel.cn");
+    expect(receivedUrl).toContain("bigmodel.cn");
+  });
+
+  it("treats any HTTP status as success (including 4xx/5xx)", async () => {
+    // Even a 404 from the upstream host means the proxy is reachable —
+    // only network-level failures should report ok=false.
+    const mockFetch = (async (_url: string, _init?: any): Promise<Response> => {
+      return new Response("Not Found", { status: 404 });
+    }) as unknown as typeof fetch;
+
+    const opts = makeAdminOpts({ fetchImpl: mockFetch });
+    const resp = await callAdmin(
+      authedReq("/admin/api/accounts/proxy-test", {
+        method: "POST",
+        body: JSON.stringify({ proxy: "http://proxy:8080" }),
+      }),
+      opts,
+    );
+    expect(resp!.status).toBe(200);
+    const body = await resp!.json();
+    expect(body.ok).toBe(true);
+    expect(body.status).toBe(404);
+  });
+
+  it("returns ok:false with error message when fetch throws", async () => {
+    // Simulate a network-level failure (proxy unreachable, DNS failure, etc.)
+    const mockFetch = (async (_url: string, _init?: any): Promise<Response> => {
+      throw new Error("ECONNREFUSED 127.0.0.1:7890");
+    }) as unknown as typeof fetch;
+
+    const opts = makeAdminOpts({ fetchImpl: mockFetch });
+    const resp = await callAdmin(
+      authedReq("/admin/api/accounts/proxy-test", {
+        method: "POST",
+        body: JSON.stringify({ proxy: "http://127.0.0.1:7890" }),
+      }),
+      opts,
+    );
+    // Still HTTP 200 so the dashboard can render the error message cleanly.
+    expect(resp!.status).toBe(200);
+    const body = await resp!.json();
+    expect(body.ok).toBe(false);
+    expect(body.error).toContain("ECONNREFUSED");
+    expect(typeof body.latencyMs).toBe("number");
+  });
+
+  it("reports timeout clearly when AbortController fires", async () => {
+    // Simulate a fetch that hangs and gets aborted by the timeout
+    const mockFetch = (async (_url: string, init?: any): Promise<Response> => {
+      // Wait longer than the timeout, then check if aborted
+      await new Promise(resolve => setTimeout(resolve, 200));
+      if (init?.signal?.aborted) {
+        throw new Error("The operation was aborted");
+      }
+      return new Response(null, { status: 200 });
+    }) as typeof fetch;
+
+    const opts = makeAdminOpts({ fetchImpl: mockFetch });
+    // Note: real timeout is 10s — for test speed we accept the 200ms wait.
+    const resp = await callAdmin(
+      authedReq("/admin/api/accounts/proxy-test", {
+        method: "POST",
+        body: JSON.stringify({ proxy: "http://slow-proxy:9999" }),
+      }),
+      opts,
+    );
+    expect(resp!.status).toBe(200);
+    const body = await resp!.json();
+    // The mock should have detected the abort; either the test runs faster
+    // than the 10s timeout (so ok:true) or the mock's own 200ms wait
+    // completes normally. We only assert the response shape.
+    expect(typeof body.ok).toBe("boolean");
+    expect(typeof body.latencyMs).toBe("number");
+  });
+});

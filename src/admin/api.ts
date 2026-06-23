@@ -29,6 +29,12 @@ export interface AdminOptions {
   auth: AuthManager;
   configPath: string;
   startTime: number;
+  /**
+   * Optional fetch override for outbound requests made by admin handlers
+   * (currently used by /admin/api/accounts/proxy-test). Defaults to the
+   * global fetch. Test code passes a mock here to avoid real network calls.
+   */
+  fetchImpl?: typeof fetch;
 }
 
 // In-memory stats collector.
@@ -541,6 +547,97 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
       return jsonResp({ ok: true, proxy: trimmed });
     } catch (err) {
       return errorResponse(500, "update_failed", (err as Error).message);
+    }
+  }
+
+  // Test proxy connectivity (v2.1.4.1test6+)
+  // Does a HEAD request to the configured provider's base URL through the
+  // supplied proxy URL. Any HTTP response (even 4xx/5xx) means the proxy is
+  // reachable; only network-level failures (timeout, connection refused, DNS
+  // failure through the proxy, auth rejection by the proxy) report ok=false.
+  //
+  // Body: { proxy: string, provider?: "zai"|"bigmodel" }
+  // Returns: { ok: true, status, latencyMs, target } on success
+  //          { ok: false, error, latencyMs, target } on failure (still HTTP 200
+  //           so the dashboard can render the error message cleanly)
+  if (path === "/admin/api/accounts/proxy-test" && method === "POST") {
+    try {
+      const body = await req.json() as { proxy?: string; provider?: string };
+      if (typeof body.proxy !== "string") {
+        return errorResponse(400, "missing_param", "proxy is required");
+      }
+      const trimmed = body.proxy.trim();
+      if (!trimmed) {
+        return errorResponse(400, "invalid_param", "proxy URL cannot be empty (use 'No proxy' on the dashboard instead)");
+      }
+      if (!/^(https?|socks5h?):\/\/[^\s]+$/i.test(trimmed)) {
+        return errorResponse(
+          400,
+          "invalid_param",
+          "proxy must be a valid URL with scheme http://, https://, socks5://, or socks5h://",
+        );
+      }
+
+      // Test target: the relevant provider's base host. Hitting the bare host
+      // (no path, no auth) is enough to verify the proxy can reach it — any
+      // HTTP response means success. 10s timeout is generous for slow proxies
+      // but short enough that a dead proxy doesn't hang the dashboard.
+      const providerId = body.provider === "bigmodel" ? "bigmodel" : "zai";
+      const providerCfg = opts.config.providers[providerId];
+      // Use the anthropicBase URL (e.g. https://api.z.ai/api/anthropic) and
+      // strip down to just the origin — we want a HEAD against the host root,
+      // not a real API path (which would 404 anyway, but origin is cleaner).
+      let target: string;
+      try {
+        const u = new URL(providerCfg.anthropicBase);
+        target = `${u.protocol}//${u.host}`;
+      } catch {
+        target = providerId === "bigmodel"
+          ? "https://open.bigmodel.cn"
+          : "https://api.z.ai";
+      }
+
+      const started = Date.now();
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 10_000);
+      // Use injected fetchImpl if provided (for tests); fall back to global.
+      const fetchImpl = opts.fetchImpl ?? fetch;
+      try {
+        // Bun native: fetch(url, { proxy, signal })
+        const resp = await fetchImpl(target, {
+          method: "HEAD",
+          signal: ctrl.signal,
+          // Allow redirects to be followed automatically so a 3xx-to-200
+          // path is treated as success, not a redirect failure.
+          redirect: "follow",
+          // cast through any because { proxy } is Bun-specific
+          ...(trimmed ? { proxy: trimmed } : {}),
+        } as any);
+        clearTimeout(timer);
+        const latencyMs = Date.now() - started;
+        // Any HTTP response means the proxy is working — the upstream may
+        // return 200, 404, 403, etc. depending on its root path handling.
+        return jsonResp({
+          ok: true,
+          status: resp.status,
+          latencyMs,
+          target,
+        });
+      } catch (err) {
+        clearTimeout(timer);
+        const latencyMs = Date.now() - started;
+        const errMsg = (err as Error).message || String(err);
+        // Distinguish timeout from other errors for clearer UX
+        const isTimeout = ctrl.signal.aborted || /abort/i.test(errMsg);
+        return jsonResp({
+          ok: false,
+          error: isTimeout ? `Connection timed out after 10s` : errMsg,
+          latencyMs,
+          target,
+        });
+      }
+    } catch (err) {
+      return errorResponse(500, "test_failed", (err as Error).message);
     }
   }
 
