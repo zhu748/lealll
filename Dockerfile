@@ -4,10 +4,12 @@
 #
 # Why Bun (not Node)?
 #   - server.ts uses Bun.serve() directly, so we MUST run on Bun.
-#   - oven/bun:1.1-debian is a slim image that supports both Bun runtime
+#   - oven/bun:1.2-debian is a slim image that supports both Bun runtime
 #     and standard Linux glibc/musl tools Render's healthcheck needs.
+#     Note: bun.lock uses the new JSON lockfile format (lockfileVersion: 1)
+#     introduced in Bun 1.2, so we MUST use Bun >= 1.2 here.
 
-FROM oven/bun:1.1-debian AS base
+FROM oven/bun:1.2-debian AS base
 
 # Render injects PORT at runtime. We default to 8080 for local `docker run`.
 ENV ZCODE_PROXY_PORT=8080 \
