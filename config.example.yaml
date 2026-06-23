@@ -82,6 +82,7 @@ logging:
 #   ZCODE_RETRY_STATUSES         — comma-separated retryable status codes (e.g. "529,429,503")
 retry:
   # Maximum number of retry attempts. Set to 0 to disable retries.
+  # No upper bound — set as high as needed (e.g. 1000 for very flaky upstreams).
   maxRetries: 3
   # Initial delay (ms) before the first retry. Subsequent retries multiply by backoffFactor.
   initialDelayMs: 1000

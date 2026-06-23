@@ -1184,11 +1184,13 @@ function validateConfigForSave(cfg: Record<string, unknown>): void {
   }
 
   // Validate retry config bounds to prevent runaway retry loops.
+  // Note: maxRetries has NO upper bound — operators may legitimately want
+  // to retry indefinitely (e.g. a flaky upstream during peak hours).
   const retry = cfg.retry as Record<string, unknown> | undefined;
   if (retry) {
     const maxRetries = typeof retry.maxRetries === "number" ? retry.maxRetries : parseInt(String(retry.maxRetries), 10);
-    if (Number.isFinite(maxRetries) && (maxRetries < 0 || maxRetries > 10)) {
-      throw new Error(`retry.maxRetries ${maxRetries} is out of range (0-10)`);
+    if (Number.isFinite(maxRetries) && maxRetries < 0) {
+      throw new Error(`retry.maxRetries ${maxRetries} must be >= 0`);
     }
     const initialDelayMs = typeof retry.initialDelayMs === "number" ? retry.initialDelayMs : parseInt(String(retry.initialDelayMs), 10);
     if (Number.isFinite(initialDelayMs) && (initialDelayMs < 0 || initialDelayMs > 60_000)) {

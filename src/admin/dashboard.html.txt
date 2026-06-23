@@ -1842,6 +1842,35 @@ async function loadSettings(){
   }catch(e){console.error('loadSettings failed:',e);toast('加载设置失败','error')}
 }
 async function saveSettings(){
+  // --- 客户端预校验重试字段（服务端 validateConfigForSave 严格校验，
+  // 不符合的值会导致整次保存失败 + 真实错误被旧 toast 吞掉，表现为
+  // 「一改重试，所有 tab 都保存失败」。这里提前拦截，给用户明确提示）。
+  const maxRetries=parseInt(document.getElementById('cfgRetryMax').value,10);
+  const initialDelayMs=parseInt(document.getElementById('cfgRetryDelay').value,10);
+  const maxDelayMs=parseInt(document.getElementById('cfgRetryMaxDelay').value,10);
+  const backoffFactor=parseFloat(document.getElementById('cfgRetryBackoff').value);
+  const statusesRaw=document.getElementById('cfgRetryStatuses').value;
+  // 与服务端 validateConfigForSave 一致：100-599
+  const statuses=statusesRaw.split(',').map(s=>s.trim()).filter(Boolean)
+    .map(s=>parseInt(s,10))
+    .filter(n=>Number.isFinite(n)&&n>=100&&n<=599);
+  if(Number.isFinite(maxRetries)&&maxRetries<0){
+    toast('最大重试次数必须 >= 0（无上限）','error');return;
+  }
+  if(Number.isFinite(initialDelayMs)&&(initialDelayMs<0||initialDelayMs>60000)){
+    toast('初始延迟必须在 0-60000ms 之间','error');return;
+  }
+  if(Number.isFinite(maxDelayMs)&&(maxDelayMs<0||maxDelayMs>300000)){
+    toast('最大延迟必须在 0-300000ms 之间','error');return;
+  }
+  if(Number.isFinite(backoffFactor)&&backoffFactor<=0){
+    toast('退避因子必须大于 0','error');return;
+  }
+  // 检查用户输入的状态码格式：如果输入了非空但全部解析失败，提示
+  if(statusesRaw.trim()&&statuses.length===0){
+    toast('可重试状态码必须是 100-599 之间的数字（逗号分隔）','error');return;
+  }
+
   const cfg={
     server:{port:+document.getElementById('cfgPort').value,host:document.getElementById('cfgHost').value},
     provider:document.getElementById('cfgProvider').value,
@@ -1849,7 +1878,15 @@ async function saveSettings(){
     auth:{mode:document.getElementById('cfgAuthMode').value},
     defaultModel:document.getElementById('cfgDefaultModel').value,
     models:document.getElementById('cfgModels').value.split('\n').map(s=>s.trim()).filter(Boolean),
-    retry:{maxRetries:+document.getElementById('cfgRetryMax').value,initialDelayMs:+document.getElementById('cfgRetryDelay').value,maxDelayMs:+document.getElementById('cfgRetryMaxDelay').value,backoffFactor:+document.getElementById('cfgRetryBackoff').value,retryableStatuses:document.getElementById('cfgRetryStatuses').value.split(',').map(s=>parseInt(s.trim())).filter(n=>n>0)},
+    retry:{
+      // 空值兜底为合理默认，避免 +"" === 0 把字段变成 0；
+      // 服务端 loadConfig 的 resolvePositive* 也有兜底，这里保持一致。
+      maxRetries:Number.isFinite(maxRetries)?maxRetries:3,
+      initialDelayMs:Number.isFinite(initialDelayMs)?initialDelayMs:1000,
+      maxDelayMs:Number.isFinite(maxDelayMs)?maxDelayMs:8000,
+      backoffFactor:Number.isFinite(backoffFactor)&&backoffFactor>0?backoffFactor:2,
+      retryableStatuses:statuses.length>0?statuses:[529],
+    },
     identity:{appVersion:document.getElementById('cfgAppVer').value,sourceTitle:document.getElementById('cfgSrcTitle').value,refererOrigin:document.getElementById('cfgReferer').value},
     logging:{level:document.getElementById('cfgLogLevel').value}
   };
@@ -1867,7 +1904,14 @@ async function saveSettings(){
         toast('设置已保存（已热生效）','success');
       }
     }
-    else{const d=await r.json().catch(()=>({}));toast(d.message||'保存失败','error')}
+    else{
+      const d=await r.json().catch(()=>({}));
+      // 服务端错误结构为 { error: { type, message } }，旧代码误读 d.message，
+      // 导致真实错误被吞掉，用户只看到无意义的「保存失败」。
+      const msg=d?.error?.message||d?.message||'保存失败';
+      toast(msg,'error');
+      console.error('saveSettings failed:',{status:r.status,body:d});
+    }
   }catch{toast('保存失败','error')}
 }
 

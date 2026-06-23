@@ -385,11 +385,33 @@ describe("/admin/api/config PUT — validation", () => {
     expect(body.error.message).toContain("must be http(s)");
   });
 
-  it("rejects retry.maxRetries > 10", async () => {
+  it("accepts large retry.maxRetries (no upper bound)", async () => {
+    const opts = makeAdminOpts({ configPath: join(tmpDir, "config.yaml") });
+    // Send the full payload the way the dashboard does — partial payloads
+    // would trip "models must contain at least one entry" before reaching
+    // the retry validation, masking the actual behavior under test.
+    const resp = await callAdmin(authedReq("/admin/api/config", {
+      method: "PUT",
+      body: JSON.stringify({
+        provider: "zai", plan: "coding-plan",
+        defaultModel: "glm-4.6", models: ["glm-4.6"],
+        retry: { maxRetries: 50, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529] },
+      }),
+    }), opts);
+    expect(resp!.status).toBe(200);
+    const body = await resp!.json();
+    expect(body.ok).toBe(true);
+  });
+
+  it("rejects negative retry.maxRetries", async () => {
     const opts = makeAdminOpts({ configPath: join(tmpDir, "config.yaml") });
     const resp = await callAdmin(authedReq("/admin/api/config", {
       method: "PUT",
-      body: JSON.stringify({ retry: { maxRetries: 50 } }),
+      body: JSON.stringify({
+        provider: "zai", plan: "coding-plan",
+        defaultModel: "glm-4.6", models: ["glm-4.6"],
+        retry: { maxRetries: -1, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529] },
+      }),
     }), opts);
     expect(resp!.status).toBe(500);
     const body = await resp!.json();
