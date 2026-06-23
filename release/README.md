@@ -1,5 +1,27 @@
 # zcode-proxy 使用说明
 
+> **v2.1.4.1test1 — Responses 思考管理 + GLM 模型目录接口**
+>
+> 修复 Codex CLI 在 `/v1/responses` 接口下思考参数丢失的问题，并新增管理面板配置入口。
+>
+> **v2.1.4.1test1 关键改进**：
+> 1. **Responses 思考管理**：Codex CLI 经常把 `reasoning` 字段传成 `null`（即使本地配置开了 reasoning），导致思考参数丢光。新增管理面板「代理规则 → Responses 思考管理」卡片，可勾选需要强制开启思考的模型，无论客户端发什么都会注入 `thinking:{type:"enabled"}`
+> 2. **GLM 模型目录接口**：新增 `GET /admin/api/glm-models` 接口，返回完整 GLM 模型目录（含 reasoning 标记、上下文窗口、最大输出 tokens），供前端快速选择
+> 3. **模型映射快速选择**：模型映射的「GLM 模型」字段 datalist 改用完整 GLM 目录（之前只用白名单），输入时能看到全部 9 个 GLM 模型作为下拉建议
+> 4. **配置持久化**：`responsesThinking` 配置持久化到 `config.yaml`，支持 canonical `{models:[]}` 和简写数组两种形式
+> 5. **匹配规则**：按映射后的最终 GLM 模型 id 匹配（大小写不敏感），确保模型映射 + 思考强制开启协同工作
+> 6. **测试覆盖**：新增 11 个单元测试（5 个 loader + 6 个 translator），全套 378 测试通过，TypeScript 类型检查零错误
+>
+> **配置示例**：
+> ```yaml
+> responsesThinking:
+>   models:
+>     - glm-5.2
+>     - glm-4.6
+> ```
+>
+> ---
+
 > **v2.1.4.1test0 — 凭证自动切换测试版**
 >
 > 新增凭证自动切换功能：当同一凭证连续失败达到设定阈值时，自动切换到另一个已存储的凭证继续重试。
