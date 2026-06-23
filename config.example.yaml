@@ -1,5 +1,11 @@
 server:
   port: 8080
+  # Host to bind the proxy on.
+  #   "0.0.0.0" = bind on ALL interfaces (LAN/remote clients can connect)
+  #   "127.0.0.1" = bind on localhost ONLY (no remote access)
+  # NOTE: even when bound to 0.0.0.0, you must access the dashboard via
+  #   http://127.0.0.1:8080/admin (or your machine's LAN IP) — opening
+  #   http://0.0.0.0:8080/admin directly does NOT work on Windows / macOS.
   host: "0.0.0.0"
 
 auth:

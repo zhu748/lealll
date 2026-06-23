@@ -16,7 +16,7 @@ import { readFileSync, existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
-const VERSION = "2.1.4";
+const VERSION = "2.1.4.1";
 
 main();
 
@@ -246,6 +246,16 @@ async function serve(configPath?: string): Promise<void> {
   console.log(`  plan: ${config.plan}`);
   console.log(`  auth mode: ${config.auth.mode}`);
   console.log(`  models: ${config.models.length} available`);
+  // Helpful access hint: when bound to 0.0.0.0, the user must use 127.0.0.1
+  // (or localhost, or the machine's LAN IP) to reach the proxy. Browsers on
+  // Windows especially refuse to connect to http://0.0.0.0:port — this is
+  // the #1 "I can't open the dashboard" cause for Windows users.
+  if (server.hostname === "0.0.0.0" || server.hostname === "::") {
+    console.log(`  dashboard: http://127.0.0.1:${server.port}/admin`);
+    console.log(`  (bound to 0.0.0.0 — access via 127.0.0.1, localhost, or your LAN IP)`);
+  } else {
+    console.log(`  dashboard: ${url}/admin`);
+  }
 
   // Security warning: if proxyApiKey is unset, anyone on the network can
   // call /v1/* with this proxy and burn the user's quota. Surface this
