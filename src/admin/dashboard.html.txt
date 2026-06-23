@@ -888,7 +888,7 @@ td input{font-family:var(--font-mono)}
     <div class="sidebar-footer">
       <div class="version">
         <span class="dot"></span>
-        <span>v2.1.4.1</span>
+        <span>v2.1.4.1test0</span>
       </div>
       <div class="logout-btn" onclick="doLogout()">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
@@ -1110,6 +1110,13 @@ td input{font-family:var(--font-mono)}
                 <label class="form-label">可重试状态码（逗号分隔）</label>
                 <input id="cfgRetryStatuses" placeholder="529,429,503">
                 <div class="form-help">当上游返回这些状态码时触发重试</div>
+              </div>
+              <div class="form-row">
+                <div class="form-group">
+                  <label class="form-label">凭证切换阈值</label>
+                  <input id="cfgRetryCredSwitch" type="number" min="0">
+                  <div class="form-help">同一凭证连续失败此次数（含首次请求）后自动切换到另一个已存储的凭证。设为 0 禁用。需先在「账号管理」中添加多个账号。默认 5。</div>
+                </div>
               </div>
             </div>
           </div>
@@ -1835,6 +1842,7 @@ async function loadSettings(){
     document.getElementById('cfgRetryMaxDelay').value=c.retry?.maxDelayMs??8000;
     document.getElementById('cfgRetryBackoff').value=c.retry?.backoffFactor??2;
     document.getElementById('cfgRetryStatuses').value=(c.retry?.retryableStatuses||[529]).join(',');
+    document.getElementById('cfgRetryCredSwitch').value=c.retry?.credentialSwitchThreshold??5;
     document.getElementById('cfgAppVer').value=c.identity?.appVersion||'';
     document.getElementById('cfgSrcTitle').value=c.identity?.sourceTitle||'';
     document.getElementById('cfgReferer').value=c.identity?.refererOrigin||'';
@@ -1850,6 +1858,7 @@ async function saveSettings(){
   const maxDelayMs=parseInt(document.getElementById('cfgRetryMaxDelay').value,10);
   const backoffFactor=parseFloat(document.getElementById('cfgRetryBackoff').value);
   const statusesRaw=document.getElementById('cfgRetryStatuses').value;
+  const credSwitch=parseInt(document.getElementById('cfgRetryCredSwitch').value,10);
   // 与服务端 validateConfigForSave 一致：100-599
   const statuses=statusesRaw.split(',').map(s=>s.trim()).filter(Boolean)
     .map(s=>parseInt(s,10))
@@ -1870,6 +1879,10 @@ async function saveSettings(){
   if(statusesRaw.trim()&&statuses.length===0){
     toast('可重试状态码必须是 100-599 之间的数字（逗号分隔）','error');return;
   }
+  // 凭证切换阈值：非负整数，0 = 禁用
+  if(Number.isFinite(credSwitch)&&credSwitch<0){
+    toast('凭证切换阈值必须 >= 0（0 = 禁用）','error');return;
+  }
 
   const cfg={
     server:{port:+document.getElementById('cfgPort').value,host:document.getElementById('cfgHost').value},
@@ -1886,6 +1899,7 @@ async function saveSettings(){
       maxDelayMs:Number.isFinite(maxDelayMs)?maxDelayMs:8000,
       backoffFactor:Number.isFinite(backoffFactor)&&backoffFactor>0?backoffFactor:2,
       retryableStatuses:statuses.length>0?statuses:[529],
+      credentialSwitchThreshold:Number.isFinite(credSwitch)&&credSwitch>=0?credSwitch:5,
     },
     identity:{appVersion:document.getElementById('cfgAppVer').value,sourceTitle:document.getElementById('cfgSrcTitle').value,refererOrigin:document.getElementById('cfgReferer').value},
     logging:{level:document.getElementById('cfgLogLevel').value}

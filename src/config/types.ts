@@ -76,6 +76,21 @@ export interface RetryConfig {
    * Default: [529]
    */
   retryableStatuses: number[];
+  /**
+   * Number of consecutive failed attempts (including the initial request) with
+   * the same credential before automatically switching to another stored
+   * credential. Set to 0 to disable credential switching entirely.
+   *
+   * When the threshold is reached mid-retry-loop, the proxy picks a different
+   * stored credential (if any), rebuilds the request with the new credential's
+   * auth headers + userId, and continues retrying. Already-tried credentials
+   * are skipped in the same request to avoid cycling back to a known-bad one.
+   *
+   * Only effective when more than one credential is stored (multi-account mode)
+   * and `retry.maxRetries` is greater than or equal to this threshold.
+   * Default: 5
+   */
+  credentialSwitchThreshold: number;
 }
 
 /** Custom routing rule — overrides the default provider/endpoint for requests

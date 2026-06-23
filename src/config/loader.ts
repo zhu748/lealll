@@ -20,6 +20,7 @@ const ENV = {
   RETRY_MAX_DELAY_MS: "ZCODE_RETRY_MAX_DELAY_MS",
   RETRY_BACKOFF_FACTOR: "ZCODE_RETRY_BACKOFF_FACTOR",
   RETRY_STATUSES: "ZCODE_RETRY_STATUSES",
+  RETRY_CREDENTIAL_SWITCH_THRESHOLD: "ZCODE_RETRY_CREDENTIAL_SWITCH_THRESHOLD",
 } as const;
 
 const DEFAULTS = {
@@ -41,6 +42,7 @@ const DEFAULTS = {
   RETRY_MAX_DELAY_MS: 8000,
   RETRY_BACKOFF_FACTOR: 2,
   RETRY_STATUSES: [529],
+  RETRY_CREDENTIAL_SWITCH_THRESHOLD: 5,
 };
 
 /** Printable-ASCII gate copied from the ZCode bundle's `rYn` helper. */
@@ -218,7 +220,19 @@ function resolveRetry(raw?: unknown): RetryConfig {
     }).filter((n: number | null): n is number => n !== null);
   }
 
-  return { maxRetries, initialDelayMs, maxDelayMs, backoffFactor, retryableStatuses };
+  const credentialSwitchThreshold = resolveNonNegativeInt(
+    process.env[ENV.RETRY_CREDENTIAL_SWITCH_THRESHOLD] ?? r.credentialSwitchThreshold,
+    DEFAULTS.RETRY_CREDENTIAL_SWITCH_THRESHOLD,
+  );
+
+  return { maxRetries, initialDelayMs, maxDelayMs, backoffFactor, retryableStatuses, credentialSwitchThreshold };
+}
+
+/** Resolve a non-negative integer from a raw value, falling back to default. */
+function resolveNonNegativeInt(raw: unknown, fallback: number): number {
+  if (raw === undefined || raw === null) return fallback;
+  const n = typeof raw === "number" ? raw : parseInt(String(raw), 10);
+  return Number.isFinite(n) && n >= 0 ? Math.round(n) : fallback;
 }
 
 /** Resolve a positive integer from a raw value, falling back to default. */

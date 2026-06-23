@@ -75,13 +75,14 @@ logging:
 # the proxy will automatically retry with exponential backoff.
 # All fields are optional; defaults are shown below.
 # Environment variable overrides:
-#   ZCODE_RETRY_MAX              — max number of retries
-#   ZCODE_RETRY_INITIAL_DELAY_MS — initial delay before first retry (ms)
-#   ZCODE_RETRY_MAX_DELAY_MS     — maximum delay cap (ms)
-#   ZCODE_RETRY_BACKOFF_FACTOR   — backoff multiplier per attempt
-#   ZCODE_RETRY_STATUSES         — comma-separated retryable status codes (e.g. "529,429,503")
+#   ZCODE_RETRY_MAX                        — max number of retries
+#   ZCODE_RETRY_INITIAL_DELAY_MS           — initial delay before first retry (ms)
+#   ZCODE_RETRY_MAX_DELAY_MS               — maximum delay cap (ms)
+#   ZCODE_RETRY_BACKOFF_FACTOR             — backoff multiplier per attempt
+#   ZCODE_RETRY_STATUSES                   — comma-separated retryable status codes (e.g. "529,429,503")
+#   ZCODE_RETRY_CREDENTIAL_SWITCH_THRESHOLD — consecutive failures before switching credentials
 retry:
-  # Maximum number of retry attempts. Set to 0 to disable retries.
+  # Maximum number of retry attempts. Set to 0 to disable retries entirely.
   # No upper bound — set as high as needed (e.g. 1000 for very flaky upstreams).
   maxRetries: 3
   # Initial delay (ms) before the first retry. Subsequent retries multiply by backoffFactor.
@@ -94,3 +95,15 @@ retry:
   # Common values: 429 (rate limited), 503 (service unavailable), 529 (site overloaded).
   retryableStatuses:
     - 529
+  # Credential auto-switching: when the SAME credential fails this many times
+  # consecutively (including the initial request), the proxy automatically
+  # switches to another stored credential (if available) and continues retrying.
+  # Already-tried credentials are skipped in the same request to avoid cycling.
+  #
+  # Set to 0 to disable. Default: 5.
+  #
+  # Only effective when:
+  #   1. More than one credential is stored (add accounts via the dashboard or
+  #      `zcode-proxy auth login`).
+  #   2. maxRetries >= this threshold (otherwise the retry loop exhausts first).
+  credentialSwitchThreshold: 5

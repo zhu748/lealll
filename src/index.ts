@@ -6,7 +6,7 @@ import { loadConfig } from "./config/loader.js";
 import { EXAMPLE_CONFIG_YAML } from "./config/template.js";
 import { AuthManager } from "./auth/manager.js";
 import { startServer } from "./server/server.js";
-import { loadCredential, saveCredential, clearCredential, getStorePath } from "./auth/store.js";
+import { loadCredential, saveCredential, clearCredential, getStorePath, exportAccounts } from "./auth/store.js";
 import { ZaiOAuthClient, BigmodelOAuthClient } from "./auth/oauth.js";
 import { KeyResolver } from "./auth/resolver.js";
 import type { Credential, PlanId } from "./auth/types.js";
@@ -16,7 +16,7 @@ import { readFileSync, existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
-const VERSION = "2.1.4.1";
+const VERSION = "2.1.4.1test0";
 
 main();
 
@@ -111,6 +111,14 @@ async function serve(configPath?: string): Promise<void> {
     mode: config.auth.mode,
     provider: config.provider,
     apiKey: config.auth.apiKey ?? config.providers[config.provider].credential,
+    // Provide access to all stored credentials so the proxy can auto-switch
+    // to a different account when the current one fails repeatedly.
+    // In apikey mode there's only one credential, so switching is a no-op
+    // (switchToNextCredential returns null) — that's fine.
+    listAllCredentials: async () => {
+      const accounts = await exportAccounts();
+      return accounts.map(a => a.credential);
+    },
   });
 
   if (config.auth.mode === "oauth") {

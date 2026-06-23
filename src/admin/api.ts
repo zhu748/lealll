@@ -1208,6 +1208,16 @@ function validateConfigForSave(cfg: Record<string, unknown>): void {
         }
       }
     }
+    // credentialSwitchThreshold: 0 = disabled, otherwise the number of
+    // consecutive failures (including initial) before switching credentials.
+    // No upper bound — but if it exceeds maxRetries+1, switching will never
+    // trigger (the retry loop exhausts first). We allow any non-negative int.
+    const credentialSwitchThreshold = typeof retry.credentialSwitchThreshold === "number"
+      ? retry.credentialSwitchThreshold
+      : parseInt(String(retry.credentialSwitchThreshold), 10);
+    if (Number.isFinite(credentialSwitchThreshold) && credentialSwitchThreshold < 0) {
+      throw new Error(`retry.credentialSwitchThreshold ${credentialSwitchThreshold} must be >= 0`);
+    }
   }
 
   // Validate models array is non-empty (after applying changes).

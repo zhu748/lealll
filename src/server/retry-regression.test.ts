@@ -36,7 +36,7 @@ function makeRetryConfig(): ProxyConfig {
     identity: { appVersion: "test-1.0.0", sourceTitle: "cli", refererOrigin: "https://zcode.z.ai" },
     logging: { level: "info" },
     // Enable retries: 529 is retryable, use short delays for fast tests
-    retry: { maxRetries: 3, initialDelayMs: 10, maxDelayMs: 50, backoffFactor: 2, retryableStatuses: [529, 502] },
+    retry: { maxRetries: 3, initialDelayMs: 10, maxDelayMs: 50, backoffFactor: 2, retryableStatuses: [529, 502], credentialSwitchThreshold: 0 },
   };
 }
 

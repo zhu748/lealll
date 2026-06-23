@@ -12,6 +12,7 @@
 import type { Format } from "../translator/types.js";
 import type { ProxyConfig } from "../config/types.js";
 import type { AuthManager } from "../auth/manager.js";
+import type { Credential } from "../auth/types.js";
 import { getProvider } from "../provider/providers.js";
 import { listModelIds } from "../provider/models.js";
 import { buildUpstreamRequest } from "./upstream.js";
@@ -24,8 +25,9 @@ import { translateResponseAnthropicToResponses, anthropicSseToResponsesSse } fro
 import { saveTurn } from "../translator/responses-store.js";
 import { anthropicSseToOpenaiSse } from "../translator/sse-translator.js";
 import type { OpenAIChatRequest, OpenAIResponseRequest, AnthropicMessagesResponse } from "../translator/types.js";
-import { recordStat, recordDebugDump } from "../admin/api.js";
+import { recordStat, recordDebugDump, appendLog } from "../admin/api.js";
 import { sleep } from "../utils/sleep.js";
+import { exportAccounts, switchAccount, maskApiKey } from "../auth/store.js";
 
 /** Options for the proxy handler. */
 export interface ProxyHandlerOptions {
@@ -105,7 +107,7 @@ export async function proxyRequest(
     // override is applied (the most common use case).
   }
 
-  let cred;
+  let cred: Credential;
   try {
     cred = await auth.getCredential();
   } catch (err) {
@@ -158,8 +160,8 @@ export async function proxyRequest(
     upstreamBodyObj = translated;
   }
 
-  const transformedObj = transformRequestBodyObj(upstreamBodyObj, { format: upstreamFormat, userId: cred.userId, startPlan: config.plan === "start-plan" });
-  const transformedBody = transformedObj !== undefined ? JSON.stringify(transformedObj) : undefined;
+  let transformedObj = transformRequestBodyObj(upstreamBodyObj, { format: upstreamFormat, userId: cred.userId, startPlan: config.plan === "start-plan" });
+  let transformedBody = transformedObj !== undefined ? JSON.stringify(transformedObj) : undefined;
 
   // Diagnostic: log thinking-block strip counts so users can verify the fix
   // is actually running. If the count goes from N → 0, the strip worked.
@@ -343,6 +345,20 @@ export async function proxyRequest(
   if (config.retry.maxRetries > 0 && config.retry.retryableStatuses.includes(upstreamResp.status)) {
     try { upstreamResp.body?.cancel(); } catch {}
 
+    // Credential switching: track consecutive failures with the current
+    // credential. When the threshold (config.retry.credentialSwitchThreshold)
+    // is reached, the proxy switches to another stored credential before the
+    // next retry. The initial attempt already failed (we only enter this block
+    // on a retryable status), so the counter starts at 1.
+    let consecutiveCredFailures = 1;
+    // Fallback to 0 (disabled) if the field is missing — e.g. when a partial
+    // config update via the admin API replaced the retry object without this
+    // field. The loader always sets it, so this is just a safety net.
+    const switchThreshold = config.retry.credentialSwitchThreshold ?? 0;
+    // Credentials already tried in this request — prevents cycling back to a
+    // known-failing credential when multiple alternatives exist.
+    const triedApiKeys = new Set<string>([cred.apiKey]);
+
     for (let attempt = 1; attempt <= config.retry.maxRetries; attempt++) {
       // Calculate backoff delay: initialDelay * backoffFactor^(attempt-1), capped at maxDelay
       const rawDelay = config.retry.initialDelayMs * Math.pow(config.retry.backoffFactor, attempt - 1);
@@ -379,6 +395,54 @@ export async function proxyRequest(
       );
       await sleep(delayMs);
 
+      // Credential switching: if the current credential has failed
+      // consecutively enough times, switch to another stored credential
+      // before this retry attempt. The new credential's auth headers and
+      // userId are applied by reassigning `cred` and rebuilding the
+      // transformed body — the buildUpstreamReq closure picks up the new
+      // values automatically on the next fetch.
+      if (switchThreshold > 0 && consecutiveCredFailures >= switchThreshold) {
+        const failedCount = consecutiveCredFailures;
+        const newCred = await auth.switchToNextCredential(triedApiKeys);
+        if (newCred) {
+          console.log(
+            `${reqId} credential switched after ${failedCount} consecutive failures ` +
+            `(retry ${attempt}/${config.retry.maxRetries}): ${maskApiKey(cred.apiKey)} → ${maskApiKey(newCred.apiKey)}`,
+          );
+          cred = newCred;
+          // Rebuild the transformed body — userId is credential-specific and
+          // gets injected into Anthropic metadata on start-plan.
+          transformedObj = transformRequestBodyObj(upstreamBodyObj, {
+            format: upstreamFormat,
+            userId: cred.userId,
+            startPlan: config.plan === "start-plan",
+          });
+          transformedBody = transformedObj !== undefined ? JSON.stringify(transformedObj) : undefined;
+          consecutiveCredFailures = 0;
+          triedApiKeys.add(newCred.apiKey);
+          // Persist the switch so the dashboard reflects the new active account.
+          // Non-fatal: if persistence fails, the in-memory switch still works
+          // for the remainder of this request.
+          try {
+            const accounts = await exportAccounts();
+            const match = accounts.find(a => a.credential.apiKey === newCred.apiKey);
+            if (match) {
+              await switchAccount(match.id);
+              appendLog("info", `Auto-switched credential to "${match.label}" (${maskApiKey(newCred.apiKey)}) after ${failedCount} consecutive failures`);
+            }
+          } catch (e) {
+            console.log(`${reqId} could not persist credential switch: ${(e as Error).message}`);
+          }
+        } else {
+          // No alternative credential available (or all alternatives already
+          // tried in this request). Continue retrying with the current one.
+          console.log(
+            `${reqId} credential switch threshold reached but no alternative credential available ` +
+            `(tried ${triedApiKeys.size} credential(s)), continuing with current`,
+          );
+        }
+      }
+
       try {
         // Build a FRESH Request for each retry — never reuse upstreamReq.
         // fetchUpstreamDetected also runs SSE error detection so 200 streams
@@ -405,6 +469,8 @@ export async function proxyRequest(
         // Network error during retry — log the ACTUAL error so users can
         // diagnose (the old code just said "network error" with no detail).
         const errMsg = (err as Error).message ?? String(err);
+        // Network errors count toward the credential-switch failure counter.
+        consecutiveCredFailures++;
         if (attempt < config.retry.maxRetries) {
           console.log(`${reqId} fetch failed on retry ${attempt}: ${errMsg}, will retry again...`);
           // Network errors are ALWAYS retryable — they are the most common
@@ -426,6 +492,9 @@ export async function proxyRequest(
         console.log(`${reqId} retry ${attempt} succeeded (status ${upstreamResp.status})`);
         break;
       }
+
+      // Still a retryable status — count as a failure for credential switching.
+      consecutiveCredFailures++;
 
       // Still a retryable status — if this was the last attempt, keep the
       // response body intact (don't cancel) so we can return it to the

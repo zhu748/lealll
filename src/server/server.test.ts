@@ -23,7 +23,7 @@ function makeConfig(overrides: Partial<ProxyConfig> = {}): ProxyConfig {
     models: ["glm-4.6"],
     identity: { appVersion: "test-1.0.0", sourceTitle: "cli", refererOrigin: "https://zcode.z.ai" },
     logging: { level: "info" },
-    retry: { maxRetries: 0, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529] },
+    retry: { maxRetries: 0, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0 },
     ...overrides,
   };
 }
