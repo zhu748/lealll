@@ -134,3 +134,73 @@ describe("KeyResolver", () => {
     expect(cred.provider).toBe("zai");
   });
 });
+
+describe("KeyResolver.resolveCredential — start-plan graceful fallback", () => {
+  // biz API answers normally → full credential (apiKey+secret) + jwt attached.
+  it("start-plan: keeps the biz-API apiKey/secret when the exchange succeeds, and attaches jwt", async () => {
+    const fetchImpl = mockFetch({
+      "/auth/z/login": () => new Response(JSON.stringify({ access_token: "bizTok" }), {
+        status: 200, headers: { "content-type": "application/json" },
+      }),
+      "getCustomerInfo": () => bizResponse({
+        organizations: [{ organizationId: "o1", organizationName: "默认机构", projects: [{ projectId: "p1", projectName: "默认项目" }] }],
+      }),
+      "api_keys/copy": () => bizResponse({ secretKey: "mySecret" }),
+      "api_keys": (body) => body ? bizResponse({ apiKey: "myApiKey" }) : bizResponse([]),
+    });
+    const resolver = new KeyResolver(fetchImpl);
+    const cred = await resolver.resolveCredential("accessTok", "zai", "u1", "start-plan", "planJWT");
+    expect(cred.apiKey).toBe("myApiKey");
+    expect(cred.secret).toBe("mySecret");
+    expect(cred.plan).toBe("start-plan");
+    expect(cred.jwt).toBe("planJWT");
+  });
+
+  // biz API fails → start-plan MUST fall back to a JWT-only credential instead
+  // of throwing away the whole login (the jwt is what start-plan actually sends).
+  it("start-plan: falls back to JWT-only credential when biz exchange fails", async () => {
+    // Every biz endpoint 404s → resolveCodingPlanCredential throws.
+    const fetchImpl = mockFetch({ "/auth/z/login": () => new Response("nope", { status: 404 }) });
+    const resolver = new KeyResolver(fetchImpl);
+    const cred = await resolver.resolveCredential("accessTok", "zai", "u1", "start-plan", "planJWT");
+    expect(cred.apiKey).toBe("planJWT"); // apiKey mirrors the JWT (fallback shape)
+    expect(cred.jwt).toBe("planJWT");
+    expect(cred.plan).toBe("start-plan");
+    expect(cred.provider).toBe("zai");
+    expect(cred.userId).toBe("u1");
+  });
+
+  // start-plan failure with NO jwt → nothing to fall back to → must throw.
+  it("start-plan: throws when biz fails and no jwt is available", async () => {
+    const fetchImpl = mockFetch({ "/auth/z/login": () => new Response("nope", { status: 404 }) });
+    const resolver = new KeyResolver(fetchImpl);
+    expect(resolver.resolveCredential("accessTok", "zai", "u1", "start-plan")).rejects.toThrow();
+  });
+
+  // coding-plan: NO fallback — biz failure must propagate.
+  it("coding-plan: does not fall back, propagates biz exchange failure", async () => {
+    const fetchImpl = mockFetch({ "/auth/z/login": () => new Response("nope", { status: 404 }) });
+    const resolver = new KeyResolver(fetchImpl);
+    expect(resolver.resolveCredential("accessTok", "zai", "u1", "coding-plan", "planJWT"))
+      .rejects.toThrow();
+  });
+
+  // coding-plan success still attaches jwt (parity with the old explicit attach).
+  it("coding-plan: attaches jwt on success", async () => {
+    const fetchImpl = mockFetch({
+      "/auth/z/login": () => new Response(JSON.stringify({ access_token: "bizTok" }), {
+        status: 200, headers: { "content-type": "application/json" },
+      }),
+      "getCustomerInfo": () => bizResponse({
+        organizations: [{ organizationId: "o1", organizationName: "默认机构", projects: [{ projectId: "p1", projectName: "默认项目" }] }],
+      }),
+      "api_keys/copy": () => bizResponse({ secretKey: "mySecret" }),
+      "api_keys": (body) => body ? bizResponse({ apiKey: "myApiKey" }) : bizResponse([]),
+    });
+    const resolver = new KeyResolver(fetchImpl);
+    const cred = await resolver.resolveCredential("accessTok", "zai", "u1", "coding-plan", "planJWT");
+    expect(cred.apiKey).toBe("myApiKey");
+    expect(cred.plan).toBe("coding-plan");
+    expect(cred.jwt).toBe("planJWT");
+  });
+});

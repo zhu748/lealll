@@ -831,8 +831,7 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
             const authCode = await oauth.waitForCallback(300_000);
             const { accessToken, userId, jwt } = await oauth.exchangeCode(authCode, callbackUrl, state);
             const resolver = new KeyResolver();
-            const cred = await resolver.resolveCodingPlanCredential(accessToken, provider, userId, oauthPlan);
-            if (jwt) cred.jwt = jwt;
+            const cred = await resolver.resolveCredential(accessToken, provider, userId, oauthPlan, jwt);
             await saveCredential(cred);
             // Hot-swap the in-memory credential so the new account takes
             // effect immediately. Without this, the AuthManager keeps using
@@ -858,17 +857,28 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
         return jsonResp({ flowId, authorizeUrl });
       }
 
-      // Z.AI OAuth
+      // Z.AI OAuth — same auth-code/callback shape as bigmodel above.
+      // start() spins up the localhost callback server and returns the
+      // authorize URL (flowId == state doubles as the CSRF token + flow key).
       const oauth = new ZaiOAuthClient();
-      const init = await oauth.init("zai");
-      activeFlows.set(init.flowId, { provider, flowId: init.flowId, pollToken: init.pollToken, expiresAt: init.expiresAt, plan: oauthPlan });
-      // Background poll
+      const init = await oauth.start();
+      activeFlows.set(init.flowId, {
+        provider,
+        flowId: init.flowId,
+        pollToken: init.pollToken,
+        expiresAt: init.expiresAt,
+        callbackUrl: init.callbackUrl,
+        state: init.state,
+        plan: oauthPlan,
+      } as any);
+      // Background process: wait for the localhost callback, then exchange.
+      // Wrapped in try/finally so oauth.close() ALWAYS runs — see bigmodel path.
       (async () => {
         try {
-          const result = await oauth.waitForAuth(init);
+          const authCode = await oauth.waitForCallback(init.expiresAt - Date.now() || 300_000);
+          const { accessToken, userId, jwt } = await oauth.exchangeCode(authCode, init.callbackUrl, init.state);
           const resolver = new KeyResolver();
-          const cred = await resolver.resolveCodingPlanCredential(result.accessToken, provider, result.userId, oauthPlan);
-          if (result.jwt) cred.jwt = result.jwt;
+          const cred = await resolver.resolveCredential(accessToken, provider, userId, oauthPlan, jwt);
           await saveCredential(cred);
           // Hot-swap the in-memory credential — see comment in bigmodel path.
           const zaiActiveCred = await loadCredential();
@@ -878,9 +888,12 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
         } catch (err) {
           const flow = activeFlows.get(init.flowId);
           if (flow) { (flow as any).status = "failed"; (flow as any).error = (err as Error).message; }
+          appendLog("debug", `zai OAuth flow ${init.flowId} failed: ${(err as Error).message}`);
+        } finally {
+          try { await oauth.close(); } catch (e) { appendLog("debug", `oauth.close() cleanup failed: ${(e as Error).message}`); }
         }
       })();
-      return jsonResp({ flowId: init.flowId, authorizeUrl: init.authorizeUrl });
+      return jsonResp({ flowId: init.flowId, authorizeUrl: init.authorizeUrl, expiresAt: init.expiresAt });
     } catch (err) {
       return errorResponse(500, "oauth_init_failed", (err as Error).message);
     }
@@ -933,35 +946,24 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
         return errorResponse(400, "invalid_callback", "Callback URL missing 'code' or 'state' parameter.");
       }
 
-      // Now poll the Z.AI OAuth endpoint — the flow should be ready since the user has authorized
+      // Z.AI manual callback: same shape as the bigmodel path below. The
+      // user pasted the redirected browser URL (containing ?code=&state=);
+      // we exchange it via the zcode.z.ai proxy using the localhost
+      // callback URL + state recorded on the flow at start() time.
       if (flow.provider === "zai") {
         const oauth = new ZaiOAuthClient();
-        let pollResult;
-        // Try polling a few times in case the server hasn't fully processed the callback yet
-        for (let attempt = 0; attempt < 5; attempt++) {
-          pollResult = await oauth.poll(flow.flowId, flow.pollToken);
-          if (pollResult.status === "ready") break;
-          if (pollResult.status === "failed") {
-            activeFlows.delete(flowId);
-            return errorResponse(400, "oauth_failed", "Authorization was rejected or failed on the server side.");
-          }
-          // pending -> wait briefly and retry
-          await new Promise(r => setTimeout(r, 1500));
+        const storedCallbackUrl = (flow as any).callbackUrl;
+        if (!storedCallbackUrl) {
+          return errorResponse(500, "missing_callback", "Original localhost callback URL not found. Please restart the login.");
         }
-
-        if (!pollResult || pollResult.status !== "ready") {
-          return errorResponse(408, "oauth_timeout", "Authorization not yet detected. Please verify you completed the authorization in the browser and try again.");
+        // state from the pasted URL must match the state recorded on the flow
+        if (state !== flow.state) {
+          return errorResponse(400, "state_mismatch", "Callback state does not match the OAuth flow. Please restart the login.");
         }
-
-        const accessToken = pollResult.zai?.access_token ?? pollResult.token;
-        if (!accessToken || typeof accessToken !== "string") {
-          return errorResponse(500, "oauth_no_token", "OAuth completed but no access_token was returned.");
-        }
-
+        const { accessToken, userId, jwt } = await oauth.exchangeCode(code, storedCallbackUrl, state);
         const resolver = new KeyResolver();
-        const flowPlan = (flow as any).plan as "coding-plan" | "start-plan" | undefined;
-        const cred = await resolver.resolveCodingPlanCredential(accessToken, "zai", pollResult.userId, flowPlan);
-        if (pollResult.token) cred.jwt = pollResult.token;
+        const flowPlan = ((flow as any).plan ?? "coding-plan") as "coding-plan" | "start-plan";
+        const cred = await resolver.resolveCredential(accessToken, "zai", userId, flowPlan, jwt);
         await saveCredential(cred);
         // Hot-swap the in-memory credential so the manual-callback flow
         // also takes effect immediately (parity with auto-poll path).
@@ -991,9 +993,8 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
         }
         const { accessToken, userId, jwt } = await oauth.exchangeCode(code, storedCallbackUrl, state);
         const resolver = new KeyResolver();
-        const flowPlan = (flow as any).plan as "coding-plan" | "start-plan" | undefined;
-        const cred = await resolver.resolveCodingPlanCredential(accessToken, "bigmodel", userId, flowPlan);
-        if (jwt) cred.jwt = jwt;
+        const flowPlan = ((flow as any).plan ?? "coding-plan") as "coding-plan" | "start-plan";
+        const cred = await resolver.resolveCredential(accessToken, "bigmodel", userId, flowPlan, jwt);
         await saveCredential(cred);
 
         activeFlows.delete(flowId);

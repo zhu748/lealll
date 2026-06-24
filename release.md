@@ -2,32 +2,35 @@
 
 > 供 Agent 参考的完整构建流程。每次发版前务必按此文档执行。
 >
-> **关键原则**：`start.bat` / `start.sh` 已纳入仓库 `release/` 目录，**默认复用**。
-> 但**不能无脑复用**——如果 CLI 命令、菜单项、参数逻辑有变化，必须重新生成脚本并提交到仓库。
-> 详见 Section 4 的「脚本变更检测」流程。
+> **关键原则**：发版已完全自动化。Agent 只需 **改版本号 + 改脚本（如需）+ 打 tag**，
+> 剩下的编译/打包/上传全部由 GitHub Actions 完成。**不要再手动跑 `bun build`、手动 zip、手动调 GitHub API。**
+>
+> `start.bat` / `start.sh` 已纳入仓库 `release/` 目录，默认复用；但**不能无脑复用**——
+> 如果 CLI 命令、菜单项、参数逻辑有变化，必须重新生成脚本并提交到仓库（见 Section 3）。
 
 ---
 
-## 0. 前置准备
+## 构建产物（不变）
 
-```bash
-cd /home/z/my-project/lealll
-git pull
+无论谁来构建，最终产物完全一致，就是这一个 zip：
+
+```
+zcode-proxy-v{VERSION}.zip
+├── zcode-proxy.exe    ← bun build --compile --target=bun-windows-x64 编译的 Windows PE
+├── config.yaml        ← 由 config.example.yaml 复制
+├── start.bat          ← 仓库内（Section 3 校验/更新，ASCII + CRLF）
+├── start.sh           ← 仓库内（Section 3 校验/更新，可执行）
+└── README.md          ← 仓库内（Section 1 更新版本号）
 ```
 
-确认 `release/` 目录已包含：
-- `start.bat`  — Windows 启动脚本（仓库内，ASCII + CRLF）
-- `start.sh`   — Linux/macOS 启动脚本（仓库内，可执行）
-- `README.md`  — 使用说明（仓库内，每次发版时更新版本号）
-
 ---
 
-## 1. 更新版本号
+## 1. 更新版本号（Agent 必做）
 
-三处版本号必须同步：
+三处版本号必须同步，且与即将打的 tag 完全一致：
 
 ```bash
-VERSION="2.1.3.5"   # 替换为当前版本
+VERSION="2.1.4.2"   # 替换为当前版本（不要带前导 v）
 
 # package.json
 sed -i "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" package.json
@@ -35,50 +38,40 @@ sed -i "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" package.json
 # src/index.ts (VERSION 常量)
 sed -i "s/const VERSION = \".*\"/const VERSION = \"$VERSION\"/" src/index.ts
 
-# src/admin/dashboard.html.txt (侧栏版本号)
-sed -i "s|<span>v2\.[0-9.]*</span>|<span>v$VERSION</span>|" src/admin/dashboard.html.txt
+# src/admin/dashboard.html.txt (侧栏版本号，带 v 前缀)
+sed -i "s|<span>v[^<]*</span>|<span>v$VERSION</span>|" src/admin/dashboard.html.txt
 
-# release/README.md (顶部版本说明，手动更新改进列表)
+# release/README.md (顶部版本说明，手动追加本次改进列表)
 ```
+
+> ⚠️ GitHub Actions 会**硬校验**这三处必须等于 tag 版本号，不一致直接构建失败。
+> 所以这一步必须先做完，再打 tag。
+
+### 1.1 release/README.md 的版本说明
+
+在 `release/README.md` 顶部追加本次版本的更新条目（沿用现有格式：`> **v{VERSION} — 一句话标题**` + 改进列表）。
+这是 zip 包内用户唯一能看到的更新说明，务必写清「改了什么、影响谁」。
 
 ---
 
-## 2. 跑测试 + 类型检查
+## 2. 跑测试 + 类型检查（本地预检，Agent 应做）
+
+提交前本地先跑一遍，避免 push 上去才发现 CI 红：
 
 ```bash
 bun test             # 必须全部通过
 bun x tsc --noEmit   # 必须零错误
 ```
 
----
-
-## 3. 编译 Windows 可执行文件
-
-```bash
-cd /home/z/my-project/lealll
-
-# 必须加 --target=bun-windows-x64，否则编译出的是 Linux ELF 格式，Windows 无法运行
-bun build --compile \
-  --define "require.resolve=undefined" \
-  --target=bun-windows-x64 \
-  src/index.ts \
-  --outfile release/zcode-proxy.exe
-```
-
-验证格式：
-```bash
-file release/zcode-proxy.exe
-# 必须输出: PE32+ executable for MS Windows 6.00 (console), x86-64
-# 如果输出 ELF 64-bit，说明忘了加 --target，Windows 会报"不兼容的16位应用程序"
-```
+> GitHub Actions 也会跑这两步作为发版门禁。本地过了，CI 基本也过。
 
 ---
 
-## 4. 脚本变更检测（关键步骤）
+## 3. 脚本变更检测（关键步骤）
 
 **不能无脑复用仓库里的 start.bat / start.sh！** 每次发版前必须检查脚本逻辑是否需要更新。
 
-### 4.1 检测时机
+### 3.1 检测时机
 
 以下任一情况发生时，**必须重新生成脚本**：
 
@@ -90,28 +83,26 @@ file release/zcode-proxy.exe
 | `src/index.ts` 的 `printHelp()` 或 `authCommand()` 改动 | 任何 CLI 入口逻辑变化 |
 | OAuth 流程变化 | `src/auth/oauth.ts` / `src/admin/api.ts` `/admin/api/oauth/*` |
 
-### 4.2 检测方法
+### 3.2 检测方法
 
 ```bash
-cd /home/z/my-project/lealll
-
-# 1. 检查 src/index.ts 自上次发版以来是否有 CLI 相关改动
+# 1. 检查自上次发版 tag 以来是否有 CLI 相关改动
 git log --oneline v$(node -p "require('./package.json').version")..HEAD -- src/index.ts src/cli/ src/auth/oauth.ts src/auth/resolver.ts
 
-# 2. 如果上面有 commit，对比当前脚本与 CLI 实际支持的命令
-#    打印当前 CLI 帮助：
+# 2. 打印当前 CLI 帮助，确认 start.bat / start.sh 里的命令都还在
 bun run src/index.ts help
 
-# 3. 检查 start.bat / start.sh 里的命令是否都还在 help 输出里
+# 3. 对比脚本里的命令是否都在 help 输出里
 grep -oE 'zcode-proxy\.exe [a-z ]+' release/start.bat | sort -u
 grep -oE 'zcode-proxy\.exe [a-z ]+' release/start.sh | sort -u
 ```
 
-### 4.3 如果脚本需要更新
+### 3.3 如果脚本需要更新
 
-如果检测到 CLI 逻辑变化，**必须**按以下流程重新生成脚本并提交到仓库：
+检测到 CLI 逻辑变化时，**必须**重新生成脚本并提交仓库（生成步骤见下方折叠块）。
 
-#### 4.3.1 生成 start.bat
+<details>
+<summary>4.3.1 生成 start.bat（点开）</summary>
 
 **关键要求**：
 - **必须纯 ASCII**，不能有中文（Windows CMD 默认 GBK 编码，中文会乱码）
@@ -233,23 +224,23 @@ goto end
 :end
 BATCHEOF
 
-# 转换为 CRLF 换行符
+# 转 CRLF
 sed -i 's/$/\r/' release/start.bat
 ```
 
-验证：
+校验：
 ```bash
 file release/start.bat
-# 应输出: DOS batch file, ASCII text, with CRLF line terminators
-
-# 纯 ASCII 检查
-if LC_ALL=C grep -P '[^\x00-\x7F]' release/start.bat; then
-  echo "❌ start.bat contains non-ASCII characters!"
-  exit 1
+# 期望: DOS batch file, ASCII text, with CRLF line terminators
+if LC_ALL=C grep -nP '[^\x00-\x7F]' release/start.bat; then
+  echo "❌ start.bat contains non-ASCII characters!"; exit 1
 fi
 ```
+（GitHub Actions 也会做同样的 ASCII + CRLF 校验，不合格直接构建失败。）
+</details>
 
-#### 4.3.2 生成 start.sh
+<details>
+<summary>4.3.2 生成 start.sh（点开）</summary>
 
 ```bash
 cat > release/start.sh << 'SHEOF'
@@ -354,199 +345,115 @@ SHEOF
 
 chmod +x release/start.sh
 ```
+</details>
 
-#### 4.3.3 提交脚本更新到仓库
+### 3.4 如果脚本无需更新（默认情况）
 
-重新生成的脚本**必须**提交到仓库，这样下次发版才能复用：
-
-```bash
-git add release/start.bat release/start.sh
-git commit -m "release: update start scripts for CLI changes
-
-- Sync menu items with current CLI commands
-- Reason: <填写触发更新的具体原因>"
-```
-
-### 4.4 如果脚本无需更新（默认情况）
-
-直接复用仓库里的脚本，但仍然要做格式校验：
-
-```bash
-# start.bat 必须是 ASCII + CRLF
-file release/start.bat
-# 期望: DOS batch file, ASCII text, with CRLF line terminators
-
-if ! LC_ALL=C grep -P '[^\x00-\x7F]' release/start.bat > /dev/null; then
-  echo "✓ start.bat is pure ASCII"
-else
-  echo "❌ start.bat contains non-ASCII — restore from git"
-  git checkout main -- release/start.bat
-fi
-
-if file release/start.bat | grep -q "CRLF"; then
-  echo "✓ start.bat uses CRLF"
-else
-  echo "❌ start.bat is NOT CRLF — fixing"
-  sed -i 's/$/\r/' release/start.bat
-fi
-
-# start.sh 必须可执行
-[ -x release/start.sh ] && echo "✓ start.sh is executable" || chmod +x release/start.sh
-```
+直接复用仓库里的脚本即可。GitHub Actions 仍会做 ASCII + CRLF 校验，校验不过会失败。
 
 ---
 
-## 5. 准备 config.yaml
+## 4. 提交并打 tag 触发自动构建（核心发版动作）
+
+完成 Section 1/2/3 后，提交改动并打 tag：
 
 ```bash
-cp config.example.yaml release/config.yaml
-```
-
-最终 release/ 目录结构：
-```
-release/
-├── zcode-proxy.exe    ← Section 3 编译的
-├── config.yaml        ← 本步骤复制
-├── start.bat          ← 仓库内（Section 4 校验/更新）
-├── start.sh           ← 仓库内（Section 4 校验/更新）
-└── README.md          ← 仓库内（Section 1 更新版本号）
-```
-
----
-
-## 6. 打包 zip
-
-```bash
-cd /home/z/my-project/lealll
 VERSION=$(node -p "require('./package.json').version")
-
-cd release
-zip -9 ../zcode-proxy-v${VERSION}.zip zcode-proxy.exe config.yaml start.bat start.sh README.md
-cd ..
-```
-
----
-
-## 7. 推送代码到 GitHub
-
-```bash
-cd /home/z/my-project/lealll
-
-# zip / exe / config.yaml 不应提交到仓库（.gitignore 已包含 *.zip）
-git status   # 确认只有 release/README.md 或 release/start.* 的改动待提交
 
 git add -A
 git commit -m "release: v${VERSION}"
-git push https://{用户名}:{token}@github.com/zhu748/lealll.git main
+git push
+
+# 打 tag —— 这一步触发 GitHub Actions 自动构建
+git tag "v${VERSION}"
+git push origin "v${VERSION}"
 ```
+
+打完 tag 后，去仓库的 **Actions** 标签页查看构建进度：
+`https://github.com/zhu748/lealll/actions`
+
+### 4.1 GitHub Actions 做了什么
+
+workflow 文件：`.github/workflows/release.yml`，触发方式：
+
+| 触发方式 | 何时用 |
+|---------|--------|
+| **push tag `v*`**（推荐） | 打 `v2.1.4.2` 这种 tag 自动触发 |
+| **workflow_dispatch**（手动按钮） | 仓库 Actions 页 → 选 Release workflow → Run workflow → 填版本号 |
+
+workflow 执行步骤（全程无需人工干预）：
+1. **Checkout** 代码
+2. **Setup Bun**（固定 1.3.14，与本地一致）
+3. **bun install** 装依赖
+4. **tsc --noEmit** 类型检查（门禁，不过则失败）
+5. **bun test** 测试（门禁，不过则失败）
+6. **校验三处版本号** 等于 tag 版本号（门禁）
+7. **bun build --compile --target=bun-windows-x64** 交叉编译 Windows exe
+8. **校验 exe 是 PE32+**（防止漏加 --target 编出 ELF）
+9. **复制 config.yaml**、**校验 start.bat ASCII+CRLF**、**chmod start.sh**
+10. **zip 打包** 五个文件
+11. **softprops/action-gh-release 创建 Release + 上传 zip**
+
+完成后 GitHub Releases 页会出现 `zcode-proxy v{VERSION}`，zip 作为附件挂在下面。
+
+### 4.2 手动触发（workflow_dispatch）
+
+如果不想打 tag（比如想重新发同一个版本），也可以在 GitHub 网页手动触发：
+1. 打开 `https://github.com/zhu748/lealll/actions/workflows/release.yml`
+2. 点 **Run workflow** → 输入版本号（如 `2.1.4.2`，不带 v）→ 运行
+
+> 注意：手动触发时，代码里三处版本号仍必须等于你填的版本号（workflow 会校验）。
+
+### 4.3 发版失败的常见原因
+
+| 症状 | 原因 | 解决 |
+|------|------|------|
+| CI 在「Verify version markers」步失败 | package.json / index.ts / dashboard 三处版本号与 tag 不一致 | 回 Section 1 同步版本号，重新打 tag |
+| CI 在「Tests」或「Type check」步失败 | 测试没过 / 类型有错 | 回 Section 2 修复 |
+| CI 在「Cross-compile」后「Verify exe format」失败 | bun 版本异常漏了 --target | 确认 workflow 里 `--target=bun-windows-x64` 没被删 |
+| CI 在「Guard start.bat」失败 | start.bat 含中文 / 不是 CRLF | 回 Section 3.3 重新生成 |
+| Release 创建成功但没附件 | 上传步失败（偶发网络） | 在 Actions 页重跑该 workflow |
 
 ---
 
-## 8. 创建 GitHub Release 并上传
+## 5. 重新发同一个版本（覆盖已有 Release）
+
+如果 `v{VERSION}` 这个 tag / Release 已存在，需要覆盖：
 
 ```bash
-cd /home/z/my-project/lealll
-VERSION=$(node -p "require('./package.json').version")
-TOKEN="{token}"
-REPO="zhu748/lealll"
+VERSION="2.1.4.2"   # 要覆盖的版本
 
-# 创建 Release
-RESPONSE=$(curl -s -X POST \
-  -H "Authorization: token $TOKEN" \
-  -H "Accept: application/vnd.github+json" \
-  https://api.github.com/repos/$REPO/releases \
-  -d "{
-    \"tag_name\": \"v$VERSION\",
-    \"target_commitish\": \"main\",
-    \"name\": \"zcode-proxy v$VERSION\",
-    \"body\": \"## zcode-proxy v$VERSION\\n\\n详见 release/README.md\\n\",
-    \"draft\": false,
-    \"prerelease\": false
-  }")
+# 删除本地和远端旧 tag
+git tag -d "v${VERSION}"
+git push origin :refs/tags/"v${VERSION}"
 
-RELEASE_ID=$(echo $RESPONSE | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
-
-# 上传 zip 附件
-curl -s -X POST \
-  -H "Authorization: token $TOKEN" \
-  -H "Accept: application/vnd.github+json" \
-  -H "Content-Type: application/zip" \
-  --data-binary @zcode-proxy-v${VERSION}.zip \
-  "https://uploads.github.com/repos/$REPO/releases/$RELEASE_ID/assets?name=zcode-proxy-v${VERSION}.zip"
+# 重新打 tag 触发构建（会重建 Release）
+git tag "v${VERSION}"
+git push origin "v${VERSION}"
 ```
 
-### 8.1 如果已有同版本 Release（重新发版）
-
-```bash
-# 查询已有 asset
-ASSET_IDS=$(curl -s -H "Authorization: token $TOKEN" \
-  https://api.github.com/repos/$REPO/releases/tags/v$VERSION | \
-  python3 -c "import sys,json; d=json.load(sys.stdin); [print(a['id']) for a in d.get('assets',[])]")
-
-# 删除所有旧 asset
-for ASSET_ID in $ASSET_IDS; do
-  curl -s -X DELETE \
-    -H "Authorization: token $TOKEN" \
-    https://api.github.com/repos/$REPO/releases/assets/$ASSET_ID
-done
-
-# 获取 Release ID
-RELEASE_ID=$(curl -s -H "Authorization: token $TOKEN" \
-  https://api.github.com/repos/$REPO/releases/tags/v$VERSION | \
-  python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
-
-# 再上传新的
-curl -s -X POST \
-  -H "Authorization: token $TOKEN" \
-  -H "Accept: application/vnd.github+json" \
-  -H "Content-Type: application/zip" \
-  --data-binary @zcode-proxy-v${VERSION}.zip \
-  "https://uploads.github.com/repos/$REPO/releases/$RELEASE_ID/assets?name=zcode-proxy-v${VERSION}.zip"
-```
-
-### 8.2 如果需要更新已有 Release 的描述
-
-```bash
-curl -s -X PATCH \
-  -H "Authorization: token $TOKEN" \
-  -H "Accept: application/vnd.github+json" \
-  -H "X-GitHub-Api-Version: 2022-11-28" \
-  https://api.github.com/repos/$REPO/releases/$RELEASE_ID \
-  -d "$(jq -n --arg body "$(cat /tmp/release-body.md)" '{body: $body}')"
-```
+或者用 `workflow_dispatch` 手动触发——它会用同名 tag，如果 Release 已存在会更新而非报错。
 
 ---
 
-## 9. 清理 token
-
-推送/上传完成后，立即从 remote URL 中移除 token，并提醒用户去 GitHub 删除 token：
-
-```bash
-git remote set-url origin "https://github.com/zhu748/lealll.git"
-```
-
-> ⚠️ **安全提示**：每次发版用的临时 token，发版完成后必须立刻去 https://github.com/settings/tokens 删除。
-
----
-
-## 10. 踩坑清单
+## 6. 踩坑清单
 
 | 坑 | 症状 | 解决 |
 |----|------|------|
-| 没加 `--target=bun-windows-x64` | Windows 报"不兼容的16位应用程序" | 编译时必须加 target |
-| bat 文件含中文 | CMD 乱码，命令被截断 | 全部用英文（仓库内 start.bat 已合规，不要重写） |
+| 没加 `--target=bun-windows-x64` | Windows 报"不兼容的16位应用程序" | workflow 已固定加 target；本地不要手编 |
+| bat 文件含中文 | CMD 乱码，命令被截断 | 全部用英文（仓库内 start.bat 已合规，CI 会校验） |
 | bat 文件用 LF 换行 | `if/goto` 解析失败，命令被截断 | 必须 CRLF（`sed -i 's/$/\r/'`） |
-| zip 包没含 config.yaml | 用户不知道怎么配置 | 必须包含模板配置 |
+| zip 包没含 config.yaml | 用户不知道怎么配置 | workflow 已固定包含 |
 | OAuth 登录未指定 plan | 凭证默认 coding-plan，但用户可能需要 start-plan | 必须传 `--plan=` 参数 |
-| 导入 ZCode 不区分 plan | 只读 coding-plan key，start-plan 用户导入失败 | 传 `--plan=start-plan`，导入函数会读取对应 key |
-| 旧凭证无 plan 字段 | 启动时 plan 为 undefined | 自动回退 config.yaml 的全局 plan，兼容无需处理 |
-| exe 超过 50MB | GitHub 推送时警告 | 可以忽略（仅警告不拒绝），或使用 Git LFS；zip 压缩后约 38MB 不会有问题 |
-| **无脑复用脚本不检查 CLI 变更** | 脚本里的命令与实际 CLI 不匹配，用户运行报错 | **每次发版必须执行 Section 4 脚本变更检测** |
-| **重新生成脚本但没提交到仓库** | 下次发版又得重写一遍 | Section 4.3.3 必须提交脚本更新到仓库 |
+| 导入 ZCode 不区分 plan | 只读 coding-plan key，start-plan 用户导入失败 | 传 `--plan=start-plan` |
+| 旧凭证无 plan 字段 | 启动时 plan 为 undefined | 自动回退 config.yaml 的全局 plan，无需处理 |
+| **无脑复用脚本不检查 CLI 变更** | 脚本里的命令与实际 CLI 不匹配，用户运行报错 | 每次发版必须执行 Section 3 |
+| **重新生成脚本但没提交到仓库** | 下次发版又得重写一遍 | Section 3 改完必须 commit 进仓库 |
+| **三处版本号不一致就打 tag** | CI 在版本校验步直接失败 | Section 1 必须三处同步后再打 tag |
 
 ---
 
-## 11. Plan 系统说明
+## 7. Plan 系统说明
 
 项目支持两种计划，决定上游请求路由：
 

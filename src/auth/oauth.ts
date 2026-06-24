@@ -1,19 +1,42 @@
 /**
- * OAuth flow handlers for Z.AI (device/poll) and Bigmodel (auth-code/callback).
+ * OAuth flow handlers for Z.AI and Bigmodel.
+ *
+ * Both providers use the SAME auth-code/callback pattern, proxied through
+ * zcode.z.ai so the appSecret stays server-side:
+ *
+ *   1. Start a localhost HTTP server on a random port
+ *   2. Build an authorize URL the user opens in a real browser
+ *   3. The provider redirects to the localhost callback with ?code=&state=
+ *   4. POST https://zcode.z.ai/api/v1/oauth/token {provider, code, redirect_uri, state}
+ *   5. zcode.z.ai exchanges using its own appSecret and returns the tokens
+ *
+ * For Z.AI this loop is what activates the start-plan trial on a fresh
+ * account (verified end-to-end against the real backend). The old device/poll
+ * flow against /oauth/cli/init + /oauth/cli/poll was the wrong protocol and
+ * never worked — it has been removed.
+ *
  * @see .omo/plans/zcode-proxy.md Task 9
  * @see _reverse/NOTEPAD.md "Method 1: OAuth Flow"
- * @see _reverse/zcode.cjs: Act (createZaiCliOAuthClient), p3r (createBigmodelOAuthClient), Wro (loginBigmodelCodingPlan)
+ * @see test-zai-oauth.cjs for the standalone replication that proved the loop.
  */
 import type { ProviderId } from "../provider/types.js";
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomBytes } from "node:crypto";
-import { sleep } from "../utils/sleep.js";
 
 // ---------------------------------------------------------------------------
-// Constants (from bundle)
+// Constants (from ZCode bundle)
 // ---------------------------------------------------------------------------
 
 const ZCODE_OAUTH_BASE = "https://zcode.z.ai/api/v1";
+
+// Z.AI (zai) OAuth — authorize lives on chat.z.ai, exchange is proxied
+// through zcode.z.ai. client_id is the public app id from the bundle.
+const ZAI_AUTHORIZE_URL = "https://chat.z.ai/api/oauth/authorize";
+const ZAI_CLIENT_ID = "client_P8X5CMWmlaRO9gyO-KSqtg";
+const ZAI_CALLBACK_PATH = "/oauth/callback/zai";
+
+// Bigmodel OAuth — authorize lives on bigmodel.cn, exchange is proxied
+// through zcode.z.ai. appId is the public app id from the bundle.
 const BIGMODEL_HOST = "https://bigmodel.cn";
 const BIGMODEL_APP_ID = "zcode";
 const BIGMODEL_CALLBACK_PATH = "/oauth/callback/bigmodel";
@@ -22,12 +45,24 @@ const BIGMODEL_CALLBACK_PATH = "/oauth/callback/bigmodel";
 // Shared types
 // ---------------------------------------------------------------------------
 
+/**
+ * Result of starting a localhost OAuth callback server.
+ *
+ * `flowId` / `pollToken` are kept as aliases for the callback `state` so the
+ * admin flow-tracker (which keys flows by flowId and stores pollToken) keeps
+ * working without churn — under the auth-code model the `state` doubles as
+ * both the CSRF guard and the flow identity.
+ */
 export interface OAuthInitResponse {
   flowId: string;
   pollToken: string;
   authorizeUrl: string;
-  expiresAt: number; // milliseconds
-  pollIntervalSec: number;
+  /** Absolute deadline (ms epoch) after which the flow is considered expired. */
+  expiresAt: number;
+  /** Localhost callback URL registered with the provider (the redirect_uri). */
+  callbackUrl: string;
+  /** CSRF state echoed back by the provider on the callback. */
+  state: string;
 }
 
 export interface OAuthResult {
@@ -42,177 +77,253 @@ export interface OAuthResult {
 export type FetchFn = typeof fetch;
 
 // ---------------------------------------------------------------------------
-// Z.AI envelope helper — {code, data, msg}
+// Shared types
 // ---------------------------------------------------------------------------
 
+/** Z.AI / zcode.z.ai {code, data, msg} response envelope. code:0 = success. */
 interface ZaiEnvelope {
   code: number;
   data?: Record<string, unknown>;
   msg?: string;
 }
 
+// ---------------------------------------------------------------------------
+// Shared localhost callback server (used by the Z.AI flow; Bigmodel keeps its
+// own equivalent inline below for backward compatibility)
+// ---------------------------------------------------------------------------
+
 /**
- * Validate and unwrap the Z.AI {code, data, msg} envelope.
- * @see bundle k3r (requestJsonEnvelope): code must be number, must be 0 for success.
+ * A tiny OAuth callback receiver. Listens on 127.0.0.1, captures the first
+ * `code` + matching `state`, and resolves a waiter promise. Both providers
+ * redirect back to this server with `?code=&state=` after the user authorizes
+ * in their browser.
  */
-function unwrapZaiEnvelope(raw: unknown, httpStatus: number): Record<string, unknown> {
-  const env = raw as ZaiEnvelope;
-  if (typeof env?.code !== "number") {
-    throw new Error(`Invalid OAuth response envelope (httpStatus=${httpStatus}): missing numeric code field`);
+class CallbackServer {
+  readonly state: string;
+  /** Localhost callback URL; finalized in listen() once the ephemeral port is bound. */
+  callbackUrl: string;
+  private server: Server;
+  private callbackResult: { code: string; error: string | null } | null = null;
+  private callbackWaiters: Array<(result: { code: string; error: string | null }) => void> = [];
+
+  constructor(
+    callbackPath: string,
+    expectedState: string,
+    onSuccessHtml: string,
+    onErrorHtml: (reason: string) => string,
+  ) {
+    this.state = expectedState;
+    this.callbackUrl = `http://127.0.0.1:0${callbackPath}`; // placeholder port, fixed by listen()
+    this.server = createServer((req: IncomingMessage, res: ServerResponse) => {
+      const url = new URL(req.url ?? "/", "http://127.0.0.1");
+      if (url.pathname !== callbackPath) {
+        res.writeHead(404, { "Content-Type": "text/plain" });
+        res.end("Not found");
+        return;
+      }
+      const state = url.searchParams.get("state") ?? "";
+      const code = url.searchParams.get("authCode") ?? url.searchParams.get("code") ?? "";
+      const cbError = url.searchParams.get("error");
+
+      if (cbError) {
+        res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });
+        res.end(onErrorHtml(cbError));
+        this.resolveOnce({ code: "", error: `Provider returned error: ${cbError}` });
+        return;
+      }
+      if (state !== expectedState || !code) {
+        res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });
+        res.end(onErrorHtml("state mismatch or missing code"));
+        this.resolveOnce({ code: "", error: "OAuth callback state mismatch or missing code." });
+        return;
+      }
+
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.end(onSuccessHtml);
+      this.resolveOnce({ code, error: null });
+    });
   }
-  if (env.code !== 0) {
-    throw new Error(env.msg ?? `OAuth business error: code=${env.code}`);
+
+  private resolveOnce(result: { code: string; error: string | null }): void {
+    if (this.callbackResult) return;
+    this.callbackResult = result;
+    this.callbackWaiters.forEach((fn) => fn(result));
   }
-  return env.data ?? {};
+
+  /** Listen on an ephemeral port and resolve with the chosen callback URL. */
+  listen(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      this.server.on("error", reject);
+      this.server.listen(0, "127.0.0.1", () => {
+        const addr = this.server.address();
+        if (!addr || typeof addr !== "object") {
+          reject(new Error("Failed to bind localhost callback server"));
+          return;
+        }
+        const callbackPath = new URL(this.callbackUrl).pathname;
+        this.callbackUrl = `http://127.0.0.1:${addr.port}${callbackPath}`;
+        resolve();
+      });
+    });
+  }
+
+  async waitForCallback(timeoutMs: number = 300_000): Promise<string> {
+    if (this.callbackResult?.code) return this.callbackResult.code;
+    if (this.callbackResult?.error) throw new Error(this.callbackResult.error);
+
+    return new Promise<string>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error("Authorization timed out. Please retry login."));
+      }, timeoutMs);
+      this.callbackWaiters.push((result) => {
+        clearTimeout(timer);
+        if (result.error) reject(new Error(result.error));
+        else resolve(result.code);
+      });
+    });
+  }
+
+  async close(): Promise<void> {
+    await new Promise<void>((resolve) => this.server.close(() => resolve()));
+  }
 }
 
 // ---------------------------------------------------------------------------
-// Z.AI OAuth — device/poll flow (Act / createZaiCliOAuthClient)
+// Z.AI OAuth — auth-code/callback flow (verified end-to-end)
 // ---------------------------------------------------------------------------
-
-/** Generate a random 32-byte hex poll token. @see bundle I3r / createZaiCliOAuthPollToken */
-function generatePollToken(): string {
-  return randomBytes(32).toString("hex");
-}
 
 /**
- * Z.AI CLI OAuth client.
+ * Z.AI OAuth client.
  *
- * Flow (from bundle Vro / loginZCodeCli):
- *   1. Client generates 32-byte hex pollToken
- *   2. POST /oauth/cli/init with Authorization: Bearer {pollToken}, body {provider:"zai"}
- *      Response: {code:0, data:{flow_id, poll_token, authorize_url, expires_at, poll_interval_sec}}
- *   3. User opens authorize_url in browser
- *   4. GET /oauth/cli/poll/{flowId} with Authorization: Bearer {pollToken}
- *      Response: {code:0, data:{status:"pending"|"ready"|"failed", token, zai:{access_token}, user}}
- *   5. Extract zai.access_token for credential resolution
+ * Flow (mirrors the ZCode desktop client's zai login, replicated in
+ * test-zai-oauth.cjs):
+ *   1. Start localhost HTTP server on a random port
+ *   2. Build authorize URL: chat.z.ai/api/oauth/authorize
+ *        ?redirect_uri={localhost}&response_type=code&client_id={...}&state={state}
+ *   3. User opens URL, logs in & authorizes on chat.z.ai
+ *   4. chat.z.ai redirects to localhost callback with ?code=...&state=...
+ *   5. POST https://zcode.z.ai/api/v1/oauth/token
+ *        body: {provider:"zai", code, redirect_uri, state}
+ *      (zcode.z.ai holds the appSecret and performs the real exchange)
+ *   6. Returns {code:0, data:{token, zai:{access_token}, user:{user_id}}}
+ *
+ * The POST in step 5 is what activates the start-plan trial server-side on a
+ * fresh account. Extract `zai.access_token` for credential resolution; `token`
+ * is the zcode plan JWT.
  */
 export class ZaiOAuthClient {
-  constructor(private fetchImpl: FetchFn = fetch) {}
+  private cb: CallbackServer | null = null;
 
-  async init(provider: ProviderId = "zai"): Promise<OAuthInitResponse> {
-    const pollToken = generatePollToken();
+  constructor(
+    private fetchImpl: FetchFn = fetch,
+    private authorizeUrl: string = ZAI_AUTHORIZE_URL,
+    private clientId: string = ZAI_CLIENT_ID,
+  ) {}
 
-    const resp = await this.fetchImpl(`${ZCODE_OAUTH_BASE}/oauth/cli/init`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: `Bearer ${pollToken}`,
-      },
-      body: JSON.stringify({ provider }),
+  /**
+   * Start the localhost callback server and build the authorize URL.
+   * Call waitForCallback() / exchangeCode() afterwards, then close().
+   */
+  async start(): Promise<OAuthInitResponse> {
+    const state = randomBytes(32).toString("hex");
+    this.cb = new CallbackServer(
+      ZAI_CALLBACK_PATH,
+      state,
+      "<h1>授权成功,可以关闭此页面。</h1>",
+      (reason) => `<h1>授权失败</h1><p>${reason}</p>`,
+    );
+    await this.cb.listen();
+
+    const params = new URLSearchParams({
+      redirect_uri: this.cb.callbackUrl,
+      response_type: "code",
+      client_id: this.clientId,
+      state,
     });
+    const authorizeUrl = `${this.authorizeUrl}?${params.toString()}`;
 
-    const raw = safeJsonParse(await resp.text());
-    if (!resp.ok) {
-      const env = raw as ZaiEnvelope | null;
-      throw new Error(
-        `OAuth init failed: ${resp.status} ${env?.msg ?? ""}`.trim(),
-      );
-    }
-    if (!raw) {
-      throw new Error(`OAuth init failed: invalid JSON response (status ${resp.status})`);
-    }
-
-    // Unwrap {code, data, msg} envelope
-    const data = unwrapZaiEnvelope(raw, resp.status);
-
-    // Validate required fields (bundle parseInitData / $ro)
-    if (
-      typeof data.flow_id !== "string" ||
-      typeof data.authorize_url !== "string" ||
-      typeof data.expires_at !== "number" ||
-      typeof data.poll_interval_sec !== "number"
-    ) {
-      throw new Error(
-        `Invalid OAuth init data: ${JSON.stringify(data).substring(0, 200)}`,
-      );
-    }
-
-    // expires_at is in seconds (bundle: initData.expires_at * 1e3)
     return {
-      flowId: data.flow_id,
-      pollToken,
-      authorizeUrl: data.authorize_url,
-      expiresAt: data.expires_at * 1000,
-      pollIntervalSec: data.poll_interval_sec,
+      flowId: state,
+      pollToken: state,
+      authorizeUrl,
+      expiresAt: Date.now() + 300_000,
+      callbackUrl: this.cb.callbackUrl,
+      state,
     };
   }
 
-  async poll(flowId: string, pollToken: string): Promise<{
-    status: "pending" | "ready" | "failed";
-    token?: string;
-    zai?: { access_token?: string };
-    userId?: string;
-  }> {
-    const resp = await this.fetchImpl(
-      `${ZCODE_OAUTH_BASE}/oauth/cli/poll/${encodeURIComponent(flowId)}`,
-      {
-        method: "GET",
-        headers: { authorization: `Bearer ${pollToken}` },
-      },
-    );
-
-    const raw = safeJsonParse(await resp.text());
-    if (!resp.ok) {
-      // 400/408/404 -> treat as failed/expired rather than fatal
-      if (resp.status === 400 || resp.status === 408 || resp.status === 404) {
-        return { status: "failed" as const };
-      }
-      const env = raw as ZaiEnvelope | null;
-      throw new Error(
-        `OAuth poll failed: ${resp.status} ${env?.msg ?? ""}`.trim(),
-      );
-    }
-    if (!raw) {
-      throw new Error(`OAuth poll failed: invalid JSON response (status ${resp.status})`);
-    }
-
-    // Unwrap envelope
-    const data = unwrapZaiEnvelope(raw, resp.status);
-    const status = data.status as string;
-
-    if (status === "pending" || status === "failed") {
-      return { status };
-    }
-    if (status === "ready") {
-      const user = data.user as { user_id?: string } | undefined;
-      return {
-        status: "ready",
-        token: data.token as string | undefined,
-        zai: data.zai as { access_token?: string } | undefined,
-        userId: typeof user?.user_id === "string" ? user.user_id : undefined,
-      };
-    }
-
-    throw new Error(`Invalid OAuth poll status: ${status}`);
+  /** Wait for the OAuth callback redirect. Resolves with the auth code. */
+  async waitForCallback(timeoutMs: number = 300_000): Promise<string> {
+    if (!this.cb) throw new Error("OAuth server not started — call start() first");
+    return this.cb.waitForCallback(timeoutMs);
   }
 
-  async waitForAuth(
-    init: OAuthInitResponse,
-    onAuthorizeUrl?: (url: string) => void,
-  ): Promise<OAuthResult> {
-    onAuthorizeUrl?.(init.authorizeUrl);
+  /**
+   * Exchange the auth code via zcode.z.ai proxy.
+   * The ZCode server holds the appSecret and performs the real Z.AI exchange.
+   * Returns the zai access_token (for credential resolution), the plan JWT,
+   * and the upstream user id.
+   */
+  async exchangeCode(
+    authCode: string,
+    redirectUri: string,
+    state: string,
+  ): Promise<{ accessToken: string; userId?: string; jwt?: string }> {
+    const resp = await this.fetchImpl(`${ZCODE_OAUTH_BASE}/oauth/token`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        provider: "zai",
+        code: authCode,
+        redirect_uri: redirectUri,
+        state,
+      }),
+    });
 
-    const deadline = init.expiresAt;
-    const intervalMs = Math.max(1000, init.pollIntervalSec * 1000);
+    const raw = safeJsonParse(await resp.text()) as ZaiEnvelope & {
+      data?: {
+        token?: string;
+        user?: { user_id?: string };
+        zai?: { access_token?: string };
+      };
+    } | null;
 
-    while (Date.now() < deadline) {
-      await sleep(intervalMs);
-      const result = await this.poll(init.flowId, init.pollToken);
-
-      if (result.status === "ready") {
-        const accessToken = result.zai?.access_token ?? result.token;
-        if (!accessToken || typeof accessToken !== "string") {
-          throw new Error("OAuth ready but no access_token in response");
-        }
-        return { accessToken, provider: "zai", userId: result.userId, jwt: result.token };
-      }
-      if (result.status === "failed") {
-        throw new Error("Authorization failed. Please retry login.");
-      }
-      // pending -> keep polling
+    if (!resp.ok || (raw && typeof raw.code === "number" && raw.code !== 0)) {
+      throw new Error(
+        `Z.AI token exchange failed: status=${resp.status} msg=${raw?.msg ?? "(none)"}`,
+      );
     }
-    throw new Error("Authorization timed out. Please retry login.");
+
+    const accessToken = raw?.data?.zai?.access_token?.trim() ?? "";
+    if (!accessToken) {
+      throw new Error("Z.AI token response missing zai.access_token");
+    }
+    const userId = raw?.data?.user?.user_id;
+    const jwt = raw?.data?.token?.trim() ?? undefined;
+    return { accessToken, userId: typeof userId === "string" ? userId : undefined, jwt };
+  }
+
+  /** Run the full Z.AI OAuth flow: start → wait → exchange. Closes the server on exit. */
+  async authorize(
+    onAuthorizeUrl?: (url: string) => void,
+    timeoutMs: number = 300_000,
+  ): Promise<OAuthResult> {
+    const init = await this.start();
+    onAuthorizeUrl?.(init.authorizeUrl);
+    try {
+      const authCode = await this.waitForCallback(timeoutMs);
+      const { accessToken, userId, jwt } = await this.exchangeCode(authCode, init.callbackUrl, init.state);
+      return { accessToken, provider: "zai", userId, jwt };
+    } finally {
+      await this.close();
+    }
+  }
+
+  async close(): Promise<void> {
+    if (this.cb) {
+      await this.cb.close();
+      this.cb = null;
+    }
   }
 }
 

@@ -1,0 +1,143 @@
+# Release builder — produces the Windows zip via Bun cross-compile.
+# Triggered by: pushing a tag named v* (e.g. v2.1.4.1), or the "Run workflow"
+# button (workflow_dispatch). The output zip is byte-for-byte the same set of
+# files as the old manual release.md flow: zcode-proxy.exe + config.yaml +
+# start.bat + start.sh + README.md.
+#
+# See release.md "GitHub Actions 构建流程" for how agents trigger a release.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    # Manual trigger: pass an explicit version. Must already be set in
+    # package.json / src/index.ts / dashboard.html.txt before running.
+    inputs:
+      version:
+        description: "Version to release (without leading v), e.g. 2.1.4.1"
+        required: true
+        type: string
+
+# Stop a superseded run on the same tag/ref; let the latest build win.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write # needed by softprops/action-gh-release to create the release
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            V="${{ inputs.version }}"
+          else
+            # tag-triggered: strip the leading "v"
+            V="${GITHUB_REF_NAME#v}"
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $V"
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Install deps
+        run: bun install --frozen-lockfile
+
+      - name: Type check (tsc --noEmit)
+        run: bun x tsc --noEmit
+
+      - name: Tests (bun test)
+        run: bun test
+
+      - name: Verify version markers match the release version
+        run: |
+          V="${{ steps.ver.outputs.version }}"
+          echo "Checking three version markers equal '$V' ..."
+          # package.json "version"
+          PKG=$(node -p "require('./package.json').version")
+          # src/index.ts const VERSION
+          SRC=$(grep -oE 'const VERSION = "[^"]+"' src/index.ts | sed -E 's/.*"(.*)"/\1/')
+          # dashboard sidebar footer <span>v...</span>
+          DASH=$(grep -oE '<span>v[^<]+</span>' src/admin/dashboard.html.txt | head -1 | sed -E 's/<span>v([^<]+)<\/span>/\1/')
+
+          echo "package.json : $PKG"
+          echo "src/index.ts : $SRC"
+          echo "dashboard    : $DASH"
+
+          if [ "$PKG" != "$V" ] || [ "$SRC" != "$V" ] || [ "$DASH" != "$V" ]; then
+            echo "::error::Version markers are out of sync with release version '$V'. Update package.json, src/index.ts const VERSION, and src/admin/dashboard.html.txt <span>v...</span> first."
+            exit 1
+          fi
+          echo "All three markers match."
+
+      - name: Cross-compile Windows executable
+        run: |
+          # --target=bun-windows-x64 is mandatory: without it Bun emits a Linux
+          # ELF that Windows rejects as "incompatible 16-bit application".
+          mkdir -p release
+          bun build --compile \
+            --define "require.resolve=undefined" \
+            --target=bun-windows-x64 \
+            src/index.ts \
+            --outfile release/zcode-proxy.exe
+
+      - name: Verify exe format (must be PE32+, not ELF)
+        run: |
+          file release/zcode-proxy.exe
+          file release/zcode-proxy.exe | grep -q "PE32" || { \
+            echo "::error::Compiled binary is not a Windows PE32+ executable. Did you forget --target=bun-windows-x64?"; exit 1; }
+
+      - name: Stage config.yaml from template
+        run: cp config.example.yaml release/config.yaml
+
+      - name: Guard start.bat (ASCII + CRLF)
+        run: |
+          file release/start.bat
+          file release/start.bat | grep -q "CRLF" || { \
+            echo "::error::release/start.bat is not CRLF — fix line endings."; exit 1; }
+          # Non-ASCII chars in a .bat break Windows CMD parsing.
+          if LC_ALL=C grep -nP '[^\x00-\x7F]' release/start.bat; then
+            echo "::error::release/start.bat contains non-ASCII characters (Chinese)."
+            exit 1
+          fi
+          echo "start.bat OK (ASCII + CRLF)."
+
+      - name: Ensure start.sh is executable
+        run: chmod +x release/start.sh
+
+      - name: Package zip
+        run: |
+          V="${{ steps.ver.outputs.version }}"
+          cd release
+          zip -9 "../zcode-proxy-v${V}.zip" \
+            zcode-proxy.exe config.yaml start.bat start.sh README.md
+          cd ..
+          ls -lh "zcode-proxy-v${V}.zip"
+
+      - name: Create GitHub Release and upload zip
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: zcode-proxy v${{ steps.ver.outputs.version }}
+          files: zcode-proxy-v${{ steps.ver.outputs.version }}.zip
+          body: |
+            ## zcode-proxy v${{ steps.ver.outputs.version }}
+
+            下载下方 `zcode-proxy-v${{ steps.ver.outputs.version }}.zip`，解压后运行 `start.bat`（Windows）或 `start.sh`（macOS/Linux）即可。
+
+            完整使用说明见压缩包内 `README.md`。
+          draft: false
+          prerelease: false

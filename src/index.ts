@@ -352,8 +352,7 @@ async function authLogin(args: string[]): Promise<void> {
     const { accessToken, userId, jwt } = await runOAuth(provider);
     console.log("\nResolving API key...");
     const resolver = new KeyResolver();
-    cred = await resolver.resolveCodingPlanCredential(accessToken, provider, userId, plan);
-    if (jwt) cred.jwt = jwt;
+    cred = await resolver.resolveCredential(accessToken, provider, userId, plan, jwt);
   }
 
   await saveCredential(cred);
@@ -451,16 +450,16 @@ async function runOAuth(provider: ProviderId): Promise<{ accessToken: string; us
     return { accessToken: result.accessToken, userId: result.userId, jwt: result.jwt };
   }
 
+  // Z.AI uses the same auth-code/callback loop as bigmodel (localhost server
+  // + zcode.z.ai token proxy). This loop is what activates the start-plan
+  // trial on a fresh account. See src/auth/oauth.ts and test-zai-oauth.cjs.
   const oauth = new ZaiOAuthClient();
-  const init = await oauth.init("zai");
-
-  console.log("Open this URL to authorize:\n");
-  console.log(`  ${init.authorizeUrl}\n`);
-  console.log(`Waiting... (expires in ${Math.floor((init.expiresAt - Date.now()) / 1000)}s)\n`);
-
-  openBrowser(init.authorizeUrl);
-
-  const result = await oauth.waitForAuth(init);
+  const result = await oauth.authorize((url) => {
+    console.log("Open this URL to authorize:\n");
+    console.log(`  ${url}\n`);
+    console.log("Waiting for authorization... (expires in 300s)\n");
+    openBrowser(url);
+  });
   return { accessToken: result.accessToken, userId: result.userId, jwt: result.jwt };
 }
 

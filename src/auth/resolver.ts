@@ -153,4 +153,63 @@ export class KeyResolver {
 
     return { apiKey: fullKey, provider: "bigmodel", plan, userId };
   }
+
+  /**
+   * Resolve a credential with a start-plan graceful fallback.
+   *
+   * For **coding-plan**, the biz-API exchange is mandatory — there is no
+   * alternative credential, so any failure propagates (throws).
+   *
+   * For **start-plan**, the actual upstream credential is the ZCode plan JWT
+   * (sent as `Authorization: Bearer {jwt}` via zcode.z.ai — see
+   * src/proxy/upstream.ts buildAuthHeaders). The biz-API `apiKey`/`secret` are
+   * only decorative for start-plan, so if the biz exchange fails (e.g. the
+   * 1-hour `zai.access_token` already expired, or the account has no biz
+   * profile), we MUST NOT lose the whole login. Instead, fall back to a
+   * start-plan credential whose `apiKey` mirrors the JWT (matching
+   * importFromZCodeConfig's start-plan shape), so the credential still saves
+   * and works.
+   *
+   * `jwt` is attached to the result whenever present (both paths).
+   */
+  async resolveCredential(
+    accessToken: string,
+    provider: ProviderId,
+    userId: string | undefined,
+    plan: PlanId,
+    jwt?: string,
+  ): Promise<Credential> {
+    // coding-plan: no fallback — biz API is the only credential source.
+    if (plan !== "start-plan") {
+      const cred = await this.resolveCodingPlanCredential(accessToken, provider, userId, plan);
+      if (jwt) cred.jwt = jwt;
+      return cred;
+    }
+
+    // start-plan: try biz API for the decorative apiKey/secret, but tolerate
+    // failure by falling back to a JWT-only credential.
+    try {
+      const cred = await this.resolveCodingPlanCredential(accessToken, provider, userId, plan);
+      if (jwt) cred.jwt = jwt;
+      return cred;
+    } catch (err) {
+      if (!jwt) {
+        // Nothing to fall back to — propagate so the caller surfaces the error
+        // instead of silently storing an empty credential.
+        throw err;
+      }
+      console.warn(
+        `[resolver] start-plan biz-API exchange failed (${(err as Error).message}); ` +
+        `falling back to JWT-only start-plan credential.`,
+      );
+      const cred: Credential = {
+        apiKey: jwt,
+        provider,
+        plan: "start-plan",
+        jwt,
+        userId,
+      };
+      return cred;
+    }
+  }
 }
