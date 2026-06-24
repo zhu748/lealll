@@ -127,7 +127,7 @@ code{font-family:var(--font-mono);font-size:.92em}
 .login-box input::placeholder{color:var(--text-3)}
 .login-box input:focus{border-color:var(--primary);box-shadow:0 0 0 3px var(--primary-soft)}
 .login-error{
-  color:var(--danger);font-size:12px;margin-top:-var(--s-2);
+  color:var(--danger);font-size:12px;margin-top:calc(var(--s-2) * -1);
   margin-bottom:var(--s-3);min-height:16px;
 }
 
@@ -141,7 +141,10 @@ code{font-family:var(--font-mono);font-size:.92em}
   border-radius:var(--r-md);
   font-family:inherit;font-size:13px;font-weight:500;
   cursor:pointer;white-space:nowrap;user-select:none;
-  transition:all var(--t-fast);
+  /* Only transition properties that actually change on hover/active.
+     Using `transition:all` forces the browser to track every property on
+     every button (6-8 per row × many rows) and causes paint jank. */
+  transition:background-color var(--t-fast),border-color var(--t-fast),color var(--t-fast),transform var(--t-fast);
   background:var(--surface-2);color:var(--text);
 }
 .btn:hover{background:var(--surface-3)}
@@ -171,11 +174,11 @@ code{font-family:var(--font-mono);font-size:.92em}
 .modal-overlay{
   position:fixed;inset:0;z-index:1050;
   background:rgba(0,0,0,.55);
-  backdrop-filter:blur(2px);
-  -webkit-backdrop-filter:blur(2px);
+  /* backdrop-filter:blur is GPU-expensive on first paint — causes the
+     "modal opens with a hitch" feeling on weaker machines. Removed. */
   display:flex;align-items:center;justify-content:center;
   padding:20px;
-  animation:modalFadeIn .18s ease;
+  animation:modalFadeIn .1s ease;
 }
 @keyframes modalFadeIn{from{opacity:0}to{opacity:1}}
 .modal{
@@ -504,10 +507,12 @@ code{font-family:var(--font-mono);font-size:.92em}
 
 /* Sticky action bar */
 .action-bar{
-  position:sticky;bottom:0;
+  position:sticky;bottom:0;z-index:5;
   display:flex;align-items:center;justify-content:flex-end;gap:var(--s-2);
   padding:var(--s-4) var(--s-5);
-  margin:var(--s-4) -var(--s-5) -var(--s-5);
+  /* Page-level action bar: break out of .main-content padding so it spans edge-to-edge.
+     calc(* -1) is the correct way to negate a CSS var — `-var(--x)` is invalid CSS. */
+  margin:var(--s-4) calc(var(--s-7) * -1) calc(var(--s-6) * -1);
   background:linear-gradient(180deg,transparent,var(--surface) 30%);
   border-top:1px solid var(--border);
 }
@@ -562,7 +567,7 @@ tbody td{
   vertical-align:middle;
 }
 tbody tr:last-child td{border-bottom:none}
-tbody tr{transition:background var(--t-fast)}
+tbody tr{transition:background-color var(--t-fast)}
 tbody tr:hover td{background:var(--surface-2)}
 .td-mono{font-family:var(--font-mono);font-size:12px}
 .td-mute{color:var(--text-2);font-size:12px}
@@ -838,6 +843,69 @@ td input{font-family:var(--font-mono)}
 }
 
 /* ============================================================
+   Page-level header (inside .main-content)
+   ============================================================ */
+/* The page header lives inside .main-content (which has 24/32px padding) and
+   uses negative margins to span edge-to-edge. Previously every page header
+   carried this as an inline `style="margin:-24px -32px 24px"`, which broke on
+   mobile (where .main-content padding shrinks to 20px) — the header poked out
+   12px on each side at <=900px. Centralising here also fixes the responsive
+   case via the media query below. */
+.page > .main-header{
+  margin:calc(var(--s-6) * -1) calc(var(--s-7) * -1) var(--s-6);
+}
+
+/* ============================================================
+   Mini stat cards (accounts page summary row)
+   ============================================================ */
+.mini-stat{
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:var(--r-lg);
+  padding:14px 18px;
+}
+.mini-stat .mini-stat-label{
+  font-size:11px;color:var(--text-2);
+  text-transform:uppercase;letter-spacing:.5px;
+}
+.mini-stat .mini-stat-value{
+  font-size:24px;font-weight:600;
+  font-family:var(--font-mono);margin-top:4px;
+  font-variant-numeric:tabular-nums;
+}
+
+/* ============================================================
+   Filter inputs (accounts page filter row)
+   ============================================================ */
+.filter-input,.filter-select{
+  font-size:12px;padding:6px 10px;
+  border:1px solid var(--border);
+  border-radius:var(--r-md);
+  background:var(--bg-elev);color:var(--text);
+  outline:none;font-family:inherit;
+  transition:border-color var(--t-fast);
+}
+.filter-input:focus,.filter-select:focus{border-color:var(--primary)}
+.filter-input{min-width:160px}
+.filter-select{
+  appearance:none;cursor:pointer;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238b92a8' stroke-width='2'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");
+  background-repeat:no-repeat;background-position:right var(--s-3) center;
+  padding-right:var(--s-7);
+}
+
+/* ============================================================
+   Reusable utility text
+   ============================================================ */
+/* Small muted paragraph — appears 5+ times across pages with the exact same
+   inline style. Centralising here. */
+.text-help-sm{
+  font-size:12px;color:var(--text-2);
+  margin-bottom:var(--s-4);
+  line-height:1.6;
+}
+
+/* ============================================================
    Responsive
    ============================================================ */
 @media (max-width:1100px){
@@ -856,6 +924,11 @@ td input{font-family:var(--font-mono)}
   .sidebar-footer{padding:var(--s-3);text-align:center}
   .main-content{padding:var(--s-5)}
   .main-header{padding:var(--s-4) var(--s-5)}
+  /* Page header negative margin needs to track .main-content padding so it
+     still spans edge-to-edge on smaller screens (previously the inline
+     style hardcoded -32px and would overhang by 12px). */
+  .page > .main-header{margin:calc(var(--s-5) * -1) calc(var(--s-5) * -1) var(--s-5)}
+  .action-bar{margin:var(--s-4) calc(var(--s-5) * -1) calc(var(--s-5) * -1)}
   .form-row,.form-row-3{grid-template-columns:1fr}
 }
 @media (max-width:600px){
@@ -863,6 +936,8 @@ td input{font-family:var(--font-mono)}
   .stat-card{padding:var(--s-4)}
   .stat-card .stat-value{font-size:20px}
   .main-content{padding:var(--s-4)}
+  .page > .main-header{margin:calc(var(--s-4) * -1) calc(var(--s-4) * -1) var(--s-4)}
+  .action-bar{margin:var(--s-4) calc(var(--s-4) * -1) calc(var(--s-4) * -1)}
   .card-body{padding:var(--s-4)}
   .hero-card{flex-direction:column;align-items:flex-start;text-align:left}
 }
@@ -964,7 +1039,7 @@ td input{font-family:var(--font-mono)}
 
       <!-- ============================================================ Overview ============================================================ -->
       <div class="page active" id="page-overview">
-        <div class="main-header" style="margin:-24px -32px 24px;padding:20px 32px;border-radius:0;">
+        <div class="main-header">
           <div class="header-left">
             <h1>概览</h1>
             <div class="subtitle">系统状态与快捷操作</div>
@@ -1042,7 +1117,7 @@ td input{font-family:var(--font-mono)}
 
       <!-- ============================================================ Settings ============================================================ -->
       <div class="page" id="page-settings">
-        <div class="main-header" style="margin:-24px -32px 24px;padding:20px 32px;border-radius:0;">
+        <div class="main-header">
           <div class="header-left">
             <h1>全局设置</h1>
             <div class="subtitle">配置代理服务器行为</div>
@@ -1230,7 +1305,7 @@ td input{font-family:var(--font-mono)}
         </div>
 
         <!-- Sticky Action Bar -->
-        <div style="position:sticky;bottom:0;display:flex;justify-content:flex-end;gap:8px;padding:16px 20px;margin:16px -20px -20px;background:linear-gradient(180deg,transparent,var(--surface) 30%);border-top:1px solid var(--border);">
+        <div class="action-bar">
           <button class="btn btn-primary" onclick="saveSettings()">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
             保存设置
@@ -1244,10 +1319,10 @@ td input{font-family:var(--font-mono)}
 
       <!-- ============================================================ Accounts ============================================================ -->
       <div class="page" id="page-accounts">
-        <div class="main-header" style="margin:-24px -32px 24px;padding:20px 32px;border-radius:0;">
+        <div class="main-header">
           <div class="header-left">
             <h1>账号管理</h1>
-            <div class="subtitle">管理 API Key 与存储的凭证 · <a href="#" onclick="loadAccountsList();loadAccountInfo();return false" style="color:var(--primary);text-decoration:none">刷新</a></div>
+            <div class="subtitle">管理 API Key 与存储的凭证</div>
           </div>
           <div class="header-right">
             <button class="btn btn-ghost" onclick="loadAccountsList();loadAccountInfo();loadCredStore()" title="重新从磁盘加载账号列表（外部进程新增的凭证会立即显示）">
@@ -1259,21 +1334,21 @@ td input{font-family:var(--font-mono)}
 
         <!-- Stats overview: quick summary of accounts by provider/plan/status -->
         <div class="stats-grid" id="accountsStatsBar" style="grid-template-columns:repeat(auto-fill,minmax(180px,1fr));margin-bottom:20px">
-          <div class="card" style="padding:14px 18px">
-            <div style="font-size:11px;color:var(--text-2);text-transform:uppercase;letter-spacing:0.5px">账号总数</div>
-            <div style="font-size:24px;font-weight:600;font-family:var(--font-mono);margin-top:4px" id="statAccountsTotal">—</div>
+          <div class="mini-stat">
+            <div class="mini-stat-label">账号总数</div>
+            <div class="mini-stat-value" id="statAccountsTotal">—</div>
           </div>
-          <div class="card" style="padding:14px 18px">
-            <div style="font-size:11px;color:var(--text-2);text-transform:uppercase;letter-spacing:0.5px">Bigmodel</div>
-            <div style="font-size:24px;font-weight:600;font-family:var(--font-mono);margin-top:4px;color:var(--primary)" id="statBigmodel">—</div>
+          <div class="mini-stat">
+            <div class="mini-stat-label">Bigmodel</div>
+            <div class="mini-stat-value" style="color:var(--primary)" id="statBigmodel">—</div>
           </div>
-          <div class="card" style="padding:14px 18px">
-            <div style="font-size:11px;color:var(--text-2);text-transform:uppercase;letter-spacing:0.5px">Z.AI</div>
-            <div style="font-size:24px;font-weight:600;font-family:var(--font-mono);margin-top:4px;color:var(--success)" id="statZai">—</div>
+          <div class="mini-stat">
+            <div class="mini-stat-label">Z.AI</div>
+            <div class="mini-stat-value" style="color:var(--success)" id="statZai">—</div>
           </div>
-          <div class="card" style="padding:14px 18px">
-            <div style="font-size:11px;color:var(--text-2);text-transform:uppercase;letter-spacing:0.5px">Start Plan</div>
-            <div style="font-size:24px;font-weight:600;font-family:var(--font-mono);margin-top:4px;color:var(--warn)" id="statStartPlan">—</div>
+          <div class="mini-stat">
+            <div class="mini-stat-label">Start Plan</div>
+            <div class="mini-stat-value" style="color:var(--warn)" id="statStartPlan">—</div>
           </div>
         </div>
 
@@ -1293,13 +1368,13 @@ td input{font-family:var(--font-mono)}
               已存储账号 <span class="tag" id="accountCountTag">多账号</span>
             </div>
             <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-              <input id="accountSearch" placeholder="搜索标签/API Key..." oninput="filterAccounts()" style="font-size:12px;padding:6px 10px;width:200px;border:1px solid var(--border);border-radius:6px;background:var(--bg-1)">
-              <select id="accountFilterProvider" onchange="filterAccounts()" style="font-size:12px;padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-1)">
+              <input id="accountSearch" class="filter-input" placeholder="搜索标签/API Key..." oninput="filterAccounts()" style="width:200px">
+              <select id="accountFilterProvider" class="filter-select" onchange="filterAccounts()">
                 <option value="">所有提供商</option>
                 <option value="bigmodel">Bigmodel</option>
                 <option value="zai">Z.AI</option>
               </select>
-              <select id="accountFilterPlan" onchange="filterAccounts()" style="font-size:12px;padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-1)">
+              <select id="accountFilterPlan" class="filter-select" onchange="filterAccounts()">
                 <option value="">所有套餐</option>
                 <option value="coding-plan">Coding</option>
                 <option value="start-plan">Start</option>
@@ -1307,7 +1382,10 @@ td input{font-family:var(--font-mono)}
             </div>
           </div>
           <div class="card-body" style="padding-bottom:0">
-            <p style="font-size:12px;color:var(--text-2);margin-bottom:var(--s-4)">所有通过 OAuth 或手动输入保存的凭证。点击 <strong style="color:var(--text)">激活</strong> 切换，点击 <strong style="color:var(--text)">套餐</strong> 修改，点击 <strong style="color:var(--text)">代理</strong> 为该账号单独配置 HTTP/SOCKS5 出口代理。外部新增的凭证请点右上角「刷新」.</p>
+            <div class="hint">
+              <span class="hint-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></span>
+              <div>所有通过 OAuth 或手动输入保存的凭证。点击 <strong>激活</strong> 切换，点击 <strong>套餐</strong> 修改，点击 <strong>代理</strong> 为该账号单独配置 HTTP/SOCKS5 出口代理。外部新增的凭证请点右上角「刷新」.</div>
+            </div>
           </div>
           <div class="table-wrap">
             <table id="accountsTable">
@@ -1343,7 +1421,7 @@ td input{font-family:var(--font-mono)}
               <div class="card-title"><span class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg></span>从 ZCode 导入</div>
             </div>
             <div class="card-body">
-              <p style="font-size:12px;color:var(--text-2);margin-bottom:var(--s-4)">从 <code class="code-inline">~/.zcode/v2/config.json</code> 导入 API Key</p>
+              <p class="text-help-sm">从 <code class="code-inline">~/.zcode/v2/config.json</code> 导入 API Key</p>
               <div class="form-row">
                 <div class="form-group"><label class="form-label">提供商</label><select id="importProvider"><option value="bigmodel">Bigmodel</option><option value="zai">Z.AI</option></select></div>
                 <div class="form-group"><label class="form-label">套餐</label><select id="importPlan"><option value="coding-plan">Coding 套餐</option><option value="start-plan">Start 套餐</option></select></div>
@@ -1366,10 +1444,11 @@ td input{font-family:var(--font-mono)}
             </div>
           </div>
           <div class="card-body">
-            <p style="font-size:12px;color:var(--text-2);margin-bottom:var(--s-4)">将所有账号导出为 JSON 文件备份，或从之前的导出文件导入。ID 匹配的现有账号将被更新。</p>
-            <p style="font-size:12px;color:var(--text-2);margin-bottom:var(--s-4);padding:8px 12px;background:var(--bg-2);border-left:3px solid var(--primary);border-radius:4px;">
-              <strong>部署到 Render / Fly.io / K8s？</strong>点击"导出 Render 凭证"获取可直接填入 <code style="background:var(--bg-1);padding:1px 4px;border-radius:2px;">ZCODE_OAUTH_CREDENTIAL</code> 环境变量的 base64 字符串。
-            </p>
+            <p class="text-help-sm">将所有账号导出为 JSON 文件备份，或从之前的导出文件导入。ID 匹配的现有账号将被更新。</p>
+            <div class="hint">
+              <span class="hint-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"/></svg></span>
+              <div><strong>部署到 Render / Fly.io / K8s？</strong>点击"导出 Render 凭证"获取可直接填入 <code class="code-inline">ZCODE_OAUTH_CREDENTIAL</code> 环境变量的 base64 字符串。</div>
+            </div>
           </div>
           <div class="card-actions">
             <button class="btn btn-success" onclick="exportAccounts()">
@@ -1391,7 +1470,7 @@ td input{font-family:var(--font-mono)}
 
       <!-- ============================================================ OAuth ============================================================ -->
       <div class="page" id="page-oauth">
-        <div class="main-header" style="margin:-24px -32px 24px;padding:20px 32px;border-radius:0;">
+        <div class="main-header">
           <div class="header-left">
             <h1>OAuth 授权</h1>
             <div class="subtitle">通过浏览器 OAuth 流程登录</div>
@@ -1417,7 +1496,7 @@ td input{font-family:var(--font-mono)}
                 <span id="oauthStatusText">等待中...</span>
               </div>
               <div id="oauthUrlBox" style="display:none;margin-top:12px">
-                <p style="font-size:12px;color:var(--text-2);margin-bottom:8px">在浏览器中打开以下 URL 进行授权：</p>
+                <p class="text-help-sm" style="margin-bottom:8px">在浏览器中打开以下 URL 进行授权：</p>
                 <div class="url-display">
                   <input id="oauthUrl" readonly>
                   <button class="btn btn-ghost btn-sm" onclick="copyOauthUrl()" title="复制">
@@ -1478,7 +1557,7 @@ td input{font-family:var(--font-mono)}
 
       <!-- ============================================================ Logs ============================================================ -->
       <div class="page" id="page-logs">
-        <div class="main-header" style="margin:-24px -32px 24px;padding:20px 32px;border-radius:0;">
+        <div class="main-header">
           <div class="header-left">
             <h1>日志</h1>
             <div class="subtitle">实时服务器日志（SSE 推送）</div>
@@ -1511,7 +1590,7 @@ td input{font-family:var(--font-mono)}
 
       <!-- ============================================================ Proxy Rules ============================================================ -->
       <div class="page" id="page-proxy">
-        <div class="main-header" style="margin:-24px -32px 24px;padding:20px 32px;border-radius:0;">
+        <div class="main-header">
           <div class="header-left">
             <h1>代理规则</h1>
             <div class="subtitle">配置按模型与按路由的代理行为</div>
@@ -1647,7 +1726,7 @@ td input{font-family:var(--font-mono)}
 
       <!-- ============================================================ Debug Dumps ============================================================ -->
       <div class="page" id="page-debug">
-        <div class="main-header" style="margin:-24px -32px 24px;padding:20px 32px;border-radius:0;">
+        <div class="main-header">
           <div class="header-left">
             <h1>调试转储</h1>
             <div class="subtitle">上游 4xx 错误的请求快照（仅存内存，最多 20 条）</div>
@@ -1705,7 +1784,7 @@ td input{font-family:var(--font-mono)}
 
       <!-- ============================================================ Statistics ============================================================ -->
       <div class="page" id="page-stats">
-        <div class="main-header" style="margin:-24px -32px 24px;padding:20px 32px;border-radius:0;">
+        <div class="main-header">
           <div class="header-left">
             <h1>统计</h1>
             <div class="subtitle">请求指标与性能数据</div>
@@ -1799,7 +1878,7 @@ td input{font-family:var(--font-mono)}
             <div class="card-title"><span class="card-icon" style="color:var(--danger)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg></span>重置统计</div>
           </div>
           <div class="card-body">
-            <p style="font-size:12px;color:var(--text-2);margin-bottom:0">清空所有已收集的请求统计。此操作不可撤销。</p>
+            <p class="text-help-sm" style="margin-bottom:0">清空所有已收集的请求统计。此操作不可撤销。</p>
           </div>
           <div class="card-actions">
             <button class="btn btn-danger" onclick="resetStats()">
@@ -2389,15 +2468,37 @@ async function changeProxy(id,proxy){
 
 /** Open a read-only detail modal showing all credential info. */
 async function openAccountDetail(id){
+  // Render the modal shell immediately with a loading state so the click
+  // feels responsive — previously the user clicked and saw nothing for
+  // 100-500ms while the fetch was in flight, which read as "lag".
+  const loadingHtml=`<div class="modal-overlay" onclick="if(event.target===this)closeModal('accountDetailModal')">
+    <div class="modal" style="max-width:640px">
+      <div class="modal-header">
+        <h3>账号详情</h3>
+        <button class="modal-close" onclick="closeModal('accountDetailModal')">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="empty-state" style="padding:var(--s-7) var(--s-4)">
+          <div class="empty-icon" style="animation:shimmer 1.4s infinite"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg></div>
+          <div class="empty-text">加载凭证信息...</div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-primary" onclick="closeModal('accountDetailModal')">关闭</button>
+      </div>
+    </div>
+  </div>`;
+  showModal('accountDetailModal',loadingHtml);
   try{
     const r=await fetch(API+'/admin/api/accounts/export-single?id='+encodeURIComponent(id),{headers:authHeaders()});
     if(!r.ok){
       const d=await r.json().catch(()=>({}));
+      closeModal('accountDetailModal');
       toast(d.error||'查看失败','error');return;
     }
     const d=await r.json();
     const acc=d.account;
-    if(!acc){toast('账号不存在','error');return;}
+    if(!acc){closeModal('accountDetailModal');toast('账号不存在','error');return;}
     const cred=acc.credential||{};
     const created=new Date(acc.createdAt).toLocaleString();
     // Build a structured key-value table for display. Sensitive fields
@@ -2433,21 +2534,6 @@ async function openAccountDetail(id){
       }
       return `<tr><td class="td-mute">${k}</td><td>${escapeHtml(String(v))}</td></tr>`;
     }).join('');
-    // vceshi0.0.7+: wire up data-toggle-secret buttons via addEventListener
-    // (the buttons are created above with data attributes; we attach handlers
-    // after injecting the HTML into the modal). Uses setTimeout(0) so the
-    // modal body is in the DOM before we query for buttons.
-    setTimeout(()=>{
-      document.querySelectorAll('button[data-toggle-secret]').forEach(btn=>{
-        btn.addEventListener('click',()=>{
-          const fieldId=btn.getAttribute('data-toggle-secret');
-          const secretJson=btn.getAttribute('data-secret')||'""';
-          let secret='';
-          try{secret=JSON.parse(secretJson)}catch{}
-          toggleSecret(fieldId,secret);
-        });
-      });
-    },0);
     const html=`<div class="modal-overlay" onclick="if(event.target===this)closeModal('accountDetailModal')">
       <div class="modal" style="max-width:640px">
         <div class="modal-header">
@@ -2463,6 +2549,21 @@ async function openAccountDetail(id){
       </div>
     </div>`;
     showModal('accountDetailModal',html);
+    // vceshi0.0.7+: wire up data-toggle-secret buttons via event delegation
+    // on the modal container (scoped, not document-wide) — avoids both the
+    // setTimeout(0) hop and the cost of querying the entire document.
+    const detailContainer=document.getElementById('accountDetailModal');
+    if(detailContainer){
+      detailContainer.querySelectorAll('button[data-toggle-secret]').forEach(btn=>{
+        btn.addEventListener('click',()=>{
+          const fieldId=btn.getAttribute('data-toggle-secret');
+          const secretJson=btn.getAttribute('data-secret')||'""';
+          let secret='';
+          try{secret=JSON.parse(secretJson)}catch{}
+          toggleSecret(fieldId,secret);
+        });
+      });
+    }
   }catch(e){console.error('openAccountDetail failed:',e);toast('查看失败','error')}
 }
 
@@ -3593,7 +3694,7 @@ function toast(msg,type='success'){
 <!-- ============================================================ -->
 <!-- Per-account proxy modal (v2.1.4.1test6+)                     -->
 <!-- ============================================================ -->
-<div id="proxyModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.55);backdrop-filter:blur(2px);align-items:center;justify-content:center;z-index:1100;padding:20px;">
+<div id="proxyModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.55);align-items:center;justify-content:center;z-index:1100;padding:20px;">
   <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--r-xl);max-width:520px;width:100%;box-shadow:var(--shadow-lg);">
     <!-- Header -->
     <div style="padding:var(--s-5) var(--s-6);border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;">
@@ -3657,7 +3758,7 @@ function toast(msg,type='success'){
 <!-- ============================================================ -->
 <!-- Quota modal (v2.1.4.2+)                                       -->
 <!-- ============================================================ -->
-<div id="quotaModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.55);backdrop-filter:blur(2px);align-items:center;justify-content:center;z-index:1100;padding:20px;">
+<div id="quotaModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.55);align-items:center;justify-content:center;z-index:1100;padding:20px;">
   <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--r-xl);max-width:520px;width:100%;box-shadow:var(--shadow-lg);">
     <div style="padding:var(--s-5) var(--s-6);border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;">
       <h3 style="margin:0;font-size:16px;font-weight:600;color:var(--text);display:flex;align-items:center;gap:var(--s-2);">
