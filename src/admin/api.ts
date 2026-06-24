@@ -834,6 +834,13 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
             const cred = await resolver.resolveCodingPlanCredential(accessToken, provider, userId, oauthPlan);
             if (jwt) cred.jwt = jwt;
             await saveCredential(cred);
+            // Hot-swap the in-memory credential so the new account takes
+            // effect immediately. Without this, the AuthManager keeps using
+            // the previously-installed credential — only the on-disk store is
+            // updated, so the dashboard would show the new account as active
+            // but the request path would still use the old one.
+            const bmActiveCred = await loadCredential();
+            if (bmActiveCred) opts.auth.setOAuthCredential(bmActiveCred);
             // Mark flow as ready
             const flow = activeFlows.get(flowId);
             if (flow) { (flow as any).status = "ready"; }
@@ -863,6 +870,9 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
           const cred = await resolver.resolveCodingPlanCredential(result.accessToken, provider, result.userId, oauthPlan);
           if (result.jwt) cred.jwt = result.jwt;
           await saveCredential(cred);
+          // Hot-swap the in-memory credential — see comment in bigmodel path.
+          const zaiActiveCred = await loadCredential();
+          if (zaiActiveCred) opts.auth.setOAuthCredential(zaiActiveCred);
           const flow = activeFlows.get(init.flowId);
           if (flow) { (flow as any).status = "ready"; }
         } catch (err) {
@@ -953,6 +963,10 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
         const cred = await resolver.resolveCodingPlanCredential(accessToken, "zai", pollResult.userId, flowPlan);
         if (pollResult.token) cred.jwt = pollResult.token;
         await saveCredential(cred);
+        // Hot-swap the in-memory credential so the manual-callback flow
+        // also takes effect immediately (parity with auto-poll path).
+        const manualActiveCred = await loadCredential();
+        if (manualActiveCred) opts.auth.setOAuthCredential(manualActiveCred);
 
         activeFlows.delete(flowId);
         return jsonResp({

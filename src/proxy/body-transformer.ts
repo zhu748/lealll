@@ -147,7 +147,13 @@ export function transformRequestBodyObj(parsed: unknown, ctx: TransformContext):
     modified = normalizeToolResultContent(obj) || modified;
     modified = sanitizeContentBlocks(obj, ctx.startPlan) || modified;
     modified = applyAnthropicCacheControl(obj, ctx.startPlan) || modified;
-    if (ctx.userId) {
+    // start-plan: ZCode gateway is stricter than official Anthropic API and
+    // rejects `metadata.user_id` (returns 200 + empty SSE stream — invisible
+    // to the SSE error detector, surfaces as "empty/malformed response" in
+    // Claude Code). Only inject for coding-plan, mirroring the
+    // applyAnthropicCacheControl no-op pattern at line 196-200.
+    // See: https://github.com/zhu748/lealll issue on OAuth-credential switch
+    if (ctx.userId && !ctx.startPlan) {
       modified = applyAnthropicUserId(obj, ctx.userId) || modified;
     }
   }

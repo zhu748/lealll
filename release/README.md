@@ -1,5 +1,28 @@
 # zcode-proxy 使用说明
 
+> **vceshi0.0.1 — OAuth 凭证切换失效修复（测试版）**
+>
+> 修复 dashboard 通过 OAuth 登录的账号在切换后立即失效的问题。原现象：OAuth 账号切换后 Claude Code 报 `API returned an empty or malformed response (HTTP 200)`，但从 ZCode 桌面版导入的账号切换后正常工作。
+>
+> **根因（两个 bug 叠加）**：
+> 1. **OAuth 登录完成后未热替换内存凭证**：`/admin/api/oauth/*` 三处完成点（bigmodel 自动回调、zai 自动轮询、zai 手动回调 URL）都只调用 `saveCredential(cred)` 写入磁盘，**没有**调用 `opts.auth.setOAuthCredential(cred)` 热替换 `AuthManager` 内存中的凭证。结果：OAuth 登录后 dashboard 显示新账号为 active，但请求路径仍使用旧凭证（通常是之前 zcode 导入的）。只有用户显式点击「激活」切换时，`/admin/api/accounts/active` 的 handler 才会真正热替换 —— 此时 OAuth 凭证第一次被真正使用，立刻暴露 bug #2。
+> 2. **start-plan 模式下注入了 `metadata.user_id`**：`src/proxy/body-transformer.ts` 的 `applyAnthropicUserId` 没有像 `applyAnthropicCacheControl` 那样为 start-plan 做特判。OAuth 登录的凭证带 `userId` 字段（zcode 导入的不带），所以只有 OAuth 账号会触发 `metadata.user_id` 注入。ZCode start-plan 网关收到该字段后返回 `200 + content-type: text/event-stream` 但 body 为空，被 `sse-error-detector.ts` 当作合法空流透传给客户端，Claude Code 报 "empty or malformed response"。
+>
+> **修复内容**：
+> 1. `src/admin/api.ts` 三处 OAuth 完成点均补充 `opts.auth.setOAuthCredential(activeCred)` 热替换，与 `importAccounts` 路径行为对齐
+> 2. `src/proxy/body-transformer.ts:150-158` 增加 `&& !ctx.startPlan` 守卫，start-plan 模式下不注入 `metadata.user_id`（与同文件 `applyAnthropicCacheControl` 的 start-plan 特判对称）
+> 3. 新增 2 个回归测试用例（start-plan 不注入 / coding-plan 仍注入），更新 1 个原有断言
+>
+> **影响范围**：
+> - **所有 OAuth 登录用户**：切换账号后立即生效，无需重启
+> - **start-plan + OAuth 用户**：不再出现 "HTTP 200 empty response" 错误
+> - **coding-plan 用户**：行为不变（仍注入 `metadata.user_id`）
+> - **zcode 导入用户**：行为不变（本来就没有 `userId`，本来就不注入）
+>
+> 全套 409 测试通过，TypeScript 类型检查零错误。
+>
+> ---
+
 > **v2.1.4.1test6 — 代理配置 UI 升级：模态框 + 测试连接**
 >
 > 重做 v2.1.4.1test5 引入的代理配置入口：移除账号表格里的内联输入框（输入 URL 字符串体验差、容易输错），改为操作列的「代理」按钮 + 弹出式模态框，支持代理类型选择、主机/端口/账号/密码分字段填写、一键测试连通性。

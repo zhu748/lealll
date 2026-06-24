@@ -1487,10 +1487,12 @@ describe("transformRequestBody — v2.1.3.9beta0: start-plan strips ALL cache_co
     const toolUseBlocks = assistantWithTools.content.filter((b: any) => b.type === "tool_use");
     expect(toolUseBlocks.length).toBe(2);
 
-    // 5. metadata.user_id injected (start-plan, OAuth mode)
-    expect(parsed.metadata).toEqual({
-      user_id: "84e5299d-a2f6-45b3-aaff-d2edde14969c",
-    });
+    // 5. metadata.user_id is NOT injected in start-plan mode.
+    // ZCode start-plan gateway rejects metadata.user_id (returns 200 + empty
+    // SSE stream — see body-transformer.ts:150-158). Only coding-plan gets
+    // the metadata.user_id injection. So in start-plan + userId, metadata
+    // must be absent entirely.
+    expect(parsed.metadata).toBeUndefined();
   });
 });
 
@@ -1550,5 +1552,39 @@ describe("transformRequestBody — metadata.user_id (Anthropic)", () => {
     const out = transformRequestBody(body, { format: "openai", userId: "u_42" });
     const parsed = JSON.parse(out as string);
     expect(parsed.metadata).toBeUndefined();
+  });
+
+  it("does NOT inject metadata.user_id in start-plan mode (ZCode gateway rejects it)", () => {
+    // Regression guard: start-plan + OAuth userId must NOT inject
+    // metadata.user_id. The ZCode gateway returns 200 + empty SSE stream
+    // when metadata.user_id is present, which surfaces to Claude Code as
+    // "API returned an empty or malformed response (HTTP 200)".
+    // Symmetric with applyAnthropicCacheControl's start-plan no-op.
+    const body = JSON.stringify({
+      model: "glm-5.2",
+      messages: [{ role: "user", content: "hi" }],
+    });
+    const out = transformRequestBody(body, {
+      format: "anthropic",
+      userId: "user-from-oauth",
+      startPlan: true,
+    });
+    const parsed = JSON.parse(out as string);
+    expect(parsed.metadata).toBeUndefined();
+  });
+
+  it("DOES inject metadata.user_id in coding-plan mode when userId is set", () => {
+    // Positive counterpart: coding-plan still gets the injection.
+    const body = JSON.stringify({
+      model: "glm-4.6",
+      messages: [{ role: "user", content: "hi" }],
+    });
+    const out = transformRequestBody(body, {
+      format: "anthropic",
+      userId: "user-from-oauth",
+      startPlan: false,
+    });
+    const parsed = JSON.parse(out as string);
+    expect(parsed.metadata).toEqual({ user_id: "user-from-oauth" });
   });
 });
