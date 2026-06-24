@@ -7,7 +7,7 @@
 import type { ProxyConfig, RoutingRule, ModelMapping, ResponsesThinkingConfig } from "../config/types.js";
 import type { AuthManager } from "../auth/manager.js";
 import type { Credential as AppCredential } from "../auth/types.js";
-import { loadCredential, saveCredential, clearCredential, listAccounts, switchAccount, removeAccount, setAccountLabel, setAccountPlan, setAccountProxy, setAccountName, setAccountEmail, exportSingleAccount, exportAccounts, exportStore, importAccounts, maskApiKey, invalidateStoreCache } from "../auth/store.js";
+import { loadCredential, saveCredential, clearCredential, listAccounts, switchAccount, removeAccount, setAccountLabel, setAccountPlan, setAccountProxy, setAccountName, setAccountEmail, setAccountDisabled, exportSingleAccount, exportAccounts, exportStore, importAccounts, maskApiKey, invalidateStoreCache } from "../auth/store.js";
 import { ZaiOAuthClient, BigmodelOAuthClient } from "../auth/oauth.js";
 import { KeyResolver } from "../auth/resolver.js";
 import { queryQuota } from "../auth/quota.js";
@@ -49,8 +49,13 @@ const stats = {
   success: 0,
   failed: 0,
   retried: 0,
-  requests: [] as Array<{ id: string; time: string; model: string; status: number; ttfb: string; tokens: string; retried?: boolean }>,
-  models: {} as Record<string, { count: number; avgTtfb: number; tokens: number }>,
+  requests: [] as Array<{ id: string; time: string; model: string; status: number; ttfb: string; tokens: string; inputTokens: string; retried?: boolean }>,
+  models: {} as Record<string, { count: number; avgTtfb: number; tokens: number; inputTokens: number }>,
+  // vceshi0.0.6+: per-credential usage stats (in-memory, reset on restart).
+  // Keyed by maskApiKey(apiKey) to avoid leaking plaintext keys in stats.
+  // The dashboard joins this with listAccounts (which has apiKeyMask) to
+  // display "使用次数" per account.
+  byCredential: {} as Record<string, { count: number; inputTokens: number; outputTokens: number; lastUsed: string }>,
 };
 const requestIndex = new Map<string, number>();
 
@@ -62,8 +67,12 @@ const requestIndex = new Map<string, number>();
  * the existing entry's status/tokens — they do NOT inflate the counters.
  * This fixes the previous bug where a single 529-then-200 request would
  * show up as 2 requests in the stats.
+ *
+ * vceshi0.0.6+: `inputTokens` and `credentialKey` fields added.
+ * - inputTokens: from upstream usage.input_tokens / prompt_tokens
+ * - credentialKey: maskApiKey(cred.apiKey) for per-credential usage tracking
  */
-export function recordStat(entry: { id: string; time: string; model: string; status: number; ttfb: string; tokens: string; retried?: boolean }) {
+export function recordStat(entry: { id: string; time: string; model: string; status: number; ttfb: string; tokens: string; inputTokens?: string; credentialKey?: string; retried?: boolean }) {
   const existingIdx = requestIndex.get(entry.id);
   if (existingIdx !== undefined) {
     // Update the existing entry — do NOT increment counters again.
@@ -77,7 +86,12 @@ export function recordStat(entry: { id: string; time: string; model: string; sta
     }
     // Always count retry flag — the final entry wins.
     if (entry.retried && !old.retried) stats.retried++;
-    stats.requests[existingIdx] = { ...old, ...entry, retried: entry.retried || old.retried };
+    stats.requests[existingIdx] = {
+      ...old,
+      ...entry,
+      inputTokens: entry.inputTokens ?? old.inputTokens ?? "0",
+      retried: entry.retried || old.retried,
+    };
     return;
   }
 
@@ -86,7 +100,8 @@ export function recordStat(entry: { id: string; time: string; model: string; sta
   if (entry.status >= 200 && entry.status < 300) stats.success++;
   else stats.failed++;
   if (entry.retried) stats.retried++;
-  stats.requests.push(entry);
+  const fullEntry = { ...entry, inputTokens: entry.inputTokens ?? "0" };
+  stats.requests.push(fullEntry);
   requestIndex.set(entry.id, idx);
   if (stats.requests.length > 200) {
     // Drop the oldest 100 entries; rebuild the index from the survivors.
@@ -96,12 +111,25 @@ export function recordStat(entry: { id: string; time: string; model: string; sta
       requestIndex.set(stats.requests[i].id, i);
     }
   }
-  const m = stats.models[entry.model] ?? { count: 0, avgTtfb: 0, tokens: 0 };
+  const m = stats.models[entry.model] ?? { count: 0, avgTtfb: 0, tokens: 0, inputTokens: 0 };
   m.count++;
   const ttfbMs = parseInt(entry.ttfb) || 0;
   m.avgTtfb = Math.round((m.avgTtfb * (m.count - 1) + ttfbMs) / m.count);
   m.tokens += parseInt(entry.tokens) || 0;
+  m.inputTokens += parseInt(fullEntry.inputTokens) || 0;
   stats.models[entry.model] = m;
+
+  // vceshi0.0.6+: per-credential usage tracking (in-memory).
+  // Only count successful requests toward credential usage — failed requests
+  // didn't actually consume the credential's quota.
+  if (entry.credentialKey && entry.status >= 200 && entry.status < 300) {
+    const c = stats.byCredential[entry.credentialKey] ?? { count: 0, inputTokens: 0, outputTokens: 0, lastUsed: "" };
+    c.count++;
+    c.inputTokens += parseInt(fullEntry.inputTokens) || 0;
+    c.outputTokens += parseInt(entry.tokens) || 0;
+    c.lastUsed = entry.time;
+    stats.byCredential[entry.credentialKey] = c;
+  }
 }
 
 /**
@@ -117,6 +145,7 @@ export function _resetStatsForTesting(): void {
   stats.retried = 0;
   stats.requests = [];
   stats.models = {};
+  stats.byCredential = {};
   requestIndex.clear();
 }
 
@@ -217,11 +246,15 @@ const logWaiters: Array<{ resolve: (value: unknown) => void }> = [];
 
 /** Add a log entry to the buffer (called by intercepting console.log). */
 export function appendLog(level: string, message: string) {
+  // vceshi0.0.6+: verbose log lines (containing [verbose]) get a higher char
+  // limit so the full transformed body / headers aren't truncated to 500 chars.
+  // Regular log lines stay at 500 to keep the buffer compact.
+  const maxLen = message.includes("[verbose]") ? 3000 : 500;
   const entry = {
     seq: ++logSeq,
     time: new Date().toISOString().slice(11, 19),
     level,
-    message: message.slice(0, 500),
+    message: message.slice(0, maxLen),
   };
   logBuffer.push(entry);
   if (logBuffer.length > LOG_BUFFER_SIZE) {
@@ -880,6 +913,28 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
     }
   }
 
+  // Toggle account disabled state (vceshi0.0.6+).
+  // Body: { id, disabled: boolean }
+  // When disabled, the credential is excluded from auto-switch + manual activation.
+  if (path === "/admin/api/accounts/disabled" && method === "PUT") {
+    try {
+      const body = await req.json() as { id?: string; disabled?: boolean };
+      if (!body.id || typeof body.id !== "string") {
+        return errorResponse(400, "missing_param", "id is required and must be a string");
+      }
+      if (typeof body.disabled !== "boolean") {
+        return errorResponse(400, "invalid_param", "disabled must be a boolean");
+      }
+      const ok = await setAccountDisabled(body.id, body.disabled);
+      if (!ok) return errorResponse(404, "not_found", "Account not found");
+      invalidateStoreCache();
+      appendLog("info", `Account ${body.id} ${body.disabled ? "disabled" : "enabled"}`);
+      return jsonResp({ ok: true, disabled: body.disabled });
+    } catch (err) {
+      return errorResponse(500, "toggle_failed", (err as Error).message);
+    }
+  }
+
   if (path === "/admin/api/accounts/render-export" && method === "GET") {
     try {
       const store = await exportStore();
@@ -1404,6 +1459,7 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
     stats.retried = 0;
     stats.requests = [];
     stats.models = {};
+    stats.byCredential = {};
     requestIndex.clear();
     appendLog("info", "Stats reset by admin");
     return jsonResp({ ok: true });

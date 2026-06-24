@@ -440,6 +440,19 @@ describe("AuthManager.switchToNextCredential", () => {
     expect(result).toBeNull();
   });
 
+  it("skips disabled credentials when switching (vceshi0.0.6+)", async () => {
+    // CRED_B is disabled — switching from A should return null (no enabled alternative)
+    const CRED_B_DISABLED: Credential = { ...CRED_B, disabled: true };
+    const mgr = new AuthManager({
+      mode: "oauth",
+      provider: "zai",
+      listAllCredentials: async () => [CRED_A, CRED_B_DISABLED],
+    });
+    mgr.setOAuthCredential(CRED_A);
+    const result = await mgr.switchToNextCredential();
+    expect(result).toBeNull(); // B is disabled, no other candidates
+  });
+
   it("returns null when listAllCredentials throws", async () => {
     const mgr = new AuthManager({
       mode: "oauth",

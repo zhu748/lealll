@@ -94,7 +94,7 @@ export class AuthManager {
     const excluded = new Set<string>(excludeApiKeys);
     if (currentKey) excluded.add(currentKey);
 
-    const candidates = all.filter(c => !excluded.has(c.apiKey));
+    const candidates = all.filter(c => !excluded.has(c.apiKey) && !c.disabled);
     if (candidates.length === 0) return null;
 
     // Pick the first candidate. A round-robin based on a stored index could be

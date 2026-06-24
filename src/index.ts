@@ -16,7 +16,7 @@ import { readFileSync, existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
-const VERSION = "ceshi0.0.5";
+const VERSION = "ceshi0.0.6";
 
 main();
 

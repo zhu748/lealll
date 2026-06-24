@@ -761,6 +761,9 @@ export async function listAccounts(): Promise<{
     /** OAuth account email (vceshi0.0.4+). Empty string for ZCode imports
      *  and manually-added API keys (no email available in those flows). */
     email: string;
+    /** Disabled flag (vceshi0.0.6+). True = excluded from auto-switch +
+     *  manual activation. Default false. */
+    disabled: boolean;
   }>;
   activeId: string | null;
 }> {
@@ -796,6 +799,8 @@ export async function listAccounts(): Promise<{
       // the current value, mirroring the `proxy` field convention.
       name: a.credential.name ?? "",
       email: a.credential.email ?? "",
+      // vceshi0.0.6+: expose disabled flag for the dashboard toggle.
+      disabled: !!a.credential.disabled,
     })),
   };
 }
@@ -812,12 +817,20 @@ function inferPlan(cred: Credential): "coding-plan" | "start-plan" {
   return "coding-plan";
 }
 
-/** Switch the active credential by account id. */
+/** Switch the active credential by account id.
+ * Returns false if the account doesn't exist OR is disabled (vceshi0.0.6+).
+ * Callers should distinguish these cases by checking the disabled flag in the
+ * listAccounts response before calling switchAccount, if they need to.
+ */
 export async function switchAccount(id: string): Promise<boolean> {
   const store = await readStore();
   if (!store) return false;
   const found = store.accounts.find(a => a.id === id);
   if (!found) return false;
+  // vceshi0.0.6+: refuse to activate a disabled credential. The dashboard
+  // should hide the "Activate" button for disabled accounts, but this is the
+  // server-side enforcement.
+  if (found.credential.disabled) return false;
   store.activeId = id;
   await writeStore(store);
   return true;
@@ -926,6 +939,31 @@ export async function setAccountEmail(id: string, email: string): Promise<boolea
     account.credential.email = trimmed;
   } else {
     delete account.credential.email;
+  }
+  await writeStore(store);
+  return true;
+}
+
+/**
+ * Enable or disable an account (vceshi0.0.6+).
+ *
+ * When disabled, the credential is:
+ *   - Excluded from `switchToNextCredential` (won't be picked as fallback)
+ *   - Refused by `switchAccount` (can't be manually activated)
+ *
+ * If the currently-active account is disabled, it remains active (so in-flight
+ * requests continue) but the next auto-switch will skip it. The dashboard
+ * should warn the user when disabling the active account.
+ */
+export async function setAccountDisabled(id: string, disabled: boolean): Promise<boolean> {
+  const store = await readStore();
+  if (!store) return false;
+  const account = store.accounts.find(a => a.id === id);
+  if (!account) return false;
+  if (disabled) {
+    account.credential.disabled = true;
+  } else {
+    delete account.credential.disabled;
   }
   await writeStore(store);
   return true;

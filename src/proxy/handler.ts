@@ -266,6 +266,32 @@ export async function proxyRequest(
       throw err;
     }
     clearTimeout(timer);
+    // vceshi0.0.6+: verbose logging — log the upstream request headers + body
+    // when logging.verbose is enabled. Auth tokens are masked to avoid leaking
+    // secrets to the dashboard log panel. Truncated to 2000 chars to avoid
+    // flooding the 500-char-per-line log buffer (appendLog truncates anyway,
+    // but we truncate here too so the console output stays readable).
+    if (config.logging?.verbose) {
+      try {
+        const headerSummary: Record<string, string> = {};
+        for (const [k, v] of req.headers.entries()) {
+          const lk = k.toLowerCase();
+          // Mask auth-bearing headers
+          if (lk === "authorization" || lk === "x-api-key") {
+            headerSummary[k] = v.length > 12 ? v.slice(0, 8) + "..." + v.slice(-4) : "***";
+          } else {
+            headerSummary[k] = v;
+          }
+        }
+        console.log(`${reqId} [verbose] upstream headers: ${JSON.stringify(headerSummary)}`);
+        if (transformedBody) {
+          const bodyPreview = transformedBody.length > 2000
+            ? transformedBody.slice(0, 2000) + `...(truncated, total ${transformedBody.length} chars)`
+            : transformedBody;
+          console.log(`${reqId} [verbose] transformed body: ${bodyPreview}`);
+        }
+      } catch { /* verbose logging must never break the request */ }
+    }
     if (resp.status === 200) {
       const originalStatus = resp.status;
       resp = await detectSseErrorAndConvert(resp);
@@ -720,32 +746,60 @@ export async function proxyRequest(
       if (isSSE && upstreamResp.body) {
         const translated = anthropicSseToResponsesSse(upstreamResp.body, meta.model);
         const [clientBody, statsBody] = translated.tee();
-        observeStream(reqId, format, meta, upstreamResp.status, started, statsBody, null);
+        observeStream(reqId, format, meta, upstreamResp.status, started, statsBody, null, maskApiKey(cred.apiKey));
         return translatedSseResponse(clientBody);
       }
       return await translatedResponsesBatchResponse(
         clientReq, upstreamResp, meta.model, reqId, format, meta, started, headersAt,
         (parsedBody as OpenAIResponseRequest | undefined)?.previous_response_id,
         (parsedBody as OpenAIResponseRequest | undefined)?.input,
+        maskApiKey(cred.apiKey),
       );
     }
     // Chat Completions translation: use the original SSE / batch translators.
     if (isSSE && upstreamResp.body) {
       const translated = anthropicSseToOpenaiSse(upstreamResp.body, meta.model);
       const [clientBody, statsBody] = translated.tee();
-      observeStream(reqId, format, meta, upstreamResp.status, started, statsBody, null);
+      observeStream(reqId, format, meta, upstreamResp.status, started, statsBody, null, maskApiKey(cred.apiKey));
       return translatedSseResponse(clientBody);
     }
-    return await translatedBatchResponse(clientReq, upstreamResp, meta.model, reqId, format, meta, started, headersAt);
+    return await translatedBatchResponse(clientReq, upstreamResp, meta.model, reqId, format, meta, started, headersAt, maskApiKey(cred.apiKey));
   }
 
   if (isSSE && upstreamResp.body) {
     const [clientBody, statsBody] = upstreamResp.body.tee();
-    observeStream(reqId, format, meta, upstreamResp.status, started, statsBody, upstreamResp.headers.get("content-encoding"));
+    observeStream(reqId, format, meta, upstreamResp.status, started, statsBody, upstreamResp.headers.get("content-encoding"), maskApiKey(cred.apiKey));
     return passthroughResponse(upstreamResp, clientBody);
   }
 
-  printRow(reqId, format, meta, upstreamResp.status, started, headersAt, 0, 0, 0);
+  // Non-streaming anthropic passthrough — try to extract usage from the response
+  // body for stats. We read the body once, parse usage, then reconstruct the
+  // Response for passthrough. (Response.clone() doesn't work reliably with all
+  // mock implementations, so we read-once-and-rebuild instead.)
+  let passthroughInputTokens = 0;
+  let passthroughOutputTokens = 0;
+  let passthroughBody: ReadableStream<Uint8Array> | string | null = null;
+  const ct = upstreamResp.headers.get("content-type") ?? "";
+  if (ct.includes("application/json") && upstreamResp.body) {
+    try {
+      const raw = await upstreamResp.text();
+      passthroughBody = raw;
+      const usage = JSON.parse(raw)?.usage;
+      if (usage) {
+        passthroughInputTokens = usage.input_tokens ?? usage.prompt_tokens ?? 0;
+        passthroughOutputTokens = usage.output_tokens ?? usage.completion_tokens ?? 0;
+      }
+    } catch { /* non-JSON or parse error — leave as 0, fall back to original body */ }
+  }
+  printRow(reqId, format, meta, upstreamResp.status, started, headersAt, passthroughOutputTokens, 0, 0, false, passthroughInputTokens, maskApiKey(cred.apiKey));
+  // Reconstruct the response with the read body so passthrough still has content
+  if (passthroughBody !== null) {
+    return new Response(passthroughBody, {
+      status: upstreamResp.status,
+      statusText: upstreamResp.statusText,
+      headers: upstreamResp.headers,
+    });
+  }
   return passthroughResponse(upstreamResp);
 }
 
@@ -933,6 +987,7 @@ async function translatedBatchResponse(
   meta: RequestMeta,
   started: number,
   headersAt: number,
+  credKey?: string,
 ): Promise<Response> {
   const raw = await upstream.text();
   let parsedAnthropic: AnthropicMessagesResponse;
@@ -945,6 +1000,9 @@ async function translatedBatchResponse(
   const openaiResp = translateResponseAnthropicToOpenAI(parsedAnthropic, model);
   const json = JSON.stringify(openaiResp);
   const payload = new TextEncoder().encode(json);
+  // vceshi0.0.6+: capture input tokens from translated OpenAI response usage
+  const inTok = openaiResp.usage?.prompt_tokens ?? 0;
+  const outTok = openaiResp.usage?.completion_tokens ?? 0;
 
   const respHeaders = new Headers();
   respHeaders.set("content-type", "application/json");
@@ -955,7 +1013,7 @@ async function translatedBatchResponse(
 
   if (clientAcceptsGzip(clientReq)) {
     respHeaders.set("content-encoding", "gzip");
-    printRow(reqId, format, meta, upstream.status, started, headersAt, openaiResp.usage?.completion_tokens ?? 0, 0, 0);
+    printRow(reqId, format, meta, upstream.status, started, headersAt, outTok, 0, 0, false, inTok, credKey);
     // Note: Bun.gzipSync blocks the event loop briefly (~5-20ms for 200KB).
     // Bun's typing only exposes gzipSync (not an async Bun.gzip), and the
     // alternative (Bun.deflateSync with GZIP format) is also sync. In
@@ -967,7 +1025,7 @@ async function translatedBatchResponse(
       headers: respHeaders,
     });
   }
-  printRow(reqId, format, meta, upstream.status, started, headersAt, openaiResp.usage?.completion_tokens ?? 0, 0, 0);
+  printRow(reqId, format, meta, upstream.status, started, headersAt, outTok, 0, 0, false, inTok, credKey);
   return new Response(payload, {
     status: upstream.status,
     headers: respHeaders,
@@ -1003,6 +1061,7 @@ async function translatedResponsesBatchResponse(
   headersAt: number,
   previousResponseId: string | undefined,
   clientInput: unknown,
+  credKey?: string,
 ): Promise<Response> {
   const raw = await upstream.text();
   let parsedAnthropic: AnthropicMessagesResponse;
@@ -1022,6 +1081,9 @@ async function translatedResponsesBatchResponse(
 
   const json = JSON.stringify(responsesResp);
   const payload = new TextEncoder().encode(json);
+  // vceshi0.0.6+: capture input/output tokens from translated Responses API usage
+  const inTok = responsesResp.usage?.input_tokens ?? 0;
+  const outTok = responsesResp.usage?.output_tokens ?? 0;
 
   const respHeaders = new Headers();
   respHeaders.set("content-type", "application/json");
@@ -1032,13 +1094,13 @@ async function translatedResponsesBatchResponse(
 
   if (clientAcceptsGzip(clientReq)) {
     respHeaders.set("content-encoding", "gzip");
-    printRow(reqId, format, meta, upstream.status, started, headersAt, responsesResp.usage?.output_tokens ?? 0, 0, 0);
+    printRow(reqId, format, meta, upstream.status, started, headersAt, outTok, 0, 0, false, inTok, credKey);
     return new Response(Bun.gzipSync(payload), {
       status: upstream.status,
       headers: respHeaders,
     });
   }
-  printRow(reqId, format, meta, upstream.status, started, headersAt, responsesResp.usage?.output_tokens ?? 0, 0, 0);
+  printRow(reqId, format, meta, upstream.status, started, headersAt, outTok, 0, 0, false, inTok, credKey);
   return new Response(payload, {
     status: upstream.status,
     headers: respHeaders,
@@ -1176,6 +1238,8 @@ function printRow(
   avgTps: number,
   streamEndAt: number,
   retried: boolean = false,
+  inputTokens: number = 0,
+  credKey?: string,
 ): void {
   printHeader();
   const ts = new Date(started).toISOString().slice(11, 19);
@@ -1184,9 +1248,10 @@ function printRow(
   const ttfb = `${headersAt - started}ms`;
   const total = streamEndAt > started ? `${streamEndAt - started}ms` : "-";
   const tok = tokens > 0 ? String(tokens) : "-";
+  const inTok = inputTokens > 0 ? String(inputTokens) : "-";
   const tps = avgTps > 0 ? avgTps.toFixed(1) : "-";
   console.log(
-    `| ${reqId.padEnd(4)} | ${ts.padEnd(10)} | ${tag} | ${meta.model.padEnd(11)} | ${mode.padEnd(6)} | ${String(status).padStart(4)} | ${ttfb.padStart(7)} | ${tok.padStart(5)} | ${tps.padStart(6)} | ${total.padStart(7)} |`,
+    `| ${reqId.padEnd(4)} | ${ts.padEnd(10)} | ${tag} | ${meta.model.padEnd(11)} | ${mode.padEnd(6)} | ${String(status).padStart(4)} | ${ttfb.padStart(7)} | in:${inTok.padStart(5)} out:${tok.padStart(5)} | ${tps.padStart(6)} | ${total.padStart(7)} |`,
   );
   // Record stats for the admin dashboard
   recordStat({
@@ -1196,6 +1261,8 @@ function printRow(
     status,
     ttfb: String(headersAt - started),
     tokens: String(tokens),
+    inputTokens: String(inputTokens),
+    credentialKey: credKey,
     retried,
   });
 }
@@ -1208,9 +1275,11 @@ function observeStream(
   requestSentAt: number,
   body: ReadableStream<Uint8Array>,
   contentEncoding: string | null,
+  credKey?: string,
 ): void {
   const compressed = contentEncoding !== null;
   let tokens = 0;
+  let inputTokens = 0;
   let sseBuffer = "";
   let firstChunkAt = 0;
 
@@ -1222,8 +1291,11 @@ function observeStream(
       try {
         const j = JSON.parse(dataStr);
         // Prefer authoritative usage fields over event counting
-        if (j.usage?.completion_tokens) { tokens = j.usage.completion_tokens; continue; }
-        if (j.usage?.output_tokens) { tokens = j.usage.output_tokens; continue; }
+        if (j.usage?.completion_tokens) { tokens = j.usage.completion_tokens; }
+        if (j.usage?.output_tokens) { tokens = j.usage.output_tokens; }
+        // vceshi0.0.6+: capture input tokens from upstream usage
+        if (j.usage?.prompt_tokens) { inputTokens = j.usage.prompt_tokens; }
+        if (j.usage?.input_tokens) { inputTokens = j.usage.input_tokens; }
         // OpenAI Chat Completions content delta: choices[0].delta.content
         const oai = j.choices?.[0]?.delta?.content;
         if (typeof oai === "string" && oai.length > 0) { tokens++; continue; }
@@ -1240,8 +1312,15 @@ function observeStream(
           continue;
         }
         // Responses API final event carries usage
-        if (j.type === "response.completed" && j.response?.usage?.output_tokens) {
-          tokens = j.response.usage.output_tokens;
+        if (j.type === "response.completed" && j.response?.usage) {
+          if (j.response.usage.output_tokens) tokens = j.response.usage.output_tokens;
+          if (j.response.usage.input_tokens) inputTokens = j.response.usage.input_tokens;
+          continue;
+        }
+        // Anthropic message_delta carries usage (final event with stop_reason)
+        if (j.type === "message_delta" && j.usage) {
+          if (j.usage.output_tokens) tokens = j.usage.output_tokens;
+          if (j.usage.input_tokens) inputTokens = j.usage.input_tokens;
           continue;
         }
       } catch {}
@@ -1271,6 +1350,6 @@ function observeStream(
     const ttfbMs = (firstChunkAt > 0 ? firstChunkAt : endAt) - requestSentAt;
     const totalMs = endAt - requestSentAt;
     const avgTps = tokens > 0 && totalMs > 0 ? tokens / (totalMs / 1000) : 0;
-    printRow(reqId, format, meta, status, requestSentAt, requestSentAt + ttfbMs, tokens, avgTps, endAt);
+    printRow(reqId, format, meta, status, requestSentAt, requestSentAt + ttfbMs, tokens, avgTps, endAt, false, inputTokens, credKey);
   })().catch(() => {});
 }

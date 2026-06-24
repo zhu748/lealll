@@ -14,6 +14,7 @@ import {
   setAccountProxy,
   setAccountName,
   setAccountEmail,
+  setAccountDisabled,
   exportSingleAccount,
   maskApiKey,
   invalidateStoreCache,
@@ -571,6 +572,55 @@ describe("multi-account store", () => {
     await saveCredential({ apiKey: "k", provider: "zai" });
     const exported = await exportSingleAccount("nonexistent-id");
     expect(exported).toBeNull();
+  });
+
+  // --- vceshi0.0.6: disabled flag ---
+
+  it("setAccountDisabled toggles the disabled flag", async () => {
+    await saveCredential({ apiKey: "k", provider: "zai" });
+    const list = await listAccounts();
+    const id = list.accounts[0].id;
+    expect(list.accounts[0].disabled).toBe(false);
+
+    // Disable
+    let ok = await setAccountDisabled(id, true);
+    expect(ok).toBe(true);
+    let list2 = await listAccounts();
+    expect(list2.accounts[0].disabled).toBe(true);
+
+    // Enable
+    ok = await setAccountDisabled(id, false);
+    expect(ok).toBe(true);
+    list2 = await listAccounts();
+    expect(list2.accounts[0].disabled).toBe(false);
+  });
+
+  it("switchAccount refuses to activate a disabled credential", async () => {
+    // Save two accounts, disable the second, verify switchAccount returns false
+    await saveCredential({ apiKey: "k1", provider: "zai" });
+    await saveCredential({ apiKey: "k2", provider: "bigmodel" });
+    const list = await listAccounts();
+    const id1 = list.accounts[0].id;
+    const id2 = list.accounts[1].id;
+
+    // Switch to id1 first (so activeId is set)
+    expect(await switchAccount(id1)).toBe(true);
+
+    // Disable id2
+    expect(await setAccountDisabled(id2, true)).toBe(true);
+
+    // Attempt to activate id2 — should fail (disabled)
+    expect(await switchAccount(id2)).toBe(false);
+
+    // Re-enable id2
+    expect(await setAccountDisabled(id2, false)).toBe(true);
+    // Now activation should succeed
+    expect(await switchAccount(id2)).toBe(true);
+  });
+
+  it("setAccountDisabled returns false for unknown id", async () => {
+    await saveCredential({ apiKey: "k", provider: "zai" });
+    expect(await setAccountDisabled("nonexistent", true)).toBe(false);
   });
 
   // --- vceshi0.0.5: undecryptableFilePresent guard auto-clears on success ---

@@ -186,6 +186,20 @@ export interface ProxyConfig {
   identity: ProxyIdentity;
   logging: {
     level: "debug" | "info" | "warn" | "error";
+    /**
+     * Verbose logging mode (vceshi0.0.6+).
+     *
+     * When true, each request logs:
+     *   - The full set of upstream request headers (auth tokens masked)
+     *   - The transformed request body sent to upstream (full JSON, truncated to 2000 chars)
+     *
+     * Default: false (simple mode — only logs request summary on 4xx, plus
+     * the standard printRow table line per request).
+     *
+     * Toggleable via dashboard "日志配置" tab. Env var:
+     * ZCODE_PROXY_VERBOSE_LOGGING=1 to enable at startup.
+     */
+    verbose?: boolean;
   };
   /**
    * Retry configuration for upstream requests.

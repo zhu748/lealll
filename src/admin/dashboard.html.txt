@@ -949,7 +949,7 @@ td input{font-family:var(--font-mono)}
     <div class="sidebar-footer">
       <div class="version">
         <span class="dot"></span>
-        <span>vceshi0.0.5</span>
+        <span>vceshi0.0.6</span>
       </div>
       <div class="logout-btn" onclick="doLogout()">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
@@ -1220,6 +1220,11 @@ td input{font-family:var(--font-mono)}
                 <select id="cfgLogLevel"><option value="debug">Debug</option><option value="info">Info</option><option value="warn">Warn</option><option value="error">Error</option></select>
                 <div class="form-help">控制输出到日志面板的最低级别</div>
               </div>
+              <div class="form-group">
+                <label class="form-label">详细日志模式</label>
+                <label class="switch"><input type="checkbox" id="cfgVerboseLog"><span class="slider"></span></label>
+                <div class="form-help">开启后，每个请求会在日志里输出：1) 发往上游的完整请求头（auth token 已脱敏）2) 经项目转换后发送给 zai/bigmodel 的完整 body（截断到 2000 字符）。默认关闭（简略模式）。排查 3001 / 参数错误时建议开启。</div>
+              </div>
             </div>
           </div>
         </div>
@@ -1306,8 +1311,8 @@ td input{font-family:var(--font-mono)}
           </div>
           <div class="table-wrap">
             <table id="accountsTable">
-              <thead><tr><th>名称</th><th>提供商</th><th>套餐</th><th>API Key</th><th>邮箱</th><th>创建时间</th><th>状态</th><th style="text-align:right">操作</th></tr></thead>
-              <tbody id="accountsList"><tr><td colspan="8"><div class="empty-state"><div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg></div><div class="empty-text">加载中...</div></div></td></tr></tbody>
+              <thead><tr><th>名称</th><th>提供商</th><th>套餐</th><th>API Key</th><th>邮箱</th><th>使用</th><th>创建时间</th><th>状态</th><th style="text-align:right">操作</th></tr></thead>
+              <tbody id="accountsList"><tr><td colspan="9"><div class="empty-state"><div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg></div><div class="empty-text">加载中...</div></div></td></tr></tbody>
             </table>
           </div>
         </div>
@@ -1771,7 +1776,7 @@ td input{font-family:var(--font-mono)}
           </div>
           <div class="table-wrap">
             <table>
-              <thead><tr><th>#</th><th>时间</th><th>模型</th><th>状态</th><th>TTFB</th><th>Tokens</th></tr></thead>
+              <thead><tr><th>#</th><th>时间</th><th>模型</th><th>状态</th><th>TTFB</th><th>输入</th><th>输出</th></tr></thead>
               <tbody id="recentRequests"></tbody>
             </table>
           </div>
@@ -1783,7 +1788,7 @@ td input{font-family:var(--font-mono)}
           </div>
           <div class="table-wrap">
             <table>
-              <thead><tr><th>模型</th><th>请求数</th><th>平均 TTFB</th><th>总 Tokens</th></tr></thead>
+              <thead><tr><th>模型</th><th>请求数</th><th>平均 TTFB</th><th>输入 Tokens</th><th>输出 Tokens</th></tr></thead>
               <tbody id="modelUsage"></tbody>
             </table>
           </div>
@@ -2006,6 +2011,7 @@ async function loadSettings(){
     document.getElementById('cfgSrcTitle').value=c.identity?.sourceTitle||'';
     document.getElementById('cfgReferer').value=c.identity?.refererOrigin||'';
     document.getElementById('cfgLogLevel').value=c.logging?.level||'info';
+    document.getElementById('cfgVerboseLog').checked=!!c.logging?.verbose;
   }catch(e){console.error('loadSettings failed:',e);toast('加载设置失败','error')}
 }
 async function saveSettings(){
@@ -2067,7 +2073,7 @@ async function saveSettings(){
       emptyStreamSwitchThreshold:Number.isFinite(emptyStreamSwitch)&&emptyStreamSwitch>=0?emptyStreamSwitch:3,
     },
     identity:{appVersion:document.getElementById('cfgAppVer').value,sourceTitle:document.getElementById('cfgSrcTitle').value,refererOrigin:document.getElementById('cfgReferer').value},
-    logging:{level:document.getElementById('cfgLogLevel').value}
+    logging:{level:document.getElementById('cfgLogLevel').value,verbose:document.getElementById('cfgVerboseLog').checked}
   };
   const apiKey=document.getElementById('cfgApiKey').value;
   const proxyApiKey=document.getElementById('cfgProxyApiKey').value;
@@ -2162,7 +2168,7 @@ async function loadAccountsList(){
     filterAccounts();
   }catch(e){
     console.error('loadAccountsList failed:',e);
-    tb.innerHTML='<tr><td colspan="8"><div class="empty-state" style="color:var(--danger)">加载账号列表失败</div></td></tr>';
+    tb.innerHTML='<tr><td colspan="9"><div class="empty-state" style="color:var(--danger)">加载账号列表失败</div></td></tr>';
   }
 }
 
@@ -2202,15 +2208,16 @@ function filterAccounts(){
   }
   const activeId=_cachedActiveId;
   if(!_cachedAccounts.length){
-    tb.innerHTML='<tr><td colspan="8"><div class="empty-state"><div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg></div><div class="empty-text">暂无存储的账号</div><div class="empty-hint">请使用 OAuth 或"添加 API Key"创建</div></div></td></tr>';
+    tb.innerHTML='<tr><td colspan="9"><div class="empty-state"><div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg></div><div class="empty-text">暂无存储的账号</div><div class="empty-hint">请使用 OAuth 或"添加 API Key"创建</div></div></td></tr>';
     return;
   }
   if(!accounts.length){
-    tb.innerHTML='<tr><td colspan="8"><div class="empty-state"><div class="empty-text">没有匹配的账号</div><div class="empty-hint">尝试调整搜索条件或过滤器</div></div></td></tr>';
+    tb.innerHTML='<tr><td colspan="9"><div class="empty-state"><div class="empty-text">没有匹配的账号</div><div class="empty-hint">尝试调整搜索条件或过滤器</div></div></td></tr>';
     return;
   }
   tb.innerHTML=accounts.map(a=>{
     const isActive=a.id===activeId;
+    const isDisabled=!!a.disabled;
     const created=new Date(a.createdAt).toLocaleString();
     const planVal=a.plan||'coding-plan';
     const hasProxy=!!(a.proxy&&a.proxy.trim());
@@ -2221,21 +2228,35 @@ function filterAccounts(){
     // editable field is now `name` (via the edit modal).
     const displayName=a.name||a.label;
     const emailCell=a.email?`<span class="td-mute" title="${escapeHtml(a.email)}">${escapeHtml(a.email)}</span>`:'<span class="td-mute">—</span>';
+    // vceshi0.0.6+: usage count from cached byCredential stats (keyed by apiKeyMask)
+    const usage=_cachedByCredential[a.apiKeyMask];
+    const usageCell=usage?`<span class="td-mono" title="输入 ${usage.inputTokens||0} / 输出 ${usage.outputTokens||0} tokens">${usage.count}</span>`:'<span class="td-mute">0</span>';
+    // vceshi0.0.6+: status column shows both active + disabled badges
+    let statusBadge;
+    if(isActive) statusBadge='<span class="badge badge-success"><span class="badge-dot"></span>已激活</span>';
+    else statusBadge='<span class="badge badge-muted">未激活</span>';
+    if(isDisabled) statusBadge+=' <span class="badge badge-danger">已禁用</span>';
+    // vceshi0.0.6+: disable/enable toggle button
+    const toggleBtn=isDisabled
+      ?`<button class="btn btn-success btn-sm" onclick="toggleDisabled('${escapeHtml(a.id)}',false)" title="启用此凭证">启用</button> `
+      :`<button class="btn btn-warn btn-sm" onclick="toggleDisabled('${escapeHtml(a.id)}',true)" title="禁用此凭证（不会被激活或自动切换到）">禁用</button> `;
     return `<tr>
-      <td><input value="${escapeHtml(displayName)}" onchange="renameAccount('${escapeHtml(a.id)}',this.value)" title="${a.name?'编辑名称（清空将回退到自动标签）':'编辑自动标签'}"></td>
+      <td><input value="${escapeHtml(displayName)}" onchange="renameAccount('${escapeHtml(a.id)}',this.value)" title="${a.name?'编辑名称（清空将回退到自动标签）':'编辑自动标签'}" ${isDisabled?'style="opacity:0.5"':''}></td>
       <td><span class="badge badge-info">${escapeHtml(a.provider)}</span></td>
-      <td><select onchange="changePlan('${escapeHtml(a.id)}',this.value)"><option value="coding-plan"${planVal==='coding-plan'?' selected':''}>Coding</option><option value="start-plan"${planVal==='start-plan'?' selected':''}>Start</option></select></td>
+      <td><select onchange="changePlan('${escapeHtml(a.id)}',this.value)" ${isDisabled?'style="opacity:0.5"':''}><option value="coding-plan"${planVal==='coding-plan'?' selected':''}>Coding</option><option value="start-plan"${planVal==='start-plan'?' selected':''}>Start</option></select></td>
       <td class="td-mono">${proxyBadge}${escapeHtml(a.apiKeyMask)}${a.hasSecret?' <span class="badge badge-success">secret</span>':''}${a.hasJwt?' <span class="badge badge-success">jwt</span>':''}</td>
       <td>${emailCell}</td>
+      <td>${usageCell}</td>
       <td class="td-mute">${escapeHtml(created)}</td>
-      <td>${isActive?'<span class="badge badge-success"><span class="badge-dot"></span>已激活</span>':'<span class="badge badge-muted">未激活</span>'}</td>
+      <td>${statusBadge}</td>
       <td class="td-actions">
         <button class="btn btn-ghost btn-sm" onclick="openAccountDetail('${escapeHtml(a.id)}')" title="查看完整凭证信息">查看</button>
         <button class="btn btn-ghost btn-sm" onclick="openEditModal('${escapeHtml(a.id)}')" title="编辑名称和邮箱">编辑</button>
         <button class="btn btn-ghost btn-sm" onclick="exportSingleAccountJson('${escapeHtml(a.id)}')" title="导出此账号的 JSON 凭证">导出</button>
         <button class="btn btn-ghost btn-sm" onclick="checkQuota('${escapeHtml(a.id)}')" title="查询上游额度">额度</button>
         <button class="btn btn-ghost btn-sm" onclick="openProxyModal('${escapeHtml(a.id)}','${escapeHtml(a.proxy||'')}',this.getAttribute('data-provider'))" data-provider="${escapeHtml(a.provider)}" title="配置代理">代理</button>
-        ${isActive?'':`<button class="btn btn-primary btn-sm" onclick="activateAccount('${escapeHtml(a.id)}')">激活</button> `}
+        ${toggleBtn}
+        ${(isActive||isDisabled)?'':`<button class="btn btn-primary btn-sm" onclick="activateAccount('${escapeHtml(a.id)}')">激活</button> `}
         <button class="btn btn-danger btn-sm" onclick="deleteAccount('${escapeHtml(a.id)}','${escapeHtml(displayName).replace(/'/g,'\\\'')}')">删除</button>
       </td>
     </tr>`;
@@ -2424,9 +2445,31 @@ async function saveAccountEdit(id){
       loadAccountInfo();loadAccountsList();loadCredStore();
     }else{
       const d=await r.json().catch(()=>({}));
-      toast(d.error||'保存失败','error');
+      toast(d.error?.message||d.error||'保存失败','error');
     }
   }catch(e){console.error('saveAccountEdit failed:',e);toast('保存失败','error')}
+}
+
+/** Toggle account disabled state (vceshi0.0.6+). */
+async function toggleDisabled(id,disabled){
+  const action=disabled?'禁用':'启用';
+  if(disabled){
+    // Warn if disabling the currently-active account
+    const acc=_cachedAccounts.find(a=>a.id===id);
+    if(acc&&acc.id===_cachedActiveId){
+      if(!confirm('正在禁用当前已激活的凭证。它仍会处理进行中的请求，但不会被自动切换选中。确定？'))return;
+    }
+  }
+  try{
+    const r=await fetch(API+'/admin/api/accounts/disabled',{method:'PUT',headers:authHeaders(),body:JSON.stringify({id,disabled})});
+    if(r.ok){
+      toast(`已${action}账号`,'success');
+      loadAccountsList();
+    }else{
+      const d=await r.json().catch(()=>({}));
+      toast(d.error?.message||d.error||`${action}失败`,'error');
+    }
+  }catch(e){console.error('toggleDisabled failed:',e);toast(`${action}失败`,'error')}
 }
 
 /** Export a single account's full credential JSON as a downloadable file. */
@@ -3288,11 +3331,21 @@ async function loadStats(){
     tb.innerHTML=(d.requests||[]).slice(-20).reverse().map(r=>`<tr>
       <td class="td-mute">${escapeHtml(r.id)}</td><td class="td-mute">${escapeHtml(r.time)}</td><td class="td-mono">${escapeHtml(r.model)}</td>
       <td><span class="badge ${r.status<300?'badge-success':r.status<500?'badge-warn':'badge-danger'}">${r.status}</span></td>
-      <td class="td-mono">${escapeHtml(r.ttfb||'-')}</td><td class="td-mono">${escapeHtml(r.tokens||'-')}</td>
-    </tr>`).join('')||'<tr><td colspan="6"><div class="empty-state"><div class="empty-text">暂无请求</div></div></td></tr>';
+      <td class="td-mono">${escapeHtml(r.ttfb||'-')}</td>
+      <td class="td-mono">${escapeHtml(r.inputTokens&&r.inputTokens!=='0'?r.inputTokens:'-')}</td>
+      <td class="td-mono">${escapeHtml(r.tokens&&r.tokens!=='0'?r.tokens:'-')}</td>
+    </tr>`).join('')||'<tr><td colspan="7"><div class="empty-state"><div class="empty-text">暂无请求</div></div></td></tr>';
     const mu=document.getElementById('modelUsage');
-    mu.innerHTML=Object.entries(d.models||{}).map(([m,v])=>`<tr><td class="td-mono">${escapeHtml(m)}</td><td>${v.count}</td><td class="td-mono">${v.avgTtfb}ms</td><td class="td-mono">${v.tokens}</td></tr>`).join('')
-      ||'<tr><td colspan="4"><div class="empty-state"><div class="empty-text">暂无数据</div></div></td></tr>';
+    mu.innerHTML=Object.entries(d.models||{}).map(([m,v])=>`<tr><td class="td-mono">${escapeHtml(m)}</td><td>${v.count}</td><td class="td-mono">${v.avgTtfb}ms</td><td class="td-mono">${v.inputTokens||0}</td><td class="td-mono">${v.tokens}</td></tr>`).join('')
+      ||'<tr><td colspan="5"><div class="empty-state"><div class="empty-text">暂无数据</div></div></td></tr>';
+    // vceshi0.0.6+: cache byCredential stats + re-render accounts table to
+    // refresh usage counts without a full loadAccountsList fetch.
+    _cachedByCredential=d.byCredential||{};
+    // Only re-render if the accounts page is currently visible (avoid unnecessary DOM work)
+    const accountsPage=document.getElementById('page-accounts');
+    if(accountsPage&&accountsPage.style.display!=='none'&&_cachedAccounts.length>0){
+      filterAccounts();
+    }
   }catch(e){console.error('loadStats failed:',e)}
 }
 
@@ -3347,6 +3400,9 @@ async function clearDebugDumps(){
     else toast('清空失败','error');
   }catch(e){console.error('clearDebugDumps failed:',e);toast('清空失败','error')}
 }
+// vceshi0.0.6+: cache byCredential stats so filterAccounts can render usage
+// counts without a separate fetch. Updated by loadStats, read by filterAccounts.
+let _cachedByCredential={};
 setInterval(()=>{if(authToken)loadStats()},10000);
 
 async function resetStats(){

@@ -125,6 +125,12 @@ export function loadConfig(path: string): ProxyConfig {
   // --- responses thinking override ---
   const responsesThinking = resolveResponsesThinking(parsed?.responsesThinking);
 
+  // vceshi0.0.6+: verbose logging flag. Env var ZCODE_PROXY_VERBOSE_LOGGING=1
+  // enables it at startup; YAML `logging.verbose: true` also works. Dashboard
+  // can toggle at runtime via PUT /config (the field is hot-swappable).
+  const verboseLogging = process.env.ZCODE_PROXY_VERBOSE_LOGGING === "1"
+    || (typeof (parsed as any)?.logging === "object" && (parsed as any).logging?.verbose === true);
+
   const config: ProxyConfig = {
     server: { port, host },
     auth: { proxyApiKey, mode, apiKey, oauthCredentialsPath },
@@ -134,7 +140,7 @@ export function loadConfig(path: string): ProxyConfig {
     defaultModel,
     models,
     identity,
-    logging: { level: logLevel },
+    logging: { level: logLevel, verbose: verboseLogging },
     retry,
     routingRules,
     modelMappings,

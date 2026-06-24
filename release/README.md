@@ -1,5 +1,47 @@
 # zcode-proxy 使用说明
 
+> **vceshi0.0.6 — 输入 token 计数 + 详细日志模式 + 凭证禁用/启用 + 使用次数**
+>
+> 用户反馈 4 项需求全部实现：统计页只看到输出 token、日志不够详细、凭证无法禁用、看不到凭证使用次数。
+>
+> **1. 统计页新增「输入 Tokens」列**
+> - 之前：只记录输出 token（completion_tokens / output_tokens），输入 token 完全没记录。
+> - 现在：`recordStat` + `printRow` + `observeStream` 全链路增加 `inputTokens` 字段。从上游响应的 `usage.input_tokens` / `usage.prompt_tokens` / `usage.input_tokens`（Responses API）/ `message_delta.usage.input_tokens`（Anthropic SSE）解析。
+> - dashboard「近期请求」表头从 `Tokens` 拆为 `输入` + `输出` 两列；「模型使用情况」表头从 `总 Tokens` 拆为 `输入 Tokens` + `输出 Tokens`。
+> - 控制台日志格式也改为 `in:N out:M`。
+>
+> **2. 详细日志模式（简略/详细开关）**
+> - 之前：正常请求完全不记录请求头和转换后 body（只在 4xx 时记录摘要）。
+> - 现在：dashboard「日志配置」标签页新增「详细日志模式」开关。开启后每个请求在日志里输出：
+>   - `[verbose] upstream headers: {完整请求头 JSON，auth token 已脱敏}`
+>   - `[verbose] transformed body: {经项目转换后发送给 zai/bigmodel 的完整 body，截断到 2000 字符}`
+> - verbose 日志行放宽到 3000 字符上限（普通日志仍 500 字符），避免 body 被截断。
+> - 配置：YAML `logging.verbose: true`，环境变量 `ZCODE_PROXY_VERBOSE_LOGGING=1`，dashboard 可热切换。
+> - 排查 3001 / 参数错误时建议开启。
+>
+> **3. 凭证禁用/启用按钮**
+> - 之前：凭证只能删除，不能临时停用。
+> - 现在：`Credential` 接口新增 `disabled?: boolean` 字段。dashboard 账号表每行新增「禁用/启用」按钮（橙色/绿色）。
+> - 禁用后：
+>   - `switchToNextCredential` 跳过此凭证（不会被自动切换选中）
+>   - `switchAccount` 拒绝激活此凭证（服务端强制，dashboard 也隐藏「激活」按钮）
+>   - 状态列显示「已禁用」红色徽章
+>   - 名称/套餐输入框半透明显示
+> - 禁用当前激活的凭证时会弹确认框（仍处理进行中请求，但不会被自动切换选中）。
+> - 新端点：`PUT /admin/api/accounts/disabled` body `{id, disabled: boolean}`。
+>
+> **4. 凭证使用次数显示**
+> - 之前：凭证没有使用统计。
+> - 现在：`stats` 对象新增 `byCredential` 内存映射，key = `maskApiKey(apiKey)`，value = `{count, inputTokens, outputTokens, lastUsed}`。
+> - 只统计成功请求（2xx）—— 失败请求不消耗凭证配额。
+> - dashboard 账号表新增「使用」列，显示该凭证的成功请求次数，hover 显示输入/输出 token 明细。
+> - 每 10 秒随 `loadStats` 自动刷新（无需手动刷新账号列表）。
+> - 内存统计，重启清零（与现有 stats 一致）。
+>
+> 全套 460 测试通过（vceshi0.0.5 是 452），TypeScript 类型检查零错误。
+>
+> ---
+
 > **vceshi0.0.5 — 全面 bug 修复（dashboard 模态框/CRITICAL 凭据切换/配置深合并/校验补全）**
 >
 > 对 dashboard、admin API、handler、store 进行全面审查后修复 22 个 bug，包括 4 个 CRITICAL、6 个 P1、12 个 P2。所有修复都有回归测试覆盖（452 测试通过，TypeScript 零错误）。

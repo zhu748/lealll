@@ -58,6 +58,18 @@ export interface Credential {
    * in those flows). Editable via the dashboard.
    */
   email?: string;
+  /**
+   * Disabled flag (vceshi0.0.6+).
+   *
+   * When true, the credential is excluded from:
+   *   - `switchToNextCredential` — won't be picked as a fallback alternative
+   *   - manual activation via dashboard "Activate" button (returns error)
+   *
+   * Useful for temporarily taking a credential out of rotation without
+   * deleting it (e.g. quota exhausted, suspected ban, maintenance).
+   * Toggleable via the dashboard "禁用/启用" button. Default: false (enabled).
+   */
+  disabled?: boolean;
 }
 
 /**

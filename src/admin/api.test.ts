@@ -1346,3 +1346,76 @@ describe("PUT /admin/api/config — retry field validation (vceshi0.0.5+)", () =
     expect(body.error.message).toContain("backoffFactor");
   });
 });
+
+// vceshi0.0.6+: disabled toggle endpoint
+describe("/admin/api/accounts/disabled — toggle disabled state (vceshi0.0.6+)", () => {
+  beforeEach(() => {
+    clearCredential();
+    _resetKeyCacheForTesting();
+    process.env.ZCODE_PROXY_CREDENTIAL_SECRET = "test-secret-disabled";
+  });
+  afterEach(() => {
+    clearCredential();
+    _resetKeyCacheForTesting();
+    delete process.env.ZCODE_PROXY_CREDENTIAL_SECRET;
+  });
+
+  it("returns 400 when id is missing", async () => {
+    const opts = makeAdminOpts();
+    const resp = await handleAdminRoute(
+      authedReq("/admin/api/accounts/disabled", {
+        method: "PUT",
+        body: JSON.stringify({ disabled: true }),
+      }),
+      opts,
+    );
+    expect(resp!.status).toBe(400);
+  });
+
+  it("returns 400 when disabled is not a boolean", async () => {
+    const opts = makeAdminOpts();
+    const resp = await handleAdminRoute(
+      authedReq("/admin/api/accounts/disabled", {
+        method: "PUT",
+        body: JSON.stringify({ id: "some-id", disabled: "yes" }),
+      }),
+      opts,
+    );
+    expect(resp!.status).toBe(400);
+  });
+
+  it("toggles disabled state for an existing account", async () => {
+    await saveCredential({ apiKey: "k", provider: "zai" });
+    const list = await listAccounts();
+    const id = list.accounts[0].id;
+
+    const opts = makeAdminOpts();
+    const resp = await handleAdminRoute(
+      authedReq("/admin/api/accounts/disabled", {
+        method: "PUT",
+        body: JSON.stringify({ id, disabled: true }),
+      }),
+      opts,
+    );
+    expect(resp!.status).toBe(200);
+    const body = await resp!.json();
+    expect(body.ok).toBe(true);
+    expect(body.disabled).toBe(true);
+
+    // Verify persisted
+    const list2 = await listAccounts();
+    expect(list2.accounts[0].disabled).toBe(true);
+  });
+
+  it("returns 404 for unknown account id", async () => {
+    const opts = makeAdminOpts();
+    const resp = await handleAdminRoute(
+      authedReq("/admin/api/accounts/disabled", {
+        method: "PUT",
+        body: JSON.stringify({ id: "nonexistent", disabled: true }),
+      }),
+      opts,
+    );
+    expect(resp!.status).toBe(404);
+  });
+});
