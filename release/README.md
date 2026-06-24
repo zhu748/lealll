@@ -1,5 +1,31 @@
 # zcode-proxy 使用说明
 
+> **vceshi0.0.7（re-release）— 追加管理面板 UI 排版系统优化**
+>
+> 本次 re-release 在原 vceshi0.0.7 逻辑修复基础上，追加 UI/排版层的系统优化。无 CLI 命令变化，无需重新生成 start.bat / start.sh。
+> 全套 473/473 测试通过。
+>
+> **1. 严重 CSS Bug 修复（功能性）**
+> - **`.login-error` 上边距失效**：`margin-top:-var(--s-2)` 是无效 CSS 语法（`-var()` 不合法，浏览器静默忽略），登录错误提示与输入框贴在一起。改为 `calc(var(--s-2) * -1)`。
+> - **`.action-bar` 上下边距失效**：`margin:var(--s-4) -var(--s-5) -var(--s-5)` 同样的 BUG，导致设置页底部 sticky action bar 上下挤在一起。改为 `calc()` 形式并修正横向负值与 `.main-content` padding 对齐。
+> - **`#quotaModal` 残留 `backdrop-filter:blur(2px)`**：上一轮只改了 `.modal-overlay` 和 `#proxyModal`，遗漏了 quotaModal，点击"额度"按钮首次打开时仍有 GPU 开销抖动。移除。
+>
+> **2. 移动端布局 Bug 修复**
+> - **8 个页面 header 移动端溢出**：所有页面 header 都用同一个内联 `style="margin:-24px -32px 24px"`，硬编码了桌面端的 32px padding。在 ≤900px 屏幕上 `.main-content` padding 缩到 20px，但负 margin 仍是 -32px → header 两边各突出 12px，看起来像被剪了一截。抽出 `.page > .main-header` CSS 类，并在 900px / 600px 两个媒体查询里分别覆盖正确的负 margin。
+> - **设置页 sticky action bar 同样的硬编码问题**：抽出 `.action-bar` 类并加响应式规则。
+>
+> **3. 内联 style 去重（约 30+ 处）**
+> - 4 个账号统计 mini-stat 卡片：抽出 `.mini-stat` / `.mini-stat-label` / `.mini-stat-value` 类
+> - 3 个账号页过滤器控件（搜索框 + 2 个下拉）：抽出 `.filter-input` / `.filter-select` 类，附带统一下拉箭头图标
+> - 5+ 处重复的 `<p style="font-size:12px;color:var(--text-2);...">` 段落：抽出 `.text-help-sm` 工具类
+>
+> **4. UX 内容优化**
+> - 移除账号管理页副标题里冗余的"刷新"文字链接（header 右上角已有图标+文字按钮）
+> - "已存储账号"卡片下方的密集说明段落改为 `.hint` 信息横幅，视觉层级更清晰
+> - "备份与恢复"卡片里手写的假提示框（`<p>` + 内联 `border-left`）改为真正的 `.hint` 横幅，统一所有提示信息的视觉语言
+>
+> ---
+
 > **vceshi0.0.8 — 修复 vceshi0.0.7 引入的"激活账号卡死面板"严重回归**
 >
 > vceshi0.0.7 在重写日志 SSE 推送逻辑时引入了一个死循环：`appendLog` 用 `while (logWaiters.length > 0) { shift().resolve() }`，
