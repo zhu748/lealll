@@ -1,5 +1,19 @@
 # zcode-proxy 使用说明
 
+> **vceshi0.0.8 — 修复 vceshi0.0.7 引入的"激活账号卡死面板"严重回归**
+>
+> vceshi0.0.7 在重写日志 SSE 推送逻辑时引入了一个死循环：`appendLog` 用 `while (logWaiters.length > 0) { shift().resolve() }`，
+> 而 waiter 的 `resolve()` 又会同步把自己 push 回 `logWaiters`，导致 while 条件永远为 true，事件循环被永久阻塞。
+>
+> **症状**：只要 SSE 日志流连接着，任何调用 `appendLog` 的操作（点"激活"账号、保存配置、清空凭证等）都会让整个面板卡死，
+> 后端 HTTP 响应永远发不出去，F5 刷新也没用（服务器还卡着），只能重启进程。重启后磁盘写入已完成，所以"重新进入"看到操作其实成功。
+>
+> **修复**：把 `appendLog` 改成 `for (const w of logWaiters) w.resolve(entry)`，每个 SSE 连接持有一个长期 waiter，
+> 连接关闭时由 `cancel()` 移除。`resolve(entry)` 直接发送该条日志，无需 re-push 也无需 flushNew 全表扫描。
+> 新增回归测试：SSE 已连接时触发 `appendLog`，5 秒内必须返回响应（旧代码会无限挂起）。
+>
+> 升级建议：**所有 vceshi0.0.7 用户必须升级**。vceshi0.0.7 在生产环境基本不可用。
+
 > **vceshi0.0.7 — 管理面板逻辑 Bug 全面修复 + 性能优化**
 >
 > 对管理面板进行了系统性审计，修复 5 个严重 Bug + 7 个高优先级 Bug + 6 个中优先级优化。

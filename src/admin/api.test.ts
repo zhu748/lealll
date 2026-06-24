@@ -396,6 +396,103 @@ describe("POST /admin/api/accounts/quota — per-account rate limit (vceshi0.0.7
 });
 
 // ---------------------------------------------------------------------------
+// /admin/api/logs/stream + appendLog — infinite loop regression (vceshi0.0.7+ HOTFIX)
+// ---------------------------------------------------------------------------
+
+describe("POST /admin/api/accounts/active — does not freeze server via appendLog (vceshi0.0.7+ HOTFIX)", () => {
+  // Regression test for the infinite-loop bug in appendLog's old
+  // `while (logWaiters.length > 0) { shift().resolve() }` form. The waiter's
+  // resolve() re-pushed itself into logWaiters synchronously, so the while
+  // condition stayed true forever — blocking the event loop and freezing
+  // the entire dashboard the moment any handler called appendLog.
+  //
+  // We simulate this by:
+  // 1. Opening an SSE log stream (registers a long-lived waiter)
+  // 2. Triggering an action that calls appendLog (PUT /admin/api/accounts/active)
+  // 3. Asserting the PUT response arrives within a reasonable timeout
+  //
+  // If the bug is present, the PUT never resolves and the test times out.
+
+  it("appendLog does not infinite-loop when an SSE client is connected", async () => {
+    // Save an account so we can switch to it.
+    const tmpDir = mkdtempSync(join(tmpdir(), "zcode-proxy-sse-"));
+    process.env.ZCODE_PROXY_STORE_DIR = tmpDir;
+    _resetKeyCacheForTesting();
+    const cred: Credential = {
+      apiKey: "sk-test-1", provider: "zai", plan: "coding-plan",
+    };
+    await saveCredential(cred, { keepActive: true });
+    const cred2: Credential = {
+      apiKey: "sk-test-2", provider: "zai", plan: "coding-plan",
+    };
+    await saveCredential(cred2, { keepActive: true });
+    const list = await listAccounts();
+    expect(list.accounts.length).toBe(2);
+    // Activate the first account so we can switch to the second
+    const targetId = list.accounts[0].id;
+
+    try {
+      const opts = makeAdminOpts({
+        auth: new AuthManager({ mode: "oauth", provider: "zai" }),
+      });
+
+      // 1. Open the SSE log stream (this registers a waiter in logWaiters).
+      const sseResp = await callAdmin(
+        authedReq("/admin/api/logs/stream"),
+        opts,
+      );
+      expect(sseResp).not.toBeNull();
+      expect(sseResp!.status).toBe(200);
+      // Start reading the stream so the controller doesn't buffer forever.
+      const reader = (sseResp!.body as ReadableStream<Uint8Array>).getReader();
+      const readPromise = (async () => {
+        // Read a few chunks then stop — we don't care about the content,
+        // we just need the stream to be actively consumed so the controller
+        // doesn't apply backpressure that would prevent enqueue.
+        for (let i = 0; i < 5; i++) {
+          await reader.read();
+        }
+      })();
+
+      // 2. Give the SSE handler a tick to register its waiter.
+      await new Promise(r => setTimeout(r, 50));
+
+      // 3. Trigger an action that calls appendLog. With the bug present,
+      //    this PUT never resolves because appendLog infinite-loops and
+      //    blocks the event loop. We use a 5s timeout to fail fast.
+      const switchPromise = callAdmin(
+        authedReq("/admin/api/accounts/active", {
+          method: "PUT",
+          body: JSON.stringify({ id: targetId }),
+        }),
+        opts,
+      );
+
+      const result = await Promise.race([
+        switchPromise.then(r => ({ ok: true, r })),
+        new Promise<{ ok: false }>(resolve => setTimeout(() => resolve({ ok: false }), 5000)),
+      ]);
+
+      // 4. Cancel the SSE stream so the test can clean up.
+      try { reader.cancel(); } catch {}
+      try { await readPromise; } catch {}
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.r!.status).toBe(200);
+        const body = await result.r!.json();
+        expect(body.ok).toBe(true);
+      }
+    } finally {
+      clearCredential();
+      delete process.env.ZCODE_PROXY_STORE_DIR;
+      _resetKeyCacheForTesting();
+      try { rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // recordDebugDump — ring buffer
 // ---------------------------------------------------------------------------
 

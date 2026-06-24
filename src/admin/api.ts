@@ -353,9 +353,22 @@ export function appendLog(level: string, message: string) {
     // Efficient: remove in bulk instead of one-by-one splice
     logBuffer.splice(0, logBuffer.length - LOG_BUFFER_TRIM);
   }
-  // Wake up any waiting SSE connections
-  while (logWaiters.length > 0) {
-    logWaiters.shift()!.resolve(entry);
+  // Push the new entry to every connected SSE client.
+  //
+  // vceshi0.0.7+ HOTFIX: the previous `while (logWaiters.length > 0) { shift().resolve() }`
+  // form caused an infinite loop because the waiter's resolve() re-pushed
+  // itself into logWaiters synchronously — the while condition stayed true
+  // forever, blocking the Node.js event loop. Symptom: any action that
+  // called appendLog (account switch, config save, etc.) froze the entire
+  // dashboard, including unrelated API requests. F5 didn't recover because
+  // the server was still stuck in the loop; only a process restart did.
+  //
+  // The fix is structural: each SSE connection owns ONE long-lived waiter
+  // (registered once at start(), removed on cancel()). appendLog just
+  // iterates the array and calls resolve(entry) — no shift, no re-push,
+  // no loop control to get wrong.
+  for (const w of logWaiters) {
+    try { w.resolve(entry); } catch { /* ignore — controller may be closed */ }
   }
 }
 
@@ -1643,14 +1656,19 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
   // cursor (lastSentSeq) is a seq value, not an array index — it stays
   // valid across splice() calls because we look up entries by seq.
   //
-  // vceshi0.0.7+: delivery is now genuinely push-based. The previous code
-  // registered a `waiter` with a noop resolve and relied on a 500ms polling
-  // loop running forever — wasteful (10 tabs = 20 polls/sec scanning the
-  // 2000-entry buffer) and the comment claiming push-based delivery was
-  // misleading. The waiter now actually flushes new entries to the SSE
-  // stream when it's resolved, then re-registers itself; the polling
-  // interval runs at a slower 2s cadence purely as a safety net for the
-  // registration race and is bounded to a short window after start.
+  // vceshi0.0.7+ HOTFIX: this handler was rewritten to fix an infinite loop
+  // bug. The previous version registered a waiter whose resolve() re-pushed
+  // itself into logWaiters synchronously — appendLog's `while (length > 0)
+  // { shift().resolve() }` then looped forever, blocking the event loop.
+  // The new model: each SSE connection owns ONE long-lived waiter (registered
+  // once at start(), removed on cancel()). appendLog just iterates the array
+  // and calls resolve(entry) — no shift, no re-push. The waiter's resolve()
+  // sends the specific entry directly to the SSE stream (no flushNew re-scan
+  // needed), keeping push-based delivery with low latency.
+  //
+  // The 2s polling interval is kept as a safety net for the rare race where
+  // appendLog fires between the initial buffer-scan and the logWaiters.push()
+  // (which would otherwise be missed because the waiter isn't registered yet).
   if (path === "/admin/api/logs/stream" && method === "GET") {
     let lastSentSeq = logSeq;
     let cleanup: (() => void) | null = null;
@@ -1666,6 +1684,8 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
         };
 
         // Flush any new entries with seq > lastSentSeq, then advance cursor.
+        // Used by the safety-net polling interval only — push delivery goes
+        // through waiter.resolve(entry) directly, no full buffer scan needed.
         const flushNew = () => {
           for (const e of logBuffer) {
             if (e.seq > lastSentSeq) send(e);
@@ -1681,16 +1701,20 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
         }
         lastSentSeq = logSeq;
 
-        // Push-based waiter: appendLog() resolves waiters when a new entry
-        // is appended. We register a real resolve function that flushes new
-        // entries, then re-registers itself for the next entry.
+        // Long-lived waiter: appendLog() calls resolve(entry) for every
+        // connected SSE client. resolve() just sends the entry directly —
+        // NO re-push, NO flushNew (the entry is right here, no need to
+        // re-scan the buffer). The waiter stays in logWaiters until the
+        // connection closes (cancel() handler removes it).
         const waiter: { resolve: (value: unknown) => void } = {
-          resolve: () => {
+          resolve: (value: unknown) => {
             if (closed) return;
-            flushNew();
-            // Re-register for the next entry (unless we've been cleaned up).
-            if (!closed && logWaiters.indexOf(waiter) < 0) {
-              logWaiters.push(waiter);
+            // The value IS the new log entry — send it directly.
+            // No need to flushNew() because we have the entry right here.
+            const entry = value as { seq: number; time: string; level: string; message: string };
+            if (entry.seq > lastSentSeq) {
+              send(entry);
+              lastSentSeq = entry.seq;
             }
           },
         };
