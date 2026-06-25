@@ -1,5 +1,30 @@
 # zcode-proxy 使用说明
 
+> **vceshi0.1.0 — 修复 start-plan 额度查询无法激活新账号的致命 Bug**
+>
+> 新号 OAuth 登录后，用 lealll 额度查询一直显示「无计划（plans 为空）」，必须手动去登录 ZCode 桌面客户端才能激活。
+> 本次彻底定位根因并修复。无 CLI 命令变化，无需重新生成 start.bat / start.sh。
+>
+> **症状**
+> - 全新账号 OAuth 登录后，dashboard 点「额度」→ 一直显示空 / no_plan
+> - 用户误以为是「凭证没激活」，反复重新 OAuth 或去登录 ZCode 客户端
+>
+> **根因：app_version 版本号过低，触发不了服务端的 trial 激活闸门**
+> - `billing/current` 接口把 `app_version` 当作 start-plan 首次激活的闸门：
+>   低版本（如 `2.0.0`）查询不激活，真实客户端版本（`3.1.x`）才授予 trial
+> - lealll 的 `quota.ts` 硬编码 `DEFAULT_APP_VERSION = "2.0.0"`，与项目 config 体系（默认 `3.1.1`）脱节
+> - 所以每次额度查询都用 `2.0.0`，**永远激活不了新号**
+> - 用户「必须登录 ZCode 才激活」的体感真相：ZCode 客户端查额度用真实版本 3.1.x，所以激活；与登录无关
+>
+> **修复**
+> - `quota.ts`：`DEFAULT_APP_VERSION` 从 `2.0.0` → `3.1.5`（真实客户端版本）
+> - `admin/api.ts`：调额度查询时注入 `config.identity.appVersion`，复用 config 体系（env/yaml 可覆盖）
+> - 激活不可逆，版本号只在首次成功查询时起作用
+>
+> **实测验证**（同一新号、同一秒、同一 jwt，唯一变量是 app_version）：
+> - `app_version=2.0.0` → `{"plans":[]}` 不激活
+> - `app_version=3.1.5` → 瞬间激活 ZCode Start Plan（GLM-5.2 3M/daily + GLM-5-Turbo 2M/daily）
+
 > **vceshi0.0.9 — 修复"空回 200 不自动切换账号"严重 Bug**
 >
 > vceshi0.0.7 / vceshi0.0.8 期间尝试修复过"额度耗尽返回空 200 不切换凭证"的问题，但实测仍不生效。

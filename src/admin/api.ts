@@ -885,7 +885,7 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
         ? ((input: RequestInfo | URL, init?: RequestInit) =>
             baseFetch(input, { ...init, ...(cred.proxy ? { proxy: cred.proxy } : {}) } as any))
         : baseFetch) as typeof fetch;
-      const result = await queryQuota(cred, accountFetch);
+      const result = await queryQuota(cred, accountFetch, opts.config.identity?.appVersion);
       // Cache the fresh result (even on failure — saves the upstream from
       // immediate re-hammering when the failure is durable like a 403).
       quotaCache.set(body.id, { ts: now, result });
