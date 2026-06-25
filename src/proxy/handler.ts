@@ -66,6 +66,14 @@ export async function proxyRequest(
   const started = Date.now();
   const reqId = nextReqId();
 
+  // Debug logging flag — when true, logs the full upstream response details
+  // (status + key headers + body preview) for every request. Enabled via
+  // config.logging.debug OR env var ZCODE_PROXY_DEBUG_LOGGING=1. This is the
+  // "调试日志" the user requested: see exactly what 529 / empty 200 / etc.
+  // the upstream returns, including the error JSON body.
+  const debugLoggingEnabled = config.logging?.debug === true
+    || process.env.ZCODE_PROXY_DEBUG_LOGGING === "1";
+
   const body = await readBody(clientReq);
 
   // Parse the body once and reuse the parsed object throughout the pipeline.
@@ -298,6 +306,16 @@ export async function proxyRequest(
       if (resp.status !== originalStatus) {
         console.log(`${reqId} SSE error detected in 200 stream → HTTP ${resp.status}`);
       }
+    }
+    // DEBUG: log the upstream response details for debugging quota / empty /
+    // error issues. Enabled when config.logging.debug is true (or env var
+    // ZCODE_PROXY_DEBUG_LOGGING=1). Shows status, key headers, and a body
+    // preview so the user can see EXACTLY what the upstream returned —
+    // whether it's a 529 with an error JSON, an empty 200, or a real
+    // response. This is the "调试日志" the user requested: "无论返回什么
+    // 都能看到它具体返回啥的东西，比如529还是空回200都能看到具体返回的参数".
+    if (debugLoggingEnabled) {
+      logUpstreamResponseDebug(reqId, resp, meta.stream);
     }
     return resp;
   };
@@ -673,6 +691,24 @@ export async function proxyRequest(
           consecutiveEmptyStreams = 0;
           triedApiKeys.add(newCred.apiKey);
           extraAttemptsFromSwitches++;
+          // Persist the switch so the dashboard reflects the new active account.
+          // This was MISSING in the end-of-loop switch block — the in-memory
+          // credential was switched (so the request used the new account), but
+          // the on-disk activeId still pointed at the old account. The user
+          // saw "激活还是停在原来的账号上，但实际上已经用了下一个账号进行调用了".
+          // Now both switch blocks (top-of-loop and end-of-loop) persist the
+          // switch consistently. Non-fatal: if persistence fails, the in-memory
+          // switch still works for the remainder of this request.
+          try {
+            const accounts = await exportAccounts();
+            const match = accounts.find(a => a.credential.apiKey === newCred.apiKey);
+            if (match) {
+              await switchAccount(match.id);
+              appendLog("info", `Auto-switched credential to "${match.label}" (${maskApiKey(newCred.apiKey)}) after ${reason}`);
+            }
+          } catch (e) {
+            console.log(`${reqId} could not persist credential switch: ${(e as Error).message}`);
+          }
           try { upstreamResp.body?.cancel(); } catch {}
           continue; // skip the break, give the new cred a chance
         }
@@ -1352,4 +1388,96 @@ function observeStream(
     const avgTps = tokens > 0 && totalMs > 0 ? tokens / (totalMs / 1000) : 0;
     printRow(reqId, format, meta, status, requestSentAt, requestSentAt + ttfbMs, tokens, avgTps, endAt, false, inputTokens, credKey);
   })().catch(() => {});
+}
+
+/**
+ * Debug log the upstream response — shows EXACTLY what the upstream returned.
+ *
+ * Uses `resp.clone()` to read a copy of the body without consuming the
+ * original — the caller's retry / passthrough logic still sees the full
+ * response. Response.clone() is supported by both Bun and the Fetch spec; it
+ * internally buffers the body so both the clone and original can be read.
+ *
+ * Logs:
+ *   - HTTP status + key headers (content-type, retry-after, empty-stream flag,
+ *     ratelimit headers)
+ *   - Body preview: first 1000 chars (for JSON) or first 2KB (for SSE streams)
+ *
+ * This is the "调试日志" the user requested: see what 529 / empty 200 / captcha
+ * 403 actually returned, including the error JSON body. Enabled via
+ * config.logging.debug or ZCODE_PROXY_DEBUG_LOGGING=1.
+ *
+ * MUST never throw — all operations wrapped in try/catch.
+ */
+async function logUpstreamResponseDebug(reqId: string, resp: Response, _isStream: boolean): Promise<void> {
+  try {
+    const status = resp.status;
+    const ct = resp.headers.get("content-type") ?? "";
+    const ce = resp.headers.get("content-encoding") ?? "";
+    const retryAfter = resp.headers.get("retry-after") ?? "";
+    const emptyStream = resp.headers.get("x-zcode-empty-stream") ?? "";
+    const ratelimitRemaining = resp.headers.get("anthropic-ratelimit-requests-remaining")
+      ?? resp.headers.get("x-ratelimit-remaining") ?? "";
+
+    // Header summary — always logged
+    const headerParts: string[] = [`status=${status}`, `ct=${ct || "(none)"}`];
+    if (ce && ce !== "identity") headerParts.push(`encoding=${ce}`);
+    if (retryAfter) headerParts.push(`retry-after=${retryAfter}`);
+    if (emptyStream) headerParts.push(`empty-stream=${emptyStream}`);
+    if (ratelimitRemaining) headerParts.push(`ratelimit-remaining=${ratelimitRemaining}`);
+    console.log(`${reqId} [debug] upstream response: ${headerParts.join(" | ")}`);
+
+    // Body preview via clone() — doesn't consume the original response.
+    // clone() buffers the body internally; both the clone and original can
+    // be read independently. This is the cleanest way to inspect a Response
+    // without breaking downstream passthrough.
+    let clone: Response;
+    try {
+      clone = resp.clone();
+    } catch {
+      // Some Response implementations (e.g. streaming with non-cloneable
+      // bodies) may reject clone() — skip body preview in that case.
+      console.log(`${reqId} [debug] (body preview unavailable — response not cloneable)`);
+      return;
+    }
+
+    // Read the clone's body with a timeout so a hung stream doesn't block
+    // the request forever. 3s is enough to get the first SSE event or the
+    // full JSON body of an error response.
+    const previewPromise = (async () => {
+      if (!clone.body) return "(no body)";
+      const reader = clone.body.getReader();
+      const decoder = new TextDecoder();
+      let preview = "";
+      const deadline = Date.now() + 3000;
+      while (preview.length < 2048 && Date.now() < deadline) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        preview += decoder.decode(value, { stream: true });
+        // For SSE: stop after first complete event (enough to diagnose)
+        if (ct.includes("text/event-stream") && preview.includes("\n\n") && preview.length > 50) break;
+        // For JSON: stop when we likely have the full body (small error responses)
+        if (ct.includes("application/json") && preview.length > 0 && preview.trim().endsWith("}")) break;
+      }
+      try { reader.cancel(); } catch {}
+      return preview;
+    })();
+
+    let preview: string;
+    try {
+      preview = await Promise.race([
+        previewPromise,
+        new Promise<string>(r => setTimeout(() => r("(read timeout after 3s)"), 3000)),
+      ]);
+    } catch {
+      preview = "(body read failed)";
+    }
+
+    const trimmed = preview.length > 1000
+      ? preview.slice(0, 1000) + `...(truncated, total ${preview.length} chars)`
+      : preview;
+    console.log(`${reqId} [debug] body preview (${preview.length} chars): ${trimmed || "(empty body)"}`);
+  } catch (err) {
+    console.log(`${reqId} [debug] failed to log response: ${(err as Error).message}`);
+  }
 }

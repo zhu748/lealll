@@ -69,6 +69,16 @@ identity:
 
 logging:
   level: info
+  # Verbose mode (vceshi0.0.6+): logs the full upstream request headers +
+  # transformed body for every request. Useful for diagnosing 3001 parameter
+  # errors. Env var: ZCODE_PROXY_VERBOSE_LOGGING=1
+  # verbose: false
+  # Debug response logging (ceshi0.1.4+): logs the FULL upstream response
+  # for every request — status + key headers + body preview (first 1000 chars
+  # for JSON, first 2KB for SSE streams). Shows EXACTLY what 529 / empty 200 /
+  # captcha 403 returned, including the error JSON body. Uses resp.clone() so
+  # it doesn't consume the original response. Env var: ZCODE_PROXY_DEBUG_LOGGING=1
+  # debug: false
 
 # Retry configuration for upstream requests.
 # When the upstream returns a retryable status code (e.g. 529 site overloaded),

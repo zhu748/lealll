@@ -200,6 +200,24 @@ export interface ProxyConfig {
      * ZCODE_PROXY_VERBOSE_LOGGING=1 to enable at startup.
      */
     verbose?: boolean;
+    /**
+     * Debug response logging (this version).
+     *
+     * When true, logs the FULL upstream response details for every request:
+     *   - HTTP status code
+     *   - Key response headers (content-type, content-encoding, retry-after,
+     *     x-zcode-empty-stream, ratelimit-* headers)
+     *   - Response body preview (first 1000 chars for non-stream, or the
+     *     first SSE event for streams)
+     *
+     * This is the "调试日志" for diagnosing quota-exhausted empty 200s, 529
+     * errors with specific error JSON, captcha 403s, etc. — you see EXACTLY
+     * what the upstream returned instead of just a status code.
+     *
+     * Default: false. Env var: ZCODE_PROXY_DEBUG_LOGGING=1 to enable at
+     * startup. Also toggleable via dashboard "日志配置" tab (alongside verbose).
+     */
+    debug?: boolean;
   };
   /**
    * Retry configuration for upstream requests.

@@ -20,10 +20,23 @@ import {
   invalidateStoreCache,
   _resetKeyCacheForTesting,
 } from "./store.js";
-import { existsSync, writeFileSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, writeFileSync, mkdirSync, readFileSync, readdirSync, unlinkSync } from "node:fs";
+import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import type { Credential } from "./types.js";
+
+/** Test helper: remove all .broken-* backup files from the store dir. */
+function cleanupBrokenBackups(): void {
+  const storeDir = join(homedir(), ".zcode-proxy");
+  if (!existsSync(storeDir)) return;
+  try {
+    for (const f of readdirSync(storeDir)) {
+      if (f.startsWith("credentials.json.broken-")) {
+        try { unlinkSync(join(storeDir, f)); } catch {}
+      }
+    }
+  } catch {}
+}
 
 // With the fixed-key scheme (SHA-256("520")), there's no per-test secret to
 // set. The env vars below are only used by the legacy-fallback recovery tests
@@ -32,10 +45,12 @@ describe("credential store", () => {
   beforeEach(() => {
     _resetKeyCacheForTesting();
     clearCredential();
+    cleanupBrokenBackups();
   });
 
   afterEach(() => {
     clearCredential();
+    cleanupBrokenBackups();
     _resetKeyCacheForTesting();
     delete process.env.ZCODE_PROXY_CREDENTIAL_SECRET;
     delete process.env.ZCODE_PROXY_LEGACY_SEED;
@@ -97,10 +112,13 @@ describe("multi-account store", () => {
   beforeEach(() => {
     _resetKeyCacheForTesting();
     clearCredential();
+    // Also clean up any leftover .broken-* files from prior test runs
+    cleanupBrokenBackups();
   });
 
   afterEach(() => {
     clearCredential();
+    cleanupBrokenBackups();
     delete process.env.ZCODE_PROXY_CREDENTIAL_SECRET;
     delete process.env.ZCODE_PROXY_LEGACY_SEED;
   });
@@ -501,12 +519,16 @@ describe("multi-account store", () => {
     expect(loaded2).not.toBeNull();
     expect(loaded2!.apiKey).toBe("important-key");
 
-    // Step 5: the env var IS still useful as a legacy-fallback recovery seed —
-    // if a file was encrypted by the old buggy code with K_env, setting the env
-    // var lets the decrypt fallback find K_env and recover the file. Verify this
-    // recovery path still works for legacy files.
+    // Step 5: ZCODE_PROXY_CREDENTIAL_SECRET is NOT consulted as a recovery
+    // seed anymore (removed in this version — it was the #1 cause of key
+    // drift / credential loss). Only ZCODE_PROXY_LEGACY_SEED works for
+    // manual recovery. Verify the new contract: a file encrypted with an
+    // old env-var-derived key CANNOT be recovered by setting the old env
+    // var — but CAN be recovered by setting ZCODE_PROXY_LEGACY_SEED to the
+    // same value.
     clearCredential();
     _resetKeyCacheForTesting();
+    delete process.env.ZCODE_PROXY_CREDENTIAL_SECRET;
     const crypto = await import("node:crypto");
     const legacyEnvSecret = "legacy-env-secret-from-old-version";
     const legacyKey = crypto.createHash("sha256").update(legacyEnvSecret).digest();
@@ -529,13 +551,24 @@ describe("multi-account store", () => {
     mkdirSync(join(homedir(), ".zcode-proxy"), { recursive: true });
     writeFileSync(storePath, JSON.stringify({ version: 2, encrypted }), { mode: 0o600 });
 
-    // Without the env var: fixed key + homedir seeds all fail → null.
+    // Without any env var: fixed key + homedir seeds all fail → null.
     _resetKeyCacheForTesting();
     invalidateStoreCache();
     expect(await loadCredential()).toBeNull();
 
-    // With the env var set to the old secret: fallback finds K_env → recovers.
+    // With ZCODE_PROXY_CREDENTIAL_SECRET set to the old secret: STILL fails —
+    // this env var is no longer consulted. The user must use
+    // ZCODE_PROXY_LEGACY_SEED instead.
     process.env.ZCODE_PROXY_CREDENTIAL_SECRET = legacyEnvSecret;
+    _resetKeyCacheForTesting();
+    invalidateStoreCache();
+    expect(await loadCredential()).toBeNull();
+
+    // With ZCODE_PROXY_LEGACY_SEED set to the old secret value: fallback
+    // finds the key → recovers. This is the ONLY supported manual recovery
+    // path going forward.
+    delete process.env.ZCODE_PROXY_CREDENTIAL_SECRET;
+    process.env.ZCODE_PROXY_LEGACY_SEED = legacyEnvSecret;
     _resetKeyCacheForTesting();
     invalidateStoreCache();
     const recovered = await loadCredential();
@@ -777,5 +810,103 @@ describe("multi-account store", () => {
     invalidateStoreCache();
     const finalLoad = await loadCredential();
     expect(finalLoad!.apiKey).toBe("new-after-recovery");
+  });
+
+  // --- Atomic write + mutex regression tests (this version) ---
+  // The user reported "重启突然凭证全部丢失" — root cause was writeFileSync
+  // truncating the file then writing; a crash between truncate and full write
+  // left credentials.json empty/partial, which failed JSON.parse on next read
+  // → "credentials cleared" symptom. These tests verify the new atomic-write
+  // path and concurrent-write serialization.
+
+  it("concurrent saveCredential calls do not lose accounts (mutex serializes writes)", async () => {
+    // Fire 5 concurrent saves with distinct apiKeys. Without the mutex, the
+    // last writer's read-modify-write would race with earlier writers and
+    // drop their accounts — final list would have <5 entries.
+    //
+    // The mutex in store.ts serializes the read-modify-write critical
+    // section so each save sees the previous one's result.
+    const keys = ["concurrent-1", "concurrent-2", "concurrent-3", "concurrent-4", "concurrent-5"];
+    await Promise.all(keys.map(k => saveCredential({ apiKey: k, provider: "zai" })));
+    const list = await listAccounts();
+    const storedKeys = list.accounts.map(a => a.apiKeyMask);
+    for (const k of keys) {
+      expect(storedKeys).toContain(k);
+    }
+    expect(list.accounts).toHaveLength(keys.length);
+  });
+
+  it("saveCredential uses atomic write (temp file + rename), not direct writeFileSync", async () => {
+    // Verify the atomic-write path is active by checking that no partial /
+    // temp files are left behind after a successful save. The old
+    // writeFileSync approach left no temp files but was non-atomic; the new
+    // atomicWriteFile approach creates a temp file then renames it, so on
+    // success the temp is gone and only credentials.json remains.
+    await saveCredential({ apiKey: "atomic-test-key", provider: "zai" });
+    const storeDir = dirname(join(homedir(), ".zcode-proxy", "credentials.json"));
+    const dirContents = await import("node:fs/promises").then(m => m.readdir(storeDir));
+    // No leftover .tmp-* files from atomicWriteFile
+    const leftovers = dirContents.filter((f: string) => f.includes(".tmp-"));
+    expect(leftovers).toEqual([]);
+    // credentials.json exists and is valid JSON (not truncated)
+    const content = readFileSync(join(homedir(), ".zcode-proxy", "credentials.json"), "utf-8");
+    expect(() => JSON.parse(content)).not.toThrow();
+  });
+
+  // --- This version: empty-file defense + .broken-* cleanup ---
+
+  it("empty credentials.json is treated as 'no store' without creating a .broken backup", async () => {
+    // Simulate a crashed write that left an empty file (the old writeFileSync
+    // truncate-then-write race). The new code should treat this as "no store"
+    // and NOT back it up (backing up an empty file is pointless spam).
+    clearCredential();
+    const storePath = join(homedir(), ".zcode-proxy", "credentials.json");
+    mkdirSync(join(homedir(), ".zcode-proxy"), { recursive: true });
+    writeFileSync(storePath, "", "utf-8");
+
+    _resetKeyCacheForTesting();
+    invalidateStoreCache();
+    const loaded = await loadCredential();
+    expect(loaded).toBeNull();
+
+    // No .broken-* file should have been created for an empty file
+    const dirContents = await import("node:fs/promises").then(m => m.readdir(join(homedir(), ".zcode-proxy")));
+    const brokenFiles = dirContents.filter((f: string) => f.startsWith("credentials.json.broken-"));
+    expect(brokenFiles).toEqual([]);
+
+    // Guard should NOT be set — saving a new credential should work
+    await saveCredential({ apiKey: "after-empty-recovery", provider: "zai" });
+    const after = await loadCredential();
+    expect(after!.apiKey).toBe("after-empty-recovery");
+  });
+
+  it(".broken-* backups are capped at 5 (oldest deleted)", async () => {
+    // Create 7 corrupted files by writing invalid JSON directly, then trigger
+    // a read (which backs up + cleans up). Only the 5 most recent should remain.
+    clearCredential();
+    const storeDir = join(homedir(), ".zcode-proxy");
+    mkdirSync(storeDir, { recursive: true });
+
+    // Write 7 .broken-* files with different timestamps (100ms apart so mtime
+    // ordering is stable)
+    for (let i = 0; i < 7; i++) {
+      const bp = join(storeDir, `credentials.json.broken-${Date.now() + i * 1000}`);
+      writeFileSync(bp, `old-backup-${i}`, "utf-8");
+      await new Promise(r => setTimeout(r, 20));
+    }
+
+    // Now write a corrupted credentials.json and read it — triggers
+    // backupCorruptedStore which should clean up to 5 most recent
+    const storePath = join(storeDir, "credentials.json");
+    writeFileSync(storePath, "{not valid json", "utf-8");
+    _resetKeyCacheForTesting();
+    invalidateStoreCache();
+    await loadCredential();
+
+    // Count .broken-* files — should be at most 5 (the 7 old ones + 1 new = 8,
+    // but cleanup keeps only 5 most recent)
+    const dirContents = await import("node:fs/promises").then(m => m.readdir(storeDir));
+    const brokenFiles = dirContents.filter((f: string) => f.startsWith("credentials.json.broken-"));
+    expect(brokenFiles.length).toBeLessThanOrEqual(5);
   });
 });

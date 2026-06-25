@@ -582,7 +582,7 @@ curl http://localhost:8080/v1/models \
 | `identity.appVersion` | `ZCODE_APP_VERSION` | `3.1.1` | `User-Agent: ZCode/{version}` |
 | `identity.sourceTitle` | `ZCODE_SOURCE_TITLE` | `cli` | `X-Title: Z Code@{title}` |
 | `identity.refererOrigin` | `ZCODE_REFERER_ORIGIN` | `https://zcode.z.ai` | `HTTP-Referer` URL |
-| — | `ZCODE_PROXY_CREDENTIAL_SECRET` | derived from `homedir` | Override the AES-256-GCM key for `~/.zcode-proxy/credentials.json` |
+| — | `ZCODE_PROXY_LEGACY_SEED` | unset | Manual one-time recovery seed for credentials.json encrypted by an older version. See Security Notes. `ZCODE_PROXY_CREDENTIAL_SECRET` is intentionally NOT consulted — it was the #1 cause of credential loss on restart. |
 | — | `ZCODE_PROXY_ALLOW_PLAINTEXT_STORE` | unset | Set to `1` to allow loading a plaintext credentials.json (debug/test only) |
 | — | `ZCODE_PROXY_CORS_ALLOWLIST` | unset | Comma-separated allowed origins for `Access-Control-Allow-Origin`. When unset, any origin is echoed (legacy permissive behavior). When set, only listed origins get `Access-Control-Allow-Origin: <origin>`; all others get `null`. |
 | — | `ZCODE_PROXY_CONFIG` | `config.yaml` | Path to the config file (used when `serve` is called with no positional arg) |
@@ -590,7 +590,10 @@ curl http://localhost:8080/v1/models \
 ## Security Notes
 
 - **`auth.proxyApiKey`**: if unset, anyone with network access to the port can use your upstream credentials. The proxy prints a warning at startup if this is missing.
-- **Credential store encryption**: `~/.zcode-proxy/credentials.json` is AES-256-GCM encrypted using a key derived from your homedir/platform. The key can be overridden with `ZCODE_PROXY_CREDENTIAL_SECRET` (useful for test isolation). Plaintext loading is gated behind `ZCODE_PROXY_ALLOW_PLAINTEXT_STORE=1` to prevent bypass-via-file-write attacks.
+- **Credential store encryption**: `~/.zcode-proxy/credentials.json` is AES-256-GCM encrypted with a FIXED key derived from `SHA-256("520")`. The same key is used on every machine, every OS, every run — so credentials.json is portable across devices and never breaks due to key drift. There is NO env-var override, NO key file in the credential directory, NO seed derivation — just one constant key, everywhere, always. This eliminates the entire class of "key drift" bugs (homedir resolving differently across Bun versions, USERPROFILE vs HOMEDRIVE+HOMEPATH on Windows, username changes, OS reinstalls, copying credentials.json between machines, and the old `ZCODE_PROXY_CREDENTIAL_SECRET` env var being set during one run and not the next) that previously caused "重启突然凭证全部丢失".
+- **Atomic writes + mutex**: credentials.json is written via `atomicWriteFile` (write-to-tmp + rename) so a crash mid-write leaves the previous file intact instead of a truncated/partial one. All mutations are serialized via an in-process mutex so concurrent dashboard writes + proxy auto-switch calls don't race (last-writer-wins would silently drop accounts).
+- **Manual recovery (one-time)**: if your credentials.json was encrypted by an older version that used seed-based or env-var-derived key derivation, set `ZCODE_PROXY_LEGACY_SEED` to the old seed string (e.g. `C:\\Users\\OldName-win32-x64` or the old `ZCODE_PROXY_CREDENTIAL_SECRET` value) and the file will be recovered on next read, then re-encrypted with the fixed 520 key on the next write — so this is a one-time migration, not a permanent dependency on the old key. `ZCODE_PROXY_CREDENTIAL_SECRET` itself is intentionally NOT consulted anymore.
+- **Plaintext loading backdoor**: gated behind `ZCODE_PROXY_ALLOW_PLAINTEXT_STORE=1` to prevent bypass-via-file-write attacks.
 - **CORS**: by default the proxy echoes the requesting Origin. For production, set `ZCODE_PROXY_CORS_ALLOWLIST` to the comma-separated list of origins you trust (e.g. `http://localhost:3000,https://your-dashboard.example.com`).
 - **Upstream timeouts**: stream requests time out after 10 minutes; batch requests after 5 minutes. A hung upstream connection no longer pins a Bun worker forever — it surfaces as `502 upstream_unreachable`.
 

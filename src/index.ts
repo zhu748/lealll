@@ -16,7 +16,42 @@ import { spawn } from "node:child_process";
 import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-const VERSION = "ceshi0.1.2";
+const VERSION = "ceshi0.1.4";
+
+// ---------------------------------------------------------------------------
+// Process-level error handlers — installed ONCE before main() so they cover
+// every code path including the dynamic import("./admin/api.js") below.
+//
+// Without these, ANY uncaught async error kills the Bun process — that's the
+// #1 cause of "exe在window运行时有时候不知道为什么会用着用着突然退出". A single
+// rejected promise from an SSE observer, an unhandled exception in a captcha
+// callback, or an error thrown by Bun.inspect during console.log formatting
+// would all silently terminate the process with no log trail.
+//
+// We LOG and CONTINUE rather than crash. For a long-running local proxy,
+// crashing mid-stream on a single bad request is worse than logging the error
+// and serving the next request. The proxy's per-request try/catch in
+// handler.ts already returns 502 to the client on upstream failures — these
+// handlers are the safety net for errors that escape THAT catch.
+// ---------------------------------------------------------------------------
+process.on("uncaughtException", (err) => {
+  // Bun's default behavior is to print + exit. We override to print + continue.
+  // The error is logged to stderr (visible in the dashboard log panel via the
+  // console.error interceptor installed in serve()).
+  try {
+    console.error("[uncaughtException]", err?.stack ?? err);
+  } catch {
+    // If even console.error throws (e.g. during shutdown), fall back to raw write.
+    try { process.stderr.write(`[uncaughtException] ${String(err)}\n`); } catch {}
+  }
+});
+process.on("unhandledRejection", (reason) => {
+  try {
+    console.error("[unhandledRejection]", reason instanceof Error ? reason.stack ?? reason : String(reason));
+  } catch {
+    try { process.stderr.write(`[unhandledRejection] ${String(reason)}\n`); } catch {}
+  }
+});
 
 main();
 
@@ -126,50 +161,63 @@ async function serve(configPath?: string): Promise<void> {
   if (config.auth.mode === "oauth") {
     const cred = await loadCredential();
     if (!cred) {
-      throw new Error(
-        `Not logged in for OAuth mode. Run this in a terminal first:\n` +
-        `    zcode-proxy auth login ${config.provider}\n` +
-        `Or edit ${path} and set:\n` +
-        `    auth.mode: apikey\n` +
-        `    auth.apiKey: <your-key>`,
-      );
-    }
-    auth.setOAuthCredential(cred);
-    // Resolve the effective plan from the credential. Priority:
-    //   1. cred.plan — explicit (set by v0.1.4+ import or dashboard)
-    //   2. inferred from cred.jwt — if a JWT is present, the credential
-    //      came from start-plan flow (JWTs are start-plan exclusive).
-    //      This handles v1 imports from zcode-api-ref which have no plan
-    //      field but DO carry a start-plan JWT.
-    //   3. config.yaml's plan — final fallback (default coding-plan)
-    //
-    // The credential's plan (explicit or inferred) wins over config.yaml
-    // because the credential determines which upstream URL and auth headers
-    // we use — sending a start-plan JWT to a coding-plan endpoint would
-    // fail with 401, and a coding-plan API key to zcode.z.ai would fail too.
-    let effectivePlan: PlanId;
-    let planSource: string;
-    if (cred.plan) {
-      effectivePlan = cred.plan;
-      planSource = `explicit on credential`;
-    } else if (cred.jwt) {
-      effectivePlan = "start-plan";
-      planSource = `inferred from JWT presence (v1 credential, no plan field)`;
+      // DON'T throw / exit — let the server start so the user can open the
+      // dashboard and log in via OAuth. The previous behavior (throw + exit
+      // with "Not logged in for OAuth mode") was a chicken-and-egg trap:
+      // the user couldn't open the dashboard to log in because the server
+      // refused to start, and couldn't log in from the CLI without a
+      // terminal (Windows exe double-click scenario).
+      //
+      // Now: server starts, dashboard is accessible, and any /v1/* request
+      // before login returns 503 "credential_unavailable" (handled by
+      // AuthManager.getCredential throwing, which proxyRequest catches).
+      // The user opens the dashboard, clicks "OAuth 登录" or "从 ZCode 导入",
+      // and the new credential is hot-swapped into the running server via
+      // opts.auth.setOAuthCredential — no restart needed.
+      console.warn("");
+      console.warn("  ⚠  OAuth mode: no credential stored yet.");
+      console.warn("  ⚠  The server is starting anyway so you can log in via the dashboard.");
+      console.warn(`  ⚠  Open http://127.0.0.1:${config.server.port}/admin and click "OAuth 登录" or "从 ZCode 导入".`);
+      console.warn("  ⚠  API requests will return 503 until a credential is added.");
+      console.warn("");
     } else {
-      // No plan on credential, no JWT — use config.yaml verbatim.
-      // Don't change config.plan; just log the source.
-      console.log(`  Using plan from config.yaml: ${config.plan}`);
-      effectivePlan = config.plan;
-      planSource = ""; // unused
-    }
-
-    if (cred.plan || cred.jwt) {
-      // We inferred/overrode the plan from the credential
-      if (effectivePlan !== config.plan) {
-        console.log(`  Overriding plan: ${config.plan} → ${effectivePlan} (source: ${planSource})`);
-        config.plan = effectivePlan;
+      auth.setOAuthCredential(cred);
+      // Resolve the effective plan from the credential. Priority:
+      //   1. cred.plan — explicit (set by v0.1.4+ import or dashboard)
+      //   2. inferred from cred.jwt — if a JWT is present, the credential
+      //      came from start-plan flow (JWTs are start-plan exclusive).
+      //      This handles v1 imports from zcode-api-ref which have no plan
+      //      field but DO carry a start-plan JWT.
+      //   3. config.yaml's plan — final fallback (default coding-plan)
+      //
+      // The credential's plan (explicit or inferred) wins over config.yaml
+      // because the credential determines which upstream URL and auth headers
+      // we use — sending a start-plan JWT to a coding-plan endpoint would
+      // fail with 401, and a coding-plan API key to zcode.z.ai would fail too.
+      let effectivePlan: PlanId;
+      let planSource: string;
+      if (cred.plan) {
+        effectivePlan = cred.plan;
+        planSource = `explicit on credential`;
+      } else if (cred.jwt) {
+        effectivePlan = "start-plan";
+        planSource = `inferred from JWT presence (v1 credential, no plan field)`;
       } else {
-        console.log(`  Plan: ${effectivePlan} (source: ${planSource})`);
+        // No plan on credential, no JWT — use config.yaml verbatim.
+        // Don't change config.plan; just log the source.
+        console.log(`  Using plan from config.yaml: ${config.plan}`);
+        effectivePlan = config.plan;
+        planSource = ""; // unused
+      }
+
+      if (cred.plan || cred.jwt) {
+        // We inferred/overrode the plan from the credential
+        if (effectivePlan !== config.plan) {
+          console.log(`  Overriding plan: ${config.plan} → ${effectivePlan} (source: ${planSource})`);
+          config.plan = effectivePlan;
+        } else {
+          console.log(`  Plan: ${effectivePlan} (source: ${planSource})`);
+        }
       }
     }
   }
@@ -284,18 +332,41 @@ async function serve(configPath?: string): Promise<void> {
   // The old code called server.stop(true) (force=true) followed by
   // process.exit(0) — which truncated SSE streams and long reasoning
   // responses mid-flight.
+  //
+  // BUGFIX (this version): the old Promise.race didn't catch rejection
+  // from server.stop(), so if stop() rejected (e.g. already-stopped
+  // server, internal Bun error), the .then(() => process.exit(0)) never
+  // fired and the process hung indefinitely until killed externally.
+  // Now we use .finally() so rejection ALSO exits, and a second signal
+  // (Ctrl+C) force-exits immediately as the comment always claimed.
   let shuttingDown = false;
+  let forceExitScheduled = false;
   const shutdown = (signal: string) => {
-    if (shuttingDown) return; // second Ctrl+C → force exit immediately
+    if (forceExitScheduled) return; // already forcing — nothing more to do
+    if (shuttingDown) {
+      // Second signal — force exit IMMEDIATELY. The old code only set
+      // shuttingDown=true again and relied on the 30s timeout, which
+      // contradicted the user-facing "press Ctrl+C again to force-exit"
+      // message. Now we honor it.
+      console.log(`\nReceived second ${signal}, force-exiting now.`);
+      forceExitScheduled = true;
+      process.exit(130); // 128 + SIGINT(2) — conventional exit code for Ctrl+C
+      return;
+    }
     shuttingDown = true;
     console.log(`\nReceived ${signal}, shutting down gracefully...`);
     console.log("  (press Ctrl+C again to force-exit)");
     // server.stop(false) = wait for in-flight requests; returns Promise.
     // We race it against a 30s timeout so we don't hang forever.
+    // .finally (not .then) ensures we exit EVEN IF server.stop() rejects —
+    // previously a rejection here left the process in a hung state with no
+    // log trail, requiring Task Manager to kill on Windows.
     Promise.race([
-      server.stop(),
+      server.stop().catch((err) => {
+        console.error("[shutdown] server.stop() rejected:", err);
+      }),
       new Promise<void>(r => setTimeout(r, 30_000)),
-    ]).then(() => process.exit(0));
+    ]).finally(() => process.exit(0));
   };
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
@@ -398,7 +469,17 @@ async function authLogin(args: string[]): Promise<void> {
     }
   }
 
-  await saveCredential(cred);
+  // Import mode: preserve the currently-active credential — the new account
+  // is added but NOT activated. The user can switch to it manually via the
+  // dashboard. OAuth login (non-import) DOES activate, matching the
+  // historical behavior where `auth login` is the primary login flow.
+  // This matches the user's requirement: "通过zcode导入的凭证会直接开启它，
+  // 应该不默认开启，而是保留原来凭证开启，就是不要立马切换新导入凭证".
+  if (importMode) {
+    await saveCredential(cred, { keepActive: true });
+  } else {
+    await saveCredential(cred);
+  }
   // Use cred.plan (auto-detected) instead of the local `plan` variable,
   // because import mode may have auto-detected a different plan than the default.
   const actualPlan = cred.plan || plan;

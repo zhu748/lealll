@@ -131,6 +131,14 @@ export function loadConfig(path: string): ProxyConfig {
   const verboseLogging = process.env.ZCODE_PROXY_VERBOSE_LOGGING === "1"
     || (typeof (parsed as any)?.logging === "object" && (parsed as any).logging?.verbose === true);
 
+  // Debug response logging (this version). Env var
+  // ZCODE_PROXY_DEBUG_LOGGING=1 enables it at startup; YAML
+  // `logging.debug: true` also works. When true, logs the FULL upstream
+  // response (status + headers + body preview) for every request — the
+  // "调试日志" for diagnosing 529 / empty 200 / captcha 403 / etc.
+  const debugLogging = process.env.ZCODE_PROXY_DEBUG_LOGGING === "1"
+    || (typeof (parsed as any)?.logging === "object" && (parsed as any).logging?.debug === true);
+
   const config: ProxyConfig = {
     server: { port, host },
     auth: { proxyApiKey, mode, apiKey, oauthCredentialsPath },
@@ -140,7 +148,7 @@ export function loadConfig(path: string): ProxyConfig {
     defaultModel,
     models,
     identity,
-    logging: { level: logLevel, verbose: verboseLogging },
+    logging: { level: logLevel, verbose: verboseLogging, debug: debugLogging },
     retry,
     routingRules,
     modelMappings,

@@ -701,12 +701,24 @@ td input{font-family:var(--font-mono)}
   border:1px solid var(--border);
 }
 .log-box::-webkit-scrollbar{width:8px}
-.log-line{padding:1px 0}
+.log-line{padding:1px 0;cursor:pointer;border-radius:var(--r-sm);padding:2px 4px;transition:background var(--t-fast)}
+.log-line:hover{background:rgba(255,255,255,0.04)}
+.log-line.log-expandable{cursor:pointer}
+.log-line.log-expanded{background:rgba(99,102,241,0.08)}
+.log-line .log-toggle{display:inline-block;width:14px;color:var(--text-3);user-select:none;font-size:10px;margin-right:2px}
+.log-line.log-expandable .log-toggle::before{content:'▶'}
+.log-line.log-expanded .log-toggle::before{content:'▼'}
+.log-line:not(.log-expandable) .log-toggle::before{content:'\00a0'}
 .log-time{color:var(--text-3)}
 .log-level-error{color:var(--danger)}
 .log-level-warn{color:var(--warn)}
 .log-level-info{color:var(--info)}
 .log-level-debug{color:var(--text-2)}
+.log-full{display:none;margin-top:4px;padding:8px 12px;background:rgba(0,0,0,0.4);border-left:2px solid var(--info);border-radius:var(--r-sm);white-space:pre-wrap;word-break:break-all;font-size:11px;line-height:1.6;color:var(--text)}
+.log-line.log-expanded .log-full{display:block}
+.log-line .log-summary{display:inline}
+.log-tag-debug{display:inline-block;padding:0 4px;margin-left:4px;background:rgba(168,85,247,0.15);color:#c084fc;border-radius:var(--r-xs);font-size:10px;font-weight:600}
+.log-tag-verbose{display:inline-block;padding:0 4px;margin-left:4px;background:rgba(59,130,246,0.15);color:#60a5fa;border-radius:var(--r-xs);font-size:10px;font-weight:600}
 
 /* ============================================================
    Toast
@@ -1248,7 +1260,7 @@ td input{font-family:var(--font-mono)}
     <div class="sidebar-footer">
       <div class="version">
         <span class="dot"></span>
-        <span>vceshi0.1.2</span>
+        <span>vceshi0.1.4</span>
       </div>
       <div class="logout-btn" onclick="doLogout()">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
@@ -1524,6 +1536,11 @@ td input{font-family:var(--font-mono)}
                 <label class="switch"><input type="checkbox" id="cfgVerboseLog"><span class="slider"></span></label>
                 <div class="form-help">开启后，每个请求会在日志里输出：1) 发往上游的完整请求头（auth token 已脱敏）2) 经项目转换后发送给 zai/bigmodel 的完整 body（截断到 2000 字符）。默认关闭（简略模式）。排查 3001 / 参数错误时建议开启。</div>
               </div>
+              <div class="form-group">
+                <label class="form-label">调试响应日志</label>
+                <label class="switch"><input type="checkbox" id="cfgDebugLog"><span class="slider"></span></label>
+                <div class="form-help">开启后，每个请求在上游响应返回时输出完整响应详情：1) 状态码 + 关键响应头（content-type / retry-after / empty-stream / ratelimit-remaining）2) 响应体预览（JSON 前 1000 字符 / SSE 流前 2KB）。能看到 529 / 空回 200 / 验证码 403 具体返回了什么 JSON。用 resp.clone() 读取副本，不影响下游 passthrough。默认关闭。</div>
+              </div>
             </div>
           </div>
         </div>
@@ -1784,7 +1801,7 @@ td input{font-family:var(--font-mono)}
         <div class="main-header">
           <div class="header-left">
             <h1>日志</h1>
-            <div class="subtitle">实时服务器日志（SSE 推送）</div>
+            <div class="subtitle">实时服务器日志（SSE 推送）· 点击行展开完整内容 · 开启调试模式查看上游响应详情</div>
           </div>
           <div class="header-actions">
             <span class="badge badge-success"><span class="badge-dot"></span>实时</span>
@@ -1800,6 +1817,14 @@ td input{font-family:var(--font-mono)}
             <option value="debug">Debug</option>
           </select>
           <input id="logSearch" placeholder="搜索日志...">
+          <label class="switch-label">
+            <label class="switch"><input type="checkbox" id="logDebugToggle" onchange="toggleLogDebugMode()"><span class="slider"></span></label>
+            调试模式
+          </label>
+          <label class="switch-label">
+            <label class="switch"><input type="checkbox" id="logExpandAll" onchange="renderLogs()"><span class="slider"></span></label>
+            全部展开
+          </label>
           <label class="switch-label">
             <label class="switch"><input type="checkbox" id="logAutoScroll" checked><span class="slider"></span></label>
             自动滚动
@@ -2330,6 +2355,9 @@ async function initDashboard(){
   await loadStats();
   await loadDebugDumps();
   connectLogStream();
+  // Sync the log-page debug toggle with the server's current state, so
+  // reloading the page doesn't lose the toggle position.
+  syncLogDebugToggle();
   // Start the periodic stats refresh now that we're authenticated.
   // (Was previously started at script load — see startStatsInterval comment.)
   startStatsInterval();
@@ -2425,6 +2453,7 @@ async function loadSettings(){
     document.getElementById('cfgReferer').value=c.identity?.refererOrigin||'';
     document.getElementById('cfgLogLevel').value=c.logging?.level||'info';
     document.getElementById('cfgVerboseLog').checked=!!c.logging?.verbose;
+    document.getElementById('cfgDebugLog').checked=!!c.logging?.debug;
   }catch(e){console.error('loadSettings failed:',e);toast('加载设置失败','error')}
 }
 async function saveSettings(){
@@ -2486,7 +2515,7 @@ async function saveSettings(){
       emptyStreamSwitchThreshold:Number.isFinite(emptyStreamSwitch)&&emptyStreamSwitch>=0?emptyStreamSwitch:3,
     },
     identity:{appVersion:document.getElementById('cfgAppVer').value,sourceTitle:document.getElementById('cfgSrcTitle').value,refererOrigin:document.getElementById('cfgReferer').value},
-    logging:{level:document.getElementById('cfgLogLevel').value,verbose:document.getElementById('cfgVerboseLog').checked}
+    logging:{level:document.getElementById('cfgLogLevel').value,verbose:document.getElementById('cfgVerboseLog').checked,debug:document.getElementById('cfgDebugLog').checked}
   };
   const apiKey=document.getElementById('cfgApiKey').value;
   const proxyApiKey=document.getElementById('cfgProxyApiKey').value;
@@ -3695,23 +3724,130 @@ function appendLog(entry){
   if(logLines.length>2000)logLines=logLines.slice(-1000);
   renderLogs();
 }
+/**
+ * Determine if a log entry should be renderable as an expandable row.
+ *
+ * Expandable rows show a ▶ toggle icon and can be clicked to reveal the full
+ * message in a styled sub-block. We mark a row as expandable when:
+ *   - The message contains [debug] (the new upstream response debug logs)
+ *   - The message contains [verbose] (the request headers/body verbose logs)
+ *   - The message is longer than 120 chars (any long log benefits from
+ *     collapse/expand to keep the panel scannable)
+ *
+ * When debug mode is OFF, expandable rows are rendered collapsed by default
+ * (summary = first 120 chars + …). When ON, the user can click to expand any
+ * row, or use the "全部展开" toggle to expand everything at once.
+ */
+function isLogExpandable(l){
+  const msg=l.message||'';
+  return msg.includes('[debug]')||msg.includes('[verbose]')||msg.length>120;
+}
+/** Build the short summary shown when a row is collapsed (max ~120 chars). */
+function logSummary(msg){
+  if(msg.length<=120)return escapeHtml(msg);
+  // Try to break at a natural boundary (space or |) near the 120-char mark
+  // so the summary doesn't cut mid-word.
+  let cut=120;
+  const pipeIdx=msg.indexOf(' | ',80);
+  if(pipeIdx>0&&pipeIdx<160)cut=pipeIdx;
+  return escapeHtml(msg.slice(0,cut))+' <span style="color:var(--text-3)">…</span>';
+}
+/** A row is "long" enough to warrant the expand affordance in debug mode. */
+const expandedLogSeqs=new Set();
 function renderLogs(){
   const box=document.getElementById('logBox');
   const level=document.getElementById('logLevel').value;
   const search=document.getElementById('logSearch').value.toLowerCase();
+  const expandAll=document.getElementById('logExpandAll').checked;
   const filtered=logLines.filter(l=>{
     if(level&&l.level!==level)return false;
     if(search&&!l.message.toLowerCase().includes(search))return false;
     return true;
   });
-  /* Render with colored levels */
+  /* Render with colored levels + expandable rows for debug/verbose/long logs.
+   * Each row is a <div class="log-line"> with:
+   *   - a toggle icon span (▶/▼/blank)
+   *   - the summary (collapsed view, inline)
+   *   - a .log-full block (hidden unless expanded) with the complete message
+   * Clicking an expandable row toggles its expanded state and re-renders.
+   * We track expanded state by seq (monotonic id from the server) so that
+   * re-rendering on new log arrival doesn't lose the user's expand selections.
+   */
   box.innerHTML=filtered.map(l=>{
     const lvl=l.level||'info';
-    return `<div class="log-line"><span class="log-time">[${l.time}]</span> <span class="log-level-${lvl}">[${lvl}]</span> ${escapeHtml(l.message)}</div>`;
+    const msg=l.message||'';
+    const expandable=isLogExpandable(l);
+    const expanded=expandAll||expandedLogSeqs.has(l.seq);
+    const cls=['log-line',`log-level-${lvl}`];
+    if(expandable)cls.push('log-expandable');
+    if(expanded)cls.push('log-expanded');
+    // Tag badge for debug/verbose rows — makes them visually scannable
+    let tag='';
+    if(msg.includes('[debug]'))tag='<span class="log-tag-debug">DEBUG</span>';
+    else if(msg.includes('[verbose]'))tag='<span class="log-tag-verbose">VERBOSE</span>';
+    const toggle='<span class="log-toggle"></span>';
+    const summary='<span class="log-summary">'+logSummary(msg)+'</span>';
+    // Full content — only rendered for expandable rows to save DOM size.
+    // For non-expandable rows the summary IS the full message.
+    const full=expandable?'<div class="log-full">'+escapeHtml(msg)+'</div>':'';
+    const clickHandler=expandable?`onclick="toggleLogExpand(${l.seq})"`:'';
+    return `<div class="${cls.join(' ')}" ${clickHandler}>${toggle}<span class="log-time">[${l.time}]</span> <span class="log-level-${lvl}">[${lvl}]</span>${tag} ${summary}${full}</div>`;
   }).join('');
   if(document.getElementById('logAutoScroll').checked)box.scrollTop=box.scrollHeight;
 }
-function clearLogs(){logLines=[];document.getElementById('logBox').innerHTML=''}
+/** Toggle a single log row's expanded state by seq id. */
+function toggleLogExpand(seq){
+  if(expandedLogSeqs.has(seq)){
+    expandedLogSeqs.delete(seq);
+  }else{
+    expandedLogSeqs.add(seq);
+  }
+  renderLogs();
+}
+/**
+ * Toggle debug response logging on the server. Sends PUT /admin/api/config
+ * with logging.debug flipped. The server hot-swaps the flag, so the next
+ * request's [debug] upstream response logs will appear in this panel.
+ *
+ * Also controls the local UI: when debug is ON, the "全部展开" toggle becomes
+ * more useful (debug rows are long and benefit from expansion).
+ */
+async function toggleLogDebugMode(){
+  const checked=document.getElementById('logDebugToggle').checked;
+  try{
+    // Fetch current config, flip logging.debug, PUT it back.
+    const cfgResp=await fetch(API+'/admin/api/config',{headers:authHeaders()});
+    const cfg=await cfgResp.json();
+    cfg.logging={...(cfg.logging||{}),debug:checked};
+    const r=await fetch(API+'/admin/api/config',{method:'PUT',headers:authHeaders(),body:JSON.stringify(cfg)});
+    if(r.ok){
+      toast(checked?'调试响应日志已开启 — 每个请求将显示上游完整响应':'调试响应日志已关闭','success');
+      // When enabling debug, auto-enable "全部展开" so the user immediately
+      // sees the full content without having to click each row.
+      if(checked){
+        document.getElementById('logExpandAll').checked=true;
+      }
+      renderLogs();
+    }else{
+      toast('切换调试模式失败','error');
+      // Revert the checkbox on failure
+      document.getElementById('logDebugToggle').checked=!checked;
+    }
+  }catch(e){
+    console.error('toggleLogDebugMode failed:',e);
+    toast('切换调试模式失败','error');
+    document.getElementById('logDebugToggle').checked=!checked;
+  }
+}
+/** Sync the log-page debug toggle with the server's current logging.debug state. */
+async function syncLogDebugToggle(){
+  try{
+    const r=await fetch(API+'/admin/api/config',{headers:authHeaders()});
+    const c=await r.json();
+    document.getElementById('logDebugToggle').checked=!!c.logging?.debug;
+  }catch{/* non-fatal — toggle just stays unchecked */}
+}
+function clearLogs(){logLines=[];expandedLogSeqs.clear();document.getElementById('logBox').innerHTML=''}
 document.getElementById('logLevel').addEventListener('change',renderLogs);
 document.getElementById('logSearch').addEventListener('input',renderLogs);
 

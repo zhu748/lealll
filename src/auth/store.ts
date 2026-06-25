@@ -17,10 +17,11 @@
  *
  * @see .omo/plans/zcode-proxy.md Task 14
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, readdirSync, statSync } from "node:fs";
+import { join, dirname, basename } from "node:path";
 import { homedir } from "node:os";
 import { randomBytes, createCipheriv, createDecipheriv, createHash } from "node:crypto";
+import { atomicWriteFile, createMutex } from "../utils/fs.js";
 import type { Credential } from "./types.js";
 
 /**
@@ -38,10 +39,20 @@ import type { Credential } from "./types.js";
  */
 const STORE_DIR = process.env.ZCODE_PROXY_STORE_DIR ?? join(homedir(), ".zcode-proxy");
 const STORE_FILE = join(STORE_DIR, "credentials.json");
-/** Optional env var: if set, its value is used as a legacy seed for decrypt
- *  fallback (lets users recover credentials.json encrypted by an old version
- *  whose homedir/platform/arch differed from the current one). Only used in
- *  the decrypt fallback — new encryption always uses the fixed key. */
+/**
+ * Optional env var: if set, its value is used as a legacy seed for decrypt
+ * fallback (lets users recover credentials.json encrypted by an old version
+ * whose homedir/platform/arch differed from the current one). ONLY used in
+ * the decrypt fallback — new encryption always uses the fixed 520 key.
+ *
+ * NOTE: ZCODE_PROXY_CREDENTIAL_SECRET is intentionally NOT consulted.
+ * The user's explicit requirement is "all keys encrypted/decrypted via the
+ * 520 fixed key only — no separate secret file, no env-var override." The
+ * old env-var-derived key was the #1 cause of "credentials lost on restart"
+ * because if the env var was set during one run and unset the next, the key
+ * silently rotated and the file became undecryptable. The fixed 520 key
+ * eliminates that entire class of bugs.
+ */
 const ENV_LEGACY_SEED = "ZCODE_PROXY_LEGACY_SEED";
 
 /**
@@ -162,10 +173,15 @@ function deriveXorFoldKey(seed: string): Buffer {
  *   - username changes / OS reinstalls
  *   - copying credentials.json between machines
  *   - ZCODE_PROXY_CREDENTIAL_SECRET env var being set during one run and not
- *     the next (the most recent incarnation of the bug)
+ *     the next (the most recent incarnation of the bug — now permanently
+ *     fixed by removing the env-var path entirely)
  *
- * The fixed key is cached after the first call. There is no env var override,
- * no key file, no seed derivation — just one constant key, everywhere, always.
+ * The fixed key is cached after the first call. There is NO env var override,
+ * NO key file in the credential directory, NO seed derivation — just one
+ * constant key, everywhere, always. New encryption always uses this key.
+ * Decrypt has a one-time fallback for files encrypted by older versions
+ * (see buildCandidateKeysForDecrypt) but that fallback only READS — it never
+ * affects what key new writes use.
  */
 function getEncryptionKeyBuffer(): Buffer {
   if (cachedKey) return cachedKey;
@@ -226,14 +242,22 @@ function buildCandidateKeysForDecrypt(): Array<{ label: string; key: Buffer }> {
     seeds.add(`${h}-${arch}`);
     seeds.add(`${h}`);
   }
-  // User-supplied legacy seed (manual recovery)
+  // User-supplied legacy seed (manual recovery). This is the ONLY env-var
+  // path consulted by the decrypt fallback. Users with credentials.json
+  // encrypted by an older version that derived the key from homedir/platform/
+  // arch (or via the removed ZCODE_PROXY_CREDENTIAL_SECRET env var) can set
+  // ZCODE_PROXY_LEGACY_SEED to that old seed string and the file will be
+  // recovered, then re-encrypted with the fixed 520 key on the next
+  // writeStore() — so this is a one-time migration, not a permanent
+  // dependency on the old key.
   const legacyEnv = process.env[ENV_LEGACY_SEED];
   if (legacyEnv) seeds.add(legacyEnv);
-  // Old env-var-derived key recovery: if the file was encrypted by the
-  // previous version of this code which consulted ZCODE_PROXY_CREDENTIAL_SECRET,
-  // the user can set it again to recover.
-  const oldEnvSecret = process.env.ZCODE_PROXY_CREDENTIAL_SECRET;
-  if (oldEnvSecret) seeds.add(oldEnvSecret);
+  // NOTE: ZCODE_PROXY_CREDENTIAL_SECRET is intentionally NOT consulted here.
+  // It was the #1 cause of "credentials lost on restart" because setting it
+  // in one run and not the next rotated the key silently. The fixed 520 key
+  // + ZCODE_PROXY_LEGACY_SEED (manual, opt-in recovery) is the only path
+  // forward. Users with old env-var-encrypted files can set
+  // ZCODE_PROXY_LEGACY_SEED to the old secret value to recover.
 
   const candidates: Array<{ label: string; key: Buffer }> = [];
   for (const seed of seeds) {
@@ -358,13 +382,15 @@ async function decrypt(ciphertext: string): Promise<string> {
   }
 
   throw new Error(
-    "Failed to decrypt credential store. Tried: fixed key (Node + WebCrypto formats), " +
-    "multi-seed fallback covering homedir/platform/arch variations across Bun versions " +
-    "(Bun 1.1/1.2/1.3 homedir() differences, USERPROFILE vs HOMEDRIVE+HOMEPATH, etc.). " +
-    "If your credentials.json was encrypted on a different machine / OS / username, " +
-    "set ZCODE_PROXY_LEGACY_SEED to the old seed string (e.g. \"C:\\\\Users\\\\OldName-win32-x64\") " +
-    "or ZCODE_PROXY_CREDENTIAL_SECRET to the old env var value, and retry. " +
-    "As a last resort, run `zcode-proxy auth logout` to discard and re-login."
+    "Failed to decrypt credential store. Tried: fixed key SHA-256(\"520\") " +
+    "(Node + WebCrypto formats), multi-seed fallback covering homedir/platform/" +
+    "arch variations across Bun versions (Bun 1.1/1.2/1.3 homedir() differences, " +
+    "USERPROFILE vs HOMEDRIVE+HOMEPATH, etc.). If your credentials.json was " +
+    "encrypted on a different machine / OS / username, or by an older version " +
+    "that consulted ZCODE_PROXY_CREDENTIAL_SECRET, set ZCODE_PROXY_LEGACY_SEED " +
+    "to the old seed string (e.g. \"C:\\\\Users\\\\OldName-win32-x64\" or the old " +
+    "secret value) and retry. As a last resort, run `zcode-proxy auth logout` " +
+    "to discard and re-login."
   );
 }
 
@@ -425,19 +451,77 @@ async function readStoreUncached(): Promise<StoreV2 | null> {
     return null;
   }
 
-  let raw: string;
-  try {
-    raw = readFileSync(STORE_FILE, "utf-8");
-  } catch {
+  // Read with retry — on Windows, the file can be transiently locked by
+  // antivirus / Windows Search indexer / backup tools during a concurrent
+  // write. A single failed read would mark the file as "corrupted" and
+  // create a .broken-* backup, even though the file is perfectly fine and
+  // the next read would succeed. This was a major contributor to the
+  // ".broken files piling up" symptom: every dashboard refresh during a
+  // brief AV scan would back up the (locked, unreadable) file.
+  //
+  // We retry up to 5 times with 50ms backoff before declaring the file
+  // unreadable. The total worst-case blocking time is 50+100+150+200+250
+  // = 750ms, acceptable for a read that happens on dashboard refresh.
+  let raw: string | null = null;
+  let readErr: unknown = null;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      raw = readFileSync(STORE_FILE, "utf-8");
+      readErr = null;
+      break;
+    } catch (err) {
+      readErr = err;
+      const code = (err as NodeJS.ErrnoException)?.code;
+      // EPERM/EBUSY/EACCES: transient Windows lock — retry.
+      // ENOENT: file disappeared between existsSync and readFileSync (another
+      // process deleted it) — retry won't help, treat as "no file".
+      if (code === "ENOENT") {
+        undecryptableFilePresent = false;
+        return null;
+      }
+      if (code === "EPERM" || code === "EBUSY" || code === "EACCES") {
+        const end = Date.now() + 50 * (attempt + 1);
+        while (Date.now() < end) { /* spin */ }
+        continue;
+      }
+      // Other errors (EISDIR, etc.) — don't retry
+      break;
+    }
+  }
+  if (raw === null) {
+    // All retries failed OR a non-retryable error. Log the actual error code
+    // so the user can diagnose (AV lock vs permission vs disk failure).
+    console.warn(`[store] Could not read credentials.json after retries: ${(readErr as Error)?.message ?? readErr}`);
+    // Do NOT backupCorruptedStore here — we don't have content to back up,
+    // and the file may just be transiently locked. Return null (treat as
+    // empty) without setting the guard, so the next read can try again.
+    return null;
+  }
+
+  // EMPTY FILE DEFENSE: if the file is empty or whitespace-only, it was
+  // almost certainly left behind by a crashed write (the old writeFileSync
+  // truncated-then-write race, before atomicWriteFile was added). Backing
+  // up an empty file is pointless (there's nothing to recover) and creates
+  // spam .broken-* files. Instead, treat as "no store" and let the next
+  // saveCredential create a fresh one. We still set the guard so a
+  // concurrent save doesn't overwrite — but since the file is empty,
+  // overwriting is actually fine, so we DON'T set the guard.
+  if (raw.trim() === "") {
+    console.warn(`[store] credentials.json is empty (likely from a crashed write). Treating as no store — next save will create a fresh one.`);
+    undecryptableFilePresent = false;
     return null;
   }
 
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
-  } catch {
-    // File exists but isn't valid JSON — back it up and start fresh.
-    console.warn(`[store] credentials.json is not valid JSON. Backing up and starting fresh.`);
+  } catch (err) {
+    // File exists but isn't valid JSON — this means the file was truncated
+    // mid-write (old writeFileSync race, before atomicWriteFile) OR corrupted
+    // by a disk error. Back up the partial content so the user can inspect
+    // what survived, then start fresh.
+    console.warn(`[store] credentials.json is not valid JSON: ${(err as Error).message}`);
+    console.warn(`[store] File size: ${raw.length} bytes, first 100 chars: ${JSON.stringify(raw.slice(0, 100))}`);
     backupCorruptedStore(raw);
     undecryptableFilePresent = true;
     return null;
@@ -535,7 +619,14 @@ async function readStoreUncached(): Promise<StoreV2 | null> {
  * Back up a corrupted / unreadable credentials.json before it gets overwritten.
  * Writes to `{STORE_FILE}.broken-{timestamp}` so the user can still recover
  * the original content if needed (e.g. they later remember the old username).
+ *
+ * CLEANUP: keeps at most MAX_BROKEN_BACKUPS (5) most recent .broken-* files.
+ * Older ones are deleted. This prevents the ".broken files piling up"
+ * symptom where repeated transient read failures (AV locks, etc.) created
+ * dozens of backup files. The user only needs the most recent few for
+ * recovery — anything older is just clutter.
  */
+const MAX_BROKEN_BACKUPS = 5;
 function backupCorruptedStore(originalContent: string): void {
   const backupPath = `${STORE_FILE}.broken-${Date.now()}`;
   try {
@@ -545,8 +636,115 @@ function backupCorruptedStore(originalContent: string): void {
     // Can't even write a backup — nothing more we can do; the next writeStore()
     // call will still overwrite the broken file with a fresh one.
   }
+  // Clean up old .broken-* backups, keeping only the most recent
+  // MAX_BROKEN_BACKUPS. This is best-effort — failures are silently ignored.
+  try {
+    cleanupOldBrokenBackups();
+  } catch { /* non-fatal */ }
 }
 
+/**
+ * Delete old .broken-* backup files, keeping only the most recent
+ * MAX_BROKEN_BACKUPS. Called after each new backup is created.
+ */
+function cleanupOldBrokenBackups(): void {
+  const dir = dirname(STORE_FILE);
+  const prefix = `${basename(STORE_FILE)}.broken-`;
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return;
+  }
+  const brokenFiles = entries
+    .filter(f => f.startsWith(prefix))
+    .map(f => ({ name: f, path: join(dir, f) }))
+    // Sort by modification time descending (newest first). fall back to name.
+    .sort((a, b) => {
+      try {
+        return statSync(b.path).mtimeMs - statSync(a.path).mtimeMs;
+      } catch {
+        return b.name.localeCompare(a.name);
+      }
+    });
+  // Delete everything past the first MAX_BROKEN_BACKUPS
+  for (let i = MAX_BROKEN_BACKUPS; i < brokenFiles.length; i++) {
+    try { unlinkSync(brokenFiles[i].path); } catch { /* best-effort */ }
+  }
+}
+
+/**
+ * Mutex serializing all credential store writes.
+ *
+ * Without this, two concurrent mutations race: e.g. the proxy's auto-switch
+ * path (handler.ts → switchAccount → writeStore) running at the same time as
+ * a dashboard "add account" call (admin/api.ts → saveCredential → writeStore).
+ * Both read the same store, both write their version — the second write wins
+ * and the first writer's change is silently lost.
+ *
+ * The mutex is process-local: a CLI invocation (e.g. `zcode-proxy auth login`
+ * from start.bat) writes to the same file from a SEPARATE process and is not
+ * serialized here. That's an inherent limitation of file-based stores; the
+ * atomic-write + retry-on-rename logic in utils/fs.ts handles the OS-level
+ * race, and the in-memory cache is invalidated by invalidateStoreCache().
+ *
+ * IMPORTANT: the mutex must wrap the ENTIRE read-modify-write sequence, not
+ * just the write. If it only wrapped writeStore, two concurrent
+ * saveCredential calls would both read the same (empty) store, then each
+ * write a single-account store — the second write would clobber the first,
+ * silently dropping the first account. This is exactly the "credentials
+ * lost" symptom the user reported. The `withStoreLock` helper below enforces
+ * the full-sequence serialization for every mutating public API.
+ */
+const storeWriteMutex = createMutex();
+
+/**
+ * Run `fn` while holding the store write lock. `fn` receives the current
+ * store (freshly read from disk + decrypted) and may mutate it freely; the
+ * returned store is persisted atomically. If `fn` throws, no write happens
+ * and the error propagates to the caller.
+ *
+ * This is the canonical entry point for ALL store mutations — it guarantees
+ * read-modify-write atomicity across concurrent callers within the same
+ * process. Reads that don't need to reflect concurrent writes (e.g.
+ * loadCredential) can skip this and use readStore() directly for performance.
+ */
+async function withStoreLock<T>(
+  fn: (store: StoreV2) => Promise<T> | T,
+): Promise<T> {
+  return storeWriteMutex.run(async () => {
+    // ALWAYS re-read inside the lock — the in-memory cache may be stale if
+    // another process (CLI) wrote to the file. The cost is one disk read +
+    // decrypt per mutation, acceptable for the low write frequency of a
+    // credential store.
+    invalidateStoreCache();
+    let store = await readStore();
+    if (!store) store = { version: 2, activeId: null, accounts: [] };
+    const result = await fn(store);
+    await writeStore(store);
+    return result;
+  });
+}
+
+/**
+ * Atomically persist the encrypted store to disk.
+ *
+ * ATOMICITY: Uses atomicWriteFile (write-to-tmp + rename) so a crash mid-write
+ * leaves the previous file intact instead of a truncated/partial one. This is
+ * the #1 fix for "重启突然凭证全部丢失" — the old code called writeFileSync
+ * directly, which truncates-then-writes; a Ctrl+C / Windows kill / AV lock
+ * between truncate and full write left credentials.json empty or partial,
+ * which then failed JSON.parse on next read → "credentials cleared" symptom.
+ *
+ * MUTEX: Serialized via storeWriteMutex so concurrent writes from the dashboard
+ * and the proxy's auto-switch path don't race (last-writer-wins would silently
+ * drop one writer's changes).
+ *
+ * ENCRYPTION: Errors from encrypt() (randomBytes, createCipheriv) propagate
+ * to the caller — these are unrecoverable and should surface, not be swallowed.
+ * Disk-write errors are caught and logged so the proxy keeps serving from the
+ * in-memory copy (matches the old behavior for read-only filesystems).
+ */
 async function writeStore(store: StoreV2): Promise<void> {
   // Guard against the "silent overwrite" footgun: if a previous read found
   // credentials.json on disk but couldn't decrypt it (e.g. encryption key
@@ -571,16 +769,34 @@ async function writeStore(store: StoreV2): Promise<void> {
       `to discard the unreadable file before saving new credentials.`,
     );
   }
+  // Encrypt OUTSIDE the mutex: crypto is CPU-bound and doesn't touch the file,
+  // so concurrent encryptions are safe. Doing it inside the mutex would serialize
+  // CPU work unnecessarily and extend the critical section.
+  const json = JSON.stringify(store);
+  let encrypted: string;
   try {
-    mkdirSync(dirname(STORE_FILE), { recursive: true });
-    const json = JSON.stringify(store);
-    const encrypted = await encrypt(json);
-    writeFileSync(STORE_FILE, JSON.stringify({ version: 2, encrypted }), { mode: 0o600 });
+    encrypted = await encrypt(json);
+  } catch (err) {
+    // Encryption failure (e.g. randomBytes entropy exhaustion, cipher init
+    // error) is unrecoverable — surface to caller so they see the real cause
+    // instead of a misleading "could not persist" message.
+    throw new Error(`Failed to encrypt credential store: ${(err as Error).message}`);
+  }
+  try {
+    await mkdirSync(dirname(STORE_FILE), { recursive: true });
+    // NOTE: no mutex here — withStoreLock (the only caller) already holds it.
+    // Calling storeWriteMutex.run() here would deadlock (the mutex is not
+    // reentrant). Direct write is safe because all mutations go through
+    // withStoreLock which serializes the full read-modify-write sequence.
+    await atomicWriteFile(STORE_FILE, JSON.stringify({ version: 2, encrypted }));
   } catch (err) {
     // Read-only filesystem (e.g. Render container without a persistent disk
-    // mounted at STORE_DIR). Don't crash the process — just log and keep the
+    // mounted at STORE_DIR), OR Windows EPERM/EBUSY that exhausted the
+    // safeRename retry budget. Don't crash the process — log and keep the
     // in-memory copy so the current request can still complete. The next
-    // restart will start with an empty store anyway.
+    // restart will start with whatever's on disk (possibly stale, but not
+    // corrupted — atomicWriteFile guarantees the file is either the OLD or
+    // the NEW content, never a partial mix).
     console.warn(`[store] Could not persist credentials to ${STORE_FILE}: ${(err as Error).message}`);
     console.warn(`[store] Set ZCODE_PROXY_STORE_DIR to a writable path (e.g. /data/.zcode-proxy on Render with a disk, or /tmp/.zcode-proxy for ephemeral storage).`);
   }
@@ -604,41 +820,38 @@ async function writeStore(store: StoreV2): Promise<void> {
  *   "Add API Key" form).
  */
 export async function saveCredential(cred: Credential, opts?: { keepActive?: boolean }): Promise<void> {
-  let store = await readStore();
-  if (!store) store = { version: 2, activeId: null, accounts: [] };
+  await withStoreLock((store) => {
+    const existingIdx = store.accounts.findIndex(
+      a => a.credential.provider === cred.provider && a.credential.apiKey === cred.apiKey,
+    );
 
-  const existingIdx = store.accounts.findIndex(
-    a => a.credential.provider === cred.provider && a.credential.apiKey === cred.apiKey,
-  );
-
-  if (existingIdx >= 0) {
-    // Update existing — preserve id, createdAt; refresh label if it looks auto-generated
-    const old = store.accounts[existingIdx];
-    store.accounts[existingIdx] = {
-      ...old,
-      credential: cred,
-      label: old.label.startsWith(`${cred.provider} · `) ? defaultLabel(cred, old.createdAt) : old.label,
-    };
-  } else {
-    const account: StoredAccount = {
-      id: genId(),
-      label: defaultLabel(cred, Date.now()),
-      createdAt: Date.now(),
-      credential: cred,
-    };
-    store.accounts.push(account);
-    // BUGFIX: previously always `store.activeId = account.id`, which silently
-    // swapped the user's active credential out from under them whenever they
-    // logged in via OAuth. Now we honor opts.keepActive so the dashboard's
-    // OAuth flow preserves the user's currently-selected account — the new
-    // account is added to the list but the user must explicitly click
-    // "Activate" to switch to it.
-    if (!opts?.keepActive || !store.activeId) {
-      store.activeId = account.id; // newly added becomes active
+    if (existingIdx >= 0) {
+      // Update existing — preserve id, createdAt; refresh label if it looks auto-generated
+      const old = store.accounts[existingIdx];
+      store.accounts[existingIdx] = {
+        ...old,
+        credential: cred,
+        label: old.label.startsWith(`${cred.provider} · `) ? defaultLabel(cred, old.createdAt) : old.label,
+      };
+    } else {
+      const account: StoredAccount = {
+        id: genId(),
+        label: defaultLabel(cred, Date.now()),
+        createdAt: Date.now(),
+        credential: cred,
+      };
+      store.accounts.push(account);
+      // BUGFIX: previously always `store.activeId = account.id`, which silently
+      // swapped the user's active credential out from under them whenever they
+      // logged in via OAuth. Now we honor opts.keepActive so the dashboard's
+      // OAuth flow preserves the user's currently-selected account — the new
+      // account is added to the list but the user must explicitly click
+      // "Activate" to switch to it.
+      if (!opts?.keepActive || !store.activeId) {
+        store.activeId = account.id; // newly added becomes active
+      }
     }
-  }
-
-  await writeStore(store);
+  });
 }
 
 /** Load the currently active credential. Returns null if none. */
@@ -652,7 +865,35 @@ export async function loadCredential(): Promise<Credential | null> {
 /** Clear ALL stored credentials (preserves old behavior — used by "Clear Credentials" button). */
 export function clearCredential(): void {
   if (existsSync(STORE_FILE)) {
-    unlinkSync(STORE_FILE);
+    // Windows: unlinkSync can fail with EPERM/EBUSY/EACCES if another process
+    // (antivirus, Windows Search indexer, backup tool) briefly has the file
+    // open. Retry a few times with backoff before surfacing the error —
+    // matches the safeRename pattern in utils/fs.ts. Without this retry, a
+    // transient AV scan during "Clear credentials" would throw an uncaught
+    // error, leaving the dashboard in a half-state and the file on disk.
+    const MAX_RETRIES = 5;
+    const RETRY_DELAY_MS = 50;
+    let lastErr: unknown;
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      try {
+        unlinkSync(STORE_FILE);
+        lastErr = null;
+        break;
+      } catch (err) {
+        lastErr = err;
+        const code = (err as NodeJS.ErrnoException)?.code;
+        if (code === "EPERM" || code === "EBUSY" || code === "EACCES") {
+          // Synchronous sleep — clearCredential is sync by API contract
+          // (callers don't await it). The total worst-case blocking time
+          // is 50+100+150+200+250 = 750ms, acceptable for a UI action.
+          const end = Date.now() + RETRY_DELAY_MS * (attempt + 1);
+          while (Date.now() < end) { /* spin */ }
+          continue;
+        }
+        throw err; // ENOENT (already gone) or other non-retryable error
+      }
+    }
+    if (lastErr) throw lastErr;
   }
   cachedStore = null; // invalidate store cache
   cachedKey = null;   // invalidate key cache (will be repopulated with the same fixed key)
@@ -761,53 +1002,49 @@ function inferPlan(cred: Credential): "coding-plan" | "start-plan" {
  * listAccounts response before calling switchAccount, if they need to.
  */
 export async function switchAccount(id: string): Promise<boolean> {
-  const store = await readStore();
-  if (!store) return false;
-  const found = store.accounts.find(a => a.id === id);
-  if (!found) return false;
-  // vceshi0.0.6+: refuse to activate a disabled credential. The dashboard
-  // should hide the "Activate" button for disabled accounts, but this is the
-  // server-side enforcement.
-  if (found.credential.disabled) return false;
-  store.activeId = id;
-  await writeStore(store);
-  return true;
+  return withStoreLock((store) => {
+    const found = store.accounts.find(a => a.id === id);
+    if (!found) return false;
+    // vceshi0.0.6+: refuse to activate a disabled credential. The dashboard
+    // should hide the "Activate" button for disabled accounts, but this is the
+    // server-side enforcement.
+    if (found.credential.disabled) return false;
+    store.activeId = id;
+    return true;
+  });
 }
 
 /** Remove an account by id. If the active account is removed, falls back to the first remaining. */
 export async function removeAccount(id: string): Promise<boolean> {
-  const store = await readStore();
-  if (!store) return false;
-  const idx = store.accounts.findIndex(a => a.id === id);
-  if (idx < 0) return false;
-  store.accounts.splice(idx, 1);
-  if (store.activeId === id) {
-    store.activeId = store.accounts[0]?.id ?? null;
-  }
-  await writeStore(store);
-  return true;
+  return withStoreLock((store) => {
+    const idx = store.accounts.findIndex(a => a.id === id);
+    if (idx < 0) return false;
+    store.accounts.splice(idx, 1);
+    if (store.activeId === id) {
+      store.activeId = store.accounts[0]?.id ?? null;
+    }
+    return true;
+  });
 }
 
 /** Update an account's human-readable label. */
 export async function setAccountLabel(id: string, label: string): Promise<boolean> {
-  const store = await readStore();
-  if (!store) return false;
-  const account = store.accounts.find(a => a.id === id);
-  if (!account) return false;
-  account.label = label.trim() || account.label;
-  await writeStore(store);
-  return true;
+  return withStoreLock((store) => {
+    const account = store.accounts.find(a => a.id === id);
+    if (!account) return false;
+    account.label = label.trim() || account.label;
+    return true;
+  });
 }
 
 /** Update an account's plan. */
 export async function setAccountPlan(id: string, plan: "coding-plan" | "start-plan"): Promise<boolean> {
-  const store = await readStore();
-  if (!store) return false;
-  const account = store.accounts.find(a => a.id === id);
-  if (!account) return false;
-  account.credential.plan = plan;
-  await writeStore(store);
-  return true;
+  return withStoreLock((store) => {
+    const account = store.accounts.find(a => a.id === id);
+    if (!account) return false;
+    account.credential.plan = plan;
+    return true;
+  });
 }
 
 /**
@@ -821,20 +1058,19 @@ export async function setAccountPlan(id: string, plan: "coding-plan" | "start-pl
  * than a silent rejection at config time.
  */
 export async function setAccountProxy(id: string, proxy: string): Promise<boolean> {
-  const store = await readStore();
-  if (!store) return false;
-  const account = store.accounts.find(a => a.id === id);
-  if (!account) return false;
-  const trimmed = (proxy ?? "").trim();
-  if (trimmed) {
-    account.credential.proxy = trimmed;
-  } else {
-    // Clear the field entirely so the serialized credential stays clean
-    // rather than accumulating empty strings across versions.
-    delete account.credential.proxy;
-  }
-  await writeStore(store);
-  return true;
+  return withStoreLock((store) => {
+    const account = store.accounts.find(a => a.id === id);
+    if (!account) return false;
+    const trimmed = (proxy ?? "").trim();
+    if (trimmed) {
+      account.credential.proxy = trimmed;
+    } else {
+      // Clear the field entirely so the serialized credential stays clean
+      // rather than accumulating empty strings across versions.
+      delete account.credential.proxy;
+    }
+    return true;
+  });
 }
 
 /**
@@ -845,19 +1081,18 @@ export async function setAccountProxy(id: string, proxy: string): Promise<boolea
  * list "名称" column when set, otherwise the auto-generated label is shown.
  */
 export async function setAccountName(id: string, name: string): Promise<boolean> {
-  const store = await readStore();
-  if (!store) return false;
-  const account = store.accounts.find(a => a.id === id);
-  if (!account) return false;
-  const trimmed = (name ?? "").trim();
-  if (trimmed) {
-    account.credential.name = trimmed;
-  } else {
-    // Clear the field entirely so the serialized credential stays clean.
-    delete account.credential.name;
-  }
-  await writeStore(store);
-  return true;
+  return withStoreLock((store) => {
+    const account = store.accounts.find(a => a.id === id);
+    if (!account) return false;
+    const trimmed = (name ?? "").trim();
+    if (trimmed) {
+      account.credential.name = trimmed;
+    } else {
+      // Clear the field entirely so the serialized credential stays clean.
+      delete account.credential.name;
+    }
+    return true;
+  });
 }
 
 /**
@@ -868,18 +1103,17 @@ export async function setAccountName(id: string, name: string): Promise<boolean>
  * accommodate edge cases (e.g. upstream returning a non-standard email format).
  */
 export async function setAccountEmail(id: string, email: string): Promise<boolean> {
-  const store = await readStore();
-  if (!store) return false;
-  const account = store.accounts.find(a => a.id === id);
-  if (!account) return false;
-  const trimmed = (email ?? "").trim();
-  if (trimmed) {
-    account.credential.email = trimmed;
-  } else {
-    delete account.credential.email;
-  }
-  await writeStore(store);
-  return true;
+  return withStoreLock((store) => {
+    const account = store.accounts.find(a => a.id === id);
+    if (!account) return false;
+    const trimmed = (email ?? "").trim();
+    if (trimmed) {
+      account.credential.email = trimmed;
+    } else {
+      delete account.credential.email;
+    }
+    return true;
+  });
 }
 
 /**
@@ -894,17 +1128,16 @@ export async function setAccountEmail(id: string, email: string): Promise<boolea
  * should warn the user when disabling the active account.
  */
 export async function setAccountDisabled(id: string, disabled: boolean): Promise<boolean> {
-  const store = await readStore();
-  if (!store) return false;
-  const account = store.accounts.find(a => a.id === id);
-  if (!account) return false;
-  if (disabled) {
-    account.credential.disabled = true;
-  } else {
-    delete account.credential.disabled;
-  }
-  await writeStore(store);
-  return true;
+  return withStoreLock((store) => {
+    const account = store.accounts.find(a => a.id === id);
+    if (!account) return false;
+    if (disabled) {
+      account.credential.disabled = true;
+    } else {
+      delete account.credential.disabled;
+    }
+    return true;
+  });
 }
 
 /**
@@ -973,22 +1206,20 @@ export async function exportStore(): Promise<StoreV2 | null> {
 export async function importAccounts(
   incoming: Array<Omit<StoredAccount, "credential"> & { credential: Credential }>,
 ): Promise<{ added: number; updated: number }> {
-  let store = await readStore();
-  if (!store) store = { version: 2, activeId: null, accounts: [] };
-
-  let added = 0;
-  let updated = 0;
-  for (const acc of incoming) {
-    const idx = store.accounts.findIndex(a => a.id === acc.id);
-    if (idx >= 0) {
-      store.accounts[idx] = acc;
-      updated++;
-    } else {
-      store.accounts.push(acc);
-      added++;
-      if (!store.activeId) store.activeId = acc.id;
+  return withStoreLock((store) => {
+    let added = 0;
+    let updated = 0;
+    for (const acc of incoming) {
+      const idx = store.accounts.findIndex(a => a.id === acc.id);
+      if (idx >= 0) {
+        store.accounts[idx] = acc;
+        updated++;
+      } else {
+        store.accounts.push(acc);
+        added++;
+        if (!store.activeId) store.activeId = acc.id;
+      }
     }
-  }
-  await writeStore(store);
-  return { added, updated };
+    return { added, updated };
+  });
 }

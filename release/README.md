@@ -1,5 +1,80 @@
 # zcode-proxy 使用说明
 
+> **vceshi0.1.4 — 凭证变破损根因修复 + 调试日志 + 导入不自动激活 + 切换后 activeId 同步**
+>
+> 本次修复用户反馈的 4 个问题。无 CLI 命令变化，无需重新生成 start.bat / start.sh。全套 508/508 测试通过（新增 2 个回归测试）。
+>
+> **问题 1：凭证突然全部变成破损的（.broken-* 文件堆积）**
+> - 症状：用着用着刷新页面，凭证全部没有了，去 `~/.zcode-proxy/` 一看，credentials.json 旁边堆了好多个 `.broken-{timestamp}` 文件
+> - 根因 1（杀毒/索引器锁文件误判）：旧代码 `readFileSync` 单次失败就直接 `backupCorruptedStore`，把当时被杀毒软件/Windows Search 短暂锁住的（其实是完好的）文件备份成 `.broken-*`。每次刷新页面遇到一次锁，就多一个 `.broken` 文件
+> - 根因 2（空文件误备份）：旧代码遇到 0 字节的 credentials.json（旧版 writeFileSync 崩溃残留）也调 `backupCorruptedStore`，备份一个空文件毫无意义，纯垃圾
+> - 根因 3（无清理机制）：`.broken-*` 文件只增不减，永远不删
+> - 修复 1：`readStoreUncached` 的 `readFileSync` 加 5 次重试（50ms 退避，应对 EPERM/EBUSY/EACCES）。重试期间锁通常已释放，文件能正常读，不再误判为破损
+> - 修复 2：空文件（`raw.trim() === ""`）直接当"无 store"处理，不备份、不设守卫，下次 saveCredential 直接创建新文件
+> - 修复 3：`backupCorruptedStore` 新增 `cleanupOldBrokenBackups`，按 mtime 降序只保留最近 5 个 `.broken-*` 文件，更早的自动删除
+> - 修复 4：JSON.parse 失败时日志输出文件大小 + 前 100 字符摘要，方便诊断是截断还是真的损坏
+>
+> **问题 2：看不到上游具体返回了什么（529/空回200都是黑盒）**
+> - 症状：遇到 529 或空回 200 时只能看到状态码，看不到上游返回的具体错误 JSON / 空响应体长什么样，难以诊断
+> - 修复：新增 `logging.debug` 配置项（环境变量 `ZCODE_PROXY_DEBUG_LOGGING=1`，YAML `logging.debug: true`）。开启后每个请求在上游响应返回时输出：
+>   - `[debug] upstream response: status=529 | ct=application/json | retry-after=120 | empty-stream=1 | ratelimit-remaining=0`
+>   - `[debug] body preview (156 chars): {"type":"error","error":{"type":"overloaded_error","message":"..."}}`
+> - 实现：用 `resp.clone()` 读取副本，不消耗原始响应体，下游 passthrough / 重试逻辑完全不受影响。SSE 流读取前 2KB（含第一个完整事件），JSON 读取到闭合 `}` 为止，3s 超时防止挂起
+> - **Dashboard 日志面板增强**：
+>   - 日志页新增「调试模式」开关（与设置页同步，热切换无需重启）—— 一键开启/关闭 `logging.debug`
+>   - 新增「全部展开」开关 —— 一键展开所有日志行看完整内容
+>   - 每条日志行现在**可点击展开/折叠**：长日志（>120 字符）、`[debug]` 行、`[verbose]` 行默认折叠显示摘要（前 120 字符 + …），点击行任意位置展开看完整内容
+>   - 展开状态按日志 seq id 记忆 —— 新日志到达触发的重渲染不会丢失你已展开的行
+>   - `[debug]` 行带紫色 `DEBUG` 徽章，`[verbose]` 行带蓝色 `VERBOSE` 徽章，方便视觉扫描
+>   - 开启调试模式时自动勾选「全部展开」，立刻看到所有上游响应详情
+>
+> **问题 3：ZCode 导入凭证不应自动激活**
+> - 症状：通过 `zcode-proxy auth login --import` 或 dashboard 导入凭证后，新导入的凭证立刻变成激活账号，原来正在用的账号被踢下线
+> - 期望：导入只是"添加"账号，不切换激活；用户手动点"激活"才切换
+> - 修复 1：CLI `auth login --import` 改用 `saveCredential(cred, { keepActive: true })`，保留原 activeId。OAuth 登录（非 import）仍然自动激活（符合"auth login 是主登录流程"的预期）
+> - 修复 2：dashboard `/admin/api/import` 端点同样改用 `keepActive: true`，并移除自动 hot-swap（不再调 `opts.auth.setOAuthCredential`）。响应新增 `activated: false` 字段通知前端
+>
+> **问题 4：空回自动切换凭证后 activeId 不同步**
+> - 症状：遇到空回 200 自动切换到下一个凭证后，请求实际已经用新凭证调用了，但 dashboard 显示的"激活账号"还停在原来那个
+> - 根因：`handler.ts` 有两个凭证切换代码块（top-of-loop 和 end-of-loop）。top-of-loop 块切换后会调 `switchAccount(match.id)` 持久化 activeId，但 **end-of-loop 块漏了这步** —— 只切换了内存中的 `cred`，没写磁盘。下次刷新页面读磁盘 activeId 还是旧的
+> - 修复：end-of-loop 块补上和 top-of-loop 一致的持久化逻辑：`exportAccounts()` 找到匹配账号 → `switchAccount(match.id)` 写磁盘 → `appendLog` 通知 dashboard。两个切换路径现在行为完全一致
+>
+> **问题 5：OAuth 模式无凭证时无法启动（鸡生蛋死锁）**
+> - 症状：config.yaml 设为 `auth.mode: oauth` 但还没登录过，启动 exe 直接报错退出：「Not logged in for OAuth mode. Run this in a terminal first...」。用户无法打开 dashboard 登录，因为服务器根本没起来；CLI 登录又需要终端（Windows 双击 exe 场景没有终端）
+> - 期望：就算没凭证也能进去，打开 dashboard 后再登录
+> - 修复：`serve()` 不再在无凭证时 `throw new Error()` 退出。改为打印警告横幅（提示用户打开 dashboard 登录），服务器正常启动。API 请求在凭证添加前返回 503 `credential_unavailable`（`proxyRequest` 已有 try/catch 处理）。用户在 dashboard 点「OAuth 登录」或「从 ZCode 导入」后，新凭证通过 `opts.auth.setOAuthCredential` 热加载到运行中的服务器，无需重启
+>
+> 升级建议：**所有用户强烈建议升级**。问题 1 的 .broken 堆积 + 凭证丢失是致命问题；问题 4 的 activeId 不同步会导致 dashboard 显示与实际使用不符，排查时误导严重；问题 5 让首次使用 OAuth 模式的用户不再卡在启动报错。
+
+> **vceshi0.1.3 — 凭证存储可靠性 + 进程稳定性双修复**
+>
+> 本次修复两个用户反馈的高频严重问题：重启后凭证突然全部丢失、Windows exe 用着用着突然退出。无 CLI 命令变化，无需重新生成 start.bat / start.sh。全套 506/506 测试通过（新增 2 个并发写 + 原子写回归测试）。
+>
+> **问题 1：重启突然凭证全部丢失**
+> - 症状：重启 exe 后偶发提示「没有凭证」，回 `~/.zcode-proxy/` 发现 `credentials.json` 被清空或变成 0 字节
+> - 根因 1（非原子写）：旧代码用 `writeFileSync` 直接写 credentials.json，该 API 先 truncate 再 write。如果中间被打断（Ctrl+C / Windows kill / 杀毒软件短暂锁文件 / 磁盘满），文件就停在截断状态，下次启动 JSON.parse 失败 → 凭证全没
+> - 根因 2（并发写竞争）：proxy 的自动切换凭证路径（handler.ts → switchAccount）和 dashboard 的添加账号路径（admin/api.ts → saveCredential）可能并发执行。两者都 read-modify-write 同一个 store，最后一个写入者覆盖前者，第一个写入者的账号被静默丢掉
+> - 修复 1：`writeStore` 改用 `atomicWriteFile`（先写 `.{pid}.tmp-{ts}` 临时文件，再 rename 覆盖）。POSIX rename 是原子的；Windows 上 `safeRename` 已内置 5 次重试应对杀毒/索引器短暂 EPERM。崩溃时临时文件残留（无害），目标文件保持原样
+> - 修复 2：新增 `withStoreLock` 互斥锁，包裹所有 mutation 的完整 read-modify-write 序列（`saveCredential` / `switchAccount` / `removeAccount` / `setAccountLabel` / `setAccountPlan` / `setAccountProxy` / `setAccountName` / `setAccountEmail` / `setAccountDisabled` / `importAccounts`）。锁内每次重新 readStore 以避免内存缓存陈旧
+> - 修复 3：`clearCredential` 的 `unlinkSync` 加 Windows EPERM/EBUSY/EACCES 重试（5 次，50ms 退避），避免杀毒扫描时「清除凭证」按钮抛未捕获错误
+>
+> **问题 2：Windows exe 用着用着突然退出**
+> - 症状：长时间运行后偶尔无提示退出，没有错误日志，需要手动重启
+> - 根因 1（未捕获异步错误）：Bun 默认遇到任何 uncaughtException / unhandledRejection 都会杀进程。SSE observer、captcha 回调、console.log 格式化等任何一处抛错都会让整个 proxy 退出
+> - 根因 2（shutdown 挂起）：旧 `Promise.race([server.stop(), timeout]).then(exit)` 没有 catch，如果 `server.stop()` reject（已停止 / Bun 内部错误），`.then` 永不触发，进程挂起直到外部 kill
+> - 根因 3（第二次 Ctrl+C 不生效）：注释说「再按一次 Ctrl+C 强制退出」，但旧代码第二次信号只是再次设 `shuttingDown=true`，实际还要等 30s 超时
+> - 修复 1：在 `main()` 之前安装 `process.on("uncaughtException")` 和 `process.on("unhandledRejection")`，只 log 不退出。每请求的 try/catch 已经返回 502 给客户端，这两个 handler 是兜底
+> - 修复 2：shutdown 改用 `.finally(() => process.exit(0))`，无论 `server.stop()` resolve 还是 reject 都会退出；并在 `server.stop()` 上加 `.catch` 记录错误
+> - 修复 3：第二次信号 `process.exit(130)` 立即退出（128 + SIGINT(2)），真正兑现注释承诺
+>
+> **凭证加密密钥策略确认**
+> - 按用户要求：所有密钥都通过 `520` 固定密钥加密解密，**不在凭证目录放任何用于解密的 secret 文件，也不读任何环境变量**
+> - 旧版曾支持 `ZCODE_PROXY_CREDENTIAL_SECRET` 环境变量覆盖密钥——这正是「重启凭证全丢」的元凶之一（一次运行设了 env，下次没设，密钥静默轮转，文件解不开）
+> - 本次彻底移除该路径：新加密永远用 `SHA-256("520")`，解密 fallback 只保留 `ZCODE_PROXY_LEGACY_SEED` 作为**手动一次性恢复**入口（用户主动设置旧 seed 值来恢复旧版加密的文件，恢复后下次写自动用 520 重新加密）
+> - `ZCODE_PROXY_CREDENTIAL_SECRET` 现在完全不被读取，设置它没有任何效果
+>
+> 升级建议：**所有用户强烈建议升级**。凭证丢失是致命问题，进程异常退出影响日常使用。
+
 > **vceshi0.1.2 — 从 ZCode 导入升级：双源读取 + 自动识别 + OAuth 自动激活额度**
 >
 > 三项改进，无 CLI 命令变化，无需重新生成 start.bat / start.sh。全套 504/504 测试通过（新增 12 个 zcode-config 用例）。

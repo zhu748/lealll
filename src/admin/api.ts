@@ -1004,20 +1004,24 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
           cred.name = `zcode(${zcodeCount + 1})-${source.plan}`;
         } catch { /* non-fatal */ }
       }
-      // Manual import: NO keepActive — new key becomes active.
-      await saveCredential(cred);
+      // Import should NOT auto-activate the new credential — preserve the
+      // user's currently-active account. The user can manually click
+      // "Activate" on the new account if they want to switch to it.
+      // This matches the user's explicit requirement: "通过zcode导入的凭证
+      // 会直接开启它，应该不默认开启，而是保留原来凭证开启，就是不要立马切换
+      // 新导入凭证".
+      await saveCredential(cred, { keepActive: true });
       invalidateStoreCache();
-      // Hot-swap so oauth-mode requests pick up the new active credential immediately.
-      const active = await loadCredential();
-      if (active && active.apiKey === cred.apiKey) {
-        opts.auth.setOAuthCredential(active);
-      }
+      // NO hot-swap — the in-memory active credential stays as-is. The new
+      // account is added to the store but doesn't become active until the
+      // user explicitly activates it via the dashboard.
       return jsonResp({
         ok: true,
         apiKeyMask: maskApiKey(cred.apiKey),
         plan: cred.plan,
         email: cred.email,
         name: cred.name,
+        activated: false, // signal to dashboard: not auto-activated
       });
     } catch (err) {
       return errorResponse(500, "import_failed", (err as Error).message);
