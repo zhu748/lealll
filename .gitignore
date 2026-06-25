@@ -1,0 +1,20 @@
+node_modules/
+*.log
+config.yaml
+.omo/evidence/
+dist/
+.DS_Store
+*.tsbuildinfo
+/.omo
+/_reverse
+/zcode-proxy.exe
+/zcode-proxy
+# Compiled Windows binaries — never track these (103MB), produce via CI/release instead
+/zcode-proxy-windows.exe
+/zcode-proxy-*.exe
+*.exe
+*.zip
+release/zcode-proxy.exe
+zcode-proxy-debug-*.json
+# Render: local data dir (only relevant if you `docker run` with a bind mount)
+/data/

@@ -1,0 +1,79 @@
+# Render Blueprint for zcode-proxy
+# https://render.com/docs/blueprint-spec
+#
+# One-click deploy: connect this repo on Render, create a new Blueprint,
+# and Render will pick up this file automatically. All sensitive values
+# are marked `sync: false` so Render prompts for them on first deploy
+# instead of storing them in git.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# AUTHENTICATION — pick ONE of two modes for the upstream (Z.AI / Bigmodel):
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Mode A (apikey — simpler, recommended for most users):
+#   Set ZCODE_API_KEY:
+#     - Z.AI:     <apiKey>.<secretKey>  (both halves, dot-separated)
+#     - Bigmodel: <apiKey>
+#   Leave ZCODE_AUTH_MODE unset (it defaults to "apikey").
+#
+# Mode B (oauth — reuse a credential you already have via ZCode desktop or
+# `zcode-proxy auth login` locally):
+#   1. On your laptop:  zcode-proxy auth login zai    (or bigmodel)
+#   2. On your laptop:  zcode-proxy auth export
+#       → prints a base64 blob
+#   3. On Render: set ZCODE_AUTH_MODE=oauth
+#                 set ZCODE_OAUTH_CREDENTIAL=<base64 blob from step 2>
+#   Leave ZCODE_API_KEY unset.
+#
+# Regardless of mode, you MUST set:
+#   ZCODE_PROXY_API_KEY  — secret YOUR clients pass as Authorization: Bearer <key>
+#
+# Optional:
+#   ZCODE_PROVIDER                — "zai" (default) or "bigmodel"
+#   ZCODE_PROXY_CORS_ALLOWLIST    — comma-separated origins for browser access
+#   ZCODE_RETRY_MAX               — e.g. "5"
+#   ZCODE_RETRY_STATUSES          — e.g. "529,429,503"
+
+services:
+  - type: web
+    name: zcode-proxy
+    runtime: docker
+    plan: free            # bump to starter for always-on + persistent disk
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /healthz
+    autoDeploy: true
+    # Render's free tier sleeps after 15 min of inactivity. The first request
+    # after sleep takes ~30s to spin up. For production use, switch to the
+    # "starter" plan ($7/mo) which is always-on.
+    envVars:
+      # === REQUIRED (always) ===
+      - key: ZCODE_PROXY_API_KEY
+        sync: false       # secret — clients must send this as Authorization: Bearer <key>
+
+      # === Mode A: apikey (pick this OR Mode B, not both) ===
+      - key: ZCODE_API_KEY
+        sync: false       # secret — upstream credential (unset if using Mode B)
+
+      # === Mode B: oauth (pick this OR Mode A, not both) ===
+      - key: ZCODE_AUTH_MODE
+        value: apikey     # change to "oauth" to use Mode B
+      - key: ZCODE_OAUTH_CREDENTIAL
+        sync: false       # secret — base64 blob from `zcode-proxy auth export` (Mode B only)
+
+      # === Optional ===
+      - key: ZCODE_PROVIDER
+        value: zai
+      - key: ZCODE_PROXY_CREDENTIAL_SECRET
+        sync: false       # secret — only needed for dashboard multi-account UI
+      - key: ZCODE_PROXY_CORS_ALLOWLIST
+        sync: false       # optional — comma-separated origins
+      - key: ZCODE_RETRY_MAX
+        value: "5"
+      - key: ZCODE_RETRY_STATUSES
+        value: "529,429,503"
+    # Persistent disk — only supported on paid plans. On free tier, comment
+    # this out; the proxy will fall back to /tmp/zcode-proxy (ephemeral).
+    # disk:
+    #   name: zcode-data
+    #   mountPath: /data
+    #   sizeGB: 1

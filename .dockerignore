@@ -1,0 +1,37 @@
+# Build artifacts
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Pre-built binaries — rebuilt inside the container
+zcode-proxy.exe
+zcode-proxy
+zcode-proxy-windows.exe
+release/zcode-proxy.exe
+
+# Local runtime files — regenerated in container
+config.yaml
+*.log
+zcode-proxy-debug-*.json
+
+# Dev / IDE
+.git/
+.gitignore
+.omo/
+_reverse/
+.DS_Store
+*.zip
+.vscode/
+.idea/
+
+# Docs not needed at runtime
+PROMPT.md
+release.md
+release/
+
+# Test config — uses fake credentials, don't ship
+config.test.yaml
+
+# Render-specific files we don't need inside the container
+render.yaml
+.dockerignore

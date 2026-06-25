@@ -1,0 +1,137 @@
+server:
+  port: 8080
+  # Host to bind the proxy on.
+  #   "0.0.0.0" = bind on ALL interfaces (LAN/remote clients can connect)
+  #   "127.0.0.1" = bind on localhost ONLY (no remote access)
+  # NOTE: even when bound to 0.0.0.0, you must access the dashboard via
+  #   http://127.0.0.1:8080/admin (or your machine's LAN IP) — opening
+  #   http://0.0.0.0:8080/admin directly does NOT work on Windows / macOS.
+  host: "0.0.0.0"
+
+auth:
+  # "apikey" = use a pre-obtained API key directly
+  # "oauth"  = use OAuth login flow (run `zcode-proxy auth login <zai|bigmodel>` first)
+  mode: apikey
+
+  # For apikey mode:
+  #   Z.AI:     "yourApiKey.yourSecretKey"
+  #   Bigmodel: "yourApiKey"
+  apiKey: "YOUR_API_KEY_HERE"
+
+  # Key that clients must provide to use the proxy.
+  # Set to null/omit to disable client auth.
+  proxyApiKey: "your-proxy-secret"
+
+  # For oauth mode (path to stored credentials from login flow):
+  # oauthCredentialsPath: "~/.zcode-proxy/credentials.json"
+
+# Which upstream provider to use: "zai" or "bigmodel"
+provider: zai
+
+# Which plan tier to use:
+#   "coding-plan" (default) — direct upstream endpoints, permanent API key
+#   "start-plan"            — routes through zcode.z.ai with JWT auth (requires `auth login`)
+plan: coding-plan
+
+providers:
+  zai:
+    anthropicBase: "https://api.z.ai/api/anthropic"
+    openaiBase: "https://api.z.ai/api/coding/paas/v4"
+  bigmodel:
+    anthropicBase: "https://open.bigmodel.cn/api/anthropic"
+    openaiBase: "https://open.bigmodel.cn/api/coding/paas/v4"
+
+defaultModel: glm-4.6
+
+models:
+  - glm-4.5-air
+  - glm-4.6
+  - glm-4.6v
+  - glm-4.7
+  - glm-5
+  - glm-5-turbo
+  - glm-5v-turbo
+  - glm-5.1
+  - glm-5.2
+
+# Identity headers injected on every upstream request to mimic the ZCode
+# desktop client (User-Agent, X-ZCode-App-Version, X-Title, X-ZCode-Agent,
+# HTTP-Referer). All optional; env vars override YAML, which overrides defaults.
+identity:
+  # Mirrors process.env.ZCODE_APP_VERSION in the ZCode bundle.
+  # Must be printable ASCII; non-conforming values fall back to the default.
+  # Default: "3.1.1" (current ZCode release). Override to match your real client.
+  appVersion: "3.1.1"
+  # X-Title suffix → "Z Code@{sourceTitle}". Default "cli".
+  sourceTitle: "cli"
+  # HTTP-Referer URL. Default "https://zcode.z.ai".
+  refererOrigin: "https://zcode.z.ai"
+
+logging:
+  level: info
+
+# Retry configuration for upstream requests.
+# When the upstream returns a retryable status code (e.g. 529 site overloaded),
+# the proxy will automatically retry with exponential backoff.
+# All fields are optional; defaults are shown below.
+# Environment variable overrides:
+#   ZCODE_RETRY_MAX                        — max number of retries
+#   ZCODE_RETRY_INITIAL_DELAY_MS           — initial delay before first retry (ms)
+#   ZCODE_RETRY_MAX_DELAY_MS               — maximum delay cap (ms)
+#   ZCODE_RETRY_BACKOFF_FACTOR             — backoff multiplier per attempt
+#   ZCODE_RETRY_STATUSES                   — comma-separated retryable status codes (e.g. "529,429,503")
+#   ZCODE_RETRY_CREDENTIAL_SWITCH_THRESHOLD — consecutive failures before switching credentials
+retry:
+  # Maximum number of retry attempts. Set to 0 to disable retries entirely.
+  # No upper bound — set as high as needed (e.g. 1000 for very flaky upstreams).
+  maxRetries: 3
+  # Initial delay (ms) before the first retry. Subsequent retries multiply by backoffFactor.
+  initialDelayMs: 1000
+  # Maximum delay cap (ms). Backoff will never exceed this value.
+  maxDelayMs: 8000
+  # Exponential backoff multiplier. 2 = each retry waits ~2x longer.
+  backoffFactor: 2
+  # HTTP status codes that trigger a retry.
+  # Common values: 429 (rate limited), 503 (service unavailable), 529 (site overloaded).
+  retryableStatuses:
+    - 529
+  # Credential auto-switching: when the SAME credential fails this many times
+  # consecutively (including the initial request), the proxy automatically
+  # switches to another stored credential (if available) and continues retrying.
+  # Already-tried credentials are skipped in the same request to avoid cycling.
+  #
+  # Set to 0 to disable. Default: 5.
+  #
+  # Only effective when:
+  #   1. More than one credential is stored (add accounts via the dashboard or
+  #      `zcode-proxy auth login`).
+  #   2. maxRetries >= this threshold (otherwise the retry loop exhausts first).
+  credentialSwitchThreshold: 5
+
+# --- Responses thinking override (Codex CLI workaround) ---
+# Codex CLI frequently sends `reasoning: null` in the /v1/responses wire
+# payload (the CLI only populates it when an explicit effort level is forced
+# via local config), so the translator's "honor reasoning.effort" branch
+# never fires and the upstream GLM request goes out without `thinking`.
+#
+# This section lets the operator force-enable thinking for specific models
+# regardless of what the client sent. Matching is case-insensitive exact
+# match on the *post-mapping* request model (i.e. the final GLM model id
+# after modelMappings is applied).
+#
+# Empty array / omitted = disabled (default). Two equivalent shapes:
+#
+#   responsesThinking:
+#     models:
+#       - glm-5.2
+#       - glm-4.6
+#
+#   # or shorthand:
+#   responsesThinking:
+#     - glm-5.2
+#     - glm-4.6
+#
+# The dashboard also exposes this as a chip-style multi-select under
+# 代理规则 → Responses 思考管理.
+responsesThinking:
+  models: []
