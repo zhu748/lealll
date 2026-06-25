@@ -177,25 +177,6 @@ test("skips detection for non-200 responses", async () => {
   expect(converted.status).toBe(529);
 });
 
-test("skips detection for non-SSE content-type", async () => {
-  const stream = new ReadableStream<Uint8Array>({
-    start(controller) {
-      controller.enqueue(new TextEncoder().encode(`{"type":"overloaded_error"}`));
-      controller.close();
-    },
-  });
-  const resp = new Response(stream, {
-    status: 200,
-    headers: { "content-type": "application/json" },
-  });
-
-  const converted = await detectSseErrorAndConvert(resp);
-
-  // Should pass through unchanged (JSON, not SSE)
-  expect(converted.status).toBe(200);
-  expect(converted.headers.get("content-type")).toBe("application/json");
-});
-
 test("skips detection for compressed SSE (content-encoding: gzip)", async () => {
   const resp = sseResponse(
     [`event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"x"}}\n\n`],
@@ -239,4 +220,271 @@ test("reconstructed stream is byte-for-byte identical to original", async () => 
 
   const actualBody = await readBody(converted);
   expect(actualBody).toBe(expectedFullBody);
+});
+
+// ---------------------------------------------------------------------------
+// vceshi0.0.9 BUGFIX: empty-stream detection was too strict
+// ---------------------------------------------------------------------------
+// Previously required `bufferedChunks.length === 0` (zero bytes read). But
+// quota-exhausted gateways typically return a few bytes of whitespace, an SSE
+// comment line (`: keepalive\n\n`), or an empty event block (`\n\n`) before
+// closing the connection. All of these produce `bufferedChunks.length > 0`
+// while `sawAnyCompleteEvent === false`. The old check fell through to
+// reconstructStream, passing the bogus 200 to the client → no retry → no
+// credential switch → user sees "200 OK but no output".
+//
+// The fix: trigger whenever `!sawAnyCompleteEvent`, regardless of byte count.
+
+test("converts SSE stream with only whitespace to synthetic 529 (empty-stream fix)", async () => {
+  // Just `\n\n` (an empty SSE event block) — old check would NOT trigger
+  // because bufferedChunks.length === 1.
+  const resp = sseResponse(["\n\n"]);
+
+  const converted = await detectSseErrorAndConvert(resp);
+
+  expect(converted.status).toBe(529);
+  expect(converted.headers.get("x-zcode-empty-stream")).toBe("1");
+  const body = await readBody(converted);
+  expect(body).toContain("overloaded_error");
+  expect(body).toContain("empty SSE stream");
+});
+
+test("converts SSE stream with only a comment line to synthetic 529", async () => {
+  // SSE comment lines start with `:` — used for keep-alive. A stream that
+  // contains only comments and no real events is effectively empty.
+  // Old check would NOT trigger because bufferedChunks.length === 1.
+  const resp = sseResponse([": keepalive\n\n"]);
+
+  const converted = await detectSseErrorAndConvert(resp);
+
+  expect(converted.status).toBe(529);
+  expect(converted.headers.get("x-zcode-empty-stream")).toBe("1");
+});
+
+test("converts SSE stream with only partial event fragment to synthetic 529", async () => {
+  // Partial event without `\n\n` terminator — never becomes a complete event.
+  // Old check would NOT trigger because bufferedChunks.length === 1.
+  const resp = sseResponse(["event: message_start\n"]);
+
+  const converted = await detectSseErrorAndConvert(resp);
+
+  expect(converted.status).toBe(529);
+  expect(converted.headers.get("x-zcode-empty-stream")).toBe("1");
+});
+
+test("still passes through stream that starts with ping then has real content", async () => {
+  // Make sure the loosened check doesn't false-positive on legitimate
+  // streams that begin with a ping event before the actual content.
+  // `ping` is a non-error event, so hasNonErrorEvent() returns true and
+  // sawAnyCompleteEvent becomes true → no false conversion.
+  const sseBody = [
+    `event: ping\ndata: {"type":"ping"}\n\n`,
+    `event: message_start\ndata: {"type":"message_start","message":{"id":"msg_4"}}\n\n`,
+    `event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hi"}}\n\n`,
+  ];
+  const resp = sseResponse(sseBody);
+
+  const converted = await detectSseErrorAndConvert(resp);
+
+  expect(converted.status).toBe(200);
+  const body = await readBody(converted);
+  expect(body).toContain("Hi");
+});
+
+// ---------------------------------------------------------------------------
+// vceshi0.0.9 BUGFIX: non-SSE (application/json) 200 empty responses
+// ---------------------------------------------------------------------------
+// Previously the detector skipped non-SSE responses entirely. Batch requests
+// (stream: false) return application/json, and when quota is exhausted the
+// gateway often returns HTTP 200 with an empty body, or `{}`, or a JSON
+// object missing the `content` / `choices` field. The detector skipped
+// these entirely → no retry → no credential switch → the empty 200 was
+// passed straight to the client.
+//
+// User-visible symptom (from log):
+//   | #063 | ... | glm-5.2 | batch | 200 | 1019ms | in:- out:- |
+
+/** Build an application/json response. */
+function jsonResponse(body: string, status: number = 200): Response {
+  return new Response(body, {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+test("converts application/json 200 with empty body to synthetic 529", async () => {
+  const resp = jsonResponse("");
+
+  const converted = await detectSseErrorAndConvert(resp);
+
+  expect(converted.status).toBe(529);
+  expect(converted.headers.get("x-zcode-empty-stream")).toBe("1");
+  expect(converted.headers.get("content-type")).toBe("application/json");
+  const body = await readBody(converted);
+  expect(body).toContain("overloaded_error");
+});
+
+test("converts application/json 200 with whitespace-only body to 529", async () => {
+  const resp = jsonResponse("   \n  \n");
+
+  const converted = await detectSseErrorAndConvert(resp);
+
+  expect(converted.status).toBe(529);
+  expect(converted.headers.get("x-zcode-empty-stream")).toBe("1");
+});
+
+test("converts application/json 200 with `{}` to synthetic 529", async () => {
+  const resp = jsonResponse("{}");
+
+  const converted = await detectSseErrorAndConvert(resp);
+
+  expect(converted.status).toBe(529);
+  expect(converted.headers.get("x-zcode-empty-stream")).toBe("1");
+});
+
+test("converts application/json 200 with malformed JSON to 529", async () => {
+  // Truncated mid-stream — gateway closed the connection during quota cutoff
+  const resp = jsonResponse('{"content":[{"type":"text","text":"partial');
+
+  const converted = await detectSseErrorAndConvert(resp);
+
+  expect(converted.status).toBe(529);
+  expect(converted.headers.get("x-zcode-empty-stream")).toBe("1");
+});
+
+test("converts application/json 200 with null body to 529", async () => {
+  const resp = jsonResponse("null");
+
+  const converted = await detectSseErrorAndConvert(resp);
+
+  expect(converted.status).toBe(529);
+  expect(converted.headers.get("x-zcode-empty-stream")).toBe("1");
+});
+
+test("converts application/json 200 with empty array to 529", async () => {
+  const resp = jsonResponse("[]");
+
+  const converted = await detectSseErrorAndConvert(resp);
+
+  expect(converted.status).toBe(529);
+  expect(converted.headers.get("x-zcode-empty-stream")).toBe("1");
+});
+
+test("converts application/json 200 with empty Anthropic content + no usage to 529", async () => {
+  // `{"content":[]}` with no usage — Anthropic's "model refused" responses
+  // still include a usage block. content:[] + no usage = quota-exhausted.
+  const resp = jsonResponse('{"id":"msg_1","content":[],"model":"glm-5.2"}');
+
+  const converted = await detectSseErrorAndConvert(resp);
+
+  expect(converted.status).toBe(529);
+  expect(converted.headers.get("x-zcode-empty-stream")).toBe("1");
+});
+
+test("passes through application/json 200 with Anthropic content + usage", async () => {
+  // Real Anthropic response — has content array AND usage block
+  const realBody = JSON.stringify({
+    id: "msg_1",
+    type: "message",
+    role: "assistant",
+    content: [{ type: "text", text: "Hello!" }],
+    model: "glm-5.2",
+    usage: { input_tokens: 10, output_tokens: 5 },
+  });
+  const resp = jsonResponse(realBody);
+
+  const converted = await detectSseErrorAndConvert(resp);
+
+  expect(converted.status).toBe(200);
+  expect(converted.headers.get("content-type")).toBe("application/json");
+  const body = await readBody(converted);
+  expect(body).toBe(realBody); // byte-for-byte unchanged
+});
+
+test("passes through application/json 200 with empty content but with usage", async () => {
+  // Anthropic "model refused" responses have content:[] but include usage
+  // (counting the input tokens that were processed before refusal).
+  // This is a legitimate response, NOT a quota-exhausted signature.
+  const realBody = JSON.stringify({
+    id: "msg_2",
+    content: [],
+    usage: { input_tokens: 50, output_tokens: 0 },
+  });
+  const resp = jsonResponse(realBody);
+
+  const converted = await detectSseErrorAndConvert(resp);
+
+  expect(converted.status).toBe(200);
+  const body = await readBody(converted);
+  expect(body).toBe(realBody);
+});
+
+test("passes through application/json 200 with OpenAI choices", async () => {
+  const realBody = JSON.stringify({
+    id: "chatcmpl-1",
+    object: "chat.completion",
+    choices: [{ message: { role: "assistant", content: "Hi" } }],
+  });
+  const resp = jsonResponse(realBody);
+
+  const converted = await detectSseErrorAndConvert(resp);
+
+  expect(converted.status).toBe(200);
+  const body = await readBody(converted);
+  expect(body).toBe(realBody);
+});
+
+test("passes through application/json 200 with Responses API output", async () => {
+  const realBody = JSON.stringify({
+    id: "resp_1",
+    object: "response",
+    output: [{ type: "message", content: [{ type: "output_text", text: "Hi" }] }],
+  });
+  const resp = jsonResponse(realBody);
+
+  const converted = await detectSseErrorAndConvert(resp);
+
+  expect(converted.status).toBe(200);
+  const body = await readBody(converted);
+  expect(body).toBe(realBody);
+});
+
+test("passes through application/json 200 with embedded error field", async () => {
+  // If the upstream already returned an error-shaped JSON, leave it alone —
+  // the existing error passthrough in handler.ts will surface it to the
+  // client with the proper error structure.
+  const errBody = JSON.stringify({
+    type: "error",
+    error: { type: "authentication_error", message: "invalid api key" },
+  });
+  const resp = jsonResponse(errBody);
+
+  const converted = await detectSseErrorAndConvert(resp);
+
+  expect(converted.status).toBe(200); // unchanged
+  expect(converted.headers.get("x-zcode-empty-stream")).toBe(null);
+  const body = await readBody(converted);
+  expect(body).toBe(errBody);
+});
+
+test("still skips detection for other content-types (text/plain, etc.)", async () => {
+  // Only application/json and text/event-stream are inspected. Other
+  // content-types are passed through unchanged.
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode("some text"));
+      controller.close();
+    },
+  });
+  const resp = new Response(stream, {
+    status: 200,
+    headers: { "content-type": "text/plain" },
+  });
+
+  const converted = await detectSseErrorAndConvert(resp);
+
+  expect(converted.status).toBe(200);
+  expect(converted.headers.get("content-type")).toBe("text/plain");
+  const body = await readBody(converted);
+  expect(body).toBe("some text");
 });

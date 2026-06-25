@@ -1,5 +1,41 @@
 # zcode-proxy 使用说明
 
+> **vceshi0.0.9 — 修复"空回 200 不自动切换账号"严重 Bug**
+>
+> vceshi0.0.7 / vceshi0.0.8 期间尝试修复过"额度耗尽返回空 200 不切换凭证"的问题，但实测仍不生效。
+> 本次彻底定位根因并修复，无 CLI 命令变化，无需重新生成 start.bat / start.sh。全套 492/492 测试通过。
+>
+> **症状**
+> - Claude Code：`API Error: API returned an empty or malformed response (HTTP 200)`
+> - Cherry Studio：输出为空，后台日志显示 `| batch | 200 | in:- out:- |`
+> - 期望：自动切换到下一个账号重试 → 实际：直接把空 200 透传给客户端
+>
+> **根因 1：SSE 空流检查条件过严**
+> - 旧代码 `sse-error-detector.ts:141` 要求 `!sawAnyCompleteEvent && bufferedChunks.length === 0`（**零字节**才算空流）
+> - 但实际网关额度耗尽时往往**返回几个字节**就关闭连接：`\n\n`（空事件块）、`: keepalive\n\n`（注释行）、或部分事件片段
+> - 这些场景下 `bufferedChunks.length > 0`，旧检查失败 → 直接 fall through 到 `reconstructStream` → 把"伪 200"透传给客户端 → retry loop 永远不进入 → 凭证切换逻辑根本没机会触发
+> - 修复：去掉 `bufferedChunks.length === 0` 条件，只看 `!sawAnyCompleteEvent`
+>
+> **根因 2：batch（非流式）路径完全没有空响应检测**
+> - 旧代码 `sse-error-detector.ts:75` 直接 `if (!ct.includes("text/event-stream")) return resp;` —— 非 SSE 响应一律跳过
+> - 用户日志中的 `#063 | batch | 200 | in:- out:-` 就是这条路径：上游返回 200 + 空 JSON body，proxy 原样透传
+> - 之前的 detector 对非流式响应**完全无感知**
+> - 修复：新增 `detectEmptyJsonAndConvert()`，对 200 + JSON 响应逐项检查：
+>   - 空体 / 纯空白 / `{}` / `null` / `[]` / 非对象 → 转 529
+>   - 畸形 JSON（被网关中途截断）→ 转 529
+>   - 缺 `content` / `choices` / `output` / `usage` 全部字段 → 转 529
+>   - 已含 `error` 字段 → 不转（让原有 error passthrough 处理）
+>   - 看起来是合法响应（有 `content`+`usage` / `choices` / `output` 等）→ 不转，原样透传
+>
+> **修复后行为**
+> - 所有空 200（SSE 或 JSON）都打上 `x-zcode-empty-stream: 1` 标记并转换为合成 529
+> - 复用 `handler.ts` 既有的"3 次重试后切换凭证"逻辑（默认 `emptyStreamSwitchThreshold=3`）
+> - 新增 19 个回归测试 + 3 个端到端集成测试，覆盖：SSE 空白流 / batch 空体 / batch `{}` 三种实际场景
+>
+> 升级建议：**所有用户强烈建议升级**。空 200 是上游额度耗尽最常见的特征，旧版本完全无法应对，会导致客户端报错且账号切换逻辑形同虚设。
+
+---
+
 > **vceshi0.0.8 — 移动端全面适配 + 逻辑 Bug 修复 + 性能优化（重新发布）**
 >
 > 本次 vceshi0.0.8 重新发布，叠加 vceshi0.0.7 re-release 之后的全部累积改动。无 CLI 命令变化，无需重新生成 start.bat / start.sh。全套 473/473 测试通过。

@@ -72,6 +72,29 @@ export async function detectSseErrorAndConvert(resp: Response): Promise<Response
   if (resp.status !== 200) return resp;
 
   const ct = resp.headers.get("content-type") ?? "";
+
+  // ----- Non-SSE 200 responses: detect empty / content-less JSON bodies -----
+  //
+  // Bugfix vceshi0.0.9: previously this function only inspected
+  // text/event-stream responses. Non-streaming (batch) requests get
+  // application/json back, and when quota is exhausted the upstream
+  // gateway often returns HTTP 200 with an empty body, or `{}`, or a
+  // JSON object missing the `content` / `choices` field. The detector
+  // skipped these entirely → no retry → no credential switch → the
+  // empty 200 was passed straight to the client.
+  //
+  // Symptom (user log):
+  //   | #063 | ... | glm-5.2 | batch | 200 | 1019ms | in:- out:- |
+  //
+  // We now read the JSON body once, check for the Anthropic/OpenAI
+  // "has real content" signals, and if absent convert to a synthetic
+  // 529 with `x-zcode-empty-stream: 1` so the existing retry+switch
+  // logic kicks in. The body is then reconstructed so any downstream
+  // passthrough still has something to read.
+  if (ct.includes("application/json")) {
+    return detectEmptyJsonAndConvert(resp);
+  }
+
   if (!ct.includes("text/event-stream")) return resp;
 
   // Skip compressed streams — we can't decode gzip/br as UTF-8.
@@ -123,10 +146,24 @@ export async function detectSseErrorAndConvert(resp: Response): Promise<Response
     if (bufferedChunks.length > 0) sawAnyCompleteEvent = true;
   }
 
-  // EMPTY-STREAM CHECK: if the stream ended with zero complete SSE events
-  // AND we read zero (or only whitespace) bytes, the upstream returned an
-  // empty 200 — treat as a retryable error so the proxy retries + switches
-  // credentials instead of passing the empty body to the client.
+  // EMPTY-STREAM CHECK: if the stream ended with zero complete SSE events,
+  // the upstream returned an empty (or whitespace/comment-only) 200 — treat
+  // as a retryable error so the proxy retries + switches credentials instead
+  // of passing the empty body to the client.
+  //
+  // vceshi0.0.9 BUGFIX: the old check required `bufferedChunks.length === 0`
+  // (zero bytes read). But many quota-exhausted gateways don't return zero
+  // bytes — they return a few bytes of whitespace, an SSE comment line
+  // (`: keepalive\n\n`), or just `\n\n` (an empty event block). All of these
+  // produce `bufferedChunks.length > 0` but `sawAnyCompleteEvent === false`.
+  // The old check would fall through to `reconstructStream`, passing the
+  // bogus 200 to the client — making the entire retry+switch machinery a
+  // no-op for the most common empty-stream signature seen in production.
+  //
+  // The fix: trigger whenever we saw no real content event, regardless of
+  // how many bytes were buffered. The `hasNonErrorEvent` check above already
+  // correctly distinguishes "legitimate stream with ping/message_start" from
+  // "only comments / whitespace / partial fragments".
   //
   // The user-visible symptom of this bug: "200 OK but no output" when a
   // credential runs out of quota. Claude Code / Codex CLI see a successful
@@ -138,7 +175,7 @@ export async function detectSseErrorAndConvert(resp: Response): Promise<Response
   //      which matches "quota exhausted, gateway returned nothing"
   //   3. The retry loop in handler.ts counts 529s toward the empty-response
   //      counter, triggering credential switch after 3 consecutive empties
-  if (!sawAnyCompleteEvent && bufferedChunks.length === 0) {
+  if (!sawAnyCompleteEvent) {
     try { await reader.cancel(); } catch {}
     const emptyInfo: SseErrorInfo = {
       type: "overloaded_error",
@@ -156,6 +193,123 @@ export async function detectSseErrorAndConvert(resp: Response): Promise<Response
 
   // No error found — reconstruct the stream with buffered bytes prepended
   return reconstructStream(resp, bufferedChunks, reader);
+}
+
+/**
+ * Detect empty / content-less non-SSE JSON 200 responses.
+ *
+ * Anthropic non-streaming responses should contain `content: [...]` (an array
+ * of content blocks, possibly empty if the model refused but still present).
+ * OpenAI non-streaming responses should contain `choices: [...]`. If the
+ * upstream returns 200 + JSON that:
+ *   - has an empty body
+ *   - parses to `{}` or any non-object
+ *   - is an object missing BOTH `content` and `choices` (no recognizable
+ *     response shape at all)
+ *   - is an object with `content: []` AND no `output_text` AND no `usage`
+ *     (Anthropic empty content with no usage — clearly a quota-exhausted
+ *     signature, not a legitimate "model refused" response which would
+ *     still include usage stats)
+ *
+ * we treat it as an empty response and convert to a synthetic 529 with
+ * `x-zcode-empty-stream: 1`, mirroring the SSE path.
+ *
+ * Returns the original response unchanged if it looks legitimate OR if it
+ * already contains an `error` field (the SSE error path covers those, but
+ * just in case a non-SSE 200 has an inline error we leave it alone — the
+ * existing error passthrough in handler.ts surfaces it to the client).
+ */
+async function detectEmptyJsonAndConvert(resp: Response): Promise<Response> {
+  // Read the body once. We'll reconstruct the response either way so
+  // downstream passthrough still has access to the bytes.
+  let raw = "";
+  try {
+    raw = await resp.text();
+  } catch {
+    // Body read failed — can't inspect, pass through unchanged
+    return resp;
+  }
+
+  // Trim whitespace — empty body is the most common case
+  const trimmed = raw.trim();
+
+  // Case 1: completely empty body
+  if (trimmed === "") {
+    return makeEmptyJson529(resp.headers, raw);
+  }
+
+  // Try to parse as JSON. If it's not valid JSON, that's a malformed 200 —
+  // treat as empty too (the client can't make sense of it either).
+  let data: any;
+  try {
+    data = JSON.parse(trimmed);
+  } catch {
+    // Malformed JSON in a 200 response — treat as empty.
+    // This happens when the upstream gateway truncates mid-stream due to
+    // connection drop or quota cutoff.
+    return makeEmptyJson529(resp.headers, raw);
+  }
+
+  // Non-object JSON (e.g. `null`, `[]`, `"string"`, `42`) — not a valid
+  // Anthropic/OpenAI response shape.
+  if (data === null || typeof data !== "object" || Array.isArray(data)) {
+    return makeEmptyJson529(resp.headers, raw);
+  }
+
+  // If the response already carries an error field, leave it alone — the
+  // existing passthrough in handler.ts will surface it to the client with
+  // the proper error structure.
+  if (data.error && typeof data.error === "object") {
+    return reconstructJsonResponse(resp, raw);
+  }
+
+  // Check for legitimate Anthropic non-streaming response:
+  //   { "content": [...], "usage": {...}, ... }
+  // Empty content is allowed IF usage is present (model refused / stopped
+  // immediately). But empty content + no usage = clearly broken.
+  const hasAnthropicContent = Array.isArray(data.content) && data.content.length > 0;
+  const hasAnthropicUsage = data.usage && typeof data.usage === "object";
+  const hasOutputText = typeof data.output_text === "string" && data.output_text.length > 0;
+
+  // Check for legitimate OpenAI non-streaming response:
+  //   { "choices": [...], ... }
+  const hasOpenAIChoices = Array.isArray(data.choices) && data.choices.length > 0;
+
+  // Check for legitimate Responses API shape:
+  //   { "output": [...], ... }
+  const hasResponsesOutput = Array.isArray(data.output) && data.output.length > 0;
+
+  if (hasAnthropicContent || hasAnthropicUsage || hasOutputText ||
+      hasOpenAIChoices || hasResponsesOutput) {
+    // Looks like a real response — pass through unchanged
+    return reconstructJsonResponse(resp, raw);
+  }
+
+  // None of the legitimate-content signals present → empty/malformed 200
+  return makeEmptyJson529(resp.headers, raw);
+}
+
+/** Build a synthetic 529 + x-zcode-empty-stream response for non-SSE paths. */
+function makeEmptyJson529(originalHeaders: Headers, originalBody: string): Response {
+  const emptyInfo: SseErrorInfo = {
+    type: "overloaded_error",
+    status: 529,
+    message: "Upstream returned an empty or content-less JSON response (likely quota exhausted). Retrying with the same credential; will switch to next credential after 3 consecutive empty responses.",
+    rawBody: originalBody.slice(0, 500),
+  };
+  const synthetic = makeSyntheticErrorResponse(emptyInfo, originalHeaders);
+  synthetic.headers.set("x-zcode-empty-stream", "1");
+  return synthetic;
+}
+
+/** Reconstruct a JSON response with the already-read body so downstream
+ *  passthrough still has access to the bytes. */
+function reconstructJsonResponse(resp: Response, body: string): Response {
+  return new Response(body, {
+    status: resp.status,
+    statusText: resp.statusText,
+    headers: resp.headers,
+  });
 }
 
 /**

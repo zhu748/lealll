@@ -578,6 +578,185 @@ describe("empty-stream 529 → 3 retries then credential switch", () => {
     expect(seenApiKeys.slice(3).every(k => k === "key-BBB")).toBe(true);
     expect(resp.status).toBe(529);
   });
+
+  // ---------------------------------------------------------------------------
+  // vceshi0.0.9 regression tests: previously-uncovered empty 200 signatures
+  // ---------------------------------------------------------------------------
+
+  it("switches credential when SSE stream contains only whitespace (not zero bytes)", async () => {
+    // vceshi0.0.9 fix: old empty-stream check required bufferedChunks.length===0.
+    // Quota-exhausted gateways often return a few bytes of whitespace / empty
+    // SSE event block (`\n\n`) instead of zero bytes. This test reproduces the
+    // user's actual scenario — the SSE stream has bytes but no real events.
+    const config = makeConfig({
+      retry: { maxRetries: 3, initialDelayMs: 1, maxDelayMs: 5, backoffFactor: 1, retryableStatuses: [529], credentialSwitchThreshold: 5, emptyStreamSwitchThreshold: 3 },
+    });
+    const auth = new AuthManager({
+      mode: "oauth",
+      provider: "zai",
+      listAllCredentials: async () => [CRED_A, CRED_B],
+    });
+    auth.setOAuthCredential(CRED_A);
+
+    const seenApiKeys: string[] = [];
+    const mockFetch = (async (req: Request): Promise<Response> => {
+      const apiKey = req.headers.get("x-api-key") ?? "";
+      seenApiKeys.push(apiKey);
+      await req.text();
+      if (apiKey === "key-AAA") {
+        // Whitespace-only SSE stream — old check would NOT detect this as empty
+        return new Response(new ReadableStream<Uint8Array>({
+          start(c) {
+            c.enqueue(new TextEncoder().encode("\n\n"));
+            c.close();
+          },
+        }), { status: 200, headers: { "content-type": "text/event-stream" } });
+      }
+      // Credential B: return a real SSE event
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(c) {
+            c.enqueue(new TextEncoder().encode("event: message_start\ndata: {\"type\":\"message_start\"}\n\n"));
+            c.close();
+          },
+        }),
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      );
+    }) as typeof fetch;
+
+    const handler = createFetchHandler({ config, auth, fetchImpl: mockFetch });
+    const resp = await handler(
+      new Request("http://localhost/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "glm-4.6", max_tokens: 100, stream: true, messages: [{ role: "user", content: "Hi" }] }),
+      }),
+    );
+
+    // Should switch to B after 3 consecutive whitespace-only streams from A,
+    // then succeed with B's real SSE event.
+    expect(seenApiKeys.length).toBe(4); // 1 initial + 3 retries
+    expect(seenApiKeys.slice(0, 3).every(k => k === "key-AAA")).toBe(true);
+    expect(seenApiKeys[3]).toBe("key-BBB");
+    expect(resp.status).toBe(200);
+  });
+
+  it("switches credential when batch (non-SSE) request returns 200 with empty body", async () => {
+    // vceshi0.0.9 fix: previously the detector only inspected text/event-stream
+    // responses. Batch requests (stream: false) get application/json back, and
+    // when quota is exhausted the gateway returns 200 with empty body. The
+    // detector skipped these entirely → no retry → no credential switch.
+    //
+    // User-visible symptom (from log):
+    //   | #063 | ... | glm-5.2 | batch | 200 | 1019ms | in:- out:- |
+    const config = makeConfig({
+      retry: { maxRetries: 3, initialDelayMs: 1, maxDelayMs: 5, backoffFactor: 1, retryableStatuses: [529], credentialSwitchThreshold: 5, emptyStreamSwitchThreshold: 3 },
+    });
+    const auth = new AuthManager({
+      mode: "oauth",
+      provider: "zai",
+      listAllCredentials: async () => [CRED_A, CRED_B],
+    });
+    auth.setOAuthCredential(CRED_A);
+
+    const seenApiKeys: string[] = [];
+    const mockFetch = (async (req: Request): Promise<Response> => {
+      const apiKey = req.headers.get("x-api-key") ?? "";
+      seenApiKeys.push(apiKey);
+      await req.text();
+      if (apiKey === "key-AAA") {
+        // Empty JSON body — old detector would skip (not text/event-stream)
+        return new Response("", {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      // Credential B: return a real Anthropic non-streaming response
+      const realBody = JSON.stringify({
+        id: "msg_1",
+        type: "message",
+        role: "assistant",
+        content: [{ type: "text", text: "Hello!" }],
+        model: "glm-5.2",
+        usage: { input_tokens: 10, output_tokens: 5 },
+      });
+      return new Response(realBody, {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+
+    const handler = createFetchHandler({ config, auth, fetchImpl: mockFetch });
+    const resp = await handler(
+      new Request("http://localhost/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        // stream: false → batch request, gets application/json back
+        body: JSON.stringify({ model: "glm-4.6", max_tokens: 100, stream: false, messages: [{ role: "user", content: "Hi" }] }),
+      }),
+    );
+
+    // Should switch to B after 3 consecutive empty JSON responses from A,
+    // then succeed with B's real response.
+    expect(seenApiKeys.length).toBe(4);
+    expect(seenApiKeys.slice(0, 3).every(k => k === "key-AAA")).toBe(true);
+    expect(seenApiKeys[3]).toBe("key-BBB");
+    expect(resp.status).toBe(200);
+    const body = await resp.text();
+    expect(body).toContain("Hello!");
+  });
+
+  it("switches credential when batch request returns 200 with `{}` (content-less JSON)", async () => {
+    // Another signature of quota exhaustion: gateway returns 200 + valid JSON
+    // but the JSON has no recognizable content/choices/usage fields.
+    const config = makeConfig({
+      retry: { maxRetries: 3, initialDelayMs: 1, maxDelayMs: 5, backoffFactor: 1, retryableStatuses: [529], credentialSwitchThreshold: 5, emptyStreamSwitchThreshold: 3 },
+    });
+    const auth = new AuthManager({
+      mode: "oauth",
+      provider: "zai",
+      listAllCredentials: async () => [CRED_A, CRED_B],
+    });
+    auth.setOAuthCredential(CRED_A);
+
+    const seenApiKeys: string[] = [];
+    const mockFetch = (async (req: Request): Promise<Response> => {
+      const apiKey = req.headers.get("x-api-key") ?? "";
+      seenApiKeys.push(apiKey);
+      await req.text();
+      if (apiKey === "key-AAA") {
+        // `{}` — parses as valid JSON but has no content/choices/usage
+        return new Response("{}", {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      const realBody = JSON.stringify({
+        id: "msg_2",
+        content: [{ type: "text", text: "World!" }],
+        usage: { input_tokens: 10, output_tokens: 5 },
+      });
+      return new Response(realBody, {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+
+    const handler = createFetchHandler({ config, auth, fetchImpl: mockFetch });
+    const resp = await handler(
+      new Request("http://localhost/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "glm-4.6", max_tokens: 100, stream: false, messages: [{ role: "user", content: "Hi" }] }),
+      }),
+    );
+
+    expect(seenApiKeys.length).toBe(4);
+    expect(seenApiKeys[3]).toBe("key-BBB");
+    expect(resp.status).toBe(200);
+    const body = await resp.text();
+    expect(body).toContain("World!");
+  });
 });
 
 describe("config loader: credentialSwitchThreshold", () => {
