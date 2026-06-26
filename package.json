@@ -1,6 +1,6 @@
 {
   "name": "zcode-proxy",
-  "version": "test0.0.1",
+  "version": "test0.0.2",
   "type": "module",
   "scripts": {
     "dev": "bun run src/index.ts",

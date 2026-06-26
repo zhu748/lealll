@@ -1,5 +1,54 @@
 # zcode-proxy 使用说明
 
+> **vtest0.0.2 — 测试版本：新增 Claude Code system blocks 身份改写**
+>
+> 在 vtest0.0.1 基础上新增：任一测试开关开启时，自动改写 Claude Code 发过来的 system blocks，避免身份冲突。无 CLI 命令变化，无需重新生成 start.bat / start.sh。全套 508/508 测试通过，TypeScript 编译零错误。
+>
+> **背景**
+> - Claude Code 发的 system 字段有 3 个 block：billing header 元数据 + "You are Claude Code" 身份 + 大段 session 提示词
+> - 项目注入的 ZCode 官方身份 block 也说 "You are ZCode"，两个身份直接冲突
+> - vtest0.0.2 在测试开关开启时自动改写 Claude Code 的 system blocks，让身份统一为 ZCode
+>
+> **改写规则（任一测试开关开启时生效）**
+> 1. **删除** billing header block（`x-anthropic-billing-header: cc_version=...`）— 纯元数据，暴露 Claude Code 版本，无用
+> 2. **替换** 身份 block：`You are Claude Code, Anthropic's official CLI for Claude.` → `You are ZCode model, working in Claude Code CLI.`（保留 cache_control）
+> 3. **保留** 大段 session block 原样不动（包含 # Harness、写代码风格、# Memory、# Environment 工作目录/平台/OS、# Context management 等会话信息，模型需要这些）
+>
+> **效果对比**
+> - 关闭测试开关（原项目行为）：3 个 Claude Code block 原样保留 + ZCode 官方 block 注入到最前 → 身份冲突
+> - 开启测试开关：billing header 删除 + Claude 身份改写为 ZCode 身份 + session 保留 + ZCode 官方 block 注入到最前 → 身份统一为 ZCode
+>
+> **测试开关 1：passthroughThinking（思考参数透传）**
+> - Dashboard 设置 → 日志配置 tab → 黄色边框「测试开关」卡片
+> - 开启后：
+>   1. 只要客户端发了任何 thinking 字段（adaptive / enabled），都**强制**改写成 ZCode 客户端格式：`thinking:{type:"enabled",budget_tokens:32000}` + `output_config:{effort:"max"}`
+>   2. **同时改写 Claude Code 的 system blocks**（见上方改写规则）
+> - **注意：Claude Code 本身不会这样做**——Claude Code 用 adaptive 模式且不固定预算；这个开关是把 Claude Code 的请求改成 ZCode 客户端那种「最大思考预算」的格式
+> - 也可通过环境变量 `ZCODE_TEST_PASSTHROUGH_THINKING=1` 或 YAML `testFlags.passthroughThinking: true` 开启
+> - 默认关闭
+>
+> **测试开关 2：fullZcodeCompat（完整 ZCode 客户端兼容）**
+> - 开启后（隐含开关 1，包含开关 1 的全部效果——思考参数改写 + system blocks 改写），让转换后的请求体尽量和官方 zcode 客户端一致
+> - **仍然保留 ZCode 网关必需的默认身份提示词注入**（start-plan 模式下，ZCode 官方 system blocks 仍会插到 system 字段最前面，Claude Code 改写后的提示词放在它们后面，否则网关会 3012 拦截）
+> - 其它变化：
+>   1. 不再把 `messages[].role:"system"` 重定位到顶层 `system` 字段
+>   2. 不剥离任何 block 上的 `cache_control`
+>   3. 不剥离 `tool_result` 上的 `is_error`
+>   4. 不再额外添加 `cache_control` 到最后一条消息
+>   5. `anthropic-beta` 头部所有 flag 都透传
+> - 也可通过环境变量 `ZCODE_TEST_FULL_ZCODE_COMPAT=1` 或 YAML `testFlags.fullZcodeCompat: true` 开启
+> - 默认关闭
+>
+> **使用建议**
+> 1. 先只开开关 1，跑几个 Claude Code 请求，看是否触发 3001。如果没触发 → 项目原假设错了，`budget_tokens` 和 `output_config` 其实可以保留
+> 2. 再开开关 2，跑请求看 `role:system` 和 `cache_control` 是否被接受
+> 3. 同时建议开启 dashboard 上的「详细日志模式」+「调试响应日志」，能看到具体上游返回的 JSON
+>
+> **回滚方式**
+> - Dashboard 关闭两个开关即可，立即热生效无需重启
+> - 或在 YAML 删除 `testFlags` 字段
+> - 或删除环境变量 `ZCODE_TEST_PASSTHROUGH_THINKING` / `ZCODE_TEST_FULL_ZCODE_COMPAT`
+>
 > **vtest0.0.1 — 测试版本：新增两个测试开关验证项目对 zcode 客户端的兼容性假设**
 >
 > 本次为**测试版本**，专门用于验证 lealll 项目对 GLM 上游 / ZCode 网关的兼容性假设是否正确。无 CLI 命令变化，无需重新生成 start.bat / start.sh。全套 508/508 测试通过，TypeScript 编译零错误。

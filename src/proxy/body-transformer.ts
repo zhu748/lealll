@@ -147,6 +147,13 @@ export function transformRequestBodyObj(parsed: unknown, ctx: TransformContext):
     const tf = ctx.testFlags ?? {};
     const passthroughThinking = !!(tf.passthroughThinking || tf.fullZcodeCompat);
     const fullZcodeCompat = !!tf.fullZcodeCompat;
+    // Any test flag on → rewrite Claude Code's system blocks to align identity
+    // with ZCode (strip billing header, replace "You are Claude Code" identity).
+    // Runs BEFORE applyStartPlanSystem so the ZCode official blocks are prepended
+    // after the Claude session blocks have been cleaned up.
+    if (passthroughThinking) {
+      modified = rewriteClaudeCodeSystemBlocks(obj) || modified;
+    }
 
     // ZCode gateway (start-plan) REQUIRES the official ZCode identity system
     // blocks at the top of `body.system` — without them the gateway returns
@@ -835,4 +842,68 @@ function applyStartPlanSystem(body: Record<string, unknown>): boolean {
   }
   body.system = newSystem;
   return true;
+}
+
+/**
+ * TEST FLAGS transformer — rewrite Claude Code's system blocks to align
+ * identity with ZCode. Called when either test switch is on.
+ *
+ * Claude Code sends 3 system blocks:
+ *   1. `x-anthropic-billing-header: cc_version=...; cc_entrypoint=cli;`
+ *      — pure metadata, exposes Claude Code identity. DELETE entirely.
+ *   2. `You are Claude Code, Anthropic's official CLI for Claude.`
+ *      — direct identity conflict with ZCode. REPLACE with
+ *      `You are ZCode model, working in Claude Code CLI.`
+ *   3. Big session block (# Harness, code style, # Memory, # Environment,
+ *      # Context management, etc.) — KEEP as-is. Contains useful session
+ *      info (working directory, platform, OS) the model needs.
+ *
+ * The cache_control field on block 2 is preserved through the rewrite.
+ * Block 3 is untouched (its inner Claude-specific paragraphs like "Claude
+ * Fable 5" intro are left alone — user only asked to fix the identity block,
+ * not scrub every Claude mention from the session text).
+ */
+function rewriteClaudeCodeSystemBlocks(body: Record<string, unknown>): boolean {
+  const system = body.system;
+  if (!Array.isArray(system)) return false;
+
+  let changed = false;
+  const newSystem: unknown[] = [];
+  const CLAUDE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
+  const ZCODE_IDENTITY = "You are ZCode model, working in Claude Code CLI.";
+
+  for (const block of system) {
+    if (!isPlainObject(block)) {
+      newSystem.push(block);
+      continue;
+    }
+    const text = typeof block.text === "string" ? block.text : "";
+
+    // 1. Delete billing header block (starts with "x-anthropic-billing-header:").
+    //    Pure metadata, exposes Claude Code version — strip to align with ZCode client.
+    if (text.startsWith("x-anthropic-billing-header:")) {
+      changed = true;
+      continue; // skip — don't push to newSystem
+    }
+
+    // 2. Replace Claude Code identity with ZCode identity.
+    //    Preserve cache_control if present.
+    if (text === CLAUDE_IDENTITY) {
+      const rewritten: Record<string, unknown> = { type: block.type ?? "text", text: ZCODE_IDENTITY };
+      if (typeof block.cache_control === "object" && block.cache_control !== null) {
+        rewritten.cache_control = block.cache_control;
+      }
+      newSystem.push(rewritten);
+      changed = true;
+      continue;
+    }
+
+    // 3. Keep all other blocks as-is (the big session block, any user-added blocks).
+    newSystem.push(block);
+  }
+
+  if (changed) {
+    body.system = newSystem;
+  }
+  return changed;
 }

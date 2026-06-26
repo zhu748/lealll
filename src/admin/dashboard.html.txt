@@ -1260,7 +1260,7 @@ td input{font-family:var(--font-mono)}
     <div class="sidebar-footer">
       <div class="version">
         <span class="dot"></span>
-        <span>vtest0.0.1</span>
+        <span>vtest0.0.2</span>
       </div>
       <div class="logout-btn" onclick="doLogout()">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
@@ -1558,12 +1558,12 @@ td input{font-family:var(--font-mono)}
               <div class="form-group">
                 <label class="form-label">开关 1：思考参数透传（passthroughThinking）</label>
                 <label class="switch"><input type="checkbox" id="cfgTestPassthroughThinking"><span class="slider"></span></label>
-                <div class="form-help">开启后，只要客户端发了任何 thinking 字段（adaptive / enabled），都<strong>强制</strong>改写成 ZCode 客户端格式：<code>thinking:{type:"enabled",budget_tokens:32000}</code> + <code>output_config:{effort:"max"}</code>。<strong>注意：Claude Code 本身不会这样做</strong>——Claude Code 用 adaptive 模式且不固定预算；这个开关是把 Claude Code 的请求改成 ZCode 客户端那种「最大思考预算」的格式。用于验证 GLM 上游 / ZCode 网关是否真的会因这些字段返回 3001（项目原假设）还是像官方 zcode 客户端那样被接受。默认关闭。</div>
+                <div class="form-help">开启后：<br>1) 只要客户端发了任何 thinking 字段（adaptive / enabled），都<strong>强制</strong>改写成 ZCode 客户端格式：<code>thinking:{type:"enabled",budget_tokens:32000}</code> + <code>output_config:{effort:"max"}</code>（Claude Code 本身不会这样做——它用 adaptive 模式且不固定预算；这个开关是把 Claude Code 的请求改成 ZCode 客户端那种「最大思考预算」的格式）。<br>2) 同时<strong>改写 Claude Code 的 system blocks</strong>：删除 billing header 元数据 block；把 <code>You are Claude Code, Anthropic's official CLI for Claude.</code> 改成 <code>You are ZCode model, working in Claude Code CLI.</code>（保留 cache_control）；大段 session block 原样保留（包含工作目录、Memory 系统等会话信息）。<br>用于验证 GLM 上游 / ZCode 网关是否真的会因这些字段返回 3001（项目原假设）还是像官方 zcode 客户端那样被接受。默认关闭。</div>
               </div>
               <div class="form-group">
                 <label class="form-label">开关 2：完整 ZCode 客户端兼容（fullZcodeCompat）</label>
                 <label class="switch"><input type="checkbox" id="cfgTestFullZcodeCompat"><span class="slider"></span></label>
-                <div class="form-help">开启后（隐含开关 1），让转换后的请求体尽量和官方 zcode 客户端一致：<strong>但仍然保留 ZCode 网关必需的默认身份提示词注入</strong>（start-plan 模式下，ZCode 官方 system blocks 仍会插到 system 字段最前面，Claude Code 的提示词放在它们后面，否则网关会 3012 拦截）。其它变化：1) 不再把 messages[].role:"system" 重定位到顶层 system 字段；2) 不剥离任何 block 上的 cache_control（包括 text、tool_use、tool_result 等）；3) 不剥离 tool_result 上的 is_error；4) 不再额外添加 cache_control 到最后一条消息（zcode 客户端自己管理 cc 位置）；5) anthropic-beta 头部所有 flag 都透传（不过滤为 claude-code-*）。默认关闭。这是最宽松的测试模式，验证上游是否能完整接受 zcode 客户端的 wire format。</div>
+                <div class="form-help">开启后（隐含开关 1，包含开关 1 的全部效果——思考参数改写 + system blocks 改写），让转换后的请求体尽量和官方 zcode 客户端一致：<strong>但仍然保留 ZCode 网关必需的默认身份提示词注入</strong>（start-plan 模式下，ZCode 官方 system blocks 仍会插到 system 字段最前面，Claude Code 改写后的提示词放在它们后面，否则网关会 3012 拦截）。其它变化：1) 不再把 messages[].role:"system" 重定位到顶层 system 字段；2) 不剥离任何 block 上的 cache_control（包括 text、tool_use、tool_result 等）；3) 不剥离 tool_result 上的 is_error；4) 不再额外添加 cache_control 到最后一条消息（zcode 客户端自己管理 cc 位置）；5) anthropic-beta 头部所有 flag 都透传（不过滤为 claude-code-*）。默认关闭。这是最宽松的测试模式，验证上游是否能完整接受 zcode 客户端的 wire format。</div>
               </div>
             </div>
           </div>
