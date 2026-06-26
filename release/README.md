@@ -1,5 +1,52 @@
 # zcode-proxy 使用说明
 
+> **vtest0.0.1 — 测试版本：新增两个测试开关验证项目对 zcode 客户端的兼容性假设**
+>
+> 本次为**测试版本**，专门用于验证 lealll 项目对 GLM 上游 / ZCode 网关的兼容性假设是否正确。无 CLI 命令变化，无需重新生成 start.bat / start.sh。全套 508/508 测试通过，TypeScript 编译零错误。
+>
+> **背景**
+> - 项目 `body-transformer.ts` 的作者认为 GLM 上游 / ZCode 网关会因 `thinking.budget_tokens`、`output_config`、`cache_control`、`messages[].role:"system"` 等字段返回 3001 "parameter error"，所以全部剥离
+> - 但官方 ZCode 桌面客户端实际就发送了这些字段，且能正常工作
+> - 这两个测试开关让你能直接验证：到底上游是会拒绝（项目原假设正确）还是会接受（项目假设过于保守，可以放宽）
+>
+> **测试开关 1：passthroughThinking（思考参数透传）**
+> - Dashboard 设置 → 日志配置 tab → 黄色边框「测试开关」卡片
+> - 开启后，只要客户端发了任何 thinking 字段（adaptive / enabled），都**强制**改写成 ZCode 客户端格式：`thinking:{type:"enabled",budget_tokens:32000}` + `output_config:{effort:"max"}`
+> - **注意：Claude Code 本身不会这样做**——Claude Code 用 adaptive 模式且不固定预算；这个开关是把 Claude Code 的请求改成 ZCode 客户端那种「最大思考预算」的格式
+> - 也可通过环境变量 `ZCODE_TEST_PASSTHROUGH_THINKING=1` 或 YAML `testFlags.passthroughThinking: true` 开启
+> - 默认关闭（保留原项目行为：剥离 budget_tokens + output_config）
+>
+> **测试开关 2：fullZcodeCompat（完整 ZCode 客户端兼容）**
+> - 开启后（隐含开关 1），让转换后的请求体尽量和官方 zcode 客户端一致
+> - **仍然保留 ZCode 网关必需的默认身份提示词注入**（start-plan 模式下，ZCode 官方 system blocks 仍会插到 system 字段最前面，Claude Code 的提示词放在它们后面，否则网关会 3012 拦截）
+> - 其它变化：
+>   1. 不再把 `messages[].role:"system"` 重定位到顶层 `system` 字段（zcode 客户端有时把 system 提示放在 messages 里）
+>   2. 不剥离任何 block 上的 `cache_control`（text / tool_use / tool_result 等全保留）
+>   3. 不剥离 `tool_result` 上的 `is_error`
+>   4. 不再额外添加 `cache_control` 到最后一条消息（zcode 客户端自己管理 cc 位置）
+>   5. `anthropic-beta` 头部所有 flag 都透传（不过滤为 claude-code-*）
+> - 也可通过环境变量 `ZCODE_TEST_FULL_ZCODE_COMPAT=1` 或 YAML `testFlags.fullZcodeCompat: true` 开启
+> - 默认关闭
+>
+> **使用建议**
+> 1. 先只开开关 1，跑几个 Claude Code 请求，看是否触发 3001。如果没触发 → 项目原假设错了，`budget_tokens` 和 `output_config` 其实可以保留
+> 2. 再开开关 2，跑请求看 `role:system` 和 `cache_control` 是否被接受。如果都通过 → 项目对 zcode 网关的兼容性假设过于保守，可以放宽
+> 3. 同时建议开启 dashboard 上的「详细日志模式」+「调试响应日志」，能看到具体上游返回的 JSON
+>
+> **回滚方式**
+> - Dashboard 关闭两个开关即可，立即热生效无需重启
+> - 或在 YAML 删除 `testFlags` 字段
+> - 或删除环境变量 `ZCODE_TEST_PASSTHROUGH_THINKING` / `ZCODE_TEST_FULL_ZCODE_COMPAT`
+>
+> **文件改动清单**
+> - `src/config/types.ts` — 新增 `TestFlags` 接口
+> - `src/config/loader.ts` — 解析 YAML + env vars（`ZCODE_TEST_PASSTHROUGH_THINKING` / `ZCODE_TEST_FULL_ZCODE_COMPAT`）
+> - `src/proxy/body-transformer.ts` — 新增 `applyZcodeThinkingFormat` + 各 transform 函数条件分支
+> - `src/proxy/upstream.ts` — `anthropic-beta` 头透传
+> - `src/proxy/handler.ts` — 三处调用点透传 `testFlags`
+> - `src/admin/api.ts` — `sanitizeConfig` / `configToYaml` / 热生效
+> - `src/admin/dashboard.html.txt` — UI 卡片 + loadSettings/saveSettings 接线
+>
 > **v0.1.6 — 全面安全与性能优化：鉴权旁路修复 + SSE socket 泄漏修复 + 凭证写盘可靠性 + 卡顿消除**
 >
 > 本次更新聚焦于安全漏洞修复、运行时崩溃风险消除和性能优化。无 CLI 命令变化，无需重新生成 start.bat / start.sh。全套 508/508 测试通过，TypeScript 编译零错误。

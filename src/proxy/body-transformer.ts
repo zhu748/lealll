@@ -93,6 +93,7 @@
  * @see _reverse/NOTEPAD.md "How Credential is Used for LLM Calls"
  */
 import type { Format } from "../translator/types.js";
+import type { TestFlags } from "../config/types.js";
 import { buildStartPlanSystem } from "./system-prompt.js";
 
 export interface TransformContext {
@@ -101,6 +102,12 @@ export interface TransformContext {
   userId?: string;
   /** When true (start-plan), prepend ZCode gateway system blocks. */
   startPlan?: boolean;
+  /**
+   * TEST FLAGS — when set, alters body-transformer behavior to match the
+   * official ZCode desktop client's wire format. See TestFlags interface.
+   * Both default to false (production behavior).
+   */
+  testFlags?: TestFlags;
 }
 
 /**
@@ -136,17 +143,59 @@ export function transformRequestBodyObj(parsed: unknown, ctx: TransformContext):
   }
   if (ctx.format === "anthropic") {
     const obj = parsed as Record<string, unknown>;
+    // TEST FLAGS — extract for readability. fullZcodeCompat implies passthroughThinking.
+    const tf = ctx.testFlags ?? {};
+    const passthroughThinking = !!(tf.passthroughThinking || tf.fullZcodeCompat);
+    const fullZcodeCompat = !!tf.fullZcodeCompat;
+
+    // ZCode gateway (start-plan) REQUIRES the official ZCode identity system
+    // blocks at the top of `body.system` — without them the gateway returns
+    // 3012 "method not allowed". This injection runs REGARDLESS of test flags
+    // (including switch 2 fullZcodeCompat), because the gateway's content
+    // inspection is unconditional. Client-supplied system blocks (Claude Code's
+    // system prompt) are placed AFTER the official ZCode blocks by
+    // `buildStartPlanSystem` — this matches the ZCode desktop client's wire
+    // format exactly (official identity blocks first, user/session blocks below).
     if (ctx.startPlan) {
       modified = applyStartPlanSystem(obj) || modified;
     }
-    modified = transformUnsupportedAnthropicFields(obj) || modified;
-    modified = relocateSystemMessages(obj) || modified;
+    // TEST SWITCH 1: passthroughThinking skips transformUnsupportedAnthropicFields
+    // and instead calls applyZcodeThinkingFormat (which forces thinking to
+    // {type:"enabled", budget_tokens:32000} + output_config:{effort:"max"},
+    // matching the ZCode client's wire format. NOTE: Claude Code does NOT do
+    // this — Claude Code uses adaptive mode without forced budget. Switch 1
+    // converts Claude Code's request to ZCode's fixed max-budget format.
+    if (passthroughThinking) {
+      modified = applyZcodeThinkingFormat(obj) || modified;
+    } else {
+      modified = transformUnsupportedAnthropicFields(obj) || modified;
+    }
+    // TEST SWITCH 2: fullZcodeCompat skips relocateSystemMessages (keeps
+    // messages[].role:"system" in place, matching ZCode client wire format —
+    // the ZCode client itself sometimes puts system reminders inside the
+    // messages array mid-conversation).
+    if (!fullZcodeCompat) {
+      modified = relocateSystemMessages(obj) || modified;
+    }
     modified = stripThinkingBlocksFromMessages(obj) || modified;
     modified = ensureAssistantTextBlock(obj) || modified;
     modified = normalizeAllMessageContent(obj) || modified;
     modified = normalizeToolResultContent(obj) || modified;
-    modified = sanitizeContentBlocks(obj, ctx.startPlan) || modified;
-    modified = applyAnthropicCacheControl(obj, ctx.startPlan) || modified;
+    // TEST SWITCH 2: fullZcodeCompat skips sanitizeContentBlocks (keeps
+    // cache_control on all block types + is_error on tool_result — ZCode client
+    // attaches cache_control to system text blocks and some user text blocks,
+    // and the gateway accepts them).
+    if (!fullZcodeCompat) {
+      modified = sanitizeContentBlocks(obj, ctx.startPlan) || modified;
+    }
+    // TEST SWITCH 2: fullZcodeCompat ALSO skips applyAnthropicCacheControl —
+    // the ZCode client already manages its own cache_control placement
+    // (system blocks + selective user blocks). Adding NEW cache_control to
+    // the last message text block would deviate from the ZCode client's wire
+    // format. Skip the auto-add when switch 2 is on.
+    if (!fullZcodeCompat) {
+      modified = applyAnthropicCacheControl(obj, ctx.startPlan) || modified;
+    }
     // start-plan: ZCode gateway is stricter than official Anthropic API and
     // rejects `metadata.user_id` (returns 200 + empty SSE stream — invisible
     // to the SSE error detector, surfaces as "empty/malformed response" in
@@ -294,6 +343,85 @@ function transformUnsupportedAnthropicFields(body: Record<string, unknown>): boo
       changed = true;
     }
   }
+  return changed;
+}
+
+/**
+ * TEST SWITCH 1 transformer — ZCode-client-compatible thinking format.
+ *
+ * This is the alternative to `transformUnsupportedAnthropicFields` used when
+ * `testFlags.passthroughThinking` (or `testFlags.fullZcodeCompat`) is enabled.
+ *
+ * Mirrors what the official ZCode desktop client sends for glm-5.2 with max
+ * effort:
+ *
+ *   "thinking": { "type": "enabled", "budget_tokens": 32000 },
+ *   "output_config": { "effort": "max" }
+ *
+ * Behavior (always-force — does NOT preserve the client's value):
+ *   1. If `thinking.type === "adaptive"` (Claude Code's adaptive mode):
+ *      → FORCE convert to `{ type: "enabled", budget_tokens: 32000 }`.
+ *   2. If `thinking.type === "enabled"` (any budget or none):
+ *      → FORCE rewrite to `{ type: "enabled", budget_tokens: 32000 }`.
+ *      The client's `budget_tokens` is ALWAYS overridden to 32000.
+ *   3. If `thinking.type === "disabled"` or absent:
+ *      → leave as-is (no thinking injected, no output_config injected).
+ *   4. Whenever thinking is enabled (cases 1/2), FORCE inject
+ *      `output_config: { effort: "max" }` — overrides any client-sent value.
+ *
+ * NOTE on Claude Code behavior:
+ *   Claude Code does NOT do this. Claude Code sends `thinking:{type:"adaptive"}`
+ *   or `thinking:{type:"enabled",budget_tokens:N}` with user-configurable N,
+ *   and does NOT send `output_config`. This transformer is what the ZCode
+ *   desktop client does — NOT what Claude Code does. Switch 1 is converting
+ *   Claude Code's adaptive thinking to ZCode's fixed max-budget format.
+ *
+ * `context_management` is still stripped (ZCode client doesn't send it either;
+ * it's a Claude Code-specific extension).
+ */
+function applyZcodeThinkingFormat(body: Record<string, unknown>): boolean {
+  let changed = false;
+
+  const ZCODE_BUDGET_TOKENS = 32000;
+  const ZCODE_EFFORT = "max";
+
+  if ("thinking" in body && isPlainObject(body.thinking)) {
+    const t = body.thinking as Record<string, unknown>;
+    const type = t.type;
+
+    if (type === "adaptive" || type === "enabled") {
+      // ALWAYS force to zcode's fixed format — don't preserve client's budget_tokens.
+      const currentBudget = typeof t.budget_tokens === "number" ? t.budget_tokens : undefined;
+      const wantBudget = ZCODE_BUDGET_TOKENS;
+      if (type !== "enabled" || currentBudget !== wantBudget) {
+        body.thinking = { type: "enabled", budget_tokens: wantBudget };
+        changed = true;
+      }
+    }
+    // "disabled" or other types: leave as-is.
+  }
+
+  // output_config: when thinking is enabled, FORCE inject zcode's { effort: "max" }.
+  // Overrides any client-sent output_config value (Claude Code doesn't send it,
+  // but if it did, we still want zcode's value).
+  const finalThinking = body.thinking as Record<string, unknown> | undefined;
+  const thinkingEnabled = isPlainObject(finalThinking) && finalThinking.type === "enabled";
+  if (thinkingEnabled) {
+    const existingOC = body.output_config;
+    const wantOC = { effort: ZCODE_EFFORT };
+    const existingEffort = isPlainObject(existingOC) ? existingOC.effort : undefined;
+    if (existingEffort !== ZCODE_EFFORT) {
+      body.output_config = wantOC;
+      changed = true;
+    }
+  }
+
+  // context_management: strip (ZCode client doesn't send it).
+  if ("context_management" in body) {
+    delete body.context_management;
+    changed = true;
+  }
+
   return changed;
 }
 

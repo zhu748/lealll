@@ -194,7 +194,7 @@ export async function proxyRequest(
     return c.jwt ? "start-plan" : "coding-plan";
   };
 
-  let transformedObj = transformRequestBodyObj(upstreamBodyObj, { format: upstreamFormat, userId: cred.userId, startPlan: currentPlan === "start-plan" });
+  let transformedObj = transformRequestBodyObj(upstreamBodyObj, { format: upstreamFormat, userId: cred.userId, startPlan: currentPlan === "start-plan", testFlags: config.testFlags });
 
   // Force-enable streaming for Anthropic format when config.forceStreamAnthropic
   // is true. Overrides the client's stream preference (including missing/undefined
@@ -249,7 +249,7 @@ export async function proxyRequest(
   // get caught by the catch block, and get converted to a synthetic 502 —
   // making retries completely ineffective.
   const buildUpstreamReq = (captcha?: Record<string, string>) =>
-    buildUpstreamRequest(clientReq, upstreamFormat, provider, cred, transformedBody, config.identity, currentPlan, captcha);
+    buildUpstreamRequest(clientReq, upstreamFormat, provider, cred, transformedBody, config.identity, currentPlan, captcha, config.testFlags);
 
   // vceshi0.0.8+: tracks the AbortController of the most-recent successful
   // upstream fetch, so the SSE response wrapper can abort it when the client
@@ -633,6 +633,7 @@ export async function proxyRequest(
             format: upstreamFormat,
             userId: cred.userId,
             startPlan: currentPlan === "start-plan",
+            testFlags: config.testFlags,
           });
           transformedBody = transformedObj !== undefined ? JSON.stringify(transformedObj) : undefined;
           consecutiveCredFailures = 0;
@@ -790,6 +791,7 @@ export async function proxyRequest(
             format: upstreamFormat,
             userId: cred.userId,
             startPlan: currentPlan === "start-plan",
+            testFlags: config.testFlags,
           });
           transformedBody = transformedObj !== undefined ? JSON.stringify(transformedObj) : undefined;
           consecutiveCredFailures = 0;

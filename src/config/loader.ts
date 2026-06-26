@@ -4,7 +4,7 @@
  */
 import { readFileSync, existsSync } from "node:fs";
 import { parse } from "yaml";
-import type { ProxyConfig, ProviderEndpoints, ProxyIdentity, RetryConfig, RoutingRule, ModelMapping, ResponsesThinkingConfig } from "./types.js";
+import type { ProxyConfig, ProviderEndpoints, ProxyIdentity, RetryConfig, RoutingRule, ModelMapping, ResponsesThinkingConfig, TestFlags } from "./types.js";
 
 /** Environment variable keys that override YAML values. */
 const ENV = {
@@ -131,6 +131,11 @@ export function loadConfig(path: string): ProxyConfig {
   // --- responses thinking override ---
   const responsesThinking = resolveResponsesThinking(parsed?.responsesThinking);
 
+  // --- TEST FLAGS (test switches for body-transformer) ---
+  // Env vars: ZCODE_TEST_PASSTHROUGH_THINKING=1, ZCODE_TEST_FULL_ZCODE_COMPAT=1
+  // YAML: testFlags: { passthroughThinking: true, fullZcodeCompat: true }
+  const testFlags = resolveTestFlags(parsed?.testFlags);
+
   // vceshi0.0.6+: verbose logging flag. Env var ZCODE_PROXY_VERBOSE_LOGGING=1
   // enables it at startup; YAML `logging.verbose: true` also works. Dashboard
   // can toggle at runtime via PUT /config (the field is hot-swappable).
@@ -168,6 +173,7 @@ export function loadConfig(path: string): ProxyConfig {
     routingRules,
     modelMappings,
     responsesThinking,
+    testFlags,
   };
 
   validate(config);
@@ -397,4 +403,51 @@ function resolveCorsAllowList(raw: string | undefined): string[] | undefined {
   if (!raw || raw.trim().length === 0) return undefined;
   const list = raw.split(",").map(s => s.trim()).filter(Boolean);
   return list.length > 0 ? list : undefined;
+}
+
+/**
+ * Resolve test flags (diagnostic body-transformer switches) from YAML + env.
+ *
+ * YAML shape:
+ *   testFlags:
+ *     passthroughThinking: true
+ *     fullZcodeCompat: true
+ *
+ * Env vars (override YAML, set to "1" / "true" to enable):
+ *   ZCODE_TEST_PASSTHROUGH_THINKING=1   → switch 1
+ *   ZCODE_TEST_FULL_ZCODE_COMPAT=1      → switch 2 (also enables switch 1)
+ *
+ * Returns undefined when both flags are false (so the field is omitted from
+ * the config object — preserves backwards compatibility with config files
+ * that don't mention testFlags at all).
+ */
+function resolveTestFlags(raw: unknown): TestFlags | undefined {
+  const obj = (typeof raw === "object" && raw !== null) ? raw as Record<string, unknown> : {};
+
+  const envPassthrough = process.env.ZCODE_TEST_PASSTHROUGH_THINKING;
+  const envFullCompat = process.env.ZCODE_TEST_FULL_ZCODE_COMPAT;
+
+  const passthroughThinking = envTruthy(envPassthrough)
+    ?? (typeof obj.passthroughThinking === "boolean" ? obj.passthroughThinking : undefined);
+  // Switch 2 implies switch 1 (fullZcodeCompat includes passthroughThinking).
+  let fullZcodeCompat = envTruthy(envFullCompat)
+    ?? (typeof obj.fullZcodeCompat === "boolean" ? obj.fullZcodeCompat : undefined);
+
+  let passthroughFinal = passthroughThinking;
+  if (fullZcodeCompat && !passthroughFinal) passthroughFinal = true;
+
+  if (!passthroughFinal && !fullZcodeCompat) return undefined;
+  return {
+    ...(passthroughFinal ? { passthroughThinking: true } : {}),
+    ...(fullZcodeCompat ? { fullZcodeCompat: true } : {}),
+  };
+}
+
+/** Return true if the env var string is set to a truthy value ("1", "true", "yes"). */
+function envTruthy(v: string | undefined): boolean | undefined {
+  if (v === undefined) return undefined;
+  const s = v.trim().toLowerCase();
+  if (s === "1" || s === "true" || s === "yes" || s === "on") return true;
+  if (s === "0" || s === "false" || s === "no" || s === "off" || s === "") return false;
+  return undefined;
 }

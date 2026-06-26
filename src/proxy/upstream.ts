@@ -14,7 +14,7 @@
 import type { Format } from "../translator/types.js";
 import type { ProviderDef } from "../provider/types.js";
 import type { Credential } from "../auth/types.js";
-import type { ProxyIdentity } from "../config/types.js";
+import type { ProxyIdentity, TestFlags } from "../config/types.js";
 import { credentialString } from "../auth/types.js";
 import { buildIdentityHeaders } from "./identity.js";
 
@@ -86,12 +86,23 @@ export function buildAuthHeaders(format: Format, cred: Credential, identity: Pro
   return base;
 }
 
-function collectPassthroughHeaders(req: Request): Record<string, string> {
+function collectPassthroughHeaders(req: Request, testFlags?: TestFlags): Record<string, string> {
+  // TEST SWITCH 2 (fullZcodeCompat): when on, do NOT filter anthropic-beta
+  // flags — pass them all through to upstream, matching the ZCode desktop
+  // client's wire format. The original filter was added because the project
+  // strips the corresponding body fields; with switch 2 the body fields are
+  // preserved, so the header flags must also be preserved.
+  const passthroughAllBetaFlags = !!testFlags?.fullZcodeCompat;
   const result: Record<string, string> = {};
   for (const [key, value] of req.headers.entries()) {
     const lower = key.toLowerCase();
     if (STRIP_HEADERS.has(lower)) continue;
     if (lower === "anthropic-beta") {
+      if (passthroughAllBetaFlags) {
+        // TEST MODE: pass through all flags unfiltered.
+        result[lower] = value;
+        continue;
+      }
       // Filter out beta flags that correspond to features we strip from the
       // request body. ZCode's start-plan gateway validates that the body
       // matches what the beta flags declare — if we strip context_management
@@ -134,10 +145,11 @@ export function buildUpstreamRequest(
   identity: ProxyIdentity,
   plan: "coding-plan" | "start-plan" = "coding-plan",
   extraHeaders?: Record<string, string>,
+  testFlags?: TestFlags,
 ): Request {
   const url = buildUpstreamURL(format, provider, plan);
   const authHeaders = buildAuthHeaders(format, cred, identity, plan);
-  const passthrough = collectPassthroughHeaders(clientReq);
+  const passthrough = collectPassthroughHeaders(clientReq, testFlags);
 
   const headers: Record<string, string> = {
     "content-type": "application/json",

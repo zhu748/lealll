@@ -1260,7 +1260,7 @@ td input{font-family:var(--font-mono)}
     <div class="sidebar-footer">
       <div class="version">
         <span class="dot"></span>
-        <span>v0.1.6</span>
+        <span>vtest0.0.1</span>
       </div>
       <div class="logout-btn" onclick="doLogout()">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
@@ -1545,6 +1545,25 @@ td input{font-family:var(--font-mono)}
                 <label class="form-label">Anthropic 强制流式输出</label>
                 <label class="switch"><input type="checkbox" id="cfgForceStreamAnthropic"><span class="slider"></span></label>
                 <div class="form-help">开启后，对 Anthropic 格式（/v1/messages）的请求强制设置 stream:true，即使客户端发送的是非流式请求。这使得 Claude Code 等默认非流式的客户端也能实时逐 token 输出，而不是等待完整响应。仅影响 Anthropic 直通路径，OpenAI / Responses 格式不受影响。默认关闭（保持客户端原始 stream 设置）。也可通过环境变量 ZCODE_PROXY_FORCE_STREAM_ANTHROPIC=1 开启。</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- TEST SWITCHES CARD (diagnostic) -->
+          <div class="card" style="border:1px solid var(--warn);margin-top:16px">
+            <div class="card-header">
+              <div class="card-title"><span class="card-icon" style="color:var(--warn)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></span>测试开关（验证项目对 zcode 客户端的兼容性假设）</div>
+            </div>
+            <div class="card-body">
+              <div class="form-group">
+                <label class="form-label">开关 1：思考参数透传（passthroughThinking）</label>
+                <label class="switch"><input type="checkbox" id="cfgTestPassthroughThinking"><span class="slider"></span></label>
+                <div class="form-help">开启后，只要客户端发了任何 thinking 字段（adaptive / enabled），都<strong>强制</strong>改写成 ZCode 客户端格式：<code>thinking:{type:"enabled",budget_tokens:32000}</code> + <code>output_config:{effort:"max"}</code>。<strong>注意：Claude Code 本身不会这样做</strong>——Claude Code 用 adaptive 模式且不固定预算；这个开关是把 Claude Code 的请求改成 ZCode 客户端那种「最大思考预算」的格式。用于验证 GLM 上游 / ZCode 网关是否真的会因这些字段返回 3001（项目原假设）还是像官方 zcode 客户端那样被接受。默认关闭。</div>
+              </div>
+              <div class="form-group">
+                <label class="form-label">开关 2：完整 ZCode 客户端兼容（fullZcodeCompat）</label>
+                <label class="switch"><input type="checkbox" id="cfgTestFullZcodeCompat"><span class="slider"></span></label>
+                <div class="form-help">开启后（隐含开关 1），让转换后的请求体尽量和官方 zcode 客户端一致：<strong>但仍然保留 ZCode 网关必需的默认身份提示词注入</strong>（start-plan 模式下，ZCode 官方 system blocks 仍会插到 system 字段最前面，Claude Code 的提示词放在它们后面，否则网关会 3012 拦截）。其它变化：1) 不再把 messages[].role:"system" 重定位到顶层 system 字段；2) 不剥离任何 block 上的 cache_control（包括 text、tool_use、tool_result 等）；3) 不剥离 tool_result 上的 is_error；4) 不再额外添加 cache_control 到最后一条消息（zcode 客户端自己管理 cc 位置）；5) anthropic-beta 头部所有 flag 都透传（不过滤为 claude-code-*）。默认关闭。这是最宽松的测试模式，验证上游是否能完整接受 zcode 客户端的 wire format。</div>
               </div>
             </div>
           </div>
@@ -2460,6 +2479,9 @@ async function loadSettings(){
     document.getElementById('cfgVerboseLog').checked=!!c.logging?.verbose;
     document.getElementById('cfgDebugLog').checked=!!c.logging?.debug;
     document.getElementById('cfgForceStreamAnthropic').checked=!!c.forceStreamAnthropic;
+    // TEST FLAGS
+    document.getElementById('cfgTestPassthroughThinking').checked=!!c.testFlags?.passthroughThinking;
+    document.getElementById('cfgTestFullZcodeCompat').checked=!!c.testFlags?.fullZcodeCompat;
   }catch(e){console.error('loadSettings failed:',e);toast('加载设置失败','error')}
 }
 async function saveSettings(){
@@ -2522,7 +2544,14 @@ async function saveSettings(){
     },
     identity:{appVersion:document.getElementById('cfgAppVer').value,sourceTitle:document.getElementById('cfgSrcTitle').value,refererOrigin:document.getElementById('cfgReferer').value},
     logging:{level:document.getElementById('cfgLogLevel').value,verbose:document.getElementById('cfgVerboseLog').checked,debug:document.getElementById('cfgDebugLog').checked},
-    forceStreamAnthropic:document.getElementById('cfgForceStreamAnthropic').checked
+    forceStreamAnthropic:document.getElementById('cfgForceStreamAnthropic').checked,
+    // TEST FLAGS — both default to false. Switch 2 (fullZcodeCompat) implies
+    // switch 1 on the server side, but we send the literal checkbox state so
+    // users can independently toggle them.
+    testFlags:{
+      passthroughThinking:document.getElementById('cfgTestPassthroughThinking').checked,
+      fullZcodeCompat:document.getElementById('cfgTestFullZcodeCompat').checked
+    }
   };
   const apiKey=document.getElementById('cfgApiKey').value;
   const proxyApiKey=document.getElementById('cfgProxyApiKey').value;

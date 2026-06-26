@@ -159,6 +159,82 @@ export interface ResponsesThinkingConfig {
   models: string[];
 }
 
+/**
+ * TEST FLAGS — diagnostic switches for validating the project's body-transform
+ * assumptions against the real ZCode desktop client wire format.
+ *
+ * ⚠️ These are TEST switches. Both default to false (production behavior is
+ * preserved exactly). Enable them in the dashboard to test alternative
+ * transformations that match the official ZCode desktop client's wire format.
+ *
+ * Background: the project's `body-transformer.ts` strips several fields that
+ * the official ZCode client actually sends (e.g. `thinking.budget_tokens`,
+ * `output_config`, `cache_control` on text blocks, `messages[].role:"system"`).
+ * The original author assumed the GLM upstream / ZCode gateway would reject
+ * these with 3001 "parameter error". These switches let you test whether
+ * that assumption is actually correct, by passing the fields through untouched.
+ *
+ * Switch 1 (passthroughThinking): only affects thinking-related fields.
+ * Switch 2 (fullZcodeCompat): affects everything (system messages, cache_control,
+ *   is_error) AND implies switch 1.
+ */
+export interface TestFlags {
+  /**
+   * TEST SWITCH 1 — Thinking parameters passthrough.
+   *
+   * When true, the body-transformer treats thinking-related fields the same
+   * way the official ZCode desktop client does:
+   *
+   *   1. `thinking.budget_tokens` is PRESERVED (not stripped) when present.
+   *   2. `output_config` is PRESERVED (not deleted) when present.
+   *   3. When Claude Code sends `thinking: { type: "adaptive" }`, it is
+   *      converted to `thinking: { type: "enabled", budget_tokens: 32000 }`
+   *      AND `output_config: { effort: "max" }` is injected — mirroring
+   *      the ZCode client's wire format for glm-5.2 with max effort.
+   *   4. When the client sends `thinking: { type: "enabled" }` without
+   *      `budget_tokens`, `budget_tokens: 32000` is added.
+   *   5. When the client sends `thinking: { type: "enabled" }` without
+   *      `output_config`, `output_config: { effort: "max" }` is added.
+   *
+   * This tests whether the GLM upstream / ZCode gateway actually rejects
+   * these fields (as the original project assumed), or accepts them like
+   * the official ZCode client's requests.
+   *
+   * Default: false (production behavior — strip budget_tokens + output_config).
+   */
+  passthroughThinking?: boolean;
+
+  /**
+   * TEST SWITCH 2 — Full ZCode client compatibility.
+   *
+   * When true, in addition to switch 1's effects, the body-transformer
+   * matches the official ZCode desktop client's wire format exactly:
+   *
+   *   1. `messages[].role: "system"` is LEFT IN PLACE (NOT relocated to
+   *      the top-level `system` field). The ZCode gateway accepts both
+   *      placements — ZCode client itself sometimes puts system messages
+   *      mid-conversation in the messages array.
+   *   2. `cache_control` on ALL block types (text, tool_use, tool_result,
+   *      image, etc.) is PRESERVED (NOT stripped). ZCode client attaches
+   *      `cache_control: { type: "ephemeral" }` to text blocks in system
+   *      and user messages, and the gateway accepts them.
+   *   3. `is_error` on `tool_result` blocks is PRESERVED (NOT stripped).
+   *      Anthropic's official API accepts this field; ZCode gateway
+   *      behavior is what we're testing.
+   *   4. `anthropic-beta` header flags are NOT filtered — all flags the
+   *      client sent are passed through to upstream, matching ZCode client
+   *      behavior.
+   *
+   * This is the most permissive mode — body + headers match what the ZCode
+   * desktop client would send. Use this to verify whether the GLM upstream
+   * truly accepts the ZCode client's wire format end-to-end.
+   *
+   * Default: false (production behavior — relocate system, strip cc/is_error,
+   * filter anthropic-beta header to claude-code-* only).
+   */
+  fullZcodeCompat?: boolean;
+}
+
 /** Top-level proxy configuration. */
 export interface ProxyConfig {
   server: {
@@ -263,4 +339,12 @@ export interface ProxyConfig {
    * @see ResponsesThinkingConfig
    */
   responsesThinking?: ResponsesThinkingConfig;
+  /**
+   * TEST FLAGS — diagnostic switches for body-transformer. Both default to
+   * false (production behavior). Enable in dashboard to test ZCode-client-
+   * compatible wire format. See TestFlags interface for what each switch does.
+   *
+   * @see TestFlags
+   */
+  testFlags?: TestFlags;
 }
