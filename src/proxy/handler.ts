@@ -17,6 +17,7 @@ import { getProvider } from "../provider/providers.js";
 import { listModelIds } from "../provider/models.js";
 import { buildUpstreamRequest } from "./upstream.js";
 import { transformRequestBodyObj } from "./body-transformer.js";
+import { logUpstreamRequest } from "./request-logger.js";
 import { detectCaptchaChallenge, getCaptchaToken, invalidateCaptchaToken, RETRY_HEADERS } from "./captcha.js";
 import { detectSseErrorAndConvert } from "./sse-error-detector.js";
 import { translateRequestOpenAIToAnthropic, translateResponseAnthropicToOpenAI } from "../translator/openai-to-anthropic.js";
@@ -295,6 +296,20 @@ export async function proxyRequest(
   const fetchUpstreamDetected = async (captcha?: Record<string, string>): Promise<{ resp: Response; ctrl: AbortController }> => {
     const req = buildUpstreamReq(captcha);
     lastSentBeta = req.headers.get("anthropic-beta");
+    // REQUEST LOG: save the prepared upstream request (headers + body) to disk
+    // for debugging. Runs synchronously; failure is caught inside the logger.
+    if (config.requestLog?.enabled) {
+      try {
+        logUpstreamRequest(req, transformedBody, reqId, {
+          enabled: true,
+          maxCount: config.requestLog.maxCount ?? 10,
+          dir: config.requestLog.dir ?? "./log",
+        });
+      } catch (e) {
+        // Logger errors must NEVER break the request flow
+        console.error(`[request-log] ${reqId} log failed:`, e);
+      }
+    }
     const timeoutMs = meta.stream ? UPSTREAM_TIMEOUT_STREAM_MS : UPSTREAM_TIMEOUT_BATCH_MS;
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), timeoutMs);

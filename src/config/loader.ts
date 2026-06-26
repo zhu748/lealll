@@ -4,7 +4,7 @@
  */
 import { readFileSync, existsSync } from "node:fs";
 import { parse } from "yaml";
-import type { ProxyConfig, ProviderEndpoints, ProxyIdentity, RetryConfig, RoutingRule, ModelMapping, ResponsesThinkingConfig, TestFlags } from "./types.js";
+import type { ProxyConfig, ProviderEndpoints, ProxyIdentity, RetryConfig, RoutingRule, ModelMapping, ResponsesThinkingConfig, TestFlags, RequestLogConfig } from "./types.js";
 
 /** Environment variable keys that override YAML values. */
 const ENV = {
@@ -136,6 +136,11 @@ export function loadConfig(path: string): ProxyConfig {
   // YAML: testFlags: { passthroughThinking: true, fullZcodeCompat: true }
   const testFlags = resolveTestFlags(parsed?.testFlags);
 
+  // --- REQUEST LOG (upstream request logger) ---
+  // Env vars: ZCODE_REQUEST_LOG_ENABLED=1, ZCODE_REQUEST_LOG_MAX_COUNT=10, ZCODE_REQUEST_LOG_DIR=./log
+  // YAML: requestLog: { enabled: true, maxCount: 10, dir: "./log" }
+  const requestLog = resolveRequestLog(parsed?.requestLog);
+
   // vceshi0.0.6+: verbose logging flag. Env var ZCODE_PROXY_VERBOSE_LOGGING=1
   // enables it at startup; YAML `logging.verbose: true` also works. Dashboard
   // can toggle at runtime via PUT /config (the field is hot-swappable).
@@ -174,6 +179,7 @@ export function loadConfig(path: string): ProxyConfig {
     modelMappings,
     responsesThinking,
     testFlags,
+    requestLog,
   };
 
   validate(config);
@@ -450,4 +456,40 @@ function envTruthy(v: string | undefined): boolean | undefined {
   if (s === "1" || s === "true" || s === "yes" || s === "on") return true;
   if (s === "0" || s === "false" || s === "no" || s === "off" || s === "") return false;
   return undefined;
+}
+
+/**
+ * Resolve request log config from YAML + env vars.
+ *
+ * YAML shape:
+ *   requestLog:
+ *     enabled: true
+ *     maxCount: 10
+ *     dir: "./log"
+ *
+ * Env vars (override YAML):
+ *   ZCODE_REQUEST_LOG_ENABLED=1
+ *   ZCODE_REQUEST_LOG_MAX_COUNT=10
+ *   ZCODE_REQUEST_LOG_DIR=./log
+ *
+ * Always returns a config object (even when disabled) so the dashboard can
+ * display current settings. Defaults: enabled=false, maxCount=10, dir="./log".
+ */
+function resolveRequestLog(raw: unknown): RequestLogConfig {
+  const obj = (typeof raw === "object" && raw !== null) ? raw as Record<string, unknown> : {};
+
+  const enabledEnv = envTruthy(process.env.ZCODE_REQUEST_LOG_ENABLED);
+  const enabled = enabledEnv ?? (typeof obj.enabled === "boolean" ? obj.enabled : false);
+
+  const maxCount = resolvePositiveInt(
+    process.env.ZCODE_REQUEST_LOG_MAX_COUNT ?? obj.maxCount,
+    10,
+  );
+
+  const dirEnv = process.env.ZCODE_REQUEST_LOG_DIR;
+  const dir = (typeof dirEnv === "string" && dirEnv.trim())
+    ? dirEnv.trim()
+    : (typeof obj.dir === "string" && obj.dir.trim() ? obj.dir.trim() : "./log");
+
+  return { enabled, maxCount, dir };
 }

@@ -1260,7 +1260,7 @@ td input{font-family:var(--font-mono)}
     <div class="sidebar-footer">
       <div class="version">
         <span class="dot"></span>
-        <span>vtest0.0.2</span>
+        <span>vtest0.0.3</span>
       </div>
       <div class="logout-btn" onclick="doLogout()">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
@@ -1564,6 +1564,43 @@ td input{font-family:var(--font-mono)}
                 <label class="form-label">开关 2：完整 ZCode 客户端兼容（fullZcodeCompat）</label>
                 <label class="switch"><input type="checkbox" id="cfgTestFullZcodeCompat"><span class="slider"></span></label>
                 <div class="form-help">开启后（隐含开关 1，包含开关 1 的全部效果——思考参数改写 + system blocks 改写），让转换后的请求体尽量和官方 zcode 客户端一致：<strong>但仍然保留 ZCode 网关必需的默认身份提示词注入</strong>（start-plan 模式下，ZCode 官方 system blocks 仍会插到 system 字段最前面，Claude Code 改写后的提示词放在它们后面，否则网关会 3012 拦截）。其它变化：1) 不再把 messages[].role:"system" 重定位到顶层 system 字段；2) 不剥离任何 block 上的 cache_control（包括 text、tool_use、tool_result 等）；3) 不剥离 tool_result 上的 is_error；4) 不再额外添加 cache_control 到最后一条消息（zcode 客户端自己管理 cc 位置）；5) anthropic-beta 头部所有 flag 都透传（不过滤为 claude-code-*）。默认关闭。这是最宽松的测试模式，验证上游是否能完整接受 zcode 客户端的 wire format。</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- REQUEST LOG CONFIG CARD (debug) -->
+          <div class="card" style="border:1px solid var(--info);margin-top:16px">
+            <div class="card-header">
+              <div class="card-title"><span class="card-icon" style="color:var(--info)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg></span>上游请求日志（保存项目处理好格式后发给 z.ai 的完整请求）</div>
+              <button class="btn btn-ghost" onclick="loadRequestLogs()" style="margin-left:auto" title="刷新日志列表">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 1 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+                刷新列表
+              </button>
+            </div>
+            <div class="card-body">
+              <div class="form-group">
+                <label class="form-label">启用上游请求日志</label>
+                <label class="switch"><input type="checkbox" id="cfgRequestLogEnabled"><span class="slider"></span></label>
+                <div class="form-help">开启后，每次代理转发给 z.ai / bigmodel 上游的请求都会保存为 JSON 文件，包含完整的方法、URL、请求头（auth token 已脱敏）、以及经项目所有 transform 处理后的请求体。用于调试「项目到底发了什么给上游」。保存在下方的目录里，按 FIFO 自动清理最旧的文件。默认关闭。</div>
+              </div>
+              <div class="form-group">
+                <label class="form-label">最大保留文件数</label>
+                <input type="number" id="cfgRequestLogMaxCount" min="1" max="1000" value="10" style="width:120px">
+                <div class="form-help">超过这个数量后，最旧的日志文件会被自动删除（按修改时间 FIFO）。默认 10。范围 1-1000。</div>
+              </div>
+              <div class="form-group">
+                <label class="form-label">日志目录</label>
+                <input type="text" id="cfgRequestLogDir" value="./log" style="width:300px">
+                <div class="form-help">保存日志文件的目录（相对当前工作目录或绝对路径）。默认 <code>./log</code>。目录不存在会自动创建。修改后只影响新写入的文件，旧目录里的文件不会移动。</div>
+              </div>
+              <div class="form-group">
+                <button class="btn btn-ghost" onclick="clearAllRequestLogs()" style="color:var(--danger)" title="删除所有日志文件">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+                  清空所有日志
+                </button>
+              </div>
+              <div id="requestLogList" style="margin-top:16px;max-height:400px;overflow-y:auto;border:1px solid var(--border);border-radius:6px">
+                <div style="padding:24px;text-align:center;color:var(--text-muted)">点击「刷新列表」加载日志文件</div>
               </div>
             </div>
           </div>
@@ -2482,6 +2519,12 @@ async function loadSettings(){
     // TEST FLAGS
     document.getElementById('cfgTestPassthroughThinking').checked=!!c.testFlags?.passthroughThinking;
     document.getElementById('cfgTestFullZcodeCompat').checked=!!c.testFlags?.fullZcodeCompat;
+    // REQUEST LOG
+    document.getElementById('cfgRequestLogEnabled').checked=!!c.requestLog?.enabled;
+    document.getElementById('cfgRequestLogMaxCount').value=c.requestLog?.maxCount??10;
+    document.getElementById('cfgRequestLogDir').value=c.requestLog?.dir||'./log';
+    // Auto-load the log list if enabled
+    if(c.requestLog?.enabled)loadRequestLogs();
   }catch(e){console.error('loadSettings failed:',e);toast('加载设置失败','error')}
 }
 async function saveSettings(){
@@ -2551,6 +2594,12 @@ async function saveSettings(){
     testFlags:{
       passthroughThinking:document.getElementById('cfgTestPassthroughThinking').checked,
       fullZcodeCompat:document.getElementById('cfgTestFullZcodeCompat').checked
+    },
+    // REQUEST LOG — enabled / maxCount / dir
+    requestLog:{
+      enabled:document.getElementById('cfgRequestLogEnabled').checked,
+      maxCount:Math.max(1,Math.min(1000,parseInt(document.getElementById('cfgRequestLogMaxCount').value,10)||10)),
+      dir:document.getElementById('cfgRequestLogDir').value.trim()||'./log'
     }
   };
   const apiKey=document.getElementById('cfgApiKey').value;
@@ -2576,6 +2625,115 @@ async function saveSettings(){
       console.error('saveSettings failed:',{status:r.status,body:d});
     }
   }catch{toast('保存失败','error')}
+}
+
+// --- Request Logs ---
+async function loadRequestLogs(){
+  const listEl=document.getElementById('requestLogList');
+  try{
+    const r=await fetch(API+'/admin/api/request-logs',{headers:authHeaders()});
+    if(!r.ok){
+      const d=await r.json().catch(()=>({}));
+      listEl.innerHTML=`<div style="padding:24px;text-align:center;color:var(--danger)">加载失败：${escapeHtml(d?.error?.message||r.statusText)}</div>`;
+      return;
+    }
+    const d=await r.json();
+    if(!d.files||d.files.length===0){
+      listEl.innerHTML=`<div style="padding:24px;text-align:center;color:var(--text-muted)">暂无日志文件${d.enabled?'（启动后等待第一个请求）':'（日志功能未启用，请在上方勾选「启用上游请求日志」并保存）'}</div>`;
+      return;
+    }
+    const rows=d.files.map(f=>{
+      const size=formatSize(f.size);
+      const time=f.timestamp?new Date(f.timestamp).toLocaleString():new Date(f.mtime).toLocaleString();
+      const url=f.url||'';
+      const urlShort=url.length>60?url.slice(0,57)+'...':url;
+      const method=f.method||'';
+      const reqId=f.reqId||'';
+      return `<div style="display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--border);font-size:12px">
+        <span style="flex:0 0 60px;color:var(--text-muted)">${escapeHtml(time)}</span>
+        <span style="flex:0 0 50px;font-weight:600;color:var(--primary)">${escapeHtml(method)}</span>
+        <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(url)}">${escapeHtml(urlShort)}</span>
+        <span style="flex:0 0 60px;color:var(--text-muted);text-align:right">${size}</span>
+        <span style="flex:0 0 70px;color:var(--text-muted);font-family:monospace;font-size:10px">${escapeHtml(reqId)}</span>
+        <button class="btn btn-ghost" style="padding:2px 8px;font-size:11px" onclick="downloadRequestLog('${escapeHtml(f.name)}')" title="下载 JSON">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        </button>
+        <button class="btn btn-ghost" style="padding:2px 8px;font-size:11px;color:var(--danger)" onclick="deleteRequestLog('${escapeHtml(f.name)}')" title="删除">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/></svg>
+        </button>
+      </div>`;
+    }).join('');
+    listEl.innerHTML=`<div style="padding:6px 12px;background:var(--bg-secondary);font-size:11px;color:var(--text-muted);border-bottom:1px solid var(--border)">
+      共 ${d.files.length} 个文件（上限 ${d.maxCount}） · 目录: <code>${escapeHtml(d.dir)}</code> · ${d.enabled?'<span style="color:var(--success)">已启用</span>':'<span style="color:var(--warn)">未启用</span>'}
+    </div>${rows}`;
+  }catch(e){
+    console.error('loadRequestLogs failed:',e);
+    listEl.innerHTML=`<div style="padding:24px;text-align:center;color:var(--danger)">加载失败：${escapeHtml(String(e))}</div>`;
+  }
+}
+
+function formatSize(bytes){
+  if(bytes<1024)return bytes+' B';
+  if(bytes<1024*1024)return (bytes/1024).toFixed(1)+' KB';
+  return (bytes/1024/1024).toFixed(1)+' MB';
+}
+
+async function downloadRequestLog(filename){
+  try{
+    const r=await fetch(API+'/admin/api/request-logs/'+encodeURIComponent(filename),{headers:authHeaders()});
+    if(!r.ok){
+      const d=await r.json().catch(()=>({}));
+      toast(d?.error?.message||'下载失败','error');
+      return;
+    }
+    const blob=await r.blob();
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    a.href=url;
+    a.download=filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }catch(e){
+    console.error('downloadRequestLog failed:',e);
+    toast('下载失败','error');
+  }
+}
+
+async function deleteRequestLog(filename){
+  if(!confirm(`确认删除 ${filename}？`))return;
+  try{
+    const r=await fetch(API+'/admin/api/request-logs/'+encodeURIComponent(filename),{method:'DELETE',headers:authHeaders()});
+    if(r.ok){
+      toast('已删除','success');
+      loadRequestLogs();
+    }else{
+      const d=await r.json().catch(()=>({}));
+      toast(d?.error?.message||'删除失败','error');
+    }
+  }catch(e){
+    console.error('deleteRequestLog failed:',e);
+    toast('删除失败','error');
+  }
+}
+
+async function clearAllRequestLogs(){
+  if(!confirm('确认清空所有日志文件？此操作不可恢复。'))return;
+  try{
+    const r=await fetch(API+'/admin/api/request-logs',{method:'DELETE',headers:authHeaders()});
+    if(r.ok){
+      const d=await r.json().catch(()=>({}));
+      toast(`已清空 ${d.deleted||0} 个文件`,'success');
+      loadRequestLogs();
+    }else{
+      const d=await r.json().catch(()=>({}));
+      toast(d?.error?.message||'清空失败','error');
+    }
+  }catch(e){
+    console.error('clearAllRequestLogs failed:',e);
+    toast('清空失败','error');
+  }
 }
 
 // --- Accounts ---

@@ -18,6 +18,8 @@ import { timingSafeEqual } from "../utils/crypto.js";
 import { atomicWriteFile, createMutex } from "../utils/fs.js";
 import { MODELS as GLM_CATALOG } from "../provider/models.js";
 import { stringify as stringifyYaml } from "yaml";
+import { existsSync, readdirSync, readFileSync, statSync, unlinkSync } from "node:fs";
+import { join } from "node:path";
 // Inline the dashboard HTML at build time so it works inside a
 // `bun build --compile` single-file executable. Runtime `readFileSync`
 // would resolve to the exe's virtual root (e.g. B:\~BUN\root\) and fail
@@ -487,6 +489,127 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
     return jsonResp(sanitizeConfig(opts.config));
   }
 
+  // --- REQUEST LOG endpoints (list / download / delete) ---
+  // These let the dashboard browse the log files saved by request-logger.ts.
+  if (path === "/admin/api/request-logs" && method === "GET") {
+    const cfg = opts.config.requestLog ?? { enabled: false, maxCount: 10, dir: "./log" };
+    const dir = cfg.dir ?? "./log";
+    try {
+      if (!existsSync(dir)) {
+        return jsonResp({ files: [], dir, enabled: cfg.enabled ?? false });
+      }
+      const entries = readdirSync(dir)
+        .filter(f => f.startsWith("upstream-") && f.endsWith(".json"))
+        .map(f => {
+          const fp = join(dir, f);
+          try {
+            const st = statSync(fp);
+            // Read first 2KB to extract timestamp + reqId + url without loading
+            // the full file (some can be 100KB+).
+            const fd = readFileSync(fp, { encoding: "utf8" });
+            let preview: { timestamp?: string; reqId?: string; url?: string; method?: string } = {};
+            try {
+              const parsed = JSON.parse(fd);
+              preview = {
+                timestamp: parsed.timestamp,
+                reqId: parsed.reqId,
+                url: parsed.url,
+                method: parsed.method,
+              };
+            } catch {}
+            return {
+              name: f,
+              size: st.size,
+              mtime: st.mtimeMs,
+              ...preview,
+            };
+          } catch {
+            return null;
+          }
+        })
+        .filter((x): x is { name: string; size: number; mtime: number; timestamp?: string; reqId?: string; url?: string; method?: string } => x !== null)
+        .sort((a, b) => b.mtime - a.mtime); // newest first
+      return jsonResp({ files: entries, dir, enabled: cfg.enabled ?? false, maxCount: cfg.maxCount ?? 10 });
+    } catch (e) {
+      return errorResponse(500, "log_read_failed", (e as Error).message);
+    }
+  }
+
+  // Download a single log file
+  if (path.startsWith("/admin/api/request-logs/") && method === "GET") {
+    const filename = decodeURIComponent(path.slice("/admin/api/request-logs/".length));
+    // Security: reject path traversal — filename must be a bare filename, not a path
+    if (!filename || filename.includes("/") || filename.includes("\\") || filename.includes("..")) {
+      return errorResponse(400, "invalid_filename", "Filename must not contain path separators");
+    }
+    if (!filename.startsWith("upstream-") || !filename.endsWith(".json")) {
+      return errorResponse(400, "invalid_filename", "Filename must match upstream-*.json");
+    }
+    const cfg = opts.config.requestLog ?? { enabled: false, maxCount: 10, dir: "./log" };
+    const dir = cfg.dir ?? "./log";
+    const fp = join(dir, filename);
+    if (!existsSync(fp)) {
+      return errorResponse(404, "not_found", "Log file not found");
+    }
+    try {
+      const content = readFileSync(fp, "utf8");
+      return new Response(content, {
+        status: 200,
+        headers: {
+          "content-type": "application/json; charset=utf-8",
+          "content-disposition": `attachment; filename="${filename}"`,
+        },
+      });
+    } catch (e) {
+      return errorResponse(500, "read_failed", (e as Error).message);
+    }
+  }
+
+  // Delete a single log file
+  if (path.startsWith("/admin/api/request-logs/") && method === "DELETE") {
+    const filename = decodeURIComponent(path.slice("/admin/api/request-logs/".length));
+    if (!filename || filename.includes("/") || filename.includes("\\") || filename.includes("..")) {
+      return errorResponse(400, "invalid_filename", "Filename must not contain path separators");
+    }
+    if (!filename.startsWith("upstream-") || !filename.endsWith(".json")) {
+      return errorResponse(400, "invalid_filename", "Filename must match upstream-*.json");
+    }
+    const cfg = opts.config.requestLog ?? { enabled: false, maxCount: 10, dir: "./log" };
+    const dir = cfg.dir ?? "./log";
+    const fp = join(dir, filename);
+    if (!existsSync(fp)) {
+      return errorResponse(404, "not_found", "Log file not found");
+    }
+    try {
+      unlinkSync(fp);
+      return jsonResp({ ok: true });
+    } catch (e) {
+      return errorResponse(500, "delete_failed", (e as Error).message);
+    }
+  }
+
+  // Clear all log files
+  if (path === "/admin/api/request-logs" && method === "DELETE") {
+    const cfg = opts.config.requestLog ?? { enabled: false, maxCount: 10, dir: "./log" };
+    const dir = cfg.dir ?? "./log";
+    try {
+      if (!existsSync(dir)) {
+        return jsonResp({ ok: true, deleted: 0 });
+      }
+      const files = readdirSync(dir).filter(f => f.startsWith("upstream-") && f.endsWith(".json"));
+      let deleted = 0;
+      for (const f of files) {
+        try {
+          unlinkSync(join(dir, f));
+          deleted++;
+        } catch {}
+      }
+      return jsonResp({ ok: true, deleted });
+    } catch (e) {
+      return errorResponse(500, "clear_failed", (e as Error).message);
+    }
+  }
+
   // Update config
   if (path === "/admin/api/config" && method === "PUT") {
     try {
@@ -576,6 +699,10 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
       if (newConfig.forceStreamAnthropic !== undefined) opts.config.forceStreamAnthropic = newConfig.forceStreamAnthropic;
       // TEST FLAGS: hot-swappable. Both switches take effect on the next request.
       if (newConfig.testFlags !== undefined) opts.config.testFlags = newConfig.testFlags;
+      // REQUEST LOG: hot-swappable. enabled / maxCount / dir all take effect
+      // on the next request. Dir change only affects NEW log files — existing
+      // files in the old dir are NOT moved.
+      if (newConfig.requestLog !== undefined) opts.config.requestLog = newConfig.requestLog;
       if (authBody) opts.config.auth = newConfig.auth;
       // providers.*.anthropicBase / openaiBase: also hot-swappable
       if (body.providers) {
@@ -588,7 +715,7 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
         requiresRestart: restartFields.length > 0,
         restartFields,
         // hotApplied: fields that were applied to the live config without restart
-        hotApplied: ["provider", "plan", "defaultModel", "models", "identity", "logging", "retry", "routingRules", "modelMappings", "responsesThinking", "forceStreamAnthropic", "testFlags", ...(authBody ? ["auth"] : []), ...(body.providers ? ["providers"] : [])],
+        hotApplied: ["provider", "plan", "defaultModel", "models", "identity", "logging", "retry", "routingRules", "modelMappings", "responsesThinking", "forceStreamAnthropic", "testFlags", "requestLog", ...(authBody ? ["auth"] : []), ...(body.providers ? ["providers"] : [])],
       });
     } catch (err) {
       return errorResponse(500, "save_failed", (err as Error).message);
@@ -2084,6 +2211,7 @@ function sanitizeConfig(config: ProxyConfig): Record<string, unknown> {
     responsesThinking: config.responsesThinking ?? { models: [] },
     forceStreamAnthropic: config.forceStreamAnthropic ?? false,
     testFlags: config.testFlags ?? {},
+    requestLog: config.requestLog ?? { enabled: false, maxCount: 10, dir: "./log" },
   };
 }
 
@@ -2144,6 +2272,17 @@ function configToYaml(config: ProxyConfig): string {
           testFlags: {
             ...(config.testFlags.passthroughThinking ? { passthroughThinking: true } : {}),
             ...(config.testFlags.fullZcodeCompat ? { fullZcodeCompat: true } : {}),
+          },
+        }
+      : {}),
+    // REQUEST LOG — persisted when enabled OR when maxCount/dir differ from
+    // defaults, so the dashboard's settings survive restarts.
+    ...(config.requestLog && (config.requestLog.enabled || (config.requestLog.maxCount && config.requestLog.maxCount !== 10) || (config.requestLog.dir && config.requestLog.dir !== "./log"))
+      ? {
+          requestLog: {
+            enabled: config.requestLog.enabled ?? false,
+            maxCount: config.requestLog.maxCount ?? 10,
+            dir: config.requestLog.dir ?? "./log",
           },
         }
       : {}),

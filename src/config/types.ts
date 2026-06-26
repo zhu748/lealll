@@ -347,4 +347,40 @@ export interface ProxyConfig {
    * @see TestFlags
    */
   testFlags?: TestFlags;
+  /**
+   * Upstream request logger — saves every request (headers + body) that the
+   * proxy sends to z.ai / bigmodel upstream to a log directory on disk.
+   *
+   * Purpose: debug what the proxy actually sends upstream after all body
+   * transforms (thinking rewrite, system block rewrite, cache_control
+   * sanitization, etc.). The log files are full JSON with method, URL,
+   * headers (auth tokens masked), and parsed body — open in any JSON viewer.
+   *
+   * Default: disabled. Enable in dashboard or via env vars.
+   *
+   * @see RequestLogConfig
+   */
+  requestLog?: RequestLogConfig;
+}
+
+/**
+ * Upstream request logger configuration.
+ *
+ * When enabled, every request the proxy sends to upstream is saved as a JSON
+ * file in `dir`. Files are named `upstream-{ISO timestamp}-{reqId}-{rand}.json`
+ * and contain `{ timestamp, reqId, method, url, headers, body }`.
+ *
+ * FIFO cleanup: when file count exceeds `maxCount`, the oldest files (by mtime)
+ * are deleted. This bounds disk usage.
+ *
+ * Auth tokens in headers (Authorization, x-api-key) are masked to avoid
+ * leaking full credentials to disk.
+ */
+export interface RequestLogConfig {
+  /** Whether to save upstream requests to disk. Default: false */
+  enabled?: boolean;
+  /** Max number of log files to keep (FIFO by mtime). Default: 10 */
+  maxCount?: number;
+  /** Directory to save log files (relative to cwd or absolute). Default: "./log" */
+  dir?: string;
 }

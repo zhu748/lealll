@@ -1,5 +1,44 @@
 # zcode-proxy 使用说明
 
+> **vtest0.0.3 — 测试版本：新增上游请求日志功能（保存发给 z.ai 的完整请求）**
+>
+> 在 vtest0.0.2 基础上新增：可开启「上游请求日志」，把每次代理处理好格式后发给 z.ai / bigmodel 上游的完整请求（方法 + URL + 请求头 + 请求体）保存为 JSON 文件到磁盘，方便调试「项目到底发了什么给上游」。无 CLI 命令变化，无需重新生成 start.bat / start.sh。全套 508/508 测试通过，TypeScript 编译零错误。
+>
+> **功能说明**
+> - Dashboard 设置 → 日志配置 tab → 蓝色边框「上游请求日志」卡片
+> - 三个配置项：
+>   1. **启用上游请求日志**（开关，默认关闭）
+>   2. **最大保留文件数**（默认 10，范围 1-1000）— 超过后自动按 FIFO 删除最旧的文件
+>   3. **日志目录**（默认 `./log`，相对当前工作目录或绝对路径，目录不存在自动创建）
+> - 启用后，每个发往上游的请求都会保存为 `upstream-{ISO时间}-{reqId}-{随机}.json`
+> - JSON 内容：`{ timestamp, reqId, method, url, headers, body }`
+> - **请求头中的 auth token 已脱敏**：`Authorization: Bearer xxx` 和 `x-api-key: xxx` 只保留前 8 个字符 + `...`，避免泄露完整凭证
+> - **请求体是经项目所有 transform 处理后的最终版本**（包括 thinking 改写、system blocks 改写、cache_control 处理等）— 这就是项目实际发给 z.ai 的内容
+>
+> **Dashboard 日志列表功能**
+> - 列表显示所有日志文件（时间 / HTTP 方法 / URL / 文件大小 / reqId）
+> - 每个文件可下载 JSON 原文 / 单独删除
+> - 一键清空所有日志
+> - 自动刷新（点击「刷新列表」按钮）
+>
+> **API 端点**
+> - `GET /admin/api/request-logs` — 列出所有日志文件
+> - `GET /admin/api/request-logs/{filename}` — 下载单个日志
+> - `DELETE /admin/api/request-logs/{filename}` — 删除单个日志
+> - `DELETE /admin/api/request-logs` — 清空所有日志
+>
+> **环境变量（也可在 YAML 配置）**
+> - `ZCODE_REQUEST_LOG_ENABLED=1` — 启用
+> - `ZCODE_REQUEST_LOG_MAX_COUNT=10` — 最大文件数
+> - `ZCODE_REQUEST_LOG_DIR=./log` — 日志目录
+>
+> **使用建议**
+> 1. 开启日志 + 保存设置
+> 2. 跑一个 Claude Code 请求
+> 3. 回到 Dashboard 点「刷新列表」，下载 JSON 文件查看
+> 4. 对比 JSON 里的 `body` 和 Claude Code 原始请求，看项目做了哪些 transform
+> 5. 配合 vtest0.0.1/vtest0.0.2 的测试开关，验证不同 transform 模式下发往上游的实际内容
+>
 > **vtest0.0.2 — 测试版本：新增 Claude Code system blocks 身份改写**
 >
 > 在 vtest0.0.1 基础上新增：任一测试开关开启时，自动改写 Claude Code 发过来的 system blocks，避免身份冲突。无 CLI 命令变化，无需重新生成 start.bat / start.sh。全套 508/508 测试通过，TypeScript 编译零错误。
