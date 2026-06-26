@@ -159,14 +159,12 @@ export function loadConfig(path: string): ProxyConfig {
   const forceStreamAnthropic = process.env.ZCODE_PROXY_FORCE_STREAM_ANTHROPIC === "1"
     || parsed?.anthropic?.forceStream === true;
 
-  // --- Inject ZCode thinking format (max_tokens + budget_tokens + output_config) ---
-  // When enabled, any Anthropic request with thinking.type === "enabled" gets
-  // its thinking-related fields overwritten with the EXACT values the real
-  // ZCode desktop client sends (max_tokens: 64000, budget_tokens: 32000,
-  // output_config: { effort: "max" }). Reduces WAF fingerprinting risk.
-  // Default: false. Env var: ZCODE_PROXY_INJECT_THINKING_FORMAT=1
-  const injectThinkingFormat = process.env.ZCODE_PROXY_INJECT_THINKING_FORMAT === "1"
-    || parsed?.anthropic?.injectThinkingFormat === true;
+  // --- Align ZCode request format (top-level field order + system blocks + identity rewrite) ---
+  // When enabled, the proxy restructures Anthropic requests to match the real
+  // ZCode desktop client's wire format exactly. Default: false.
+  // Env var: ZCODE_PROXY_ALIGN_ZCODE_FORMAT=1
+  const alignZCodeFormat = process.env.ZCODE_PROXY_ALIGN_ZCODE_FORMAT === "1"
+    || parsed?.anthropic?.alignZCodeFormat === true;
 
   const config: ProxyConfig = {
     server: { port, host, upstreamTimeoutMs: upstreamTimeoutMs || undefined },
@@ -177,7 +175,7 @@ export function loadConfig(path: string): ProxyConfig {
     defaultModel,
     models,
     forceStreamAnthropic,
-    injectThinkingFormat,
+    alignZCodeFormat,
     corsAllowList,
     identity,
     logging: { level: logLevel, verbose: verboseLogging, debug: debugLogging },

@@ -158,16 +158,20 @@ anthropic:
   # unaffected (they already default to streaming in most clients).
   # Default: false. Env var: ZCODE_PROXY_FORCE_STREAM_ANTHROPIC=1
   forceStream: false
-  # Inject the EXACT thinking-format fields the real ZCode desktop client sends.
-  # When true, any Anthropic-format request with thinking.type === "enabled"
-  # gets its thinking-related fields overwritten with the values the real ZCode
-  # client sends:
-  #   - max_tokens: 64000
-  #   - thinking.budget_tokens: 32000
-  #   - output_config: { effort: "max" }
-  # This reduces WAF fingerprinting risk by making the request body
-  # indistinguishable from the real ZCode client at the body-inspection layer.
-  # Only triggers when the client already has thinking enabled — does NOT
-  # force-enable thinking on requests that didn't ask for it.
-  # Default: false. Env var: ZCODE_PROXY_INJECT_THINKING_FORMAT=1
-  injectThinkingFormat: false
+  # Align request body structure to match the real ZCode desktop client exactly.
+  # When true:
+  #   1. Top-level field order: model → max_tokens → thinking → output_config
+  #      → system → messages → tools → tool_choice → stream
+  #   2. Inject 3 ZCode official system blocks (both coding-plan AND start-plan),
+  #      client's original system appended after
+  #   3. Rewrite "You are Claude Code, Anthropic's official CLI for Claude."
+  #      → "You are ZCode model working in Claude Code."
+  #   4. Keep role: "system" inside messages[] (don't relocate to top-level system)
+  # Default: false. Env var: ZCODE_PROXY_ALIGN_ZCODE_FORMAT=1
+  alignZCodeFormat: false
+# NOTE: ZCode thinking-format injection (max_tokens=64000 + budget_tokens=32000
+# + output_config.effort=max) is now UNCONDITIONAL default behavior since v0.1.9.
+# Any Anthropic request with thinking.type === "enabled" automatically gets
+# these fields rewritten to match the real ZCode desktop client. No config
+# needed — this aligns our request body fingerprint with the real client at
+# the WAF body-inspection layer.

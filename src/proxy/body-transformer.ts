@@ -93,7 +93,8 @@
  * @see _reverse/NOTEPAD.md "How Credential is Used for LLM Calls"
  */
 import type { Format } from "../translator/types.js";
-import { buildStartPlanSystem } from "./system-prompt.js";
+import { buildStartPlanSystem, ZCODE_SYSTEM_BLOCKS } from "./system-prompt.js";
+import type { SystemBlock } from "./system-prompt.js";
 
 export interface TransformContext {
   format: Format;
@@ -102,17 +103,15 @@ export interface TransformContext {
   /** When true (start-plan), prepend ZCode gateway system blocks. */
   startPlan?: boolean;
   /**
-   * When true, any Anthropic-format request with `thinking.type === "enabled"`
-   * gets its thinking-related fields overwritten with the EXACT values the
-   * real ZCode desktop client sends:
-   *   - max_tokens: 64000
-   *   - thinking.budget_tokens: 32000
-   *   - output_config: { effort: "max" }
-   *
-   * This reduces WAF fingerprinting risk by making the request body
-   * indistinguishable from the real ZCode client. Default: false.
+   * When true, restructure the request body to match the real ZCode desktop
+   * client's wire format exactly:
+   *   - Top-level field order: model → max_tokens → thinking → output_config → system → messages → tools → tool_choice → stream
+   *   - Inject ZCode system blocks (both coding-plan AND start-plan)
+   *   - Rewrite "You are Claude Code" → "You are ZCode model working in Claude Code"
+   *   - Keep system role in messages (skip relocateSystemMessages)
+   * Default: false.
    */
-  injectThinkingFormat?: boolean;
+  alignZCodeFormat?: boolean;
 }
 
 /**
@@ -153,15 +152,21 @@ export function transformRequestBodyObj(parsed: unknown, ctx: TransformContext):
     }
     modified = transformUnsupportedAnthropicFields(obj) || modified;
     // Inject ZCode thinking format (max_tokens + budget_tokens + output_config)
-    // — runs AFTER transformUnsupportedAnthropicFields so we can detect the
+    // — runs UNCONDITIONALLY (default behavior since v0.1.9). Any Anthropic
+    // request with thinking.type === "enabled" gets the EXACT thinking-format
+    // fields the real ZCode desktop client sends. This aligns our request
+    // body fingerprint with the real client at the WAF body-inspection layer.
+    //
+    // Runs AFTER transformUnsupportedAnthropicFields so we can detect the
     // simplified `thinking: { type: "enabled" }` shape. Must run BEFORE
-    // any transform that might strip output_config (none currently do, but
-    // historically transformUnsupportedAnthropicFields stripped it — that's
-    // why we run AFTER it, so our injection isn't undone).
-    if (ctx.injectThinkingFormat) {
-      modified = injectZCodeThinkingFormat(obj) || modified;
+    // any transform that might strip output_config.
+    modified = injectZCodeThinkingFormat(obj) || modified;
+    // When alignZCodeFormat is ON, skip relocateSystemMessages — real ZCode
+    // keeps role: "system" inside messages[] instead of moving to top-level
+    // system field. The align function (called last) handles system injection.
+    if (!ctx.alignZCodeFormat) {
+      modified = relocateSystemMessages(obj) || modified;
     }
-    modified = relocateSystemMessages(obj) || modified;
     modified = stripThinkingBlocksFromMessages(obj) || modified;
     modified = ensureAssistantTextBlock(obj) || modified;
     modified = normalizeAllMessageContent(obj) || modified;
@@ -176,6 +181,22 @@ export function transformRequestBodyObj(parsed: unknown, ctx: TransformContext):
     // See: https://github.com/zhu748/lealll issue on OAuth-credential switch
     if (ctx.userId && !ctx.startPlan) {
       modified = applyAnthropicUserId(obj, ctx.userId) || modified;
+    }
+    // Align request structure to match real ZCode client (must run LAST so
+    // all other transforms have settled). Rewrites top-level field order,
+    // injects ZCode system blocks (both coding-plan AND start-plan), and
+    // rewrites "You are Claude Code" → "You are ZCode model working in Claude Code".
+    if (ctx.alignZCodeFormat) {
+      const aligned = alignZCodeRequestFormat(obj);
+      if (aligned) {
+        // alignZCodeRequestFormat rebuilds the object with correct key order.
+        // We need to replace parsed's keys in place — clear and re-assign.
+        for (const k of Object.keys(parsed as Record<string, unknown>)) {
+          delete (parsed as Record<string, unknown>)[k];
+        }
+        Object.assign(parsed as Record<string, unknown>, aligned);
+        modified = true;
+      }
     }
   }
 
@@ -381,6 +402,194 @@ function injectZCodeThinkingFormat(body: Record<string, unknown>): boolean {
   }
 
   return changed;
+}
+
+/**
+ * Align request structure to match the real ZCode desktop client's wire format.
+ *
+ * Triggered only when `ctx.alignZCodeFormat === true`. Performs three transformations:
+ *
+ * 1. **Inject ZCode system blocks** (both coding-plan AND start-plan):
+ *    - Prepend 3 official ZCode identity blocks from zcode_system.json
+ *    - Each block carries `cache_control: { type: "ephemeral" }`
+ *    - Client's original system blocks (if any) appended AFTER the ZCode blocks
+ *    - Critical for start-plan: gateway does content inspection and rejects
+ *      requests missing the ZCode identity blocks
+ *
+ * 2. **Client identity rewrite**: if the client's system text contains
+ *    "You are Claude Code, Anthropic's official CLI for Claude." (Claude Code's
+ *    default identity string), rewrite it to "You are ZCode model working in
+ *    Claude Code." — preserves Claude Code's harness instructions while adopting
+ *    ZCode identity for WAF bypass.
+ *
+ * 3. **Top-level field reorder**: rebuild the object with key insertion order
+ *    matching the real ZCode client:
+ *      model → max_tokens → thinking → output_config → system → messages →
+ *      tools → tool_choice → stream → (other fields)
+ *    JSON object key order is preserved by JS engines (ES2015+), so this
+ *    actually changes the wire bytes — important because some WAFs inspect
+ *    key order as a fingerprint.
+ *
+ * Returns the new object with reordered keys, or null if no changes were made
+ * (though in practice the system injection always triggers when alignZCodeFormat
+ * is on, so this always returns a non-null object).
+ *
+ * @see _reverse/NOTEPAD.md "Real ZCode Request Structure (2026-06)"
+ */
+const ZCODE_OFFICIAL_SYSTEM_BLOCKS: ReadonlyArray<{ type: "text"; text: string; cache_control?: { type: "ephemeral" } }> = Object.freeze(
+  (ZCODE_SYSTEM_BLOCKS as SystemBlock[]).map(b => Object.freeze({ ...b })),
+);
+
+/** Claude Code's default identity string — we rewrite it to ZCode identity. */
+const CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
+const ZCODE_IDENTITY_REPLACEMENT = "You are ZCode model working in Claude Code.";
+
+function alignZCodeRequestFormat(body: Record<string, unknown>): Record<string, unknown> | null {
+  let changed = false;
+
+  // === Step 1: Inject ZCode system blocks (always, both plans) ===
+  // Prepend official ZCode identity blocks. Client's existing system blocks
+  // are appended after (with identity rewrite applied — see Step 2).
+  //
+  // IDEMPOTENCY: if the request has already been aligned (e.g. on retry), the
+  // system field already starts with the 3 ZCode official blocks. We detect
+  // this by checking if the first block's text matches the first ZCode block,
+  // and if so, DON'T re-inject (just rewrite identity + reorder keys).
+  const clientSystem = normalizeSystemToArray(body.system);
+  const alreadyInjected = clientSystem.length > 0
+    && clientSystem[0].text === ZCODE_OFFICIAL_SYSTEM_BLOCKS[0].text;
+
+  const rewrittenClientSystem = rewriteClaudeCodeIdentity(clientSystem);
+  if (rewrittenClientSystem !== clientSystem) changed = true;
+
+  if (!alreadyInjected) {
+    const officialBlocks = ZCODE_OFFICIAL_SYSTEM_BLOCKS.map(b => ({ ...b }));
+    body.system = [...officialBlocks, ...rewrittenClientSystem];
+  } else {
+    body.system = rewrittenClientSystem;
+  }
+  changed = true;
+
+  // === Step 2: Identity rewrite inside messages too ===
+  // Claude Code's "You are Claude Code..." can also appear in messages[].role: "system"
+  // (Claude Code puts its identity in messages too). Rewrite those as well.
+  if (Array.isArray(body.messages)) {
+    for (const msg of body.messages) {
+      if (!isPlainObject(msg)) continue;
+      if ((msg as Record<string, unknown>).role !== "system") continue;
+      const content = (msg as Record<string, unknown>).content;
+      if (typeof content === "string") {
+        if (content.includes(CLAUDE_CODE_IDENTITY)) {
+          (msg as Record<string, unknown>).content = content.replace(
+            CLAUDE_CODE_IDENTITY,
+            ZCODE_IDENTITY_REPLACEMENT,
+          );
+          changed = true;
+        }
+      } else if (Array.isArray(content)) {
+        for (const block of content) {
+          if (!isPlainObject(block)) continue;
+          const text = (block as Record<string, unknown>).text;
+          if (typeof text === "string" && text.includes(CLAUDE_CODE_IDENTITY)) {
+            (block as Record<string, unknown>).text = text.replace(
+              CLAUDE_CODE_IDENTITY,
+              ZCODE_IDENTITY_REPLACEMENT,
+            );
+            changed = true;
+          }
+        }
+      }
+    }
+  }
+
+  // === Step 3: Fill in missing fields real ZCode always sends ===
+  // Real ZCode client always includes tool_choice and stream, even when the
+  // client (e.g. Claude Code) doesn't send them. Fill in the defaults to match.
+  // tool_choice: { type: "auto" } — only when tools are present (real ZCode
+  // only sends tool_choice when tools array is non-empty).
+  if (Array.isArray(body.tools) && body.tools.length > 0 && body.tool_choice === undefined) {
+    body.tool_choice = { type: "auto" };
+    changed = true;
+  }
+  // stream: true — real ZCode always streams. Claude Code defaults to non-stream
+  // (stream field absent or false), so we force it on to match the real client.
+  if (body.stream !== true) {
+    body.stream = true;
+    changed = true;
+  }
+
+  // === Step 4: Drop fields real ZCode client never sends ===
+  // Claude Code sends `metadata: { user_id: "..." }` for tracking. Real ZCode
+  // client never sends this field — its presence is a clear "non-ZCode client"
+  // fingerprint. Drop it.
+  if ("metadata" in body) {
+    delete body.metadata;
+    changed = true;
+  }
+
+  // === Step 5: Rebuild top-level keys in ZCode wire order ===
+  // Real ZCode order (reverse-engineered):
+  //   model → max_tokens → thinking → output_config → system → messages →
+  //   tools → tool_choice → stream → (others)
+  const ORDERED_KEYS = [
+    "model", "max_tokens", "thinking", "output_config",
+    "system", "messages", "tools", "tool_choice", "stream",
+  ];
+  const result: Record<string, unknown> = {};
+  for (const k of ORDERED_KEYS) {
+    if (k in body) {
+      result[k] = body[k];
+    }
+  }
+  // Append any remaining keys not in the ordered list (e.g. stop_sequences)
+  // — but NOT metadata (already deleted in Step 4).
+  for (const k of Object.keys(body)) {
+    if (!ORDERED_KEYS.includes(k)) {
+      result[k] = body[k];
+    }
+  }
+  changed = true; // always rebuild — key order matters even if values same
+
+  return changed ? result : null;
+}
+
+/** Normalize system field (string | array | undefined) to an array of text blocks. */
+function normalizeSystemToArray(system: unknown): SystemBlock[] {
+  if (system == null) return [];
+  if (typeof system === "string") {
+    return system.trim() ? [{ type: "text", text: system }] : [];
+  }
+  if (Array.isArray(system)) {
+    const out: SystemBlock[] = [];
+    for (const item of system) {
+      if (typeof item === "string") {
+        if (item.trim()) out.push({ type: "text", text: item });
+      } else if (isPlainObject(item)) {
+        const b = item as Record<string, unknown>;
+        if (b.type === "text" && typeof b.text === "string" && b.text.trim()) {
+          out.push({
+            type: "text",
+            text: b.text,
+            ...(typeof b.cache_control === "object" && b.cache_control !== null
+              ? { cache_control: b.cache_control as { type: "ephemeral" } }
+              : {}),
+          });
+        }
+      }
+    }
+    return out;
+  }
+  return [];
+}
+
+/** Rewrite "You are Claude Code..." → "You are ZCode model working in Claude Code." */
+function rewriteClaudeCodeIdentity(blocks: SystemBlock[]): SystemBlock[] {
+  return blocks.map(b => {
+    if (b.text.includes(CLAUDE_CODE_IDENTITY)) {
+      return { ...b, text: b.text.replace(CLAUDE_CODE_IDENTITY, ZCODE_IDENTITY_REPLACEMENT) };
+    }
+    return b;
+  });
 }
 
 /**

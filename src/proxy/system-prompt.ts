@@ -13,7 +13,7 @@
  */
 import blocks from "./zcode_system.json" with { type: "json" };
 
-interface SystemBlock {
+export interface SystemBlock {
   type: "text";
   text: string;
   cache_control?: { type: "ephemeral" };

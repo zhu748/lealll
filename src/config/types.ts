@@ -264,25 +264,38 @@ export interface ProxyConfig {
    */
   responsesThinking?: ResponsesThinkingConfig;
   /**
-   * Inject full ZCode thinking format on every request that has thinking enabled.
+   * Align request body structure to match the real ZCode desktop client exactly.
    *
-   * When true, any Anthropic-format request with `thinking.type === "enabled"`
-   * (whether from Claude Code, Cherry Studio, or any other client) gets its
-   * thinking-related fields overwritten with the EXACT values the real ZCode
-   * desktop client sends:
+   * When true, the proxy restructures the Anthropic-format request body to match
+   * the real ZCode client's wire format (reverse-engineered 2026-06):
    *
-   *   - `max_tokens: 64000`           (force max output budget)
-   *   - `thinking.budget_tokens: 32000` (force thinking budget)
-   *   - `output_config: { effort: "max" }` (force max effort)
+   *   1. **Top-level field order**: model → max_tokens → thinking → output_config
+   *      → system → messages → tools → tool_choice → stream
+   *      (real ZCode order, not arbitrary JSON key order)
    *
-   * This makes the request body indistinguishable from the real ZCode client
-   * at the body-inspection layer of the WAF, reducing fingerprinting risk.
+   *   2. **ZCode system blocks always injected** (both coding-plan AND start-plan):
+   *      - Prepend 3 official ZCode identity blocks ("You are ZCode...")
+   *      - Each block carries `cache_control: { type: "ephemeral" }`
+   *      - Client's original system blocks appended AFTER the ZCode blocks
+   *      - Critical for start-plan: gateway does content inspection and rejects
+   *        requests missing the ZCode identity blocks
    *
-   * Default: false (preserve client's original values). Env var:
-   * ZCODE_PROXY_INJECT_THINKING_FORMAT=1 to enable at startup. Also toggleable
-   * via dashboard "代理规则" tab.
+   *   3. **Client identity rewrite**: if the client's system contains
+   *      "You are Claude Code, Anthropic's official CLI for Claude." (Claude Code's
+   *      default identity), rewrite it to "You are ZCode model working in Claude
+   *      Code." — preserves Claude Code's harness instructions while adopting
+   *      ZCode identity for WAF bypass.
    *
-   * @see body-transformer.ts `injectZCodeThinkingFormat`
+   *   4. **Keep system role in messages**: do NOT relocate `role: "system"`
+   *      messages from `messages[]` to top-level `system` field. Real ZCode
+   *      keeps them in `messages[]` (e.g. "The Bash tool shell was changed...").
+   *      The previous `relocateSystemMessages` transform is skipped when this
+   *      flag is on.
+   *
+   * Default: false (preserve existing behavior). Env var:
+   * ZCODE_PROXY_ALIGN_ZCODE_FORMAT=1 to enable at startup.
+   *
+   * @see body-transformer.ts `alignZCodeRequestFormat`
    */
-  injectThinkingFormat?: boolean;
+  alignZCodeFormat?: boolean;
 }

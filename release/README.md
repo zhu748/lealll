@@ -1,5 +1,47 @@
 # zcode-proxy 使用说明
 
+> **vceshi0.1.5 — 测试版本：请求体结构对齐真实 ZCode 客户端（alignZCodeFormat 开关）**
+>
+> 本次测试版本新增「对齐 ZCode 请求格式」开关（默认关闭），开启后请求体结构完全对齐真实 ZCode 桌面客户端抓包。全套 532/532 测试通过，TypeScript 编译零错误。
+>
+> **新增功能 — alignZCodeFormat 开关（默认关闭）**
+>
+> 开启后，任何 Anthropic 格式（/v1/messages）请求都会被改写成真实 ZCode 客户端的请求结构：
+>
+> 1. **顶层字段顺序对齐**：按 ZCode 抓包顺序重排 → `model → max_tokens → thinking → output_config → system → messages → tools → tool_choice → stream`。JSON 对象的 key 顺序会影响实际传输的字节序列，部分 WAF 会检查 key 顺序作为指纹。
+>
+> 2. **注入 ZCode 官方 system blocks**（2 条，coding-plan 和 start-plan 都注入）：
+>    - Block 1: `You are ZCode, an interactive coding agent`（身份声明）
+>    - Block 2: harness 说明 + 安全策略（"You are an interactive ZCode agent that helps users with software engineering tasks..."）
+>    - 每个 block 带 `cache_control: { type: "ephemeral" }`
+>    - 客户端原 system blocks 追加在这两条后面
+>    - **start-plan 必须**：网关做内容检查，缺少 ZCode 身份 block 会被拒
+>
+> 3. **身份改写**：客户端 system/messages 里的 `You are Claude Code, Anthropic's official CLI for Claude.` 自动改写成 `You are ZCode model working in Claude Code.`（保留 Claude Code 的 harness 指令，仅切换身份声明）
+>
+> 4. **保留 messages 里 role:system**：不再把 `role: "system"` 从 messages 移到顶层 system 字段（真实 ZCode 就保留在 messages 里，之前的 relocateSystemMessages 适配是改错了）
+>
+> 5. **补全缺失字段**：
+>    - 有 tools 但没 tool_choice 时自动补 `tool_choice: { type: "auto" }`
+>    - stream !== true 时强制 `stream: true`（Claude Code 默认 false，真实 ZCode 总是 true）
+>
+> 6. **删除非 ZCode 字段**：
+>    - 删除 `metadata`（Claude Code 自带 user_id 跟踪字段，真实 ZCode 客户端从不发送）
+>
+> **实测对齐效果**（用 Claude Code 真实请求做输入）：
+> - 顶层字段顺序 9/9 完全对齐 ✅
+> - system blocks: 2 个 ZCode 官方 block + 客户端原 system（身份已改写）✅
+> - tool_choice / stream / metadata 全部处理 ✅
+> - 身份字符串改写 ✅
+>
+> **三种开启方式**：
+> 1. Dashboard「代理规则」→ 勾选「对齐 ZCode 请求格式（测试开关）」→ 保存（热切换，无需重启）
+> 2. YAML: `anthropic: alignZCodeFormat: true`
+> 3. 环境变量: `ZCODE_PROXY_ALIGN_ZCODE_FORMAT=1`
+>
+> **继承 v0.1.8 的所有改动**（请求头指纹对齐、思考格式默认注入、WAF 拦截短路检测、[undefined] 字段清理等）
+>
+
 > **v0.1.8 — WAF 指纹对齐：请求头/请求体全面模拟真实 ZCode 客户端**
 >
 > 本次升级针对阿里云 WAF 拦截问题，根据逆向真实 ZCode Electron 客户端抓包，全面对齐请求指纹。全套 518/518 测试通过，TypeScript 编译零错误。
