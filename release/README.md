@@ -1,5 +1,44 @@
 # zcode-proxy 使用说明
 
+> **v0.1.9 — 正式版：ZCode 请求体对齐成为默认行为（移除测试开关）**
+>
+> 在 vceshi0.1.5 ~ vceshi0.1.7 经过 3 个测试版本验证后，将「对齐 ZCode 请求格式」从测试开关转正为默认且唯一的行为。同时适配了 OpenAI / Responses 格式：所有客户端请求（无论 Anthropic / OpenAI / Responses）最终都通过 translator 转成 Anthropic 格式后走对齐逻辑，统一对齐到真实 ZCode 客户端的 wire format。514/514 测试通过，TypeScript 编译零错误。
+>
+> **本次改动**
+>
+> 1. **删除 `alignZCodeFormat` 配置项**：不再需要手动开启，默认就是对齐模式。Dashboard、YAML、环境变量三种配置方式均移除。原版的非对齐代码路径（`relocateSystemMessages`、`ensureAssistantTextBlock`、`normalizeToolResultContent`、`sanitizeContentBlocks` 的 strip 逻辑等）全部废弃删除。
+>
+> 2. **OpenAI / Responses 格式自动适配**：发现 OpenAI（`/v1/chat/completions`）和 Responses（`/v1/responses`）格式的请求在 handler.ts 中已经通过 translator 翻译成 Anthropic 格式后才走 `transformRequestBodyObj`，`upstreamFormat` 永远是 `"anthropic"`。所以对齐逻辑天然覆盖所有客户端格式，无需单独适配。
+>
+> 3. **移除强制 `stream: true`**：原 alignZCodeFormat 强制 stream:true（模拟真实 ZCode 总是流式），但这破坏了非流式客户端（如某些 Anthropic SDK 调用、集成测试等）。v0.1.9 改为尊重客户端的 stream 设置。如需强制流式，使用独立的 `forceStreamAnthropic` 配置项。
+>
+> 4. **代码清理**：删除 3 个废弃函数（`relocateSystemMessages`、`ensureAssistantTextBlock`、`normalizeToolResultContent`），body-transformer.ts 从 1081 行精简到 876 行。删除约 1000 行废弃测试代码。
+>
+> 5. **`metadata.user_id` 注入路径移除**：原 coding-plan 模式下会注入 `metadata.user_id` 用于 OAuth 跟踪，但 alignZCodeRequestFormat 总是删除 metadata（真实 ZCode 从不发送）。两者矛盾，所以 v0.1.9 直接移除 `applyAnthropicUserId` 调用（函数定义保留以备将来需要）。
+>
+> **当前对齐效果**（用 Claude Code 真实长任务请求做样本模拟，对比真实 ZCode 抓包）：
+>
+> | 维度 | v0.1.9 | 真实 ZCode |
+> |---|---|---|
+> | 顶层 9 字段顺序 | ✅ | ✅ |
+> | `tool_result.content` 格式 | ✅ string (49/49) | string (49/49) |
+> | assistant 无 text 块 | ✅ 18 | 18 |
+> | `is_error` 保留 | ✅ 1 | 1 |
+> | `cache_control` 块数 | ✅ 1 | 1 |
+> | system 块数 (start-plan 幂等) | ✅ 3 | 3 |
+> | ZCode 官方 2 条 system 块 | ✅ | ✅ |
+> | `tools` 15 个名称+顺序 | ✅ | ✅ |
+> | metadata 剥离 | ✅ | ✅ |
+> | `thinking` / `output_config` / `max_tokens` | ✅ | ✅ |
+>
+> **保留的配置项**：
+> - **ZCode 思考等级**（`thinkingLevel`）：高 / 最高，默认最高。客户端发 `thinking.type=enabled` 时按此档位注入；不发 thinking 时只注入 `max_tokens=64000`，不强制开思考。
+> - **Anthropic 强制流式输出**（`forceStreamAnthropic`）：独立开关，默认关闭。
+>
+> **继承 vceshi0.1.5 ~ vceshi0.1.7 / v0.1.8 的所有改动**（消息体内部指纹对齐、顶层字段顺序对齐、ZCode 官方 system 块注入、身份改写、请求头指纹对齐、WAF 拦截短路检测、[undefined] 字段清理、思考等级面板控制等）
+>
+> ---
+
 > **vceshi0.1.7 — 测试版本：新增思考等级面板控制（高 / 最高）**
 >
 > 在 vceshi0.1.6 的基础上，新增「ZCode 思考等级」面板下拉，支持两档思考强度，与真实 ZCode 桌面客户端的「高 / 最高」选项一一对应。同时移除了 v0.1.9 遗留的「ZCode 思考格式注入（默认开启）」固定说明文字（既然已默认开启，没必要在面板占一行）。547/547 测试通过，TypeScript 编译零错误。

@@ -159,13 +159,6 @@ export function loadConfig(path: string): ProxyConfig {
   const forceStreamAnthropic = process.env.ZCODE_PROXY_FORCE_STREAM_ANTHROPIC === "1"
     || parsed?.anthropic?.forceStream === true;
 
-  // --- Align ZCode request format (top-level field order + system blocks + identity rewrite) ---
-  // When enabled, the proxy restructures Anthropic requests to match the real
-  // ZCode desktop client's wire format exactly. Default: false.
-  // Env var: ZCODE_PROXY_ALIGN_ZCODE_FORMAT=1
-  const alignZCodeFormat = process.env.ZCODE_PROXY_ALIGN_ZCODE_FORMAT === "1"
-    || parsed?.anthropic?.alignZCodeFormat === true;
-
   // --- ZCode thinking level (controls budget_tokens + effort when thinking enabled) ---
   // Two tiers mirror real ZCode desktop client:
   //   "max"  (default): max_tokens=64000, budget_tokens=32000, effort="max"
@@ -187,7 +180,6 @@ export function loadConfig(path: string): ProxyConfig {
     defaultModel,
     models,
     forceStreamAnthropic,
-    alignZCodeFormat,
     thinkingLevel,
     corsAllowList,
     identity,

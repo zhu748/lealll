@@ -1260,7 +1260,7 @@ td input{font-family:var(--font-mono)}
     <div class="sidebar-footer">
       <div class="version">
         <span class="dot"></span>
-        <span>vceshi0.1.7</span>
+        <span>v0.1.9</span>
       </div>
       <div class="logout-btn" onclick="doLogout()">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
@@ -1553,11 +1553,6 @@ td input{font-family:var(--font-mono)}
                   <option value="high">高（budget_tokens=16000，effort=high）</option>
                 </select>
                 <div class="form-help" style="padding-top:6px">控制开启思考时注入的 ZCode 档位。客户端发送 <code class="code-inline">thinking.type=enabled</code> 时按此档位改写：<strong>最高</strong> → max_tokens=64000 / budget_tokens=32000 / effort=max；<strong>高</strong> → max_tokens=64000 / budget_tokens=16000 / effort=high。客户端不发 thinking 字段时只注入 max_tokens=64000，不强制开思考（对应 ZCode「不思考」模式）。默认「最高」（与真实 ZCode 客户端 max 档位一致）。</div>
-              </div>
-              <div class="form-group">
-                <label class="form-label">对齐 ZCode 请求格式（测试开关）</label>
-                <label class="switch"><input type="checkbox" id="cfgAlignZCodeFormat"><span class="slider"></span></label>
-                <div class="form-help">开启后，请求体结构完全对齐真实 ZCode 桌面客户端：①顶层字段顺序按 ZCode 抓包重排（model→max_tokens→thinking→output_config→system→messages→tools→tool_choice→stream）；②无论 coding-plan 还是 start-plan 都前置注入 3 个 ZCode 官方 system blocks（每个带 cache_control: ephemeral），客户端原 system 追加在后面；③客户端 system/messages 里 "You are Claude Code, Anthropic's official CLI for Claude." 自动改写成 "You are ZCode model working in Claude Code."（保留 Claude Code harness 指令，仅切换身份）；④不再把 messages 里 role:system 移到顶层 system（真实 ZCode 就保留在 messages 里）。默认关闭。也可通过环境变量 ZCODE_PROXY_ALIGN_ZCODE_FORMAT=1 开启。</div>
               </div>
             </div>
           </div>
@@ -2473,7 +2468,6 @@ async function loadSettings(){
     document.getElementById('cfgVerboseLog').checked=!!c.logging?.verbose;
     document.getElementById('cfgDebugLog').checked=!!c.logging?.debug;
     document.getElementById('cfgForceStreamAnthropic').checked=!!c.forceStreamAnthropic;
-    document.getElementById('cfgAlignZCodeFormat').checked=!!c.alignZCodeFormat;
     document.getElementById('cfgThinkingLevel').value=(c.thinkingLevel==='high'?'high':'max');
   }catch(e){console.error('loadSettings failed:',e);toast('加载设置失败','error')}
 }
@@ -2538,7 +2532,6 @@ async function saveSettings(){
     identity:{appVersion:document.getElementById('cfgAppVer').value,sourceTitle:document.getElementById('cfgSrcTitle').value,refererOrigin:document.getElementById('cfgReferer').value},
     logging:{level:document.getElementById('cfgLogLevel').value,verbose:document.getElementById('cfgVerboseLog').checked,debug:document.getElementById('cfgDebugLog').checked},
     forceStreamAnthropic:document.getElementById('cfgForceStreamAnthropic').checked,
-    alignZCodeFormat:document.getElementById('cfgAlignZCodeFormat').checked,
     thinkingLevel:document.getElementById('cfgThinkingLevel').value==='high'?'high':'max'
   };
   const apiKey=document.getElementById('cfgApiKey').value;

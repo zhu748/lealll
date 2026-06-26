@@ -125,11 +125,16 @@ describe("transformRequestBody — cache_control (Anthropic)", () => {
     });
     const out = transformRequestBody(body, { format: "anthropic" });
     const parsed = JSON.parse(out as string);
-    // The user msg (index 0) is the last non-system; gets cache_control
+    // v0.1.9+: alignZCodeFormat is always-on. System message stays in messages[]
+    // (real ZCode behavior) — it is NOT relocated to top-level system field.
+    // The user msg (index 0) is the last non-system; gets cache_control.
     expect(parsed.messages[0].content[0].cache_control).toEqual({ type: "ephemeral" });
-    // System message relocated from messages to top-level system field
-    expect(parsed.messages.length).toBe(1);
-    expect(parsed.system).toEqual([{ type: "text", text: "sys-prompt" }]);
+    // System message stays in messages[]
+    expect(parsed.messages.length).toBe(2);
+    expect(parsed.messages[1].role).toBe("system");
+    // Top-level system field is the ZCode official blocks (NOT the relocated msg)
+    expect(Array.isArray(parsed.system)).toBe(true);
+    expect(parsed.system[0].text).toBe("You are ZCode, an interactive coding agent");
   });
 
   it("does nothing to messages when messages array is empty", () => {
@@ -142,13 +147,16 @@ describe("transformRequestBody — cache_control (Anthropic)", () => {
     expect(parsed.max_tokens).toBe(64000);
   });
 
-  it("relocates system-only messages to system field", () => {
+  it("keeps system-only messages in messages[] (v0.1.9+: no relocation)", () => {
     const body = JSON.stringify({ messages: [{ role: "system", content: "sys" }] });
     const out = transformRequestBody(body, { format: "anthropic" });
     const parsed = JSON.parse(out as string);
-    // System message moved out of messages array
-    expect(parsed.messages).toEqual([]);
-    expect(parsed.system).toEqual([{ type: "text", text: "sys" }]);
+    // v0.1.9+: alignZCodeFormat is always-on. System message stays in messages[]
+    expect(parsed.messages.length).toBe(1);
+    expect(parsed.messages[0].role).toBe("system");
+    // Top-level system field is the ZCode official blocks (not the relocated msg)
+    expect(Array.isArray(parsed.system)).toBe(true);
+    expect(parsed.system[0].text).toBe("You are ZCode, an interactive coding agent");
   });
 
   it("does NOT apply cache_control for openai format", () => {
@@ -277,80 +285,6 @@ describe("transformRequestBody — transform unsupported fields (Anthropic)", ()
   });
 });
 
-describe("transformRequestBody — relocate system messages (Anthropic)", () => {
-  it("moves role:system messages from messages to system field", () => {
-    const body = JSON.stringify({
-      messages: [
-        { role: "system", content: "you are helpful" },
-        { role: "user", content: "hello" },
-      ],
-    });
-    const out = transformRequestBody(body, { format: "anthropic" });
-    const parsed = JSON.parse(out as string);
-    expect(parsed.messages.length).toBe(1);
-    expect(parsed.messages[0].role).toBe("user");
-    expect(parsed.system).toEqual([{ type: "text", text: "you are helpful" }]);
-  });
-
-  it("appends to existing system array", () => {
-    const body = JSON.stringify({
-      system: [{ type: "text", text: "existing sys" }],
-      messages: [
-        { role: "system", content: "injected sys" },
-        { role: "user", content: "hi" },
-      ],
-    });
-    const out = transformRequestBody(body, { format: "anthropic" });
-    const parsed = JSON.parse(out as string);
-    expect(parsed.system.length).toBe(2);
-    expect(parsed.system[0].text).toBe("existing sys");
-    expect(parsed.system[1].text).toBe("injected sys");
-  });
-
-  it("converts existing string system to array and appends", () => {
-    const body = JSON.stringify({
-      system: "string system",
-      messages: [
-        { role: "system", content: "array system" },
-        { role: "user", content: "hi" },
-      ],
-    });
-    const out = transformRequestBody(body, { format: "anthropic" });
-    const parsed = JSON.parse(out as string);
-    expect(parsed.system.length).toBe(2);
-    expect(parsed.system[0]).toEqual({ type: "text", text: "string system" });
-    expect(parsed.system[1]).toEqual({ type: "text", text: "array system" });
-  });
-
-  it("handles system message with array content", () => {
-    const body = JSON.stringify({
-      messages: [
-        { role: "system", content: [{ type: "text", text: "block1" }, { type: "text", text: "block2" }] },
-        { role: "user", content: "hi" },
-      ],
-    });
-    const out = transformRequestBody(body, { format: "anthropic" });
-    const parsed = JSON.parse(out as string);
-    expect(parsed.system).toEqual([
-      { type: "text", text: "block1" },
-      { type: "text", text: "block2" },
-    ]);
-  });
-
-  it("does NOT relocate for openai format", () => {
-    const body = JSON.stringify({
-      messages: [
-        { role: "system", content: "sys" },
-        { role: "user", content: "hi" },
-      ],
-    });
-    const out = transformRequestBody(body, { format: "openai" });
-    const parsed = JSON.parse(out as string);
-    // For openai format, system messages stay in messages array
-    expect(parsed.messages.length).toBe(2);
-    expect(parsed.messages[0].role).toBe("system");
-  });
-});
 
 describe("transformRequestBody — strip thinking blocks from messages (Anthropic)", () => {
   it("removes thinking content blocks from assistant messages", () => {
@@ -544,9 +478,11 @@ describe("transformRequestBody — strip thinking blocks from messages (Anthropi
     expect(parsed.context_management).toBeUndefined();
     expect(parsed.output_config).toEqual({ effort: "max" });
 
-    // System message relocated
-    expect(parsed.system).toEqual([{ type: "text", text: "agent types and skills..." }]);
-    expect(parsed.messages.find((m: any) => m.role === "system")).toBeUndefined();
+    // v0.1.9+: alignZCodeFormat is always-on. System message stays in messages[]
+    // (NOT relocated to top-level system). Top-level system is the ZCode official blocks.
+    expect(parsed.messages.find((m: any) => m.role === "system")).toBeDefined();
+    expect(Array.isArray(parsed.system)).toBe(true);
+    expect(parsed.system[0].text).toBe("You are ZCode, an interactive coding agent");
 
     // Thinking block stripped from assistant history
     const assistant = parsed.messages.find((m: any) => m.role === "assistant");
@@ -554,610 +490,6 @@ describe("transformRequestBody — strip thinking blocks from messages (Anthropi
   });
 });
 
-describe("transformRequestBody — strip cache_control from tool_result (Anthropic)", () => {
-  it("removes cache_control from tool_result blocks", () => {
-    // Reproduces the v2.1.3.4beta0 start-plan 3001: Claude Code attaches
-    // cache_control to the last block of the last user message. When that
-    // message is a tool_result, cache_control lands ON the tool_result block,
-    // which ZCode's start-plan gateway rejects with 3001.
-    const body = JSON.stringify({
-      model: "glm-5.2",
-      messages: [
-        { role: "user", content: "你好" },
-        {
-          role: "assistant",
-          content: [
-            { type: "text", text: "let me check" },
-            { type: "tool_use", id: "t1", name: "Bash", input: { cmd: "ls" } },
-          ],
-        },
-        {
-          role: "user",
-          content: [
-            {
-              tool_use_id: "t1",
-              type: "tool_result",
-              content: "file1\nfile2",
-              is_error: false,
-              cache_control: { type: "ephemeral" },  // ← Claude Code adds this
-            },
-          ],
-        },
-      ],
-    });
-    const out = transformRequestBody(body, { format: "anthropic" });
-    const parsed = JSON.parse(out as string);
-    const toolResultMsg = parsed.messages[parsed.messages.length - 1];
-    expect(toolResultMsg.content[0].type).toBe("tool_result");
-    expect(toolResultMsg.content[0].cache_control).toBeUndefined();
-    // Other fields on tool_result preserved
-    expect(toolResultMsg.content[0].tool_use_id).toBe("t1");
-    // v2.1.3.9beta0: tool_result.content is normalized from string to array
-    // format — ZCode gateway requires array, Anthropic accepts both.
-    expect(toolResultMsg.content[0].content).toEqual([
-      { type: "text", text: "file1\nfile2" },
-    ]);
-    // v2.1.3.9beta0: is_error stripped — ZCode gateway doesn't accept it.
-    expect("is_error" in toolResultMsg.content[0]).toBe(false);
-  });
-
-  it("preserves cache_control on text blocks", () => {
-    const body = JSON.stringify({
-      messages: [
-        { role: "user", content: "q" },
-        { role: "assistant", content: "a" },
-        {
-          role: "user",
-          content: [
-            { type: "text", text: "follow up", cache_control: { type: "ephemeral" } },
-          ],
-        },
-      ],
-    });
-    const out = transformRequestBody(body, { format: "anthropic" });
-    const parsed = JSON.parse(out as string);
-    // text block keeps its cache_control
-    expect(parsed.messages[2].content[0].cache_control).toEqual({ type: "ephemeral" });
-  });
-
-  it("does NOT re-add cache_control to tool_result via applyAnthropicCacheControl", () => {
-    // After stripping, the proxy's applyAnthropicCacheControl runs and tries
-    // to add cache_control to the last block of the last message. If that
-    // block is a tool_result, it MUST skip it — otherwise we re-introduce
-    // the 3001. This test verifies the skip logic.
-    const body = JSON.stringify({
-      messages: [
-        { role: "user", content: "你好" },
-        {
-          role: "assistant",
-          content: [
-            { type: "tool_use", id: "t1", name: "Bash", input: { cmd: "ls" } },
-          ],
-        },
-        {
-          role: "user",
-          content: [
-            {
-              tool_use_id: "t1",
-              type: "tool_result",
-              content: "output",
-              is_error: false,
-              cache_control: { type: "ephemeral" },
-            },
-          ],
-        },
-      ],
-    });
-    const out = transformRequestBody(body, { format: "anthropic" });
-    const parsed = JSON.parse(out as string);
-    const lastMsg = parsed.messages[parsed.messages.length - 1];
-    // tool_result block must NOT have cache_control after transform
-    expect(lastMsg.content[0].type).toBe("tool_result");
-    expect(lastMsg.content[0].cache_control).toBeUndefined();
-  });
-
-  it("handles tool_result-only user message: skips cache_control, no crash", () => {
-    // If the last user message has ONLY tool_result blocks (no text), the
-    // proxy can't attach cache_control anywhere on it. Should skip gracefully
-    // and not attach to tool_result.
-    const body = JSON.stringify({
-      messages: [
-        { role: "user", content: "你好" },
-        {
-          role: "assistant",
-          content: [{ type: "tool_use", id: "t1", name: "Bash", input: { cmd: "ls" } }],
-        },
-        {
-          role: "user",
-          content: [
-            { tool_use_id: "t1", type: "tool_result", content: "out", is_error: false },
-          ],
-        },
-      ],
-    });
-    const out = transformRequestBody(body, { format: "anthropic" });
-    const parsed = JSON.parse(out as string);
-    const lastMsg = parsed.messages[parsed.messages.length - 1];
-    expect(lastMsg.content[0].type).toBe("tool_result");
-    expect(lastMsg.content[0].cache_control).toBeUndefined();
-  });
-
-  it("start-plan full Claude Code round-3 regression (thinking + tool_result+cc)", () => {
-    // Reproduces the EXACT structure from user's v2.1.3.4beta0 diagnostic:
-    // msgs[[0]user/{text,text},[1]assistant/{text},[2]user/str,[3]assistant/{text,tool_use},[4]user/{tool_result}]
-    // where [3] had a thinking block (now stripped) and [4] had cache_control
-    // on the tool_result (now stripped).
-    const body = JSON.stringify({
-      model: "glm-5.2",
-      messages: [
-        {
-          role: "user",
-          content: [
-            { type: "text", text: "<system-reminder>...</system-reminder>" },
-            { type: "text", text: "你好" },
-          ],
-        },
-        {
-          role: "system",
-          content: "Available agent types...",
-        },
-        {
-          role: "assistant",
-          content: [{ type: "text", text: "你好！我是 ZCode..." }],
-        },
-        { role: "user", content: "帮我看看当前项目是干嘛的" },
-        {
-          role: "assistant",
-          content: [
-            { type: "thinking", thinking: "用户想了解...", signature: "" },
-            { type: "text", text: "我来看看..." },
-            { type: "tool_use", id: "call_x", name: "Bash", input: { command: "ls" } },
-          ],
-        },
-        {
-          role: "user",
-          content: [
-            {
-              tool_use_id: "call_x",
-              type: "tool_result",
-              content: "total 12",
-              is_error: false,
-              cache_control: { type: "ephemeral" },
-            },
-          ],
-        },
-      ],
-      system: [{ type: "text", text: "You are Claude Code." }],
-      tools: [{ name: "Bash", description: "run bash", input_schema: { type: "object" } }],
-      thinking: { type: "adaptive" },
-      context_management: { edits: [] },
-      output_config: { effort: "max" },
-    });
-    const out = transformRequestBody(body, {
-      format: "anthropic",
-      userId: "u-123",
-      startPlan: true,
-    });
-    const parsed = JSON.parse(out as string);
-
-    // Thinking block stripped from assistant [3]
-    const assistant3 = parsed.messages.find((m: any) =>
-      m.role === "assistant" && Array.isArray(m.content) &&
-      m.content.some((b: any) => b.type === "tool_use")
-    );
-    expect(assistant3.content.some((b: any) => b.type === "thinking")).toBe(false);
-    expect(assistant3.content.map((b: any) => b.type)).toEqual(["text", "tool_use"]);
-
-    // cache_control stripped from tool_result in [4]
-    const toolResultMsg = parsed.messages[parsed.messages.length - 1];
-    expect(toolResultMsg.content[0].type).toBe("tool_result");
-    expect(toolResultMsg.content[0].cache_control).toBeUndefined();
-
-    // System message relocated, start-plan blocks prepended
-    expect(parsed.system.length).toBeGreaterThanOrEqual(3);  // 2 ZCode + 1 client
-    expect(parsed.messages.find((m: any) => m.role === "system")).toBeUndefined();
-
-    // Top-level fields normalized.
-    // Since v0.1.9, injectZCodeThinkingFormat re-adds budget_tokens=32000
-    // and output_config.effort=max to match the real ZCode client.
-    expect(parsed.thinking.type).toBe("enabled");
-    expect(parsed.thinking.budget_tokens).toBe(32000);
-    expect(parsed.context_management).toBeUndefined();
-    expect(parsed.output_config).toEqual({ effort: "max" });
-  });
-
-  it("strips cache_control from tool_use blocks (v2.1.3.5beta0 regression)", () => {
-    // v2.1.3.5beta0 fixed tool_result+cc but applyAnthropicCacheControl then
-    // attached cc to tool_use blocks when the last user message was all
-    // tool_results. ZCode gateway ALSO rejects cc on tool_use blocks → 3001.
-    // This reproduces the user's v2.1.3.5beta0 diagnostic:
-    //   msgs[..., [3]assistant/{tool_use,tool_use+cc}, [4]user/{tool_result,tool_result}]
-    // The assistant called 2 tools; proxy walked back and put cc on 2nd tool_use.
-    const body = JSON.stringify({
-      model: "glm-5.2",
-      messages: [
-        {
-          role: "user",
-          content: [
-            { type: "text", text: "<system-reminder>...</system-reminder>" },
-            { type: "text", text: "你好" },
-          ],
-        },
-        {
-          role: "assistant",
-          content: [{ type: "text", text: "你好！我是 ZCode..." }],
-        },
-        { role: "user", content: "帮我看看当前项目是干嘛的" },
-        {
-          role: "assistant",
-          content: [
-            { type: "thinking", thinking: "...", signature: "" },
-            { type: "tool_use", id: "call_1", name: "Grep", input: { pattern: "x" } },
-            { type: "tool_use", id: "call_2", name: "Bash", input: { command: "ls" } },
-          ],
-        },
-        {
-          role: "user",
-          content: [
-            { tool_use_id: "call_1", type: "tool_result", content: "result1", is_error: false },
-            { tool_use_id: "call_2", type: "tool_result", content: "result2", is_error: false },
-          ],
-        },
-      ],
-      system: [{ type: "text", text: "You are Claude Code." }],
-      tools: [],
-      thinking: { type: "adaptive" },
-      context_management: { edits: [] },
-      output_config: { effort: "max" },
-    });
-    const out = transformRequestBody(body, {
-      format: "anthropic",
-      userId: "u-123",
-      startPlan: true,
-    });
-    const parsed = JSON.parse(out as string);
-
-    // The assistant message with tool_use blocks — NO block should have cc
-    const assistantWithTools = parsed.messages.find((m: any) =>
-      m.role === "assistant" && Array.isArray(m.content) &&
-      m.content.some((b: any) => b.type === "tool_use")
-    );
-    expect(assistantWithTools).toBeDefined();
-    for (const block of assistantWithTools.content) {
-      // No tool_use block should carry cache_control
-      if (block.type === "tool_use") {
-        expect(block.cache_control).toBeUndefined();
-      }
-    }
-    // Thinking block should also be stripped
-    expect(assistantWithTools.content.some((b: any) => b.type === "thinking")).toBe(false);
-
-    // The last user message (tool_results) — NO block should have cc
-    const lastMsg = parsed.messages[parsed.messages.length - 1];
-    for (const block of lastMsg.content) {
-      expect(block.cache_control).toBeUndefined();
-    }
-  });
-
-  it("attachable text block found when last msg is all tool_results", () => {
-    // When the last user message is all tool_results and the previous
-    // assistant has a text block, cache_control should land on that text
-    // block — NOT on any tool_use block.
-    const body = JSON.stringify({
-      messages: [
-        { role: "user", content: "你好" },
-        {
-          role: "assistant",
-          content: [
-            { type: "text", text: "let me check" },
-            { type: "tool_use", id: "t1", name: "Bash", input: { cmd: "ls" } },
-          ],
-        },
-        {
-          role: "user",
-          content: [
-            { tool_use_id: "t1", type: "tool_result", content: "out", is_error: false },
-          ],
-        },
-      ],
-    });
-    const out = transformRequestBody(body, { format: "anthropic" });
-    const parsed = JSON.parse(out as string);
-    const assistant = parsed.messages[1];
-    // text block should get cache_control
-    const textBlock = assistant.content.find((b: any) => b.type === "text");
-    expect(textBlock.cache_control).toEqual({ type: "ephemeral" });
-    // tool_use block should NOT have cache_control
-    const toolUseBlock = assistant.content.find((b: any) => b.type === "tool_use");
-    expect(toolUseBlock.cache_control).toBeUndefined();
-    // tool_result block should NOT have cache_control
-    const toolResultBlock = parsed.messages[2].content[0];
-    expect(toolResultBlock.cache_control).toBeUndefined();
-  });
-
-  it("skips cache_control entirely when no text block exists in any message", () => {
-    // After v2.1.3.7beta0, assistant messages with only tool_use get an empty
-    // text block inserted. So cache_control lands on that inserted text block
-    // in the assistant message — NOT on tool_use, NOT on tool_result, NOT on
-    // the first user message (which would have been the fallback before).
-    const body = JSON.stringify({
-      messages: [
-        { role: "user", content: "你好" },  // string content
-        {
-          role: "assistant",
-          content: [{ type: "tool_use", id: "t1", name: "Bash", input: { cmd: "ls" } }],
-        },
-        {
-          role: "user",
-          content: [
-            { tool_use_id: "t1", type: "tool_result", content: "out", is_error: false },
-          ],
-        },
-      ],
-    });
-    const out = transformRequestBody(body, { format: "anthropic" });
-    const parsed = JSON.parse(out as string);
-
-    // First user message: v2.1.3.10beta0 normalizes string content to array
-    // [{type:"text", text:"你好"}] — ZCode gateway requires array format.
-    const firstUser = parsed.messages[0];
-    expect(Array.isArray(firstUser.content)).toBe(true);
-    expect(firstUser.content[0].type).toBe("text");
-    expect(firstUser.content[0].text).toBe("你好");
-
-    // Assistant message: non-empty text block inserted at front, cache_control
-    // attached to that text block
-    // v2.1.3.10beta0: text is " " (space) instead of "" (some gateways reject empty)
-    const assistant = parsed.messages[1];
-    expect(Array.isArray(assistant.content)).toBe(true);
-    expect(assistant.content[0].type).toBe("text");
-    expect(assistant.content[0].text).toBe(" ");
-    expect(assistant.content[0].cache_control).toEqual({ type: "ephemeral" });
-    // tool_use block has NO cache_control
-    expect(assistant.content[1].type).toBe("tool_use");
-    expect(assistant.content[1].cache_control).toBeUndefined();
-
-    // Last user message: tool_result, NO cache_control
-    const lastUser = parsed.messages[2];
-    expect(lastUser.content[0].type).toBe("tool_result");
-    expect(lastUser.content[0].cache_control).toBeUndefined();
-  });
-});
-
-describe("transformRequestBody — ensure assistant has text block (v2.1.3.7beta0)", () => {
-  it("inserts empty text block when assistant has only tool_use (after thinking strip)", () => {
-    // Reproduces the v2.1.3.6beta0 user report: rounds 3-5 had assistant
-    // messages like [thinking, tool_use]; after thinking strip they became
-    // [tool_use] only, which ZCode gateway rejects with 3001.
-    const body = JSON.stringify({
-      messages: [
-        { role: "user", content: "你好" },
-        {
-          role: "assistant",
-          content: [
-            { type: "thinking", thinking: "let me check", signature: "" },
-            { type: "tool_use", id: "t1", name: "Bash", input: { cmd: "ls" } },
-          ],
-        },
-        {
-          role: "user",
-          content: [
-            { tool_use_id: "t1", type: "tool_result", content: "out", is_error: false },
-          ],
-        },
-      ],
-    });
-    const out = transformRequestBody(body, { format: "anthropic" });
-    const parsed = JSON.parse(out as string);
-    const assistant = parsed.messages[1];
-    // After thinking strip + ensureAssistantTextBlock:
-    // content should be [text(" "), tool_use]
-    // v2.1.3.10beta0: text is " " (space) instead of "" (some gateways reject empty)
-    expect(assistant.content.length).toBe(2);
-    expect(assistant.content[0].type).toBe("text");
-    expect(assistant.content[0].text).toBe(" ");
-    expect(assistant.content[1].type).toBe("tool_use");
-    expect(assistant.content[1].id).toBe("t1");
-  });
-
-  it("inserts empty text block when assistant originally has only tool_use (no thinking)", () => {
-    // Claude Code sometimes sends assistant messages with only tool_use
-    // (no thinking, no text). ZCode gateway rejects these too.
-    const body = JSON.stringify({
-      messages: [
-        { role: "user", content: "你好" },
-        {
-          role: "assistant",
-          content: [
-            { type: "tool_use", id: "t1", name: "Bash", input: { cmd: "ls" } },
-          ],
-        },
-        {
-          role: "user",
-          content: [
-            { tool_use_id: "t1", type: "tool_result", content: "out", is_error: false },
-          ],
-        },
-      ],
-    });
-    const out = transformRequestBody(body, { format: "anthropic" });
-    const parsed = JSON.parse(out as string);
-    const assistant = parsed.messages[1];
-    expect(assistant.content.length).toBe(2);
-    expect(assistant.content[0].type).toBe("text");
-    expect(assistant.content[0].text).toBe(" ");
-    expect(assistant.content[1].type).toBe("tool_use");
-  });
-
-  it("does NOT modify assistant that already has a text block", () => {
-    const body = JSON.stringify({
-      messages: [
-        { role: "user", content: "你好" },
-        {
-          role: "assistant",
-          content: [
-            { type: "text", text: "let me check" },
-            { type: "tool_use", id: "t1", name: "Bash", input: { cmd: "ls" } },
-          ],
-        },
-      ],
-    });
-    const out = transformRequestBody(body, { format: "anthropic" });
-    const parsed = JSON.parse(out as string);
-    const assistant = parsed.messages[1];
-    expect(assistant.content.length).toBe(2);
-    expect(assistant.content[0].type).toBe("text");
-    expect(assistant.content[0].text).toBe("let me check");
-  });
-
-  it("does NOT modify user messages (user can be all tool_result)", () => {
-    const body = JSON.stringify({
-      messages: [
-        { role: "user", content: "你好" },
-        {
-          role: "assistant",
-          content: [{ type: "text", text: "checking" }],
-        },
-        {
-          role: "user",
-          content: [
-            { tool_use_id: "t1", type: "tool_result", content: "out", is_error: false },
-          ],
-        },
-      ],
-    });
-    const out = transformRequestBody(body, { format: "anthropic" });
-    const parsed = JSON.parse(out as string);
-    // user message with only tool_result should NOT get a text block inserted
-    const userMsg = parsed.messages[2];
-    expect(userMsg.content.length).toBe(1);
-    expect(userMsg.content[0].type).toBe("tool_result");
-  });
-
-  it("full Claude Code multi-round regression (v2.1.3.6beta0 round-7 scenario)", () => {
-    // Reproduces the EXACT message structure from user's v2.1.3.6beta0 log:
-    //   msgs[[0]user/{text,text},[1]assistant/{text},[2]user/str,
-    //        [3]assistant/{tool_use},[4]user/{tool_result},
-    //        [5]assistant/{tool_use},[6]user/{tool_result},
-    //        [7]assistant/{tool_use},[8]user/{tool_result},
-    //        [9]assistant/{text+cc,tool_use},[10]user/{tool_result}]
-    // [3],[5],[7] had thinking blocks stripped → became [tool_use] only.
-    // ZCode gateway 3001'd on round 7 because of these text-less assistant msgs.
-    const body = JSON.stringify({
-      model: "glm-5.2",
-      messages: [
-        {
-          role: "user",
-          content: [
-            { type: "text", text: "<system-reminder>...</system-reminder>" },
-            { type: "text", text: "你好" },
-          ],
-        },
-        {
-          role: "assistant",
-          content: [{ type: "text", text: "你好！我是 ZCode..." }],
-        },
-        { role: "user", content: "帮我看看这个项目是干嘛的" },
-        // Round 3: [thinking, tool_use] → after strip: [text(""), tool_use]
-        {
-          role: "assistant",
-          content: [
-            { type: "thinking", thinking: "...", signature: "" },
-            { type: "tool_use", id: "call_1", name: "Bash", input: { command: "ls" } },
-          ],
-        },
-        {
-          role: "user",
-          content: [
-            { tool_use_id: "call_1", type: "tool_result", content: "out1", is_error: false },
-          ],
-        },
-        // Round 4: [thinking, tool_use] → after strip: [text(""), tool_use]
-        {
-          role: "assistant",
-          content: [
-            { type: "thinking", thinking: "...", signature: "" },
-            { type: "tool_use", id: "call_2", name: "Bash", input: { command: "ls subdir" } },
-          ],
-        },
-        {
-          role: "user",
-          content: [
-            { tool_use_id: "call_2", type: "tool_result", content: "out2", is_error: false },
-          ],
-        },
-        // Round 5: [thinking, tool_use] → after strip: [text(""), tool_use]
-        {
-          role: "assistant",
-          content: [
-            { type: "thinking", thinking: "...", signature: "" },
-            { type: "tool_use", id: "call_3", name: "Bash", input: { command: "ls subdir2" } },
-          ],
-        },
-        {
-          role: "user",
-          content: [
-            { tool_use_id: "call_3", type: "tool_result", content: "out3", is_error: false },
-          ],
-        },
-        // Round 6: [thinking, text, tool_use] → after strip: [text, tool_use]
-        {
-          role: "assistant",
-          content: [
-            { type: "thinking", thinking: "...", signature: "" },
-            { type: "text", text: "让我再看几个关键文件确认细节。" },
-            { type: "tool_use", id: "call_4", name: "Read", input: { file_path: "x" } },
-          ],
-        },
-        {
-          role: "user",
-          content: [
-            { tool_use_id: "call_4", type: "tool_result", content: "out4", is_error: false },
-          ],
-        },
-      ],
-      system: [{ type: "text", text: "You are Claude Code." }],
-      tools: [],
-      thinking: { type: "adaptive" },
-      context_management: { edits: [] },
-      output_config: { effort: "max" },
-    });
-    const out = transformRequestBody(body, {
-      format: "anthropic",
-      userId: "u-123",
-      startPlan: true,
-    });
-    const parsed = JSON.parse(out as string);
-
-    // Every assistant message MUST have at least one text block
-    const assistants = parsed.messages.filter((m: any) => m.role === "assistant");
-    for (const a of assistants) {
-      const hasText = Array.isArray(a.content) &&
-        a.content.some((b: any) => b.type === "text");
-      expect(hasText).toBe(true);
-    }
-
-    // Specifically check the round-3,4,5 assistants (which had thinking stripped)
-    // They should now be [text(""), tool_use]
-    const round3Assistant = parsed.messages.find((m: any) =>
-      m.role === "assistant" && Array.isArray(m.content) &&
-      m.content.some((b: any) => b.id === "call_1")
-    );
-    expect(round3Assistant.content.length).toBe(2);
-    expect(round3Assistant.content[0].type).toBe("text");
-    expect(round3Assistant.content[0].text).toBe(" ");
-    expect(round3Assistant.content[1].type).toBe("tool_use");
-
-    // No thinking blocks anywhere
-    for (const m of parsed.messages) {
-      if (!Array.isArray(m.content)) continue;
-      for (const b of m.content) {
-        expect(b.type).not.toBe("thinking");
-        expect(b.type).not.toBe("redacted_thinking");
-      }
-    }
-  });
-});
 
 describe("transformRequestBody — v2.1.3.11beta0: empty string content → non-empty space (Responses API path)", () => {
   it("converts empty string user content to non-empty text block", () => {
@@ -1202,6 +534,8 @@ describe("transformRequestBody — v2.1.3.11beta0: empty string content → non-
   it("preserves non-empty string content as-is (no space substitution)", () => {
     // Only EMPTY strings get the space substitution. Non-empty strings pass
     // through as their actual text value.
+    // v0.1.9+: applyAnthropicCacheControl adds cache_control to the last user
+    // message's text block (alignment is always-on, even in start-plan).
     const body = JSON.stringify({
       messages: [
         { role: "user", content: "hello world" },
@@ -1209,14 +543,17 @@ describe("transformRequestBody — v2.1.3.11beta0: empty string content → non-
     });
     const out = transformRequestBody(body, { format: "anthropic", startPlan: true });
     const parsed = JSON.parse(out as string);
-    expect(parsed.messages[0].content).toEqual([{ type: "text", text: "hello world" }]);
+    expect(parsed.messages[0].content).toEqual([
+      { type: "text", text: "hello world", cache_control: { type: "ephemeral" } },
+    ]);
   });
 
   it("Responses API full regression: function_call_output with empty output", () => {
     // Reproduces a Codex CLI scenario where function_call_output has empty
     // output. The translator produces tool_result with content: "".
-    // After body-transformer, this should become a non-empty text block
-    // inside the tool_result.
+    // v0.1.9+: alignZCodeFormat is always-on. We DON'T normalize tool_result
+    // content from string to array (real ZCode sends string). Empty string
+    // stays as empty string (wire-format aligned with real ZCode).
     const body = JSON.stringify({
       messages: [
         { role: "user", content: "run tool" },
@@ -1235,401 +572,16 @@ describe("transformRequestBody — v2.1.3.11beta0: empty string content → non-
     const out = transformRequestBody(body, { format: "anthropic", startPlan: true });
     const parsed = JSON.parse(out as string);
 
-    // tool_result.content should be array with a non-empty text block
+    // v0.1.9+: tool_result.content stays as STRING (real ZCode behavior).
+    // Empty string is preserved as-is — wire alignment takes priority over
+    // gateway strictness workaround.
     const toolResult = parsed.messages[2].content[0];
     expect(toolResult.type).toBe("tool_result");
-    expect(Array.isArray(toolResult.content)).toBe(true);
-    expect(toolResult.content[0].type).toBe("text");
-    // Empty tool_result content → non-empty space (v2.1.3.11beta0 fix)
-    expect(toolResult.content[0].text).toBe(" ");
+    expect(typeof toolResult.content).toBe("string");
+    expect(toolResult.content).toBe("");
   });
 });
 
-describe("transformRequestBody — v2.1.3.9beta0: start-plan strips ALL cache_control + tool_result normalization", () => {
-  it("start-plan: strips cache_control from text blocks (v2.1.3.8beta0 regression)", () => {
-    // v2.1.3.5/6/7/8beta0 assumed text-block cache_control was safe in
-    // start-plan. v2.1.3.9beta0 fix: in start-plan, strip cache_control from
-    // ALL blocks including text. Reproduces #004 from v2.1.3.8beta0:
-    //   msgs[..., [3]assistant/{text+cc,tool_use,tool_use}, [4]user/{tool_result,tool_result}]
-    // The `text+cc` on the assistant message's text block was the 3001 trigger.
-    const body = JSON.stringify({
-      model: "glm-5.2",
-      messages: [
-        {
-          role: "user",
-          content: [
-            { type: "text", text: "<system-reminder>...</system-reminder>" },
-            { type: "text", text: "你好" },
-          ],
-        },
-        {
-          role: "assistant",
-          content: [{ type: "text", text: "你好！" }],
-        },
-        { role: "user", content: "帮我看看当前项目" },
-        {
-          role: "assistant",
-          content: [
-            { type: "text", text: "let me check", cache_control: { type: "ephemeral" } },
-            { type: "tool_use", id: "call_1", name: "Grep", input: { pattern: "x" } },
-            { type: "tool_use", id: "call_2", name: "Bash", input: { command: "ls" } },
-          ],
-        },
-        {
-          role: "user",
-          content: [
-            { tool_use_id: "call_1", type: "tool_result", content: "r1", is_error: false },
-            { tool_use_id: "call_2", type: "tool_result", content: "r2", is_error: false },
-          ],
-        },
-      ],
-      system: [{ type: "text", text: "You are Claude Code." }],
-      thinking: { type: "enabled" },
-    });
-    const out = transformRequestBody(body, {
-      format: "anthropic",
-      userId: "u-123",
-      startPlan: true,
-    });
-    const parsed = JSON.parse(out as string);
-
-    // No block in any message should carry cache_control in start-plan mode.
-    for (const m of parsed.messages) {
-      if (!Array.isArray(m.content)) continue;
-      for (const b of m.content) {
-        expect(b.cache_control).toBeUndefined();
-      }
-    }
-  });
-
-  it("coding-plan: KEEPS cache_control on text blocks (preserves prompt caching)", () => {
-    // In coding-plan mode, only non-text blocks have cache_control stripped.
-    // Text blocks keep cache_control for prompt caching on direct GLM API.
-    const body = JSON.stringify({
-      messages: [
-        { role: "user", content: "你好" },
-        {
-          role: "assistant",
-          content: [
-            { type: "text", text: "let me check" },
-            { type: "tool_use", id: "t1", name: "Bash", input: { cmd: "ls" } },
-          ],
-        },
-        {
-          role: "user",
-          content: [
-            { tool_use_id: "t1", type: "tool_result", content: "out", is_error: false },
-          ],
-        },
-      ],
-    });
-    // No startPlan flag → coding-plan mode
-    const out = transformRequestBody(body, { format: "anthropic" });
-    const parsed = JSON.parse(out as string);
-
-    // The assistant text block should have cache_control attached by
-    // applyAnthropicCacheControl (last non-system msg with text block).
-    const assistant = parsed.messages[1];
-    const textBlock = assistant.content.find((b: any) => b.type === "text");
-    expect(textBlock.cache_control).toEqual({ type: "ephemeral" });
-    // tool_use block should NOT have cache_control
-    const toolUseBlock = assistant.content.find((b: any) => b.type === "tool_use");
-    expect(toolUseBlock.cache_control).toBeUndefined();
-    // tool_result block should NOT have cache_control
-    const toolResultBlock = parsed.messages[2].content[0];
-    expect(toolResultBlock.cache_control).toBeUndefined();
-  });
-
-  it("normalizes tool_result.content from string to array (both modes)", () => {
-    // Claude Code sends tool_result.content as a string. The ZCode gateway
-    // (and some other Anthropic-compatible upstreams) only accepts the array
-    // format. This converts string → array of one text block.
-    const body = JSON.stringify({
-      messages: [
-        { role: "user", content: "hi" },
-        {
-          role: "assistant",
-          content: [{ type: "tool_use", id: "t1", name: "Bash", input: { cmd: "ls" } }],
-        },
-        {
-          role: "user",
-          content: [
-            { tool_use_id: "t1", type: "tool_result", content: "the result text" },
-          ],
-        },
-      ],
-    });
-    const out = transformRequestBody(body, { format: "anthropic", startPlan: true });
-    const parsed = JSON.parse(out as string);
-    const toolResult = parsed.messages[2].content[0];
-    expect(toolResult.type).toBe("tool_result");
-    // content should now be an array of text blocks
-    expect(Array.isArray(toolResult.content)).toBe(true);
-    expect(toolResult.content).toEqual([{ type: "text", text: "the result text" }]);
-  });
-
-  it("preserves tool_result.content when already array", () => {
-    // If content is already an array (some clients send it this way), leave
-    // it untouched.
-    const body = JSON.stringify({
-      messages: [
-        { role: "user", content: "hi" },
-        {
-          role: "assistant",
-          content: [{ type: "tool_use", id: "t1", name: "Bash", input: { cmd: "ls" } }],
-        },
-        {
-          role: "user",
-          content: [
-            {
-              tool_use_id: "t1",
-              type: "tool_result",
-              content: [{ type: "text", text: "already array" }],
-            },
-          ],
-        },
-      ],
-    });
-    const out = transformRequestBody(body, { format: "anthropic", startPlan: true });
-    const parsed = JSON.parse(out as string);
-    const toolResult = parsed.messages[2].content[0];
-    expect(toolResult.content).toEqual([{ type: "text", text: "already array" }]);
-  });
-
-  it("strips is_error from tool_result blocks (both modes)", () => {
-    // Claude Code attaches `is_error: false` to successful tool_result blocks.
-    // Anthropic's official API accepts this, but ZCode gateway rejects it
-    // with 3001. Strip in both modes (the field is informational).
-    const body = JSON.stringify({
-      messages: [
-        { role: "user", content: "hi" },
-        {
-          role: "assistant",
-          content: [{ type: "tool_use", id: "t1", name: "Bash", input: { cmd: "ls" } }],
-        },
-        {
-          role: "user",
-          content: [
-            { tool_use_id: "t1", type: "tool_result", content: "ok", is_error: false },
-          ],
-        },
-      ],
-    });
-    const out = transformRequestBody(body, { format: "anthropic", startPlan: true });
-    const parsed = JSON.parse(out as string);
-    const toolResult = parsed.messages[2].content[0];
-    expect("is_error" in toolResult).toBe(false);
-  });
-
-  it("strips is_error even in coding-plan mode (gateway-strict field)", () => {
-    // is_error is stripped in both modes — it's a Claude Code metadata field
-    // that the upstream doesn't need and ZCode gateway actively rejects.
-    const body = JSON.stringify({
-      messages: [
-        { role: "user", content: "hi" },
-        {
-          role: "assistant",
-          content: [{ type: "tool_use", id: "t1", name: "Bash", input: { cmd: "ls" } }],
-        },
-        {
-          role: "user",
-          content: [
-            { tool_use_id: "t1", type: "tool_result", content: "ok", is_error: true },
-          ],
-        },
-      ],
-    });
-    // No startPlan → coding-plan
-    const out = transformRequestBody(body, { format: "anthropic" });
-    const parsed = JSON.parse(out as string);
-    const toolResult = parsed.messages[2].content[0];
-    expect("is_error" in toolResult).toBe(false);
-  });
-
-  it("v2.1.3.9beta0 full #004 regression: multi-tool_use + tool_result + cache_control on text", () => {
-    // Reproduces the exact #004 request from v2.1.3.8beta0 that 3001'd:
-    //   msgs[[0]user/{text,text},[1]assistant/{text},
-    //        [2]user/str,[3]assistant/{text+cc,tool_use,tool_use},
-    //        [4]user/{tool_result,tool_result}]
-    // After v2.1.3.9beta0 fixes:
-    //   - text block's cache_control stripped (start-plan mode)
-    //   - tool_result.content converted string → array
-    //   - tool_result.is_error stripped
-    const body = JSON.stringify({
-      model: "glm-5.2",
-      messages: [
-        {
-          role: "user",
-          content: [
-            { type: "text", text: "<system-reminder>...</system-reminder>" },
-            { type: "text", text: "你好" },
-          ],
-        },
-        { role: "assistant", content: [{ type: "text", text: "你好！" }] },
-        { role: "user", content: "帮我看看当前项目" },
-        {
-          role: "assistant",
-          content: [
-            { type: "text", text: "let me check", cache_control: { type: "ephemeral" } },
-            { type: "tool_use", id: "call_1", name: "Grep", input: { pattern: "x" } },
-            { type: "tool_use", id: "call_2", name: "Bash", input: { command: "ls" } },
-          ],
-        },
-        {
-          role: "user",
-          content: [
-            { tool_use_id: "call_1", type: "tool_result", content: "r1", is_error: false },
-            { tool_use_id: "call_2", type: "tool_result", content: "r2", is_error: false },
-          ],
-        },
-      ],
-      system: [{ type: "text", text: "You are Claude Code." }],
-      tools: [],
-      thinking: { type: "enabled" },
-    });
-    const out = transformRequestBody(body, {
-      format: "anthropic",
-      userId: "84e5299d-a2f6-45b3-aaff-d2edde14969c",
-      startPlan: true,
-    });
-    const parsed = JSON.parse(out as string);
-
-    // 1. NO cache_control anywhere in start-plan mode
-    for (const m of parsed.messages) {
-      if (!Array.isArray(m.content)) continue;
-      for (const b of m.content) {
-        expect(b.cache_control).toBeUndefined();
-      }
-    }
-
-    // 2. tool_result.content is now array format
-    const lastMsg = parsed.messages[parsed.messages.length - 1];
-    for (const b of lastMsg.content) {
-      expect(b.type).toBe("tool_result");
-      expect(Array.isArray(b.content)).toBe(true);
-      expect(b.content[0].type).toBe("text");
-      expect(typeof b.content[0].text).toBe("string");
-      // 3. is_error stripped
-      expect("is_error" in b).toBe(false);
-    }
-
-    // 4. assistant message [3] still has text + 2 tool_use (structure preserved)
-    const assistantWithTools = parsed.messages.find((m: any) =>
-      m.role === "assistant" && Array.isArray(m.content) &&
-      m.content.some((b: any) => b.type === "tool_use")
-    );
-    expect(assistantWithTools).toBeDefined();
-    const textBlock = assistantWithTools.content.find((b: any) => b.type === "text");
-    expect(textBlock).toBeDefined();
-    const toolUseBlocks = assistantWithTools.content.filter((b: any) => b.type === "tool_use");
-    expect(toolUseBlocks.length).toBe(2);
-
-    // 5. metadata.user_id is NOT injected in start-plan mode.
-    // ZCode start-plan gateway rejects metadata.user_id (returns 200 + empty
-    // SSE stream — see body-transformer.ts:150-158). Only coding-plan gets
-    // the metadata.user_id injection. So in start-plan + userId, metadata
-    // must be absent entirely.
-    expect(parsed.metadata).toBeUndefined();
-  });
-});
-
-describe("transformRequestBody — metadata.user_id (Anthropic)", () => {
-  it("injects metadata.user_id when ctx.userId is set", () => {
-    const body = JSON.stringify({
-      model: "glm-4.6",
-      messages: [{ role: "user", content: "hi" }],
-    });
-    const out = transformRequestBody(body, { format: "anthropic", userId: "u_42" });
-    const parsed = JSON.parse(out as string);
-    expect(parsed.metadata).toEqual({ user_id: "u_42" });
-  });
-
-  it("preserves existing metadata fields when adding user_id", () => {
-    const body = JSON.stringify({
-      messages: [],
-      metadata: { existing_field: "keep" },
-    });
-    const out = transformRequestBody(body, { format: "anthropic", userId: "u_99" });
-    const parsed = JSON.parse(out as string);
-    expect(parsed.metadata).toEqual({ existing_field: "keep", user_id: "u_99" });
-  });
-
-  it("does NOT touch metadata.user_id when it already equals ctx.userId", () => {
-    const body = JSON.stringify({
-      messages: [],
-      metadata: { user_id: "u_x" },
-    });
-    const out = transformRequestBody(body, { format: "anthropic", userId: "u_x" });
-    const parsed = JSON.parse(out as string);
-    // metadata.user_id should be unchanged (no overwrite)
-    expect(parsed.metadata.user_id).toBe("u_x");
-    // vceshi0.1.7+: max_tokens=64000 still injected unconditionally
-    expect(parsed.max_tokens).toBe(64000);
-  });
-
-  it("overwrites metadata.user_id when value differs from ctx.userId", () => {
-    const body = JSON.stringify({
-      messages: [],
-      metadata: { user_id: "client_set" },
-    });
-    const out = transformRequestBody(body, { format: "anthropic", userId: "oauth_resolved" });
-    const parsed = JSON.parse(out as string);
-    expect(parsed.metadata.user_id).toBe("oauth_resolved");
-  });
-
-  it("does NOT inject metadata when ctx.userId is absent (apikey mode)", () => {
-    const body = JSON.stringify({
-      messages: [{ role: "user", content: "hi" }],
-    });
-    const out = transformRequestBody(body, { format: "anthropic" });
-    const parsed = JSON.parse(out as string);
-    expect(parsed.metadata).toBeUndefined();
-  });
-
-  it("does NOT inject metadata for OpenAI format even if userId is set", () => {
-    const body = JSON.stringify({
-      stream: true,
-      messages: [{ role: "user", content: "hi" }],
-    });
-    const out = transformRequestBody(body, { format: "openai", userId: "u_42" });
-    const parsed = JSON.parse(out as string);
-    expect(parsed.metadata).toBeUndefined();
-  });
-
-  it("does NOT inject metadata.user_id in start-plan mode (ZCode gateway rejects it)", () => {
-    // Regression guard: start-plan + OAuth userId must NOT inject
-    // metadata.user_id. The ZCode gateway returns 200 + empty SSE stream
-    // when metadata.user_id is present, which surfaces to Claude Code as
-    // "API returned an empty or malformed response (HTTP 200)".
-    // Symmetric with applyAnthropicCacheControl's start-plan no-op.
-    const body = JSON.stringify({
-      model: "glm-5.2",
-      messages: [{ role: "user", content: "hi" }],
-    });
-    const out = transformRequestBody(body, {
-      format: "anthropic",
-      userId: "user-from-oauth",
-      startPlan: true,
-    });
-    const parsed = JSON.parse(out as string);
-    expect(parsed.metadata).toBeUndefined();
-  });
-
-  it("DOES inject metadata.user_id in coding-plan mode when userId is set", () => {
-    // Positive counterpart: coding-plan still gets the injection.
-    const body = JSON.stringify({
-      model: "glm-4.6",
-      messages: [{ role: "user", content: "hi" }],
-    });
-    const out = transformRequestBody(body, {
-      format: "anthropic",
-      userId: "user-from-oauth",
-      startPlan: false,
-    });
-    const parsed = JSON.parse(out as string);
-    expect(parsed.metadata).toEqual({ user_id: "user-from-oauth" });
-  });
-});
 
 describe("transformRequestBody — injectZCodeThinkingFormat (WAF fingerprint alignment, default ON since v0.1.9)", () => {
   // The real ZCode desktop client sends these EXACT values when thinking is
@@ -1873,7 +825,7 @@ describe("transformRequestBody — alignZCodeFormat (ZCode wire format alignment
       max_tokens: 1000,
       thinking: { type: "enabled" },
     });
-    const out = transformRequestBody(body, { format: "anthropic", alignZCodeFormat: true });
+    const out = transformRequestBody(body, { format: "anthropic" });
     const parsed = JSON.parse(out as string);
     const keys = Object.keys(parsed);
     // Expected order: model, max_tokens, thinking, output_config (injected),
@@ -1895,14 +847,14 @@ describe("transformRequestBody — alignZCodeFormat (ZCode wire format alignment
       thinking: { type: "enabled" },
     });
     // coding-plan
-    const outCoding = transformRequestBody(body, { format: "anthropic", alignZCodeFormat: true, startPlan: false });
+    const outCoding = transformRequestBody(body, { format: "anthropic", startPlan: false });
     const parsedCoding = JSON.parse(outCoding as string);
     expect(Array.isArray(parsedCoding.system)).toBe(true);
     expect(parsedCoding.system.length).toBeGreaterThanOrEqual(2); // 2 ZCode blocks
     expect(parsedCoding.system[0].text).toBe("You are ZCode, an interactive coding agent");
     expect(parsedCoding.system[0].cache_control).toEqual({ type: "ephemeral" });
     // start-plan
-    const outStart = transformRequestBody(body, { format: "anthropic", alignZCodeFormat: true, startPlan: true });
+    const outStart = transformRequestBody(body, { format: "anthropic", startPlan: true });
     const parsedStart = JSON.parse(outStart as string);
     expect(Array.isArray(parsedStart.system)).toBe(true);
     expect(parsedStart.system[0].text).toBe("You are ZCode, an interactive coding agent");
@@ -1918,7 +870,7 @@ describe("transformRequestBody — alignZCodeFormat (ZCode wire format alignment
         { type: "text", text: "Custom client instructions" },
       ],
     });
-    const out = transformRequestBody(body, { format: "anthropic", alignZCodeFormat: true });
+    const out = transformRequestBody(body, { format: "anthropic" });
     const parsed = JSON.parse(out as string);
     // 2 ZCode blocks + 1 client block = 3
     expect(parsed.system.length).toBe(3);
@@ -1937,7 +889,7 @@ describe("transformRequestBody — alignZCodeFormat (ZCode wire format alignment
         { type: "text", text: "Some harness instructions" },
       ],
     });
-    const out = transformRequestBody(body, { format: "anthropic", alignZCodeFormat: true });
+    const out = transformRequestBody(body, { format: "anthropic" });
     const parsed = JSON.parse(out as string);
     // Find the rewritten block (it's in the client blocks, after the 2 ZCode blocks)
     const clientBlocks = parsed.system.slice(2);
@@ -1956,7 +908,7 @@ describe("transformRequestBody — alignZCodeFormat (ZCode wire format alignment
         { role: "system", content: "You are Claude Code, Anthropic's official CLI for Claude. Be helpful." },
       ],
     });
-    const out = transformRequestBody(body, { format: "anthropic", alignZCodeFormat: true });
+    const out = transformRequestBody(body, { format: "anthropic" });
     const parsed = JSON.parse(out as string);
     const sysMsg = parsed.messages.find((m: any) => m.role === "system");
     expect(sysMsg).toBeDefined();
@@ -1969,8 +921,9 @@ describe("transformRequestBody — alignZCodeFormat (ZCode wire format alignment
   });
 
   it("does NOT relocate system role from messages (keeps them in messages[])", () => {
-    // When alignZCodeFormat is OFF, relocateSystemMessages moves role:system to top-level system.
-    // When ON, the system message stays in messages[] (matching real ZCode behavior).
+    // v0.1.9+: alignZCodeFormat is always-on. The system role message stays
+    // in messages[] (matching real ZCode behavior — sample has 5 role:system
+    // messages in messages[], not moved to top-level system field).
     const body = JSON.stringify({
       model: "glm-5.2",
       max_tokens: 1000,
@@ -1980,7 +933,7 @@ describe("transformRequestBody — alignZCodeFormat (ZCode wire format alignment
         { role: "system", content: "The Bash tool shell was changed by the user." },
       ],
     });
-    const out = transformRequestBody(body, { format: "anthropic", alignZCodeFormat: true });
+    const out = transformRequestBody(body, { format: "anthropic" });
     const parsed = JSON.parse(out as string);
     // The system role message should STILL be in messages (not relocated)
     const sysInMessages = parsed.messages.find((m: any) => m.role === "system");
@@ -1998,7 +951,7 @@ describe("transformRequestBody — alignZCodeFormat (ZCode wire format alignment
       messages: [{ role: "user", content: "hi" }],
       max_tokens: 1000,
     });
-    const out = transformRequestBody(body, { format: "openai", alignZCodeFormat: true });
+    const out = transformRequestBody(body, { format: "openai" });
     const parsed = JSON.parse(out as string);
     // No system injection for OpenAI
     expect(parsed.system).toBeUndefined();
@@ -2011,7 +964,7 @@ describe("transformRequestBody — alignZCodeFormat (ZCode wire format alignment
       thinking: { type: "enabled" },
       messages: [{ role: "user", content: "hi" }],
     });
-    const ctx = { format: "anthropic" as const, alignZCodeFormat: true };
+    const ctx = { format: "anthropic" as const };
     const out1 = transformRequestBody(body, ctx);
     const out2 = transformRequestBody(out1 as string, ctx);
     // Second run should produce same output (no duplicate system blocks)
@@ -2031,7 +984,7 @@ describe("transformRequestBody — alignZCodeFormat (field fill + drop, v0.2.0+)
       messages: [{ role: "user", content: "hi" }],
       tools: [{ name: "Read", description: "read", input_schema: {} }],
     });
-    const out = transformRequestBody(body, { format: "anthropic", alignZCodeFormat: true });
+    const out = transformRequestBody(body, { format: "anthropic" });
     const parsed = JSON.parse(out as string);
     expect(parsed.tool_choice).toEqual({ type: "auto" });
   });
@@ -2044,7 +997,7 @@ describe("transformRequestBody — alignZCodeFormat (field fill + drop, v0.2.0+)
       messages: [{ role: "user", content: "hi" }],
       tools: [],
     });
-    const out = transformRequestBody(body, { format: "anthropic", alignZCodeFormat: true });
+    const out = transformRequestBody(body, { format: "anthropic" });
     const parsed = JSON.parse(out as string);
     expect(parsed.tool_choice).toBeUndefined();
   });
@@ -2058,24 +1011,25 @@ describe("transformRequestBody — alignZCodeFormat (field fill + drop, v0.2.0+)
       tools: [{ name: "Read", description: "read", input_schema: {} }],
       tool_choice: { type: "any" },
     });
-    const out = transformRequestBody(body, { format: "anthropic", alignZCodeFormat: true });
+    const out = transformRequestBody(body, { format: "anthropic" });
     const parsed = JSON.parse(out as string);
     expect(parsed.tool_choice).toEqual({ type: "any" }); // preserved, not overwritten
   });
 
-  it("forces stream: true when client didn't send it", () => {
+  it("does NOT force stream when client didn't send it (v0.1.9+: respects client preference)", () => {
     const body = JSON.stringify({
       model: "glm-5.2",
       max_tokens: 1000,
       thinking: { type: "enabled" },
       messages: [{ role: "user", content: "hi" }],
     });
-    const out = transformRequestBody(body, { format: "anthropic", alignZCodeFormat: true });
+    const out = transformRequestBody(body, { format: "anthropic" });
     const parsed = JSON.parse(out as string);
-    expect(parsed.stream).toBe(true);
+    // v0.1.9+: stream is NOT forced. Use forceStreamAnthropic config for that.
+    expect(parsed.stream).toBeUndefined();
   });
 
-  it("forces stream: true even when client sent stream: false", () => {
+  it("preserves client's stream: false (v0.1.9+: respects client preference)", () => {
     const body = JSON.stringify({
       model: "glm-5.2",
       max_tokens: 1000,
@@ -2083,9 +1037,9 @@ describe("transformRequestBody — alignZCodeFormat (field fill + drop, v0.2.0+)
       messages: [{ role: "user", content: "hi" }],
       stream: false,
     });
-    const out = transformRequestBody(body, { format: "anthropic", alignZCodeFormat: true });
+    const out = transformRequestBody(body, { format: "anthropic" });
     const parsed = JSON.parse(out as string);
-    expect(parsed.stream).toBe(true); // forced on
+    expect(parsed.stream).toBe(false); // preserved as-is
   });
 
   it("drops metadata field (Claude Code's user_id tracking — real ZCode never sends it)", () => {
@@ -2096,13 +1050,15 @@ describe("transformRequestBody — alignZCodeFormat (field fill + drop, v0.2.0+)
       messages: [{ role: "user", content: "hi" }],
       metadata: { user_id: "device-123" },
     });
-    const out = transformRequestBody(body, { format: "anthropic", alignZCodeFormat: true });
+    const out = transformRequestBody(body, { format: "anthropic" });
     const parsed = JSON.parse(out as string);
     expect(parsed.metadata).toBeUndefined();
   });
 
   it("complete alignment: Claude Code request → real ZCode wire format", () => {
     // Mimics Claude Code's actual request shape (model→messages→system→tools→metadata→max_tokens→thinking)
+    // v0.1.9+: stream is NOT forced by alignZCodeFormat (use forceStreamAnthropic config
+    // for that). Test sends stream:true explicitly to verify wire format alignment.
     const body = JSON.stringify({
       model: "glm5.1",
       messages: [{ role: "user", content: "hi" }],
@@ -2113,8 +1069,9 @@ describe("transformRequestBody — alignZCodeFormat (field fill + drop, v0.2.0+)
       metadata: { user_id: "device-xyz" },
       max_tokens: 32000,
       thinking: { type: "adaptive" },
+      stream: true,
     });
-    const out = transformRequestBody(body, { format: "anthropic", alignZCodeFormat: true });
+    const out = transformRequestBody(body, { format: "anthropic" });
     const parsed = JSON.parse(out as string);
     const keys = Object.keys(parsed);
 
@@ -2135,7 +1092,7 @@ describe("transformRequestBody — alignZCodeFormat (field fill + drop, v0.2.0+)
     // 3. tool_choice filled
     expect(parsed.tool_choice).toEqual({ type: "auto" });
 
-    // 4. stream forced on
+    // 4. stream preserved (v0.1.9+: NOT forced — respects client preference)
     expect(parsed.stream).toBe(true);
 
     // 5. max_tokens forced to 64000 (thinking enabled)
@@ -2168,7 +1125,7 @@ describe("transformRequestBody — alignZCodeFormat (message body fingerprint al
       ],
       tools: [{ name: "Bash", description: "shell", input_schema: {} }],
     });
-    const out = transformRequestBody(body, { format: "anthropic", alignZCodeFormat: true });
+    const out = transformRequestBody(body, { format: "anthropic" });
     const parsed = JSON.parse(out as string);
     // tool_result.content should STILL be a string — real ZCode client sends string
     const tr = parsed.messages[2].content[0];
@@ -2189,7 +1146,7 @@ describe("transformRequestBody — alignZCodeFormat (message body fingerprint al
       ],
       tools: [{ name: "Glob", description: "find files", input_schema: {} }],
     });
-    const out = transformRequestBody(body, { format: "anthropic", alignZCodeFormat: true });
+    const out = transformRequestBody(body, { format: "anthropic" });
     const parsed = JSON.parse(out as string);
     // assistant message should STILL have only the tool_use block — no inserted text:" "
     const asst = parsed.messages[1];
@@ -2211,7 +1168,7 @@ describe("transformRequestBody — alignZCodeFormat (message body fingerprint al
       ],
       tools: [{ name: "Bash", description: "shell", input_schema: {} }],
     });
-    const out = transformRequestBody(body, { format: "anthropic", alignZCodeFormat: true });
+    const out = transformRequestBody(body, { format: "anthropic" });
     const parsed = JSON.parse(out as string);
     const tr = parsed.messages[2].content[0];
     expect(tr.type).toBe("tool_result");
@@ -2229,7 +1186,7 @@ describe("transformRequestBody — alignZCodeFormat (message body fingerprint al
       ],
       tools: [],
     });
-    const out = transformRequestBody(body, { format: "anthropic", alignZCodeFormat: true, startPlan: true });
+    const out = transformRequestBody(body, { format: "anthropic", startPlan: true });
     const parsed = JSON.parse(out as string);
     // The client's cache_control on messages[0].content[0] should be preserved
     expect(parsed.messages[0].content[0].cache_control).toEqual({ type: "ephemeral" });
@@ -2249,8 +1206,8 @@ describe("transformRequestBody — alignZCodeFormat (message body fingerprint al
         { role: "user", content: [{ type: "text", text: "last question" }] },
       ],
     });
-    // startPlan + alignZCodeFormat: cc should STILL be added (was no-op before fix)
-    const out = transformRequestBody(body, { format: "anthropic", alignZCodeFormat: true, startPlan: true });
+    // v0.1.9+: cc is always added (was no-op in start-plan pre-v0.1.9)
+    const out = transformRequestBody(body, { format: "anthropic", startPlan: true });
     const parsed = JSON.parse(out as string);
     const lastUser = parsed.messages[parsed.messages.length - 1];
     expect(lastUser.role).toBe("user");
@@ -2260,10 +1217,10 @@ describe("transformRequestBody — alignZCodeFormat (message body fingerprint al
     expect(lastBlock.cache_control).toEqual({ type: "ephemeral" });
   });
 
-  it("applyStartPlanSystem is idempotent under alignZCodeFormat + start-plan (no double-injection)", () => {
-    // Reproduces the vceshi0.1.5 bug: when alignZCodeFormat + startPlan are
-    // both on AND the body already has ZCode blocks in system (e.g. retry),
-    // applyStartPlanSystem used to inject another copy, producing 5 blocks
+  it("applyStartPlanSystem is idempotent (no double-injection)", () => {
+    // Reproduces the vceshi0.1.5 bug: when startPlan is on AND the body
+    // already has ZCode blocks in system (e.g. retry), applyStartPlanSystem
+    // used to inject another copy, producing 5 blocks
     // instead of 3 (ZCode, ZCode, ZCode, ZCode, client).
     //
     // Use the EXACT official block texts (a real retry would carry the exact
@@ -2282,7 +1239,7 @@ describe("transformRequestBody — alignZCodeFormat (message body fingerprint al
         { type: "text", text: "client instructions" },
       ],
     });
-    const out = transformRequestBody(body, { format: "anthropic", alignZCodeFormat: true, startPlan: true });
+    const out = transformRequestBody(body, { format: "anthropic", startPlan: true });
     const parsed = JSON.parse(out as string);
     // Should be 3 blocks (2 ZCode + 1 client), NOT 5
     expect(parsed.system.length).toBe(3);
@@ -2294,6 +1251,7 @@ describe("transformRequestBody — alignZCodeFormat (message body fingerprint al
     // Integration test mirroring the captured samples: a multi-turn ClaudeCode
     // request with tool_use/tool_result should produce output matching the
     // real ZCode client's wire format on every dimension that WAF inspects.
+    // v0.1.9+: stream is NOT forced — test sends stream:true to verify wire alignment.
     const body = JSON.stringify({
       model: "glm-5.2",
       max_tokens: 32000,
@@ -2315,8 +1273,9 @@ describe("transformRequestBody — alignZCodeFormat (message body fingerprint al
         { name: "Bash", description: "shell", input_schema: {} },
       ],
       metadata: { user_id: "device-abc" },
+      stream: true,
     });
-    const out = transformRequestBody(body, { format: "anthropic", alignZCodeFormat: true });
+    const out = transformRequestBody(body, { format: "anthropic" });
     const parsed = JSON.parse(out as string);
     const keys = Object.keys(parsed);
 

@@ -264,42 +264,6 @@ export interface ProxyConfig {
    */
   responsesThinking?: ResponsesThinkingConfig;
   /**
-   * Align request body structure to match the real ZCode desktop client exactly.
-   *
-   * When true, the proxy restructures the Anthropic-format request body to match
-   * the real ZCode client's wire format (reverse-engineered 2026-06):
-   *
-   *   1. **Top-level field order**: model → max_tokens → thinking → output_config
-   *      → system → messages → tools → tool_choice → stream
-   *      (real ZCode order, not arbitrary JSON key order)
-   *
-   *   2. **ZCode system blocks always injected** (both coding-plan AND start-plan):
-   *      - Prepend 3 official ZCode identity blocks ("You are ZCode...")
-   *      - Each block carries `cache_control: { type: "ephemeral" }`
-   *      - Client's original system blocks appended AFTER the ZCode blocks
-   *      - Critical for start-plan: gateway does content inspection and rejects
-   *        requests missing the ZCode identity blocks
-   *
-   *   3. **Client identity rewrite**: if the client's system contains
-   *      "You are Claude Code, Anthropic's official CLI for Claude." (Claude Code's
-   *      default identity), rewrite it to "You are ZCode model working in Claude
-   *      Code." — preserves Claude Code's harness instructions while adopting
-   *      ZCode identity for WAF bypass.
-   *
-   *   4. **Keep system role in messages**: do NOT relocate `role: "system"`
-   *      messages from `messages[]` to top-level `system` field. Real ZCode
-   *      keeps them in `messages[]` (e.g. "The Bash tool shell was changed...").
-   *      The previous `relocateSystemMessages` transform is skipped when this
-   *      flag is on.
-   *
-   * Default: false (preserve existing behavior). Env var:
-   * ZCODE_PROXY_ALIGN_ZCODE_FORMAT=1 to enable at startup.
-   *
-   * @see body-transformer.ts `alignZCodeRequestFormat`
-   */
-  alignZCodeFormat?: boolean;
-
-  /**
    * ZCode thinking level — controls the budget_tokens + effort injected when
    * the client sends `thinking.type=enabled`.
    *

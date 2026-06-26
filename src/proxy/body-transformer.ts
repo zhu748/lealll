@@ -111,16 +111,6 @@ export interface TransformContext {
    * injected (ZCode "no thinking" wire shape) — thinking is never forced on.
    */
   thinkingLevel?: "high" | "max";
-  /**
-   * When true, restructure the request body to match the real ZCode desktop
-   * client's wire format exactly:
-   *   - Top-level field order: model → max_tokens → thinking → output_config → system → messages → tools → tool_choice → stream
-   *   - Inject ZCode system blocks (both coding-plan AND start-plan)
-   *   - Rewrite "You are Claude Code" → "You are ZCode model working in Claude Code"
-   *   - Keep system role in messages (skip relocateSystemMessages)
-   * Default: false.
-   */
-  alignZCodeFormat?: boolean;
 }
 
 /**
@@ -161,48 +151,35 @@ export function transformRequestBodyObj(parsed: unknown, ctx: TransformContext):
     }
     modified = transformUnsupportedAnthropicFields(obj) || modified;
     // Inject ZCode thinking format (max_tokens + budget_tokens + output_config)
-    // — runs UNCONDITIONALLY (default behavior since v0.1.9). Any Anthropic
-    // request with thinking.type === "enabled" gets the EXACT thinking-format
-    // fields the real ZCode desktop client sends. This aligns our request
-    // body fingerprint with the real client at the WAF body-inspection layer.
+    // — runs UNCONDITIONALLY. Any Anthropic request with thinking.type === "enabled"
+    // gets the EXACT thinking-format fields the real ZCode desktop client sends.
     //
     // Runs AFTER transformUnsupportedAnthropicFields so we can detect the
     // simplified `thinking: { type: "enabled" }` shape. Must run BEFORE
     // any transform that might strip output_config.
     //
-    // vceshi0.1.7+: thinkingLevel controls the tier (high/max). When client
-    // doesn't send `thinking`, only max_tokens=64000 is injected (ZCode "no
-    // thinking" mode) — thinking is NOT forced on.
+    // v0.1.9+: thinkingLevel controls the tier (high/max). When client doesn't
+    // send `thinking`, only max_tokens=64000 is injected (ZCode "no thinking"
+    // mode) — thinking is NOT forced on.
     modified = injectZCodeThinkingFormat(obj, ctx.thinkingLevel ?? "max") || modified;
-    // When alignZCodeFormat is ON, skip relocateSystemMessages — real ZCode
-    // keeps role: "system" inside messages[] instead of moving to top-level
-    // system field. The align function (called last) handles system injection.
-    if (!ctx.alignZCodeFormat) {
-      modified = relocateSystemMessages(obj) || modified;
-    }
+    // v0.1.9+: alignZCodeFormat is the DEFAULT (and only) behavior. We no longer
+    // relocate role:"system" from messages[] to top-level system — real ZCode
+    // keeps them in messages[] (e.g. "The Bash tool shell was changed...").
+    // The align function (called last) handles system injection.
     modified = stripThinkingBlocksFromMessages(obj) || modified;
-    // alignZCodeFormat: skip ensureAssistantTextBlock — real ZCode client
-    // allows assistant messages with only tool_use blocks (no text). Sample
-    // shows 18 such messages in real ZCode traffic. Inserting a placeholder
-    // text:" " block creates a fingerprint mismatch.
-    if (!ctx.alignZCodeFormat) {
-      modified = ensureAssistantTextBlock(obj) || modified;
-    }
+    // v0.1.9+: normalizeAllMessageContent still runs (converts string content
+    // to array form). Real ZCode uses array form for user/assistant messages.
     modified = normalizeAllMessageContent(obj) || modified;
-    // alignZCodeFormat: skip normalizeToolResultContent — real ZCode client
-    // sends tool_result.content as STRING (49/49 in sample). Converting to
-    // array creates a fingerprint mismatch.
-    if (!ctx.alignZCodeFormat) {
-      modified = normalizeToolResultContent(obj) || modified;
-    }
-    modified = sanitizeContentBlocks(obj, ctx.startPlan, ctx.alignZCodeFormat) || modified;
-    modified = applyAnthropicCacheControl(obj, ctx.startPlan, ctx.alignZCodeFormat) || modified;
+    // v0.1.9+: skip normalizeToolResultContent — real ZCode client sends
+    // tool_result.content as STRING (49/49 in sample).
+    // v0.1.9+: skip ensureAssistantTextBlock — real ZCode client allows
+    // assistant messages with only tool_use blocks (18 in sample).
+    modified = sanitizeContentBlocks(obj) || modified;
+    modified = applyAnthropicCacheControl(obj) || modified;
     // start-plan: ZCode gateway is stricter than official Anthropic API and
     // rejects `metadata.user_id` (returns 200 + empty SSE stream — invisible
     // to the SSE error detector, surfaces as "empty/malformed response" in
-    // Claude Code). Only inject for coding-plan, mirroring the
-    // applyAnthropicCacheControl no-op pattern at line 196-200.
-    // See: https://github.com/zhu748/lealll issue on OAuth-credential switch
+    // Claude Code). Only inject for coding-plan.
     if (ctx.userId && !ctx.startPlan) {
       modified = applyAnthropicUserId(obj, ctx.userId) || modified;
     }
@@ -210,17 +187,16 @@ export function transformRequestBodyObj(parsed: unknown, ctx: TransformContext):
     // all other transforms have settled). Rewrites top-level field order,
     // injects ZCode system blocks (both coding-plan AND start-plan), and
     // rewrites "You are Claude Code" → "You are ZCode model working in Claude Code".
-    if (ctx.alignZCodeFormat) {
-      const aligned = alignZCodeRequestFormat(obj);
-      if (aligned) {
-        // alignZCodeRequestFormat rebuilds the object with correct key order.
-        // We need to replace parsed's keys in place — clear and re-assign.
-        for (const k of Object.keys(parsed as Record<string, unknown>)) {
-          delete (parsed as Record<string, unknown>)[k];
-        }
-        Object.assign(parsed as Record<string, unknown>, aligned);
-        modified = true;
+    // v0.1.9+: this is now the default and only path.
+    const aligned = alignZCodeRequestFormat(obj);
+    if (aligned) {
+      // alignZCodeRequestFormat rebuilds the object with correct key order.
+      // We need to replace parsed's keys in place — clear and re-assign.
+      for (const k of Object.keys(parsed as Record<string, unknown>)) {
+        delete (parsed as Record<string, unknown>)[k];
       }
+      Object.assign(parsed as Record<string, unknown>, aligned);
+      modified = true;
     }
   }
 
@@ -267,17 +243,15 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
  */
 function applyAnthropicCacheControl(
   body: Record<string, unknown>,
-  startPlan?: boolean,
-  alignZCodeFormat?: boolean,
 ): boolean {
-  // In start-plan mode WITHOUT alignZCodeFormat, do NOT add any cache_control.
-  // The ZCode gateway is stricter than Anthropic's official API and rejects
-  // cache_control on ALL block types, including text blocks.
+  // v0.1.9+: alignZCodeFormat is always-on. Real ZCode client sends
+  // cache_control on the last user message's text block even in start-plan
+  // mode. We always inject cc to mirror that (and sanitizeContentBlocks
+  // no longer strips it).
   //
-  // In alignZCodeFormat mode (regardless of start-plan), real ZCode client
-  // DOES send cache_control on the last user message's text block — we mirror
-  // that. sanitizeContentBlocks is also told to preserve cc in this mode.
-  if (startPlan && !alignZCodeFormat) return false;
+  // (Pre-v0.1.9 behavior: start-plan was a no-op — ZCode gateway was
+  // believed to reject cc on all block types. That assumption was wrong;
+  // the real ZCode client sends cc in start-plan too.)
   const messages = body.messages;
   if (!Array.isArray(messages) || messages.length === 0) return false;
 
@@ -560,12 +534,11 @@ function alignZCodeRequestFormat(body: Record<string, unknown>): Record<string, 
     body.tool_choice = { type: "auto" };
     changed = true;
   }
-  // stream: true — real ZCode always streams. Claude Code defaults to non-stream
-  // (stream field absent or false), so we force it on to match the real client.
-  if (body.stream !== true) {
-    body.stream = true;
-    changed = true;
-  }
+  // stream: real ZCode always streams, but the proxy serves various clients
+  // (some non-stream). v0.1.9+: we DON'T force stream:true here — that broke
+  // non-stream clients (mock upstream returns SSE, client expects JSON).
+  // Users who want forced streaming should enable `forceStreamAnthropic` config.
+  // We DO include `stream` in the reordered output if client sent it.
 
   // === Step 4: Drop fields real ZCode client never sends ===
   // Claude Code sends `metadata: { user_id: "..." }` for tracking. Real ZCode
@@ -639,68 +612,6 @@ function rewriteClaudeCodeIdentity(blocks: SystemBlock[]): SystemBlock[] {
     }
     return b;
   });
-}
-
-/**
- * Relocate `role: "system"` messages from the `messages` array to the `system` field.
- *
- * Claude Code places system instructions in `messages[].role = "system"`, but the
- * Anthropic Messages API requires system content in the top-level `system` field —
- * `role: "system"` is not a valid value inside `messages`. GLM's Anthropic-compatible
- * endpoint rejects this with 3001 "parameter error".
- *
- * Existing `system` content (string or array) is preserved; relocated system messages
- * are appended after any existing system blocks.
- */
-function relocateSystemMessages(body: Record<string, unknown>): boolean {
-  const messages = body.messages;
-  if (!Array.isArray(messages)) return false;
-
-  const systemMsgs: Array<Record<string, unknown>> = [];
-  const remaining: unknown[] = [];
-
-  for (const msg of messages) {
-    if (isPlainObject(msg) && msg.role === "system") {
-      systemMsgs.push(msg);
-    } else {
-      remaining.push(msg);
-    }
-  }
-
-  if (systemMsgs.length === 0) return false;
-
-  // Move system messages out of the messages array
-  body.messages = remaining;
-
-  // Append their content to the top-level `system` field
-  const newBlocks: Array<{ type: string; text: string }> = [];
-  for (const msg of systemMsgs) {
-    const content = msg.content;
-    if (typeof content === "string" && content.trim()) {
-      newBlocks.push({ type: "text", text: content });
-    } else if (Array.isArray(content)) {
-      for (const block of content) {
-        if (isPlainObject(block) && block.type === "text" && typeof block.text === "string" && block.text.trim()) {
-          newBlocks.push({ type: "text", text: block.text });
-        }
-      }
-    }
-  }
-
-  if (newBlocks.length === 0) return true; // messages array was modified even if nothing to append
-
-  // Merge with existing system field
-  const existing = body.system;
-  if (existing == null) {
-    body.system = newBlocks;
-  } else if (typeof existing === "string") {
-    body.system = [{ type: "text", text: existing }, ...newBlocks];
-  } else if (Array.isArray(existing)) {
-    body.system = [...existing, ...newBlocks];
-  }
-  // If system is some other type, overwrite with newBlocks (shouldn't happen)
-
-  return true;
 }
 
 /**
@@ -810,58 +721,6 @@ function stripThinkingBlocksFromMessages(body: Record<string, unknown>): boolean
 }
 
 /**
- * Ensure every assistant message has at least one `text` content block.
- *
- * ZCode's start-plan gateway rejects assistant messages that contain only
- * `tool_use` blocks (no text) with 3001 "parameter error". Anthropic's
- * official API accepts assistant messages with only tool_use blocks, but
- * the gateway is stricter.
- *
- * This can happen in two scenarios:
- *   1. Claude Code sends an assistant message with `[thinking, tool_use]`
- *      and stripThinkingBlocksFromMessages removes the thinking block,
- *      leaving only `[tool_use]`.
- *   2. Claude Code sends an assistant message with only `[tool_use]`
- *      directly (less common, but possible when the model calls a tool
- *      without any preamble text).
- *
- * In both cases, we insert an empty `text` block at the front of the
- * content array. The empty text is harmless — it renders as nothing in
- * the conversation, but satisfies the gateway's requirement that
- * assistant messages have a text block.
- *
- * No-op for:
- *   - Non-array content (string content is already text)
- *   - Messages that already have a text block
- *   - Non-assistant messages (user messages can be all tool_result)
- */
-function ensureAssistantTextBlock(body: Record<string, unknown>): boolean {
-  const messages = body.messages;
-  if (!Array.isArray(messages)) return false;
-
-  let changed = false;
-  for (const msg of messages) {
-    if (!isPlainObject(msg)) continue;
-    if (msg.role !== "assistant") continue;
-    const content = msg.content;
-    if (!Array.isArray(content)) continue;
-
-    const hasText = content.some((b: unknown) =>
-      isPlainObject(b) && b.type === "text"
-    );
-    if (!hasText) {
-      // Insert a single-space text block at the front.
-      // v2.1.3.10beta0: use " " instead of "" — some gateways reject
-      // empty text blocks. A space renders as nothing visible but is
-      // technically non-empty.
-      content.unshift({ type: "text", text: " " });
-      changed = true;
-    }
-  }
-  return changed;
-}
-
-/**
  * Sanitize content blocks in `messages[].content` to remove fields that GLM
  * upstream / ZCode gateway reject with 3001 "parameter error".
  *
@@ -892,8 +751,6 @@ function ensureAssistantTextBlock(body: Record<string, unknown>): boolean {
  */
 function sanitizeContentBlocks(
   body: Record<string, unknown>,
-  startPlan?: boolean,
-  alignZCodeFormat?: boolean,
 ): boolean {
   const messages = body.messages;
   if (!Array.isArray(messages)) return false;
@@ -907,81 +764,17 @@ function sanitizeContentBlocks(
     for (const block of content) {
       if (!isPlainObject(block)) continue;
 
-      // cache_control stripping — see function header for mode logic.
-      if ("cache_control" in block) {
-        let shouldStrip: boolean;
-        if (alignZCodeFormat) {
-          // alignZCodeFormat: NEVER strip cache_control. Real ZCode client
-          // keeps cache_control on the last user message's text block
-          // (sample: messages[122].content[3] role=user type=text).
-          // Stripping it removes the client's prompt-cache breakpoint,
-          // hurting cache hit rate AND creating a fingerprint mismatch.
-          shouldStrip = false;
-        } else if (startPlan) {
-          shouldStrip = true; // start-plan: strip from ALL blocks (including text)
-        } else {
-          shouldStrip = block.type !== "text"; // coding-plan: strip from non-text only
-        }
-        if (shouldStrip) {
-          delete block.cache_control;
-          changed = true;
-        }
-      }
+      // v0.1.9+: alignZCodeFormat is always-on. We NEVER strip cache_control
+      // — real ZCode client keeps cache_control on the last user message's
+      // text block (sample: messages[122].content[3] role=user type=text).
+      // Stripping it removes the client's prompt-cache breakpoint, hurting
+      // cache hit rate AND creating a fingerprint mismatch.
+      // (Pre-v0.1.9 behavior was: start-plan strips ALL cc, coding-plan
+      // strips non-text cc. Both are obsolete now.)
 
-      // is_error stripping on tool_result blocks.
-      // alignZCodeFormat: KEEP is_error — real ZCode client preserves it
-      // (sample: messages[6].content[0] has is_error=true on a timeout result).
-      // Non-align modes: strip (ZCode gateway doesn't accept this field — 3001).
-      if (!alignZCodeFormat && block.type === "tool_result" && "is_error" in block) {
-        delete block.is_error;
-        changed = true;
-      }
-    }
-  }
-  return changed;
-}
-
-/**
- * Normalize `tool_result.content` from string to array format.
- *
- * Anthropic's official API accepts both formats for `tool_result.content`:
- *   - string:  `{ type: "tool_result", content: "result text" }`
- *   - array:   `{ type: "tool_result", content: [{ type: "text", text: "..." }] }`
- *
- * Claude Code sends the **string** format. However, the ZCode gateway (and
- * some other Anthropic-compatible upstreams) ONLY accepts the **array** format
- * and rejects the string format with 3001 "parameter error".
- *
- * This function converts string content to the array format by wrapping it in
- * a single text block. Array content is left untouched. Non-tool_result blocks
- * are not affected.
- *
- * No-op if `messages` is missing or not an array.
- */
-function normalizeToolResultContent(body: Record<string, unknown>): boolean {
-  const messages = body.messages;
-  if (!Array.isArray(messages)) return false;
-
-  let changed = false;
-  for (const msg of messages) {
-    if (!isPlainObject(msg)) continue;
-    const content = msg.content;
-    if (!Array.isArray(content)) continue;
-
-    for (const block of content) {
-      if (!isPlainObject(block)) continue;
-      if (block.type !== "tool_result") continue;
-
-      // Convert string content to array format.
-      // Anthropic accepts both, but ZCode gateway requires array.
-      // v2.1.3.11beta0: empty string → single space (non-empty placeholder),
-      // matching normalizeAllMessageContent's behavior. ZCode gateway rejects
-      // empty text blocks.
-      if (typeof block.content === "string") {
-        const text = block.content.length > 0 ? block.content : " ";
-        block.content = [{ type: "text", text }];
-        changed = true;
-      }
+      // v0.1.9+: KEEP is_error — real ZCode client preserves it (sample:
+      // messages[6].content[0] has is_error=true on a timeout result).
+      // (Pre-v0.1.9 behavior was: strip is_error in both modes. Obsolete now.)
     }
   }
   return changed;

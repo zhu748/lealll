@@ -205,7 +205,7 @@ export async function proxyRequest(
     return c.jwt ? "start-plan" : "coding-plan";
   };
 
-  let transformedObj = transformRequestBodyObj(upstreamBodyObj, { format: upstreamFormat, userId: cred.userId, startPlan: currentPlan === "start-plan", alignZCodeFormat: config.alignZCodeFormat === true, thinkingLevel: config.thinkingLevel === "high" ? "high" : "max" });
+  let transformedObj = transformRequestBodyObj(upstreamBodyObj, { format: upstreamFormat, userId: cred.userId, startPlan: currentPlan === "start-plan", thinkingLevel: config.thinkingLevel === "high" ? "high" : "max" });
 
   // Force-enable streaming for Anthropic format when config.forceStreamAnthropic
   // is true. Overrides the client's stream preference (including missing/undefined
@@ -629,7 +629,6 @@ export async function proxyRequest(
             format: upstreamFormat,
             userId: cred.userId,
             startPlan: currentPlan === "start-plan",
-            alignZCodeFormat: config.alignZCodeFormat === true,
             thinkingLevel: config.thinkingLevel === "high" ? "high" : "max",
           });
           transformedBody = transformedObj !== undefined ? JSON.stringify(transformedObj) : undefined;
@@ -773,7 +772,6 @@ export async function proxyRequest(
             format: upstreamFormat,
             userId: cred.userId,
             startPlan: currentPlan === "start-plan",
-            alignZCodeFormat: config.alignZCodeFormat === true,
             thinkingLevel: config.thinkingLevel === "high" ? "high" : "max",
           });
           transformedBody = transformedObj !== undefined ? JSON.stringify(transformedObj) : undefined;
