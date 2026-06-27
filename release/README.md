@@ -1,5 +1,72 @@
 # zcode-proxy 使用说明
 
+> **v0.2.0.4 — Claude Code + Codex 双路径 ZCode wire-shape 完全对齐**
+>
+> 本次发版聚焦于"客户端请求 → ZCode 上游"的请求体结构对齐，让 Claude Code 和 Codex CLI 两条客户端路径产出的 wire bytes 与真实 ZCode 桌面客户端完全一致（顶层字段顺序、thinking 格式、max_tokens、stream、tool_choice、system 块 cache_control 等），降低 WAF 指纹检测风险。
+>
+> **本次改动**
+>
+> **1. 移除 `forceStreamAnthropic` 配置项，强制 `stream: true` 对齐 ZCode**
+>
+> 真实 ZCode 客户端的请求体永远带 `stream: true`。之前这个开关默认关闭，Claude Code / Codex 等客户端发请求时 body 里没有 `stream` 字段，造成 wire-shape 指纹差异。v0.2.0.4 起：
+> - `stream: true` 在 `body-transformer.alignZCodeRequestFormat` 内**无条件注入**，不再受配置控制
+> - 删除 `forceStreamAnthropic` 配置项（YAML `anthropic.forceStream`、环境变量 `ZCODE_PROXY_FORCE_STREAM_ANTHROPIC`、dashboard 复选框全部移除）
+> - 现有配置文件里的 `forceStream: false` 字段会被**静默忽略**，不影响运行
+>
+> **2. 新增 SSE → batch JSON 响应缓冲（关键修复）**
+>
+> 强制 `stream: true` 后，上游永远返回 SSE。但 Claude Code / Codex 等客户端有时会发非流式请求（`stream: false` 或不传），期望收到 batch JSON 响应。之前 proxy 直接透传 SSE 给非流式客户端，导致客户端无法解析——这就是用户反馈"开了 forceStream 在 Claude Code 里还是非流式"的根本原因。
+>
+> v0.2.0.4 修复：在响应路径检测 `isSSE && !meta.stream` 时，proxy 自动缓冲上游 SSE 流并重组为完整 Anthropic Message JSON 返回给客户端。客户端无感知：
+> - 流式客户端：SSE 透传（不变）
+> - 非流式客户端：proxy 缓冲 SSE → batch JSON（透明转换）
+>
+> 新增模块 `src/proxy/sse-to-batch.ts`（Anthropic SSE → Message 重组器），覆盖 11 个测试用例（文本块、tool_use 块、混合内容、容忍缺失 content_block_start、分块传输、ping、错误事件、malformed JSON、空流、网络断开兜底等）。
+>
+> **3. system 块 cache_control 对齐 ZCode 客户端**
+>
+> 真实 ZCode 客户端在自己的第三块 system 上加 `cache_control: { type: "ephemeral" }` 作为 prompt cache 断点。之前 proxy 只给注入的 2 块官方 ZCode 块加 cc，客户端自己带的 system 块（Codex 的 `instructions`、Claude Code 的 harness 块）没有 cc，造成 wire-shape 差异。
+>
+> v0.2.0.4 修复：在 `alignZCodeRequestFormat` Step 1b 给 system 数组的**最后一块**补 `cache_control: { type: "ephemeral" }`（幂等——已有 cc 的不覆盖）。现在 Claude Code 和 Codex 两条路径的 system 块结构都完全对齐 ZCode 客户端：
+> ```
+> [0] ZCode 官方块 +cc
+> [1] ZCode 官方块 +cc
+> [2] 用户自己的 system +cc   ← 本次修复
+> ```
+>
+> **4. 标注格式转换边界（防止后续误改）**
+>
+> 在 3 个关键文件加了 `FORMAT CONVERSION BOUNDARY — DO NOT MODIFY WITHOUT REVIEW` 标注框：
+> - `src/proxy/body-transformer.ts` — `alignZCodeRequestFormat`（两条客户端路径的最终汇聚点）
+> - `src/translator/responses-to-anthropic.ts` — `translateRequestResponsesToAnthropic`（Codex 专属翻译）
+> - `src/proxy/handler.ts` — 转换编排点（ASCII 流程图说明三条客户端路径如何汇聚）
+>
+> 每个标注框包含：当前 VERIFIED ALIGNED 状态（2026-06-27）、验证脚本路径、改动失败模式清单。
+>
+> **5. 验证脚本（开发参考）**
+>
+> 新增两个对齐验证脚本（位于 `/home/z/my-project/scripts/`，开发环境用，不打包进 release）：
+> - `test_alignment.ts` — Claude Code 请求 → 对比真实 ZCode 客户端
+> - `test_responses_alignment.ts` — Codex 请求 → 对比真实 ZCode 客户端
+>
+> 后续若需修改转换逻辑，必须先跑这两个脚本确认对齐状态未破坏。
+>
+> **本质说明**
+>
+> 本次对齐**只动结构、不动内容**——所有 Claude Code / Codex 原始内容（harness 指令、messages、tools、tool 结果）都原样透传。proxy 只做：
+> - 注入 2 块 ZCode 官方 system 提示词（冻结在 `zcode_system.json`）
+> - 改写 Claude Code 身份串 "You are Claude Code..." → "You are ZCode model working in Claude Code."（**仅 Claude Code**，Codex 不改）
+> - 重排顶层字段顺序
+> - 强制 stream:true / max_tokens:64000 / thinking 格式 / output_config
+> - 剥离客户端专属字段（metadata / context_management / billing-header / Codex 10 个专属字段）
+> - 格式归一化（string content → array、document block → text、剥离 thinking block）
+>
+> 不会塞任何其它提示词或内容到请求里，客户端上下文保持完整。
+>
+> **测试结果**：570/570 pass，TypeScript 零错误，Claude Code + Codex 两条路径核心结构全部对齐 ZCode 客户端。
+>
+> ---
+
 > **v0.2.0.3 — 安全加固 + 协议转换 bug 修复**
 >
 > 本次发版聚焦于安全防护与协议转换正确性，修复了多个高危问题。
@@ -124,7 +191,7 @@
 >
 > 2. **OpenAI / Responses 格式自动适配**：发现 OpenAI（`/v1/chat/completions`）和 Responses（`/v1/responses`）格式的请求在 handler.ts 中已经通过 translator 翻译成 Anthropic 格式后才走 `transformRequestBodyObj`，`upstreamFormat` 永远是 `"anthropic"`。所以对齐逻辑天然覆盖所有客户端格式，无需单独适配。
 >
-> 3. **移除强制 `stream: true`**：原 alignZCodeFormat 强制 stream:true（模拟真实 ZCode 总是流式），但这破坏了非流式客户端（如某些 Anthropic SDK 调用、集成测试等）。v0.1.9 改为尊重客户端的 stream 设置。如需强制流式，使用独立的 `forceStreamAnthropic` 配置项。
+> 3. **v0.2.0.4 恢复强制 `stream: true`**：v0.1.9 曾改为可选的 `forceStreamAnthropic` 配置项（默认关闭），但实测发现「对齐 ZCode wire shape」的优先级高于「尊重客户端 stream 偏好」——响应路径已能正确把上游 SSE buffer 成 batch JSON 返还给非流式客户端，所以不会破坏非流式客户端。v0.2.0.4 移除该配置项，`stream: true` 永远在 `alignZCodeRequestFormat` 内部强制注入。
 >
 > 4. **代码清理**：删除 3 个废弃函数（`relocateSystemMessages`、`ensureAssistantTextBlock`、`normalizeToolResultContent`），body-transformer.ts 从 1081 行精简到 876 行。删除约 1000 行废弃测试代码。
 >
@@ -145,9 +212,8 @@
 > | metadata 剥离 | ✅ | ✅ |
 > | `thinking` / `output_config` / `max_tokens` | ✅ | ✅ |
 >
-> **保留的配置项**：
-> - **ZCode 思考等级**（`thinkingLevel`）：高 / 最高，默认最高。客户端发 `thinking.type=enabled` 时按此档位注入；不发 thinking 时只注入 `max_tokens=64000`，不强制开思考。
-> - **Anthropic 强制流式输出**（`forceStreamAnthropic`）：独立开关，默认关闭。
+> **移除的配置项（v0.2.0.4）**：
+> - **Anthropic 强制流式输出**（`forceStreamAnthropic` / `anthropic.forceStream` / `ZCODE_PROXY_FORCE_STREAM_ANTHROPIC`）：已移除。`stream: true` 现在无条件注入对齐 ZCode wire shape。
 >
 > **继承 vceshi0.1.5 ~ vceshi0.1.7 / v0.1.8 的所有改动**（消息体内部指纹对齐、顶层字段顺序对齐、ZCode 官方 system 块注入、身份改写、请求头指纹对齐、WAF 拦截短路检测、[undefined] 字段清理、思考等级面板控制等）
 >

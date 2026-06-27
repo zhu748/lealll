@@ -19,6 +19,7 @@ import { buildUpstreamRequest } from "./upstream.js";
 import { transformRequestBodyObj } from "./body-transformer.js";
 import { detectCaptchaChallenge, getCaptchaToken, invalidateCaptchaToken, RETRY_HEADERS } from "./captcha.js";
 import { detectSseErrorAndConvert } from "./sse-error-detector.js";
+import { anthropicSseToBatchMessage } from "./sse-to-batch.js";
 import { translateRequestOpenAIToAnthropic, translateResponseAnthropicToOpenAI } from "../translator/openai-to-anthropic.js";
 import { translateRequestResponsesToAnthropic } from "../translator/responses-to-anthropic.js";
 import { translateResponseAnthropicToResponses, anthropicSseToResponsesSse } from "../translator/anthropic-to-responses.js";
@@ -230,6 +231,37 @@ export async function proxyRequest(
     }
   }
 
+  // =====================================================================
+  //  FORMAT CONVERSION ORCHESTRATION (Claude Code + Codex → ZCode upstream)
+  // =====================================================================
+  //  Two client paths converge here before forwarding to z.ai upstream:
+  //
+  //    Claude Code (anthropic)  ─→  NO translation needed (already Anthropic)
+  //                                 ↓
+  //                                 body-transformer.alignZCodeRequestFormat
+  //                                 ↓
+  //                                 upstream
+  //
+  //    Codex      (responses)  ─→  responses-to-anthropic.translateRequest...
+  //                                 ↓
+  //                                 body-transformer.alignZCodeRequestFormat
+  //                                 ↓
+  //                                 upstream
+  //
+  //    OpenAI     (openai)     ─→  openai-to-anthropic.translateRequest...
+  //                                 ↓
+  //                                 body-transformer.alignZCodeRequestFormat
+  //                                 ↓
+  //                                 upstream
+  //
+  //  Both translators + alignZCodeRequestFormat are MARKED as format conversion
+  //  boundaries — see the doc comments in those files. Do NOT casually modify
+  //  them; run the alignment test scripts first if you must.
+  //
+  //  Verification scripts:
+  //    /home/z/my-project/scripts/test_alignment.ts            (Claude Code)
+  //    /home/z/my-project/scripts/test_responses_alignment.ts  (Codex)
+  // =====================================================================
   let upstreamBodyObj: unknown = parsedBody;
   if (translateMode) {
     const forceThinkingModels = format === "openai-responses"
@@ -255,20 +287,12 @@ export async function proxyRequest(
 
   let transformedObj = transformRequestBodyObj(upstreamBodyObj, { format: upstreamFormat, userId: cred.userId, startPlan: currentPlan === "start-plan", thinkingLevel: config.thinkingLevel === "high" ? "high" : "max" });
 
-  // Force-enable streaming for Anthropic format when config.forceStreamAnthropic
-  // is true. Overrides the client's stream preference (including missing/undefined
-  // and stream:false) so the upstream returns SSE — giving the client real-time
-  // token-by-token output instead of waiting for the full batch response.
-  // Only applies to the Anthropic passthrough path (format === "anthropic");
-  // translation modes (openai / openai-responses) already default to streaming.
-  if (format === "anthropic" && config.forceStreamAnthropic && transformedObj && typeof transformedObj === "object") {
-    const obj = transformedObj as Record<string, unknown>;
-    if (obj.stream !== true) {
-      console.log(`${reqId} force-stream: overriding stream=${obj.stream ?? "(unset)"} → true (forceStreamAnthropic enabled)`);
-      obj.stream = true;
-      meta.stream = true;
-    }
-  }
+  // v0.2.0.4: `stream: true` is now forced unconditionally inside
+  // alignZCodeRequestFormat (body-transformer.ts) to match the real ZCode
+  // desktop client's wire shape. The separate `forceStreamAnthropic` config
+  // toggle has been removed — there is no longer a "respect client stream
+  // preference" mode. The response path buffers SSE → batch JSON for clients
+  // that originally requested non-streaming, so this is transparent to them.
 
   let transformedBody = transformedObj !== undefined ? JSON.stringify(transformedObj) : undefined;
 
@@ -926,7 +950,51 @@ export async function proxyRequest(
     }
   }
 
-  const isSSE = upstreamResp.headers.get("content-type")?.includes("text/event-stream") ?? false;
+  const isSSEUpstream = upstreamResp.headers.get("content-type")?.includes("text/event-stream") ?? false;
+  // isSSE mutates below: when we buffer SSE → batch JSON for non-stream
+  // clients, isSSE becomes false so the SSE branch is skipped.
+  let isSSE = isSSEUpstream;
+
+  // v0.2.0.4: stream:true is forced upstream (in alignZCodeRequestFormat) to
+  // match the real ZCode desktop client's wire shape. When the original client
+  // requested non-streaming (no `stream: true` in their body), upstream still
+  // returns SSE — we buffer it into batch JSON so the client gets the response
+  // format it expects. This makes the wire-shape alignment transparent to
+  // non-stream clients (Claude Code, SDK calls, integration tests, etc.).
+  //
+  // Both passthrough AND translation paths benefit (translatedBatchResponse /
+  // translatedResponsesBatchResponse both expect a JSON body — the synthetic
+  // JSON response flows through them naturally).
+  //
+  // Runs only on 2xx SSE responses (4xx/5xx are handled by the diagnostic
+  // peek below; the SSE error detector converts errored/empty SSE to non-2xx
+  // JSON before we reach here, so isSSE=false for those).
+  if (isSSE && upstreamResp.ok && !meta.stream && upstreamResp.body) {
+    const result = await anthropicSseToBatchMessage(upstreamResp.body, meta.model);
+    if ("error" in result) {
+      console.log(`${reqId} SSE->batch reassembly error: ${result.error}`);
+      printRow(reqId, format, meta, 502, started, headersAt, 0, 0, 0);
+      return errorResponse(502, "upstream_stream_error", result.error);
+    }
+    const json = JSON.stringify(result.message);
+    // Preserve relevant upstream headers (request-id, ratelimit-*). Drop the
+    // text/event-stream content-type — the synthetic response is JSON.
+    const respHeaders = new Headers();
+    for (const h of ["x-request-id", "anthropic-ratelimit-requests-limit", "anthropic-ratelimit-requests-remaining", "anthropic-ratelimit-requests-reset", "anthropic-ratelimit-tokens-limit", "anthropic-ratelimit-tokens-remaining", "anthropic-ratelimit-tokens-reset"]) {
+      const v = upstreamResp.headers.get(h);
+      if (v) respHeaders.set(h, v);
+    }
+    respHeaders.set("content-type", "application/json");
+    upstreamResp = new Response(json, {
+      status: upstreamResp.status,
+      statusText: upstreamResp.statusText,
+      headers: respHeaders,
+    });
+    isSSE = false; // the synthetic response is JSON, not SSE
+    // The reassembled message carries `usage` (input_tokens / output_tokens),
+    // which the batch path below extracts automatically — no need to plumb
+    // token counts separately.
+  }
 
   // Diagnostic: when the upstream rejects with 4xx (especially 3001 "parameter
   // error" from GLM), record a debug dump in memory so the user can inspect

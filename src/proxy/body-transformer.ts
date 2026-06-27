@@ -434,20 +434,65 @@ function injectZCodeThinkingFormat(body: Record<string, unknown>, level: "high" 
 /**
  * Align request structure to match the real ZCode desktop client's wire format.
  *
- * Triggered only when `ctx.alignZCodeFormat === true`. Performs three transformations:
+ * =====================================================================
+ *  FORMAT CONVERSION BOUNDARY — DO NOT MODIFY WITHOUT REVIEW
+ * =====================================================================
+ *  This function is the FINAL stage of ZCode wire-shape alignment. Both
+ *  Claude Code (Anthropic format) and Codex (Responses API format) requests
+ *  flow through it after their format-specific translation.
+ *
+ *  Pipeline:
+ *    - Claude Code  ─┐
+ *                   ├─→ body-transformer.alignZCodeRequestFormat  ─→ upstream
+ *    - Codex        ─┘   (Responses→Anthropic translation upstream)
+ *
+ *  Status: VERIFIED ALIGNED (2026-06-27)
+ *    - Top-level field order: model → max_tokens → thinking → output_config
+ *                             → system → messages → tools → tool_choice → stream
+ *    - thinking: {type:enabled, budget_tokens:32000}
+ *    - output_config: {effort:max}
+ *    - max_tokens: 64000
+ *    - stream: true (unconditional)
+ *    - tool_choice: {type:auto} (when tools present)
+ *    - system: [ZCode official +cc, ZCode official +cc, user blocks +cc on last]
+ *    - metadata / context_management / billing-header: stripped
+ *    - document / thinking blocks in messages: stripped
+ *    - string content → array form
+ *
+ *  Before modifying ANY step here, run:
+ *    bun run /home/z/my-project/scripts/test_alignment.ts            (Claude Code)
+ *    bun run /home/z/my-project/scripts/test_responses_alignment.ts  (Codex)
+ *  and confirm both still report "[OK]" on max_tokens / thinking /
+ *  output_config / tool_choice / stream / all strip checks.
+ *
+ *  Failure modes if you "simplify" this function:
+ *    - Removing stream:true force → breaks non-stream clients (no SSE buffering)
+ *    - Removing cache_control injection on last system block → WAF fingerprint mismatch
+ *    - Reordering steps → field conflicts / 3001 "parameter error" from gateway
+ *    - Removing metadata drop → "non-ZCode client" fingerprint
+ * =====================================================================
+ *
+ * Triggered only when `ctx.alignZCodeFormat === true`. Performs these transformations:
  *
  * 1. **Inject ZCode system blocks** (both coding-plan AND start-plan):
- *    - Prepend 3 official ZCode identity blocks from zcode_system.json
- *    - Each block carries `cache_control: { type: "ephemeral" }`
+ *    - Prepend 2 official ZCode identity blocks from zcode_system.json
+ *    - Each official block carries `cache_control: { type: "ephemeral" }`
  *    - Client's original system blocks (if any) appended AFTER the ZCode blocks
  *    - Critical for start-plan: gateway does content inspection and rejects
  *      requests missing the ZCode identity blocks
  *
- * 2. **Client identity rewrite**: if the client's system text contains
- *    "You are Claude Code, Anthropic's official CLI for Claude." (Claude Code's
- *    default identity string), rewrite it to "You are ZCode model working in
- *    Claude Code." — preserves Claude Code's harness instructions while adopting
- *    ZCode identity for WAF bypass.
+ * 1b. **Mark last system block with cache_control** (v0.2.0.5):
+ *    - Real ZCode client puts cc on its last (own #3) system block as a
+ *      prompt-cache breakpoint. We mirror this by adding cc to the last
+ *      block of our injected system array (idempotent — won't overwrite
+ *      existing cc).
+ *
+ * 2. **Client identity rewrite** (Claude Code only): if the client's system
+ *    text contains "You are Claude Code, Anthropic's official CLI for Claude."
+ *    (Claude Code's default identity string), rewrite it to "You are ZCode
+ *    model working in Claude Code." — preserves Claude Code's harness
+ *    instructions while adopting ZCode identity for WAF bypass.
+ *    Codex identity is NOT rewritten — by design, only Claude Code gets this.
  *
  * 3. **Top-level field reorder**: rebuild the object with key insertion order
  *    matching the real ZCode client:
@@ -456,6 +501,14 @@ function injectZCodeThinkingFormat(body: Record<string, unknown>, level: "high" 
  *    JSON object key order is preserved by JS engines (ES2015+), so this
  *    actually changes the wire bytes — important because some WAFs inspect
  *    key order as a fingerprint.
+ *
+ * 3b. **Force stream: true** (v0.2.0.4): real ZCode client always streams.
+ *     We unconditionally set `body.stream = true`. The response path in
+ *     handler.ts buffers SSE → batch JSON for non-stream clients transparently.
+ *
+ * 4. **Drop client-only fields**: `metadata` (Claude Code tracking),
+ *    `context_management` (Claude Code-specific) — neither is sent by real
+ *    ZCode client, their presence is a clear "non-ZCode client" fingerprint.
  *
  * Returns the new object with reordered keys, or null if no changes were made
  * (though in practice the system injection always triggers when alignZCodeFormat
@@ -502,6 +555,30 @@ function alignZCodeRequestFormat(body: Record<string, unknown>): Record<string, 
   }
   changed = true;
 
+  // === Step 1b: Mark the last user-provided system block with cache_control ===
+  // Real ZCode desktop client puts `cache_control: { type: "ephemeral" }` on
+  // the LAST system block (its own #3 "Write code..." block) — that's the
+  // prompt-cache breakpoint. Our 2 official ZCode blocks already carry cc
+  // (frozen in zcode_system.json), but when the client (Claude Code, Codex,
+  // etc.) sends its own system text, the resulting last block has no cc.
+  //
+  // Without this fix, the upstream sees [official+cc, official+cc, user_no_cc]
+  // — a clear fingerprint mismatch vs real ZCode's [official+cc, official+cc,
+  // user+cc]. We add cc to the last user-provided block to match.
+  //
+  // Idempotent: if the last block already has cache_control, leave it alone.
+  //
+  // Edge case: if there are no user-provided blocks (rewrittenClientSystem
+  // is empty), the last block IS the last official block (which already has
+  // cc) — also leave it alone.
+  if (Array.isArray(body.system) && body.system.length > 0) {
+    const lastBlock = body.system[body.system.length - 1] as SystemBlock;
+    if (lastBlock && typeof lastBlock === "object" && !lastBlock.cache_control) {
+      lastBlock.cache_control = { type: "ephemeral" };
+      changed = true;
+    }
+  }
+
   // === Step 2: Identity rewrite inside messages too ===
   // Claude Code's "You are Claude Code..." can also appear in messages[].role: "system"
   // (Claude Code puts its identity in messages too). Rewrite those as well.
@@ -543,11 +620,23 @@ function alignZCodeRequestFormat(body: Record<string, unknown>): Record<string, 
     body.tool_choice = { type: "auto" };
     changed = true;
   }
-  // stream: real ZCode always streams, but the proxy serves various clients
-  // (some non-stream). v0.1.9+: we DON'T force stream:true here — that broke
-  // non-stream clients (mock upstream returns SSE, client expects JSON).
-  // Users who want forced streaming should enable `forceStreamAnthropic` config.
-  // We DO include `stream` in the reordered output if client sent it.
+  // === Step 3b: Force stream: true ===
+  // Real ZCode desktop client ALWAYS streams — its body always carries
+  // `stream: true`. Claude Code and some other clients omit the field (or
+  // send `stream: false`), which creates a wire-shape fingerprint mismatch
+  // vs the real ZCode client.
+  //
+  // We now ALWAYS set `stream: true` to match the real client's wire shape.
+  // The proxy's response path already buffers SSE → batch JSON for clients
+  // that originally requested non-streaming, so this is safe.
+  //
+  // History: v0.1.9 made this a configurable `forceStreamAnthropic` toggle
+  // (default off) because of a concern about breaking non-stream clients.
+  // v0.2.0.4: the toggle was removed and stream:true became unconditional —
+  // empirically, the response-path buffering handles non-stream clients
+  // correctly, and the WAF body-fingerprint alignment is more important.
+  body.stream = true;
+  changed = true;
 
   // === Step 4: Drop fields real ZCode client never sends ===
   // Claude Code sends `metadata: { user_id: "..." }` for tracking. Real ZCode

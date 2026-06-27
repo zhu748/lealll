@@ -165,9 +165,12 @@ export function loadConfig(path: string): ProxyConfig {
   // --- CORS allowlist ---
   const corsAllowList = resolveCorsAllowList(process.env.ZCODE_PROXY_CORS_ALLOWLIST);
 
-  // --- Force stream for Anthropic ---
-  const forceStreamAnthropic = process.env.ZCODE_PROXY_FORCE_STREAM_ANTHROPIC === "1"
-    || parsed?.anthropic?.forceStream === true;
+  // v0.2.0.4: `forceStreamAnthropic` config option removed.
+  // `stream: true` is now forced unconditionally inside alignZCodeRequestFormat
+  // (body-transformer.ts) to match the real ZCode desktop client's wire shape.
+  // The env vars `ZCODE_PROXY_FORCE_STREAM_ANTHROPIC` and YAML
+  // `anthropic.forceStream` are no longer read — they're silently ignored
+  // if present in existing configs (no error, just dead config).
 
   // --- ZCode thinking level (controls budget_tokens + effort when thinking enabled) ---
   // Two tiers mirror real ZCode desktop client:
@@ -189,7 +192,6 @@ export function loadConfig(path: string): ProxyConfig {
     providers: { zai, bigmodel },
     defaultModel,
     models,
-    forceStreamAnthropic,
     thinkingLevel,
     corsAllowList,
     identity,

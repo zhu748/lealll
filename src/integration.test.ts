@@ -45,10 +45,16 @@ beforeAll(() => {
 
       if (url.pathname.includes("/v1/messages")) {
         if (parsed.stream) {
+          // v0.2.0.4+: proxy now forces stream:true to upstream regardless of
+          // client's stream preference (wire-shape alignment with real ZCode
+          // client). The mock returns the SAME text in both branches so batch
+          // tests (which receive buffered SSE → JSON) see consistent content.
           const sse = [
-            'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_int","model":"glm-4.6"}}\n\n',
-            'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Integration stream"}}\n\n',
-            'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\n',
+            'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_int","model":"glm-4.6","usage":{"input_tokens":10,"output_tokens":0}}}\n\n',
+            'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+            'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Integration test response"}}\n\n',
+            'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+            'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":8}}\n\n',
             'event: message_stop\ndata: {"type":"message_stop"}\n\n',
           ].join("");
           return new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } });

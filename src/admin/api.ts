@@ -732,7 +732,7 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
       opts.config.routingRules = newConfig.routingRules;
       opts.config.modelMappings = newConfig.modelMappings;
       if (newConfig.responsesThinking) opts.config.responsesThinking = newConfig.responsesThinking;
-      if (newConfig.forceStreamAnthropic !== undefined) opts.config.forceStreamAnthropic = newConfig.forceStreamAnthropic;
+      // v0.2.0.4: forceStreamAnthropic removed — stream:true is now unconditional.
       if (newConfig.thinkingLevel !== undefined) opts.config.thinkingLevel = newConfig.thinkingLevel === "high" ? "high" : "max";
       if (authBody) opts.config.auth = newConfig.auth;
       // providers.*.anthropicBase / openaiBase: also hot-swappable
@@ -746,7 +746,7 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
         requiresRestart: restartFields.length > 0,
         restartFields,
         // hotApplied: fields that were applied to the live config without restart
-        hotApplied: ["provider", "plan", "defaultModel", "models", "identity", "logging", "retry", "routingRules", "modelMappings", "responsesThinking", "forceStreamAnthropic", "thinkingLevel", ...(authBody ? ["auth"] : []), ...(body.providers ? ["providers"] : [])],
+        hotApplied: ["provider", "plan", "defaultModel", "models", "identity", "logging", "retry", "routingRules", "modelMappings", "responsesThinking", "thinkingLevel", ...(authBody ? ["auth"] : []), ...(body.providers ? ["providers"] : [])],
       });
     } catch (err) {
       return errorResponse(500, "save_failed", (err as Error).message);
@@ -2389,7 +2389,7 @@ function sanitizeConfig(config: ProxyConfig): Record<string, unknown> {
     routingRules: config.routingRules ?? [],
     modelMappings: config.modelMappings ?? [],
     responsesThinking: config.responsesThinking ?? { models: [] },
-    forceStreamAnthropic: config.forceStreamAnthropic === true,
+    // v0.2.0.4: forceStreamAnthropic removed — stream:true is now unconditional.
     thinkingLevel: config.thinkingLevel === "high" ? "high" : "max",
   };
 }
@@ -2448,7 +2448,7 @@ function configToYaml(config: ProxyConfig): string {
     // across saves — otherwise turning ON then saving then turning OFF would
     // leave a stale `true` in the YAML forever.
     anthropic: {
-      ...(config.forceStreamAnthropic ? { forceStream: true } : {}),
+      // v0.2.0.4: forceStream removed — stream:true is now unconditional.
       // Always persist thinkingLevel so users can see/change it in YAML.
       // Default "max" mirrors real ZCode desktop client's max tier.
       thinkingLevel: config.thinkingLevel === "high" ? "high" : "max",

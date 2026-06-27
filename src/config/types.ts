@@ -198,20 +198,16 @@ export interface ProxyConfig {
   /** Whitelist of allowed model ids. */
   models: string[];
   /**
-   * Force-enable streaming for Anthropic-format requests.
+   * REMOVED in v0.2.0.4 — `stream: true` is now forced unconditionally inside
+   * alignZCodeRequestFormat (body-transformer.ts) to match the real ZCode
+   * desktop client's wire shape. The response path buffers SSE → batch JSON
+   * for clients that originally requested non-streaming, so this is transparent.
    *
-   * When true, the proxy overrides `stream: false` (or missing stream field)
-   * in Anthropic `/v1/messages` requests to `stream: true` before forwarding
-   * upstream. This lets clients that default to non-streaming (e.g. some
-   * Claude Code configurations) receive SSE responses instead of waiting for
-   * the full batch response — providing real-time token-by-token output.
-   *
-   * OpenAI and Responses API formats are unaffected (they already default to
-   * streaming in most clients). Only applies to the Anthropic passthrough path.
-   *
-   * Default: false (preserve original client's stream preference).
+   * Kept here as a comment for git-history reference; do NOT re-add this as a
+   * real field. If you need per-request control over streaming, do it at the
+   * client→proxy layer (the proxy→upstream layer must always stream to match
+   * the real ZCode client).
    */
-  forceStreamAnthropic?: boolean;
   /**
    * CORS origin allowlist. When set, only origins in this list receive
    * `Access-Control-Allow-Origin` headers. When empty/unset, any origin

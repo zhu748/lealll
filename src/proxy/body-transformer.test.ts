@@ -1073,7 +1073,7 @@ describe("transformRequestBody — alignZCodeFormat (field fill + drop, v0.2.0+)
     expect(parsed.tool_choice).toEqual({ type: "any" }); // preserved, not overwritten
   });
 
-  it("does NOT force stream when client didn't send it (v0.1.9+: respects client preference)", () => {
+  it("forces stream: true when client didn't send it (v0.2.0.4+: align ZCode wire shape)", () => {
     const body = JSON.stringify({
       model: "glm-5.2",
       max_tokens: 1000,
@@ -1082,11 +1082,11 @@ describe("transformRequestBody — alignZCodeFormat (field fill + drop, v0.2.0+)
     });
     const out = transformRequestBody(body, { format: "anthropic" });
     const parsed = JSON.parse(out as string);
-    // v0.1.9+: stream is NOT forced. Use forceStreamAnthropic config for that.
-    expect(parsed.stream).toBeUndefined();
+    // v0.2.0.4+: stream is ALWAYS forced to true (matches real ZCode client).
+    expect(parsed.stream).toBe(true);
   });
 
-  it("preserves client's stream: false (v0.1.9+: respects client preference)", () => {
+  it("overrides client's stream: false to true (v0.2.0.4+: align ZCode wire shape)", () => {
     const body = JSON.stringify({
       model: "glm-5.2",
       max_tokens: 1000,
@@ -1096,7 +1096,8 @@ describe("transformRequestBody — alignZCodeFormat (field fill + drop, v0.2.0+)
     });
     const out = transformRequestBody(body, { format: "anthropic" });
     const parsed = JSON.parse(out as string);
-    expect(parsed.stream).toBe(false); // preserved as-is
+    // v0.2.0.4+: stream:false is overridden to true (matches real ZCode client).
+    expect(parsed.stream).toBe(true);
   });
 
   it("drops metadata field (Claude Code's user_id tracking — real ZCode never sends it)", () => {
@@ -1114,8 +1115,9 @@ describe("transformRequestBody — alignZCodeFormat (field fill + drop, v0.2.0+)
 
   it("complete alignment: Claude Code request → real ZCode wire format", () => {
     // Mimics Claude Code's actual request shape (model→messages→system→tools→metadata→max_tokens→thinking)
-    // v0.1.9+: stream is NOT forced by alignZCodeFormat (use forceStreamAnthropic config
-    // for that). Test sends stream:true explicitly to verify wire format alignment.
+    // v0.2.0.4+: stream:true is forced unconditionally inside alignZCodeRequestFormat
+    // to match the real ZCode desktop client's wire shape. The test no longer needs
+    // to send stream:true explicitly.
     const body = JSON.stringify({
       model: "glm5.1",
       messages: [{ role: "user", content: "hi" }],
@@ -1149,7 +1151,7 @@ describe("transformRequestBody — alignZCodeFormat (field fill + drop, v0.2.0+)
     // 3. tool_choice filled
     expect(parsed.tool_choice).toEqual({ type: "auto" });
 
-    // 4. stream preserved (v0.1.9+: NOT forced — respects client preference)
+    // 4. stream forced to true (v0.2.0.4+: aligns with real ZCode client)
     expect(parsed.stream).toBe(true);
 
     // 5. max_tokens forced to 64000 (thinking enabled)
@@ -1166,6 +1168,71 @@ describe("transformRequestBody — alignZCodeFormat (field fill + drop, v0.2.0+)
     expect(parsed.system[0].text).toBe("You are ZCode, an interactive coding agent");
     expect(parsed.system[2].text).toContain("You are ZCode model working in Claude Code");
     expect(parsed.system[2].text).not.toContain("You are Claude Code, Anthropic's official CLI for Claude.");
+
+    // 9. v0.2.0.5: last system block carries cache_control (mirrors real ZCode
+    // client's prompt-cache breakpoint — without this, the wire shape is
+    // [cc, cc, no-cc] vs real ZCode's [cc, cc, cc]).
+    expect(parsed.system[0].cache_control).toEqual({ type: "ephemeral" });
+    expect(parsed.system[1].cache_control).toEqual({ type: "ephemeral" });
+    expect(parsed.system[2].cache_control).toEqual({ type: "ephemeral" });
+  });
+
+  it("v0.2.0.5: injects cache_control on last user-provided system block (Codex instructions case)", () => {
+    // Mimics Codex CLI's instructions field (a long string with no cache_control)
+    // being translated to Anthropic system. The proxy should inject cache_control
+    // on the resulting last block to match real ZCode client's wire shape.
+    const body = JSON.stringify({
+      model: "glm-5.2",
+      messages: [{ role: "user", content: "hi" }],
+      system: "You are Codex, an elite System Architect...",
+      max_tokens: 4096,
+      thinking: { type: "enabled" },
+      stream: true,
+    });
+    const out = transformRequestBody(body, { format: "anthropic" });
+    const parsed = JSON.parse(out as string);
+
+    // 3 blocks: 2 official ZCode + 1 user-provided (the Codex instructions)
+    expect(parsed.system.length).toBe(3);
+    expect(parsed.system[0].cache_control).toEqual({ type: "ephemeral" }); // official
+    expect(parsed.system[1].cache_control).toEqual({ type: "ephemeral" }); // official
+    // v0.2.0.5: last block now carries cache_control (was missing before)
+    expect(parsed.system[2].cache_control).toEqual({ type: "ephemeral" });
+    expect(parsed.system[2].text).toBe("You are Codex, an elite System Architect...");
+  });
+
+  it("v0.2.0.5: does NOT overwrite existing cache_control on last system block", () => {
+    // If the client already set cache_control on their last system block, we
+    // preserve it (idempotent injection).
+    const existingCc = { type: "ephemeral" };
+    const body = JSON.stringify({
+      model: "glm-5.2",
+      messages: [{ role: "user", content: "hi" }],
+      system: [{ type: "text", text: "client system", cache_control: existingCc }],
+      max_tokens: 1000,
+      thinking: { type: "enabled" },
+    });
+    const out = transformRequestBody(body, { format: "anthropic" });
+    const parsed = JSON.parse(out as string);
+    // Last block (user-provided) should still have its cache_control unchanged
+    expect(parsed.system[2].cache_control).toEqual(existingCc);
+  });
+
+  it("v0.2.0.5: when no user-provided system blocks, last official block keeps its cc", () => {
+    // Edge case: client didn't send any system text. The result is just the 2
+    // official ZCode blocks. The last one already has cc (from zcode_system.json),
+    // and Step 1b should be a no-op (idempotent check finds cc already present).
+    const body = JSON.stringify({
+      model: "glm-5.2",
+      messages: [{ role: "user", content: "hi" }],
+      max_tokens: 1000,
+      thinking: { type: "enabled" },
+    });
+    const out = transformRequestBody(body, { format: "anthropic" });
+    const parsed = JSON.parse(out as string);
+    expect(parsed.system.length).toBe(2); // 2 official only
+    expect(parsed.system[0].cache_control).toEqual({ type: "ephemeral" });
+    expect(parsed.system[1].cache_control).toEqual({ type: "ephemeral" });
   });
 });
 

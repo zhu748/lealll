@@ -1,6 +1,47 @@
 /**
  * Responses API → Anthropic Messages request translator.
  *
+ * =====================================================================
+ *  FORMAT CONVERSION BOUNDARY — DO NOT MODIFY WITHOUT REVIEW
+ * =====================================================================
+ *  This is the Codex (Responses API) → Anthropic format translator. It runs
+ *  BEFORE body-transformer.alignZCodeRequestFormat, which does the final
+ *  ZCode wire-shape alignment.
+ *
+ *  Pipeline (Codex path):
+ *    Codex request
+ *      ↓
+ *    translateRequestResponsesToAnthropic  ← THIS FILE
+ *      ↓
+ *    body-transformer.alignZCodeRequestFormat  ← ZCode wire-shape alignment
+ *      ↓
+ *    upstream (z.ai)
+ *
+ *  Status: VERIFIED ALIGNED (2026-06-27)
+ *    - All Codex-specific fields (instructions / input / parallel_tool_calls /
+ *      reasoning / store / include / prompt_cache_key / text / client_metadata
+ *      / max_output_tokens) are correctly dropped during translation.
+ *    - reasoning.effort → thinking.type:"enabled" (later normalized to
+ *      {type:enabled, budget_tokens:32000} by body-transformer)
+ *    - instructions → system string (later split into blocks + cc by align)
+ *    - input items → Anthropic messages with proper role merging
+ *    - tools: function pass through, custom→function conversion,
+ *      tool_search→function conversion, web_search/file_search/etc dropped
+ *    - tool_choice: "auto" / "required" / "none" / {function,name} → Anthropic form
+ *
+ *  Before modifying ANY step here, run:
+ *    bun run /home/z/my-project/scripts/test_responses_alignment.ts
+ *  and confirm Codex path still reports "[OK]" on max_tokens / thinking /
+ *  output_config / tool_choice / stream / all strip checks AND "dropped" on
+ *  all 10 Codex-only fields.
+ *
+ *  Failure modes if you "simplify" this translator:
+ *    - Forgetting to drop client_metadata → wire-shape mismatch with ZCode
+ *    - Merging consecutive same-role messages → 3001 from GLM gateway
+ *    - Mishandling custom_tool_call → apply_patch tool calls lost
+ *    - Not translating tool_choice: "auto" string → Anthropic expects object
+ * =====================================================================
+ *
  * Translates `POST /v1/responses` request bodies into Anthropic Messages
  * request bodies so they can be forwarded to GLM's anthropic-compatible
  * upstream. Handles:
