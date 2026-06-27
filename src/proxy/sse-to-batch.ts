@@ -229,11 +229,19 @@ function handleEvent(
           const prev = partialJsonByIndex.get(idx) ?? "";
           partialJsonByIndex.set(idx, prev + delta.partial_json);
         }
+      } else if (delta.type === "thinking_delta") {
+        // v0.2.0.7: reassemble thinking content. When thinking is enabled,
+        // GLM streams thinking_delta events with partial thinking text in
+        // `delta.thinking`. We concatenate into block.thinking so the
+        // reassembled message preserves the full reasoning trace.
+        // (Non-stream clients — those going through SSE→batch buffering —
+        // should see the same thinking content as stream clients.)
+        if (typeof delta.thinking === "string") {
+          block.thinking = (block.thinking ?? "") + delta.thinking;
+        }
       }
-      // Other delta types (e.g. thinking_delta, citations_delta) are not
-      // currently reassembled — they would only appear in thinking-enabled
-      // responses, and the proxy strips thinking blocks from message history
-      // before sending back to upstream anyway.
+      // Other delta types (e.g. citations_delta, signature_delta) are not
+      // reassembled — they're rare and not critical for non-stream clients.
       return {};
     }
 

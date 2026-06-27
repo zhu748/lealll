@@ -161,7 +161,11 @@ export type AnthropicContentBlock =
   | { type: "text"; text: string }
   | { type: "image"; source: { type: "base64"; media_type: string; data: string } }
   | { type: "tool_use"; id: string; name: string; input: Record<string, unknown> }
-  | { type: "tool_result"; tool_use_id: string; content: string | AnthropicContentBlock[] };
+  | { type: "tool_result"; tool_use_id: string; content: string | AnthropicContentBlock[] }
+  // v0.2.0.7: thinking block — returned by GLM when thinking is enabled.
+  // `thinking` holds the reasoning text, `signature` is an opaque upstream
+  // token (not a real Anthropic cryptographic signature).
+  | { type: "thinking"; thinking: string; signature?: string };
 
 /** Anthropic message in a request. */
 export interface AnthropicMessage {
@@ -232,6 +236,7 @@ export type AnthropicStreamEvent =
       delta:
         | { type: "text_delta"; text: string }
         | { type: "input_json_delta"; partial_json: string }
+        | { type: "thinking_delta"; thinking: string }
         | { type: "stop_reason"; stop_reason: string };
     }
   | { type: "content_block_stop"; index: number }

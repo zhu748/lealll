@@ -1,8 +1,8 @@
 # zcode-proxy 使用说明
 
-> **v0.2.0.6 — Token 计数修复：cache token 读取 + Anthropic SSE 协议合规**
+> **v0.2.0.6 — Token 计数修复：cache token 读取 + Anthropic SSE 协议合规 + thinking 计数显示**
 >
-> 本次发版聚焦于"日志里 token 计数显示偏小"的诊断与修复。v0.2.0.4 给 system 块和最后一块用户消息加了 `cache_control: ephemeral`（对齐 ZCode 客户端 wire shape）后，prompt cache 开始命中——但日志的 token 计数没跟上这个变化，导致用户看到 `in: 1152 out: 4413` 这种"看起来丢了几万 token"的怪现象。
+> 本次发版聚焦于"日志里 token 计数显示偏小"的诊断与修复。v0.2.0.4 给 system 块和最后一块用户消息加了 `cache_control: ephemeral`（对齐 ZCode 客户端 wire shape）后，prompt cache 开始命中——但日志的 token 计数没跟上这个变化，导致用户看到 `in: 1152 out: 4413` 这种"看起来丢了几万 token"的怪现象。同时 thinking 开启后日志缺少思考 token 显示，TTFB 90 秒但 out 只有 529 让人困惑。
 >
 > **本次改动**
 >
@@ -63,12 +63,33 @@
 > - `translatedResponsesBatchResponse`（Responses 翻译）：同上
 > - batch passthrough path（Anthropic 直通）：从 `usage.cache_read_input_tokens` 提取
 >
-> **测试**：573/573 pass，TypeScript 零错误。新增 4 个测试用例：
-> - cache token 保留 / 无 cache 字段不回归 / message_start 与 message_delta 冲突时 message_delta 获胜 / spec-compliant 流验证
+> **7. 新增 thinking token 计数显示（解释"TTFB 90 秒但 out 只有 529"）**
+>
+> v0.2.0.4 把 thinking 格式对齐 ZCode 客户端后，思考真正生效——GLM 在 SSE 流里返回 thinking 块（`content_block_start` type=thinking + 一串 `thinking_delta` 事件），模型在"自言自语"推理，最后才输出正式回答。之前日志只显示 `out: 529`，让人困惑"TTFB 90 秒怎么才输出 529 token"。
+>
+> 本次修复：`observeStream` 单独追踪 `thinking_delta` 事件计数（`thinkingTokens`），日志新格式：
+> ```
+> | in: 31529 (c:19584) out: 529 (th:1234) |  4.8 | 109382ms |  TTFB=92103ms
+> ```
+> - `out: 529` = 正式输出 529 token
+> - `(th:1234)` = 思考了 1234 个 chunk（近似计数）
+>
+> 这样你能直观看到"为什么 TTFB 90s 但 out 只有 529"——**因为 thinking 占了大量时间，模型在思考**，不是 bug。
+>
+> **8. SSE→batch 重组器支持 thinking_delta**
+>
+> 之前重组器注释说"thinking_delta 不重组"——但非流式客户端（走 SSE→batch 缓冲）应该也能看到完整 thinking 内容。本次修复：重组器把 `thinking_delta` 拼接成完整的 `block.thinking` 字段，非流式客户端拿到的 message 与流式客户端一致。
+>
+> **9. debug 日志 SSE timeout：3s → 10s**
+>
+> 之前 debug 日志的 SSE 预览只有 3 秒 timeout，长 thinking 流（thinking 阶段可能持续 30s+）永远读不到末尾的 `message_delta` usage，显示 `(read timeout after 3s)`。本次修复：SSE 预览 timeout 提升到 10 秒，JSON 错误响应保持 3 秒（小 body 不需要长 timeout）。
+>
+> **测试**：574/574 pass，TypeScript 零错误。新增 5 个测试用例：
+> - cache token 保留 / 无 cache 字段不回归 / message_start 与 message_delta 冲突时 message_delta 获胜 / spec-compliant 流验证 / thinking_delta 不污染 output_tokens 计数
 >
 > **本质说明**
 >
-> "日志显示 token 少"不是对齐丢提示词——所有 Claude Code / Codex 原始内容完整透传。原因是 v0.2.0.4 给 system 块加 `cache_control: ephemeral` 后 prompt cache 大幅命中，cache 命中部分在 `cache_read_input_tokens` 字段里没被读到。这次修复让日志显示真实总数 + 缓存命中量，让你直观看到 cache 在工作。
+> "日志显示 token 少"不是对齐丢提示词——所有 Claude Code / Codex 原始内容完整透传。原因是 v0.2.0.4 给 system 块加 `cache_control: ephemeral` 后 prompt cache 大幅命中，cache 命中部分在 `cache_read_input_tokens` 字段里没被读到。这次修复让日志显示真实总数 + 缓存命中量 + 思考量，让你直观看到 cache 在工作、thinking 在思考。
 >
 > 关于 quota 额度消耗比预期少：这是**正常的**——start-plan 的 billing/balance API 返回的是 zcode 自己的"折算单位"，不是 raw token。prompt cache 命中部分在计费时大幅折扣（通常 10% 或 0%），所以 40000 cache token 实际可能只算 4000 个单位。这是 cache 在帮你省钱，不是 bug。
 >

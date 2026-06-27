@@ -280,4 +280,39 @@ describe("anthropicSseToBatchMessage", () => {
     expect(result.inputTokens).toBe(84213);
     expect(result.outputTokens).toBe(4413);
   });
+
+  it("v0.2.0.7: thinking_delta events do NOT pollute output_tokens count", async () => {
+    // When thinking is enabled, GLM streams content_block_start type=thinking
+    // + a series of thinking_delta events BEFORE the final text output.
+    // The reassembler MUST preserve thinking content in the message (so
+    // clients see the full reasoning trace), but the `outputTokens` count
+    // returned to the caller should reflect ONLY the final text output,
+    // NOT the thinking tokens. This matches how handler.ts observeStream
+    // counts thinking chunks separately from text chunks.
+    const sse = [
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_th","model":"glm-5.2","usage":{"input_tokens":100,"output_tokens":0}}}\n\n',
+      'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":"abc123"}}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"let me think"}}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":" about this"}}\n\n',
+      'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+      'event: content_block_start\ndata: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"final answer"}}\n\n',
+      'event: content_block_stop\ndata: {"type":"content_block_stop","index":1}\n\n',
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":50}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ].join("");
+    const result = await anthropicSseToBatchMessage(makeStream([sse]), "fallback");
+    if ("error" in result) throw new Error("unexpected error");
+    // Message content has BOTH thinking block and text block
+    expect(result.message.content.length).toBe(2);
+    const block0 = result.message.content[0] as any;
+    const block1 = result.message.content[1] as any;
+    expect(block0.type).toBe("thinking");
+    expect(block0.thinking).toBe("let me think about this");
+    expect(block1.type).toBe("text");
+    expect(block1.text).toBe("final answer");
+    // outputTokens comes from message_delta.usage.output_tokens (50) —
+    // NOT inflated by the 2 thinking_delta chunks
+    expect(result.outputTokens).toBe(50);
+  });
 });

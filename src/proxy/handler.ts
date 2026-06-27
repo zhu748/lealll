@@ -1675,6 +1675,7 @@ function printRow(
   credKey?: string,
   captchaMs: number = 0,
   cacheReadTokens: number = 0,
+  thinkingTokens: number = 0,
 ): void {
   printHeader();
   const ts = new Date(started).toISOString().slice(11, 19);
@@ -1693,16 +1694,22 @@ function printRow(
   const inTok = totalInput > 0 ? String(totalInput) : "-";
   const cacheMarker = cacheReadTokens > 0 ? `(c:${cacheReadTokens})` : "";
   const inField = `${inTok.padStart(5)}${cacheMarker}`.trim();
+  // v0.2.0.7: when thinking is enabled, GLM streams thinking_delta events
+  // before the final text output. Show thinking token count inline so users
+  // can distinguish "model is thinking" from "model produced final answer".
+  // Format: "out: 529 (th:1234)" means 529 output tokens + 1234 thinking tokens.
+  const thinkMarker = thinkingTokens > 0 ? `(th:${thinkingTokens})` : "";
+  const outField = `${tok.padStart(5)}${thinkMarker}`.trim();
   const tps = avgTps > 0 ? avgTps.toFixed(1) : "-";
   // When captcha took a significant portion of TTFB, show the breakdown
   if (captchaMs > 0 && ttfbMs > 0) {
     const netTtfb = ttfbMs - captchaMs;
     console.log(
-      `| ${reqId.padEnd(4)} | ${ts.padEnd(10)} | ${tag} | ${meta.model.padEnd(11)} | ${mode.padEnd(6)} | ${String(status).padStart(4)} | ${ttfb.padStart(7)} | ${captcha.padStart(7)} | in:${inField} out:${tok.padStart(5)} | ${tps.padStart(6)} | ${total.padStart(7)} |  TTFB=${ttfbMs}ms (net ${netTtfb}ms + captcha ${captchaMs}ms)`,
+      `| ${reqId.padEnd(4)} | ${ts.padEnd(10)} | ${tag} | ${meta.model.padEnd(11)} | ${mode.padEnd(6)} | ${String(status).padStart(4)} | ${ttfb.padStart(7)} | ${captcha.padStart(7)} | in:${inField} out:${outField} | ${tps.padStart(6)} | ${total.padStart(7)} |  TTFB=${ttfbMs}ms (net ${netTtfb}ms + captcha ${captchaMs}ms)`,
     );
   } else {
     console.log(
-      `| ${reqId.padEnd(4)} | ${ts.padEnd(10)} | ${tag} | ${meta.model.padEnd(11)} | ${mode.padEnd(6)} | ${String(status).padStart(4)} | ${ttfb.padStart(7)} | ${captcha.padStart(7)} | in:${inField} out:${tok.padStart(5)} | ${tps.padStart(6)} | ${total.padStart(7)} |`,
+      `| ${reqId.padEnd(4)} | ${ts.padEnd(10)} | ${tag} | ${meta.model.padEnd(11)} | ${mode.padEnd(6)} | ${String(status).padStart(4)} | ${ttfb.padStart(7)} | ${captcha.padStart(7)} | in:${inField} out:${outField} | ${tps.padStart(6)} | ${total.padStart(7)} |`,
     );
   }
   // Record stats for the admin dashboard
@@ -1735,6 +1742,14 @@ function observeStream(
   const compressed = contentEncoding !== null;
   let tokens = 0;
   let inputTokens = 0;
+  // v0.2.0.7: thinking token count — when thinking is enabled, GLM streams
+  // content_block_start type=thinking + a series of thinking_delta events
+  // BEFORE the final text output. We count thinking_delta chunks separately
+  // so the log can show "out: 529 (th:1234)" — distinguishing "model's
+  // final answer was 529 tokens" from "model also thought 1234 tokens
+  // before answering". This explains why TTFB can be 90+ seconds with
+  // seemingly small output — most of the time was spent thinking.
+  let thinkingTokens = 0;
   // v0.2.0.6: cache-read / cache-creation tokens — GLM returns these as
   // separate fields in message_delta.usage when prompt caching is in play.
   // Without tracking them, the log shows the small `input_tokens` value
@@ -1801,6 +1816,16 @@ function observeStream(
         // OpenAI Chat Completions content delta: choices[0].delta.content
         const oai = j.choices?.[0]?.delta?.content;
         if (typeof oai === "string" && oai.length > 0) { tokens++; continue; }
+        // v0.2.0.7: Anthropic thinking_delta — count separately so we can show
+        // "out: N (th:M)" in the log. Thinking tokens are NOT added to `tokens`
+        // (which represents final output for tok/s calc). This is just chunk
+        // counting (approximate) — the authoritative count comes from
+        // message_delta.usage if present, but GLM doesn't always include it.
+        if (j.type === "content_block_delta" && j.delta?.type === "thinking_delta") {
+          const t = j.delta?.thinking;
+          if (typeof t === "string" && t.length > 0) thinkingTokens++;
+          continue;
+        }
         // Anthropic content delta: type=content_block_delta, delta.type=text_delta
         if (j.type === "content_block_delta" && j.delta?.type === "text_delta") {
           const t = j.delta?.text;
@@ -1854,7 +1879,7 @@ function observeStream(
     const ttfbMs = (firstChunkAt > 0 ? firstChunkAt : endAt) - requestSentAt;
     const totalMs = endAt - requestSentAt;
     const avgTps = tokens > 0 && totalMs > 0 ? tokens / (totalMs / 1000) : 0;
-    printRow(reqId, format, meta, status, requestSentAt, requestSentAt + ttfbMs, tokens, avgTps, endAt, false, inputTokens, credKey, captchaMs, cacheReadTokens);
+    printRow(reqId, format, meta, status, requestSentAt, requestSentAt + ttfbMs, tokens, avgTps, endAt, false, inputTokens, credKey, captchaMs, cacheReadTokens, thinkingTokens);
   })().catch(() => {});
 }
 
@@ -1910,30 +1935,40 @@ async function logUpstreamResponseDebug(reqId: string, resp: Response, _isStream
     }
 
     // Read the clone's body with a timeout so a hung stream doesn't block
-    // the request forever. 3s is enough to get the first SSE event or the
-    // full JSON body of an error response.
+    // the request forever.
     //
     // v0.2.0.6: For SSE streams, the AUTHORITATIVE usage (including cache
     // token counts) is in the `message_delta` event near the END of the
     // stream — the previous 2KB cap + "stop at first \n\n" logic always
     // captured only message_start (with 0/0 placeholder usage). We now
     // keep reading until we see `message_delta` (which carries the real
-    // usage) or hit the 8KB / 3s limit. This lets users see real token
+    // usage) or hit the 8KB / timeout limit. This lets users see real token
     // counts in the debug log without enabling full request logging.
+    //
+    // v0.2.0.7: timeout raised from 3s to 10s for SSE streams. When thinking
+    // is enabled, GLM streams a long series of thinking_delta events BEFORE
+    // producing any text output — the message_delta (carrying usage) only
+    // arrives at the very end. A 3s timeout always cut off mid-thinking,
+    // showing "(read timeout after 3s)" instead of the real usage. 10s is
+    // enough for most thinking-enabled responses; very long thinking traces
+    // (30s+) will still time out, but at least we capture the thinking_delta
+    // prefix for diagnosis. JSON error responses stay at 3s (small bodies).
+    const isSSE = ct.includes("text/event-stream");
+    const PREVIEW_TIMEOUT_MS = isSSE ? 10_000 : 3_000;
     const previewPromise = (async () => {
       if (!clone.body) return "(no body)";
       const reader = clone.body.getReader();
       const decoder = new TextDecoder();
       let preview = "";
-      const deadline = Date.now() + 3000;
-      const PREVIEW_CAP = ct.includes("text/event-stream") ? 8192 : 2048;
+      const deadline = Date.now() + PREVIEW_TIMEOUT_MS;
+      const PREVIEW_CAP = isSSE ? 8192 : 2048;
       while (preview.length < PREVIEW_CAP && Date.now() < deadline) {
         const { done, value } = await reader.read();
         if (done) break;
         preview += decoder.decode(value, { stream: true });
         // For SSE: stop after we see message_delta (carries real usage)
         // — this is the event we care about for token diagnostics.
-        if (ct.includes("text/event-stream") && preview.includes('"type":"message_delta"')) break;
+        if (isSSE && preview.includes('"type":"message_delta"')) break;
         // For JSON: stop when we likely have the full body (small error responses)
         if (ct.includes("application/json") && preview.length > 0 && preview.trim().endsWith("}")) break;
       }
@@ -1945,7 +1980,7 @@ async function logUpstreamResponseDebug(reqId: string, resp: Response, _isStream
     try {
       preview = await Promise.race([
         previewPromise,
-        new Promise<string>(r => setTimeout(() => r("(read timeout after 3s)"), 3000)),
+        new Promise<string>(r => setTimeout(() => r(`(read timeout after ${PREVIEW_TIMEOUT_MS / 1000}s)`), PREVIEW_TIMEOUT_MS)),
       ]);
     } catch {
       preview = "(body read failed)";
