@@ -120,10 +120,38 @@ export function translateRequestResponsesToAnthropic(
     result.thinking = { type: "enabled" };
   }
 
-  // Filter to only function-type tools (local_shell, web_search etc. are built-in client-side)
-  const functionTools = (req.tools ?? []).filter((t) => t && t.type === "function" && t.name);
-  if (functionTools.length > 0) {
-    result.tools = functionTools.map(translateToolResponsesToAnthropic);
+  // Translate tools: function-type pass through directly; custom-type tools
+  // (e.g. Codex's apply_patch) are converted to function-type so the upstream
+  // GLM endpoint accepts them. Built-in client-side tools (tool_search,
+  // web_search, etc.) are dropped — they only exist on the client side.
+  const translatedTools: AnthropicToolDefinition[] = [];
+  for (const tool of (req.tools ?? [])) {
+    if (!tool) continue;
+    if (tool.type === "function" && tool.name) {
+      translatedTools.push(translateToolResponsesToAnthropic(tool));
+    } else if (tool.type === "custom" && tool.name) {
+      // Convert custom tools to function-type. The "format" field (e.g. grammar
+      // definition) is not representable in Anthropic's input_schema, so we
+      // embed a description of the format in the tool description instead.
+      // The patch content itself arrives as plain text in function_call arguments,
+      // which the upstream model processes as a string parameter.
+      translatedTools.push(translateCustomToolToAnthropic(tool));
+    } else if (tool.type === "tool_search" && tool.parameters) {
+      // Codex uses tool_search for deferred tool discovery. Convert to a
+      // function tool so the model knows it can search for tools. The
+      // execution is client-side, but the model needs the schema to decide
+      // when to call it.
+      translatedTools.push({
+        name: "tool_search",
+        description: tool.description || "Search for available tools by query.",
+        input_schema: tool.parameters as Record<string, unknown>,
+      });
+    }
+    // tool_search, web_search, file_search, computer_use, code_interpreter,
+    // local_shell — all client-side built-ins, no upstream equivalent. Skip.
+  }
+  if (translatedTools.length > 0) {
+    result.tools = translatedTools;
   }
 
   if (req.tool_choice) {
@@ -224,9 +252,15 @@ function translateInputItem(item: ResponsesInputItem): TranslatedItem | null {
       // Prior assistant tool call → Anthropic assistant message with tool_use block.
       // Use call_id as the tool_use id so the matching function_call_output can reference it.
       let inputObj: Record<string, unknown> = {};
+      const args = item.arguments || "{}";
       try {
-        inputObj = JSON.parse(item.arguments || "{}");
-      } catch { inputObj = {}; }
+        inputObj = JSON.parse(args);
+      } catch {
+        // Custom tools (e.g. Codex's apply_patch) send freeform text as arguments,
+        // not JSON. Wrap it in a `{ patch: "..." }` object so it matches the
+        // input_schema we generated for custom tools.
+        inputObj = { patch: args };
+      }
       const block: AnthropicContentBlock = {
         type: "tool_use",
         id: item.call_id,
@@ -302,6 +336,48 @@ function translateToolResponsesToAnthropic(tool: ResponsesToolDefinition): Anthr
   const out: AnthropicToolDefinition = { name: tool.name! };
   if (tool.description) out.description = tool.description;
   if (tool.parameters) out.input_schema = tool.parameters;
+  return out;
+}
+
+/**
+ * Convert a Responses API `type: "custom"` tool into an Anthropic function tool.
+ *
+ * Codex CLI uses custom tools like `apply_patch` which have a `format` field
+ * (containing a grammar definition) instead of `parameters`/`input_schema`.
+ * The grammar syntax is not representable in JSON Schema, so we:
+ *   1. Create a single `patch` string parameter to hold the tool input
+ *   2. Append the grammar/format info to the tool description so the model
+ *      knows the expected syntax
+ *
+ * When Codex calls this tool, it sends the patch text as a plain string in
+ * `function_call.arguments`, which we translate to a `tool_use` block with
+ * `{ patch: "<the patch text>" }` as input.
+ */
+function translateCustomToolToAnthropic(tool: ResponsesToolDefinition): AnthropicToolDefinition {
+  const out: AnthropicToolDefinition = { name: tool.name! };
+
+  // Build description — append format info if available
+  let desc = tool.description || "";
+  const format = tool.format as Record<string, unknown> | undefined;
+  if (format && typeof format.definition === "string") {
+    desc += `\n\nFormat: ${format.type || "grammar"}\n${format.definition}`;
+  } else if (format) {
+    desc += `\n\nFormat: ${JSON.stringify(format)}`;
+  }
+  out.description = desc || undefined;
+
+  // Create a simple schema with a single string parameter
+  out.input_schema = {
+    type: "object",
+    properties: {
+      patch: {
+        type: "string",
+        description: `The ${tool.name} content to apply`,
+      },
+    },
+    required: ["patch"],
+  };
+
   return out;
 }
 

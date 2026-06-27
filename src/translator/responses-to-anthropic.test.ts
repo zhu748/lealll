@@ -301,4 +301,76 @@ describe("translateRequestResponsesToAnthropic", () => {
     expect(result.top_p).toBe(0.9);
     expect(result.stop_sequences).toEqual(["END"]);
   });
+
+  it("converts type:custom tools (e.g. apply_patch) to function tools", () => {
+    const req: OpenAIResponseRequest = {
+      model: "glm-4.6",
+      input: "Hi",
+      tools: [
+        {
+          type: "custom",
+          name: "apply_patch",
+          description: "Use the apply_patch tool to edit files.",
+          format: {
+            type: "grammar",
+            syntax: "lark",
+            definition: "start: begin_patch hunk+ end_patch",
+          },
+        } as any,
+      ],
+    };
+    const result = translateRequestResponsesToAnthropic(req);
+    expect(result.tools).toBeDefined();
+    expect(result.tools!.length).toBe(1);
+    const tool = result.tools![0];
+    expect(tool.name).toBe("apply_patch");
+    // Should have input_schema with a patch parameter
+    expect(tool.input_schema).toBeDefined();
+    expect((tool.input_schema as any).properties.patch).toBeDefined();
+    // Description should include format info
+    expect(tool.description).toContain("apply_patch");
+    expect(tool.description).toContain("grammar");
+  });
+
+  it("converts type:tool_search tools to function tools", () => {
+    const req: OpenAIResponseRequest = {
+      model: "glm-4.6",
+      input: "Hi",
+      tools: [
+        {
+          type: "tool_search",
+          description: "Search for available tools.",
+          parameters: {
+            type: "object",
+            properties: {
+              query: { type: "string", description: "Search query" },
+            },
+            required: ["query"],
+          },
+        } as any,
+      ],
+    };
+    const result = translateRequestResponsesToAnthropic(req);
+    expect(result.tools).toBeDefined();
+    expect(result.tools!.length).toBe(1);
+    const tool = result.tools![0];
+    expect(tool.name).toBe("tool_search");
+    expect(tool.input_schema).toBeDefined();
+    expect((tool.input_schema as any).properties.query).toBeDefined();
+  });
+
+  it("drops type:web_search and other built-in tools", () => {
+    const req: OpenAIResponseRequest = {
+      model: "glm-4.6",
+      input: "Hi",
+      tools: [
+        { type: "function", name: "shell_command", parameters: { type: "object", properties: {} } },
+        { type: "web_search", external_web_access: false } as any,
+      ],
+    };
+    const result = translateRequestResponsesToAnthropic(req);
+    expect(result.tools).toBeDefined();
+    expect(result.tools!.length).toBe(1);
+    expect(result.tools![0].name).toBe("shell_command");
+  });
 });
