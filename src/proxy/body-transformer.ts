@@ -248,21 +248,36 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
 function applyAnthropicCacheControl(
   body: Record<string, unknown>,
 ): boolean {
-  // v0.1.9+: alignZCodeFormat is always-on. Real ZCode client sends
-  // cache_control on the last user message's text block even in start-plan
-  // mode. We always inject cc to mirror that (and sanitizeContentBlocks
-  // no longer strips it).
+  // Real ZCode desktop client (verified against captured zcode traffic,
+  // 2026-06-28): cache_control is attached to a `text` block at the tail of
+  // the LAST **user** message. The client NEVER attaches cc to:
+  //   - assistant messages (no matter what blocks they hold)
+  //   - tool_result blocks (cc on tool_result is a Claude-Code-only
+  //     fingerprint — sanitizeContentBlocks() strips it; see below)
   //
-  // (Pre-v0.1.9 behavior: start-plan was a no-op — ZCode gateway was
-  // believed to reject cc on all block types. That assumption was wrong;
-  // the real ZCode client sends cc in start-plan too.)
+  // In the captured sample (msg[122]), the cc-bearing text block has
+  // text_len=1 — i.e. the ZCode client effectively appends a near-empty
+  // text block as the cc anchor, rather than requiring the user's content
+  // to end in a text block. We mirror that: if the last user message has
+  // a text block, attach cc to the last one; if it has NO text block
+  // (only tool_result blocks — common when Claude Code sends a tool-call
+  // continuation request), we APPEND a single-space text block carrying
+  // cc at the tail. This matches the ZCode wire shape (cc anchor on a
+  // near-empty text block at the end of the last user message) without
+  // disturbing the existing tool_result blocks.
+  //
+  // We NEVER fall through to assistant messages — that was the v0.1.9
+  // behavior and produced a clear fingerprint mismatch (cc on assistant
+  // is something the real ZCode client never emits).
   const messages = body.messages;
   if (!Array.isArray(messages) || messages.length === 0) return false;
 
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i];
     if (typeof msg !== "object" || msg === null) continue;
-    if (msg.role === "system") continue;
+    // ONLY attach cc on user messages. Skip system (no cc) and assistant
+    // (real ZCode never puts cc on assistant turns — verified 2026-06-28).
+    if (msg.role !== "user") continue;
 
     if (typeof msg.content === "string") {
       msg.content = [{ type: "text", text: msg.content, cache_control: { type: "ephemeral" } }];
@@ -271,26 +286,34 @@ function applyAnthropicCacheControl(
     if (Array.isArray(msg.content) && msg.content.length > 0) {
       // Walk backwards through this message's blocks looking for a `text`
       // block to attach cache_control to. Skip tool_use / tool_result / image
-      // etc. — ZCode gateway only accepts cache_control on text blocks.
-      let attached = false;
+      // etc. — ZCode gateway only accepts cache_control on text blocks,
+      // AND real ZCode only ever places it on a text block at the tail of
+      // the last user message.
       for (let j = msg.content.length - 1; j >= 0; j--) {
         const block = msg.content[j];
         if (typeof block !== "object" || block === null) continue;
         if (block.type !== "text") continue; // ONLY text blocks can carry cc
         if (!block.cache_control) {
           block.cache_control = { type: "ephemeral" };
-          attached = true;
-          break;
+          return true;
         }
         // Already has cache_control on a text block — message is fine.
-        attached = true;
-        break;
+        return true;
       }
-      if (attached) return true;
-      // No text block on this message — fall through to previous message.
-      continue;
+      // No text block on the last user message (e.g. only tool_result).
+      // Mirror the real ZCode client's cc-anchor pattern: append a single-
+      // space text block carrying cc at the tail. A space renders as nothing
+      // visible but is technically non-empty (avoids gateway 3001 on empty
+      // text blocks). Real ZCode's cc anchor block in the captured sample
+      // has text_len=1, so this matches the wire shape.
+      //
+      // We do NOT fall through to earlier messages (would land on assistant,
+      // which is a fingerprint mismatch vs real ZCode).
+      msg.content.push({ type: "text", text: " ", cache_control: { type: "ephemeral" } });
+      return true;
     }
-    continue;
+    // Last user message has empty/no content array — nothing to attach to.
+    return false;
   }
   return false;
 }
@@ -921,12 +944,27 @@ function sanitizeContentBlocks(
       if (!isPlainObject(block)) continue;
 
       // v0.1.9+: alignZCodeFormat is always-on. We NEVER strip cache_control
-      // — real ZCode client keeps cache_control on the last user message's
-      // text block (sample: messages[122].content[3] role=user type=text).
-      // Stripping it removes the client's prompt-cache breakpoint, hurting
-      // cache hit rate AND creating a fingerprint mismatch.
+      // from `text` blocks — real ZCode client keeps cache_control on the
+      // last user message's text block (sample: messages[122].content[3]
+      // role=user type=text). Stripping it removes the client's prompt-cache
+      // breakpoint, hurting cache hit rate AND creating a fingerprint mismatch.
       // (Pre-v0.1.9 behavior was: start-plan strips ALL cc, coding-plan
       // strips non-text cc. Both are obsolete now.)
+
+      // v0.2.1+: STRIP cache_control from `tool_result` blocks. Real ZCode
+      // desktop client (verified against captured zcode traffic, 2026-06-28)
+      // NEVER attaches cc to tool_result blocks — the cc fingerprint is
+      // always on a text block at the tail of the last user message. Claude
+      // Code, by contrast, frequently puts cc on tool_result blocks (e.g.
+      // the last tool_result of an agentic turn). Forwarding those upstream
+      // is a clear "non-ZCode client" tell. Strip them here; the cc on the
+      // last user message's text block (added by applyAnthropicCacheControl)
+      // is the only cc that should survive.
+      if ((block as Record<string, unknown>).type === "tool_result"
+          && "cache_control" in (block as Record<string, unknown>)) {
+        delete (block as Record<string, unknown>).cache_control;
+        changed = true;
+      }
 
       // Strip is_error:false from tool_result blocks. Real ZCode client only
       // sends is_error:true (for actual errors). Claude Code adds is_error:false

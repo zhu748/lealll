@@ -42,6 +42,20 @@ export interface ProxyIdentity {
   appVersion: string;
   sourceTitle: string;
   refererOrigin: string;
+  /**
+   * ZCode release channel — emitted as the `X-Release-Channel` header.
+   *
+   * Reverse-engineered from app.asar Mf() (offset 886853), 2026-06-28:
+   * the real client emits this header ONLY when the channel value is
+   * non-empty (the outer code is `r ? { "X-Release-Channel": r } : {}`).
+   * Stable builds send "stable", test builds send "test". When unset /
+   * empty, the header is omitted entirely (NOT sent with an empty value).
+   *
+   * We mirror that: when this field is undefined or empty, no
+   * X-Release-Channel header is emitted. Setting it to "stable" matches
+   * the production client's wire shape.
+   */
+  releaseChannel?: string;
 }
 
 /** Retry configuration for upstream requests. */

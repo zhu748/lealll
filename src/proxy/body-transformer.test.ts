@@ -1586,3 +1586,167 @@ describe("transformRequestBody — document block conversion + is_error:false st
     expect("is_error" in tr.content[0]).toBe(false);
   });
 });
+
+// v0.2.1+: cache_control fingerprint alignment vs real ZCode desktop client.
+// Captured real ZCode sample (2026-06-28): the client places cc on a near-empty
+// text block at the tail of the LAST **user** message, and NEVER on tool_result
+// blocks or assistant messages. Claude Code, by contrast, frequently puts cc on
+// tool_result blocks (the last tool_result of an agentic turn). The proxy must
+// strip cc from tool_result blocks AND ensure cc lands only on the last user
+// message — never on assistant (which was the pre-v0.2.1 behavior via fallthrough).
+describe("transformRequestBody — cache_control fingerprint alignment (v0.2.1+)", () => {
+  it("strips cache_control from tool_result blocks (real ZCode never sends it there)", () => {
+    // Claude Code often attaches cc to the final tool_result of an agentic turn.
+    // Real ZCode client never does this — cc is always on a text block at the
+    // tail of the last user message. Stripping tool_result cc is required for
+    // fingerprint alignment.
+    const body = JSON.stringify({
+      model: "glm-5.2",
+      max_tokens: 1000,
+      thinking: { type: "enabled" },
+      messages: [
+        { role: "user", content: "first question" },
+        {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "call_1", name: "Bash", input: { cmd: "ls" } }],
+        },
+        {
+          role: "user",
+          content: [
+            // Claude Code's tool_result with cc attached — must be stripped.
+            {
+              tool_use_id: "call_1",
+              type: "tool_result",
+              content: "file1.js\nfile2.js",
+              cache_control: { type: "ephemeral" },
+            },
+          ],
+        },
+      ],
+    });
+    const out = transformRequestBody(body, { format: "anthropic" });
+    const parsed = JSON.parse(out as string);
+
+    // The tool_result block must NOT carry cache_control after transform.
+    const lastUser = parsed.messages[parsed.messages.length - 1];
+    expect(lastUser.role).toBe("user");
+    const toolResultBlock = lastUser.content.find((b: any) => b.type === "tool_result");
+    expect(toolResultBlock).toBeDefined();
+    expect(toolResultBlock.cache_control).toBeUndefined();
+  });
+
+  it("appends a near-empty text block carrying cc when last user msg has only tool_result (mirrors real ZCode)", () => {
+    // Real ZCode desktop client sample (msg[122]): cc sits on a text block
+    // with text_len=1 at the tail of the last user message. When Claude Code's
+    // last user message is purely tool_result blocks (tool-call continuation),
+    // the proxy appends a single-space text block carrying cc to mirror that
+    // wire shape — without disturbing the existing tool_result blocks.
+    const body = JSON.stringify({
+      model: "glm-5.2",
+      max_tokens: 1000,
+      thinking: { type: "enabled" },
+      messages: [
+        { role: "user", content: "first question" },
+        {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "call_1", name: "Bash", input: { cmd: "ls" } }],
+        },
+        {
+          role: "user",
+          content: [
+            { tool_use_id: "call_1", type: "tool_result", content: "file1.js" },
+          ],
+        },
+      ],
+    });
+    const out = transformRequestBody(body, { format: "anthropic" });
+    const parsed = JSON.parse(out as string);
+
+    const lastUser = parsed.messages[parsed.messages.length - 1];
+    expect(lastUser.role).toBe("user");
+
+    // The tool_result block must remain unchanged.
+    const toolResultBlock = lastUser.content.find((b: any) => b.type === "tool_result");
+    expect(toolResultBlock).toBeDefined();
+    expect(toolResultBlock.cache_control).toBeUndefined();
+
+    // A new text block must have been APPENDED at the tail, carrying cc, with
+    // a near-empty (single-space) text payload — mirrors real ZCode's
+    // msg[122].content[3] (text_len=1, cc=ephemeral).
+    const lastBlock = lastUser.content[lastUser.content.length - 1];
+    expect(lastBlock.type).toBe("text");
+    expect(lastBlock.cache_control).toEqual({ type: "ephemeral" });
+    expect(lastBlock.text.length).toBe(1);
+  });
+
+  it("NEVER attaches cache_control to assistant messages (no fallthrough)", () => {
+    // Pre-v0.2.1 bug: when the last user message had only tool_result blocks
+    // (no text), applyAnthropicCacheControl would fall through to earlier
+    // messages and attach cc to an assistant message — a clear fingerprint
+    // mismatch vs real ZCode (which never puts cc on assistant turns).
+    const body = JSON.stringify({
+      model: "glm-5.2",
+      max_tokens: 1000,
+      thinking: { type: "enabled" },
+      messages: [
+        { role: "user", content: "first" },
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "let me check" },
+            { type: "tool_use", id: "call_1", name: "Bash", input: { cmd: "ls" } },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            { tool_use_id: "call_1", type: "tool_result", content: "file1.js" },
+          ],
+        },
+      ],
+    });
+    const out = transformRequestBody(body, { format: "anthropic" });
+    const parsed = JSON.parse(out as string);
+
+    // No assistant message should carry cache_control on any of its blocks.
+    for (const msg of parsed.messages) {
+      if (msg.role !== "assistant") continue;
+      if (!Array.isArray(msg.content)) continue;
+      for (const block of msg.content) {
+        if (block.type === "text") {
+          expect(block.cache_control).toBeUndefined();
+        }
+      }
+    }
+  });
+
+  it("still attaches cc to last user message's existing text block when one is present", () => {
+    // Sanity: when the last user message already has a text block (the
+    // common case for non-tool-call-continuation requests), cc attaches to
+    // the LAST text block of that message — no new block is appended.
+    const body = JSON.stringify({
+      model: "glm-5.2",
+      max_tokens: 1000,
+      thinking: { type: "enabled" },
+      messages: [
+        { role: "user", content: "first question" },
+        { role: "assistant", content: "answer" },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "part 1" },
+            { type: "text", text: "part 2" },
+          ],
+        },
+      ],
+    });
+    const out = transformRequestBody(body, { format: "anthropic" });
+    const parsed = JSON.parse(out as string);
+
+    const lastUser = parsed.messages[parsed.messages.length - 1];
+    expect(lastUser.role).toBe("user");
+    expect(lastUser.content.length).toBe(2); // no new block appended
+    expect(lastUser.content[0].cache_control).toBeUndefined(); // first text block: no cc
+    expect(lastUser.content[1].cache_control).toEqual({ type: "ephemeral" }); // last text block: cc
+  });
+});
