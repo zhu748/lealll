@@ -125,4 +125,23 @@ export class AuthManager {
   getMode(): AuthMode {
     return this.mode;
   }
+
+  /**
+   * Returns the count of NON-DISABLED stored credentials available for
+   * switching. Used by the proxy's retry loop to distinguish "no alternatives
+   * because there's only one credential" (transient overload, return 529)
+   * from "no alternatives because all N credentials have been tried"
+   * (genuinely exhausted, return 503 to stop client retry loops).
+   *
+   * Returns 0 if listAllCredentials is not configured or throws.
+   */
+  async getAvailableCredentialCount(): Promise<number> {
+    if (!this.listAllCredentials) return 0;
+    try {
+      const all = await this.listAllCredentials();
+      return all.filter(c => !c.disabled).length;
+    } catch {
+      return 0;
+    }
+  }
 }

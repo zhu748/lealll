@@ -611,6 +611,12 @@ export async function proxyRequest(
   // Reusing the same Request object fails with "Request body already used"
   // because fetch() consumes the body on the first call — this was the bug
   // where every retry after the first would silently fail with a synthetic 502.
+  //
+  // === CRITICAL FIX (命令行还在继续重试 bug) ===
+  // Declared OUTSIDE the retry-if block so the post-retry 503 check (which
+  // lives outside the block, after the retry loop ends) can read it. Without
+  // this outer scope, TypeScript would reject the reference as out-of-scope.
+  let allCredentialsExhausted = false;
   if (config.retry.maxRetries > 0 && config.retry.retryableStatuses.includes(upstreamResp.status)) {
     // Detect empty-stream 529 (set by sse-error-detector.ts when the upstream
     // returned HTTP 200 + text/event-stream with zero SSE events — typical
@@ -656,6 +662,31 @@ export async function proxyRequest(
     // the switch (default maxRetries=3 would exhaust before the switch+retry).
     // We bump the effective limit by 1 per credential switch.
     let extraAttemptsFromSwitches = 0;
+    // === CRITICAL FIX (命令行还在继续重试 bug) ===
+    // allCredentialsExhausted is declared OUTSIDE this if-block (a few lines
+    // above) so the post-retry 503 check can read it. When this flag is true
+    // and the retry loop exhausts, we return 503 (non-retryable) instead of
+    // forwarding 529 (retryable) — tells well-behaved clients like Claude
+    // Code, OpenAI SDK to STOP retrying.
+    //
+    // IMPORTANT: this flag is ONLY set when we actually had multiple
+    // credentials to try AND all of them failed. When there's only one
+    // credential (no alternatives to begin with), we DON'T set this flag —
+    // the failure might be transient upstream overload, so forwarding 529
+    // (retryable) is correct. Setting 503 in the single-credential case
+    // would break legitimate "service overloaded, retry later" semantics.
+    //
+    // We track the total available credential count up front so we can
+    // distinguish "no alternatives because there's only one" from "no
+    // alternatives because all N have been tried".
+    let totalAvailableCredentials = 1; // default: assume only the current one
+    try {
+      totalAvailableCredentials = await auth.getAvailableCredentialCount();
+      // Edge case: getAvailableCredentialCount returns 0 if listAllCredentials
+      // isn't configured. In that case, fall back to 1 (the current credential
+      // is the only one we know about).
+      if (totalAvailableCredentials === 0) totalAvailableCredentials = 1;
+    } catch { /* ignore — fall back to 1 */ }
 
     for (let attempt = 1; attempt <= config.retry.maxRetries + extraAttemptsFromSwitches; attempt++) {
       // Calculate backoff delay: initialDelay * backoffFactor^(attempt-1), capped at maxDelay
@@ -757,23 +788,62 @@ export async function proxyRequest(
           // Persist the switch so the dashboard reflects the new active account.
           // Non-fatal: if persistence fails, the in-memory switch still works
           // for the remainder of this request.
+          //
+          // === CRITICAL FIX (账号全没 bug) ===
+          // switchAccount now returns `null` when the store can't be read
+          // (transient AV lock etc.) instead of silently writing an empty
+          // store. Handle all three return values explicitly so we don't
+          // log a misleading "Auto-switched" message when the write was
+          // actually skipped.
           try {
             const accounts = await exportAccounts();
-            const match = accounts.find(a => a.credential.apiKey === newCred.apiKey);
-            if (match) {
-              await switchAccount(match.id);
-              appendLog("info", `Auto-switched credential to "${match.label}" (${maskApiKey(newCred.apiKey)}) after ${reason}`);
+            if (accounts.length === 0) {
+              // Store is empty — don't even try switchAccount (it would
+              // return false anyway). This is expected when the user has
+              // cleared credentials; the in-memory switch above still
+              // works for the remainder of this request.
+              console.log(`${reqId} credential store is empty, skipping switchAccount persist`);
+            } else {
+              const match = accounts.find(a => a.credential.apiKey === newCred.apiKey);
+              if (match) {
+                const persistResult = await switchAccount(match.id);
+                if (persistResult === true) {
+                  appendLog("info", `Auto-switched credential to "${match.label}" (${maskApiKey(newCred.apiKey)}) after ${reason}`);
+                } else if (persistResult === null) {
+                  // Transient store read failure — the in-memory switch still
+                  // works for this request. Don't log an error (it's not
+                  // actionable), just a debug note.
+                  console.log(`${reqId} could not persist credential switch: store temporarily unreadable, will retry on next switch`);
+                } else {
+                  // false: account not in store (race condition — another
+                  // process removed it between exportAccounts and switchAccount)
+                  console.log(`${reqId} could not persist credential switch: account ${match.id} not found in store (race condition)`);
+                }
+              }
             }
           } catch (e) {
             console.log(`${reqId} could not persist credential switch: ${(e as Error).message}`);
           }
         } else {
           // No alternative credential available (or all alternatives already
-          // tried in this request). Continue retrying with the current one.
-          console.log(
-            `${reqId} credential switch threshold reached but no alternative credential available ` +
-            `(tried ${triedApiKeys.size} credential(s)), continuing with current`,
-          );
+          // tried in this request). Mark exhausted ONLY when there were
+          // multiple credentials to begin with — if there's only one, the
+          // failure might be transient upstream overload and forwarding 529
+          // (retryable) is the correct behavior.
+          if (totalAvailableCredentials > 1) {
+            allCredentialsExhausted = true;
+            console.log(
+              `${reqId} credential switch threshold reached but no alternative credential available ` +
+              `(tried ${triedApiKeys.size} of ${totalAvailableCredentials} credential(s)). ` +
+              `Will return 503 (not 529) after retries exhaust to stop client retry loops.`,
+            );
+          } else {
+            console.log(
+              `${reqId} credential switch threshold reached but no alternative credential available ` +
+              `(only ${totalAvailableCredentials} credential configured). Continuing with current — ` +
+              `forwarding 529 (retryable) to client since this may be transient overload.`,
+            );
+          }
         }
       }
 
@@ -921,12 +991,26 @@ export async function proxyRequest(
           // Now both switch blocks (top-of-loop and end-of-loop) persist the
           // switch consistently. Non-fatal: if persistence fails, the in-memory
           // switch still works for the remainder of this request.
+          //
+          // === CRITICAL FIX (账号全没 bug) ===
+          // Handle switchAccount's new null return value (store transiently
+          // unreadable) — don't log misleading "Auto-switched" message.
           try {
             const accounts = await exportAccounts();
-            const match = accounts.find(a => a.credential.apiKey === newCred.apiKey);
-            if (match) {
-              await switchAccount(match.id);
-              appendLog("info", `Auto-switched credential to "${match.label}" (${maskApiKey(newCred.apiKey)}) after ${reason}`);
+            if (accounts.length === 0) {
+              console.log(`${reqId} credential store is empty, skipping switchAccount persist (end-of-loop)`);
+            } else {
+              const match = accounts.find(a => a.credential.apiKey === newCred.apiKey);
+              if (match) {
+                const persistResult = await switchAccount(match.id);
+                if (persistResult === true) {
+                  appendLog("info", `Auto-switched credential to "${match.label}" (${maskApiKey(newCred.apiKey)}) after ${reason}`);
+                } else if (persistResult === null) {
+                  console.log(`${reqId} could not persist credential switch (end-of-loop): store temporarily unreadable`);
+                } else {
+                  console.log(`${reqId} could not persist credential switch (end-of-loop): account ${match.id} not found (race)`);
+                }
+              }
             }
           } catch (e) {
             console.log(`${reqId} could not persist credential switch: ${(e as Error).message}`);
@@ -934,7 +1018,23 @@ export async function proxyRequest(
           try { upstreamResp.body?.cancel(); } catch {}
           continue; // skip the break, give the new cred a chance
         }
-        // No alternative credential — fall through to break
+        // No alternative credential — mark exhausted ONLY if we had multiple
+        // to begin with (single-credential failure may be transient overload,
+        // forward 529). Fall through to break.
+        if (totalAvailableCredentials > 1) {
+          allCredentialsExhausted = true;
+          console.log(
+            `${reqId} no alternative credential available after switch threshold ` +
+            `(tried ${triedApiKeys.size} of ${totalAvailableCredentials} credential(s)). ` +
+            `Will return 503 to stop client retries.`,
+          );
+        } else {
+          console.log(
+            `${reqId} no alternative credential available ` +
+            `(only ${totalAvailableCredentials} credential configured). ` +
+            `Forwarding 529 (retryable) — may be transient overload.`,
+          );
+        }
       }
 
       // Still a retryable status — if this was the last attempt, keep the
@@ -950,6 +1050,54 @@ export async function proxyRequest(
       // More retries left — cancel the body before looping
       try { upstreamResp.body?.cancel(); } catch {}
     }
+  }
+
+  // === CRITICAL FIX (命令行还在继续重试 bug) ===
+  // If all credentials have been tried and exhausted (switchToNextCredential
+  // returned null), return 503 (non-retryable) instead of forwarding the
+  // upstream's 529 (retryable). This tells well-behaved clients like Claude
+  // Code, OpenAI SDK, etc. to STOP retrying — they honor Retry-After.
+  //
+  // Previously the proxy forwarded 529 to the client after exhausting all
+  // credentials. Clients interpret 529 as "service overloaded, try again
+  // later" and keep re-sending the request. The proxy runs the same retry
+  // loop, exhausts again, returns 529 again... infinite loop. The user
+  // reported "命令行还在继续重试" long after the proxy had given up.
+  //
+  // 503 with Retry-After: 300 (5 minutes) gives the upstream quota time to
+  // reset. The user can also manually add a new credential via the dashboard
+  // during this window.
+  //
+  // We only do this if the final status is a retryable 5xx (529/503/502 etc.)
+  // — for non-retryable statuses (4xx), forwarding the original response is
+  // correct.
+  if (allCredentialsExhausted && upstreamResp.status >= 500 && upstreamResp.status < 600) {
+    console.log(
+      `${reqId} all credentials exhausted + upstream ${upstreamResp.status}, ` +
+      `returning 503 (Retry-After: 300) to stop client retry loops`,
+    );
+    printRow(reqId, format, meta, 503, started, headersAt, 0, 0, 0);
+    try { upstreamResp.body?.cancel(); } catch {}
+    const body = JSON.stringify({
+      error: {
+        type: "all_credentials_exhausted",
+        message:
+          "All stored credentials have been tried and exhausted. " +
+          "The proxy will not retry automatically — please add a new credential " +
+          "via the dashboard, or wait for upstream quota to reset " +
+          "(Retry-After: 300 seconds).",
+      },
+    });
+    return new Response(body, {
+      status: 503,
+      headers: {
+        "content-type": "application/json",
+        "retry-after": "300",
+        // X-Should-Not-Retry is a non-standard hint for clients that don't
+        // honor Retry-After on 503 (rare but possible).
+        "x-should-not-retry": "1",
+      },
+    });
   }
 
   const isSSEUpstream = upstreamResp.headers.get("content-type")?.includes("text/event-stream") ?? false;

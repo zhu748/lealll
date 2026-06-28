@@ -511,8 +511,17 @@ async function readStoreUncached(): Promise<StoreV2 | null> {
   // brief AV scan would back up the (locked, unreadable) file.
   //
   // We retry up to 5 times with 50ms backoff before declaring the file
-  // unreadable. The total worst-case blocking time is 50+100+150+200+250
-  // = 750ms, acceptable for a read that happens on dashboard refresh.
+  // unreadable.
+  //
+  // === CRITICAL FIX (event-loop blocking) ===
+  // Previously this used a SYNCHRONOUS busy-wait spin:
+  //   `while (Date.now() < end) { /* spin */ }`
+  // which blocked the entire Bun event loop for up to 50+100+150+200+250
+  // = 750ms. During that window, ALL HTTP requests, SSE pushes, and
+  // timers were frozen — manifesting as "管理面板刷新卡一会才能点击".
+  //
+  // Now we use `await new Promise(r => setTimeout(r, ms))` which yields
+  // to the event loop, letting other requests proceed during the backoff.
   let raw: string | null = null;
   let readErr: unknown = null;
   for (let attempt = 0; attempt < 5; attempt++) {
@@ -523,7 +532,7 @@ async function readStoreUncached(): Promise<StoreV2 | null> {
     } catch (err) {
       readErr = err;
       const code = (err as NodeJS.ErrnoException)?.code;
-      // EPERM/EBUSY/EACCES: transient Windows lock — retry.
+      // EPERM/EBUSY/EACCES: transient Windows lock — retry with ASYNC sleep.
       // ENOENT: file disappeared between existsSync and readFileSync (another
       // process deleted it) — retry won't help, treat as "no file".
       if (code === "ENOENT") {
@@ -531,8 +540,10 @@ async function readStoreUncached(): Promise<StoreV2 | null> {
         return null;
       }
       if (code === "EPERM" || code === "EBUSY" || code === "EACCES") {
-        const end = Date.now() + 50 * (attempt + 1);
-        while (Date.now() < end) { /* spin */ }
+        // ASYNC sleep — yields to the event loop so other requests aren't
+        // blocked during the backoff window. This is the key fix for the
+        // "刷新卡顿" symptom on Windows.
+        await new Promise(r => setTimeout(r, 50 * (attempt + 1)));
         continue;
       }
       // Other errors (EISDIR, etc.) — don't retry
@@ -759,6 +770,30 @@ const storeWriteMutex = createMutex();
  * read-modify-write atomicity across concurrent callers within the same
  * process. Reads that don't need to reflect concurrent writes (e.g.
  * loadCredential) can skip this and use readStore() directly for performance.
+ *
+ * === CRITICAL FIX (凭证丢失 bug) ===
+ * Previously this function had an UNCONDITIONAL empty-store fallback:
+ *   `if (!store) store = { version: 2, activeId: null, accounts: [] };`
+ * When readStore() returned null for ANY reason (Windows AV transiently
+ * locking the file, IO error, file deleted by another process, empty file
+ * from a crashed write), the code would silently replace the user's entire
+ * credential store with `{accounts: []}` and write that to disk —
+ * EVAPORATING ALL ACCOUNTS with NO error log.
+ *
+ * The retry loop in handler.ts calls switchAccount on every credential
+ * switch (3+ times per retry storm). If any one of those calls hit a
+ * transient readStore() null, all accounts were gone. The user saw:
+ *   1. "账号全没" — because disk now has {accounts: []}
+ *   2. "切换失败" — because switchAccount can't find any account in empty store → 404
+ *   3. "命令行还在继续重试" — because in-memory credential was still set,
+ *      proxy kept retrying, returning 529 to client, client kept retrying
+ *
+ * FIX: split into two variants based on caller intent.
+ *   - withStoreLock (allows empty fallback): for saveCredential / importAccounts
+ *     where creating a fresh store is the explicit intent.
+ *   - withExistingStoreLock (NO empty fallback): for switchAccount / removeAccount /
+ *     setAccount* where mutating an empty store is ALWAYS a bug — returns null
+ *     to signal "no store available, do not write".
  */
 async function withStoreLock<T>(
   fn: (store: StoreV2) => Promise<T> | T,
@@ -768,10 +803,79 @@ async function withStoreLock<T>(
     // another process (CLI) wrote to the file. The cost is one disk read +
     // decrypt per mutation, acceptable for the low write frequency of a
     // credential store.
-    invalidateStoreCache();
+    //
+    // NOTE: we do NOT call invalidateStoreCache() here anymore. readStore()
+    // already does a statSync-based mtime check (store.ts:441-447) that
+    // detects external writes. Calling invalidateStoreCache() forces a
+    // full disk read + decrypt on EVERY mutation, AND it makes concurrent
+    // READS (from the dashboard's GET /admin/api/accounts) miss the cache
+    // too — turning the mutation into a global cache-bust event. The mtime
+    // check is sufficient for cross-process correctness; the explicit
+    // invalidate was a performance footgun.
     let store = await readStore();
     if (!store) store = { version: 2, activeId: null, accounts: [] };
     const result = await fn(store);
+    await writeStore(store);
+    return result;
+  });
+}
+
+/**
+ * Like withStoreLock, but REFUSES to create an empty store if readStore()
+ * returns null. Used by all mutations that operate on EXISTING accounts
+ * (switchAccount, removeAccount, setAccount*).
+ *
+ * Returns:
+ *   - T (the fn's return value) when the store was read successfully and fn
+ *     returned a truthy value (mutation happened, persisted to disk)
+ *   - false when either:
+ *       a) readStore() returned null BECAUSE THE FILE DOESN'T EXIST — in
+ *          this case the store is genuinely empty, so any account id is
+ *          "not found". Return false (not null) so callers return 404, not
+ *          503. This is the right behavior for "user has no credentials
+ *          stored, dashboard tries to edit a nonexistent account".
+ *       b) fn returned false (e.g. switchAccount didn't find the id) — no
+ *          mutation, no write. Caller returns 404 "not found".
+ *   - null when readStore() returned null BUT THE FILE EXISTS — this is the
+ *     dangerous case: the file is there (possibly with accounts) but we
+ *     can't read it (transient AV lock, IO error). Return null to signal
+ *     "transient failure, don't write, caller returns 503". This is the
+ *     key defense against the "账号全没" bug: we refuse to write an empty
+ *     store that would clobber the (possibly intact) file on disk.
+ *
+ * The file-existence check uses a separate existsSync call. This adds one
+ * statSync per failed read, but only on the error path (rare) — acceptable.
+ */
+async function withExistingStoreLock<T>(
+  fn: (store: StoreV2) => Promise<T | false> | (T | false),
+): Promise<T | null> {
+  return storeWriteMutex.run(async () => {
+    const store = await readStore();
+    if (!store) {
+      // Distinguish "file doesn't exist" (genuine empty store → 404) from
+      // "file exists but unreadable" (transient failure → 503, refuse write).
+      // The existsSync check is the only reliable way to tell these apart
+      // because readStore() returns null for both cases.
+      if (!existsSync(STORE_FILE)) {
+        // File genuinely doesn't exist — any account id is "not found".
+        // Return false (not null) so callers return 404, not 503.
+        return false as unknown as T;
+      }
+      // File EXISTS but readStore() returned null — this is the dangerous
+      // case. Log loudly and return null to signal "transient failure,
+      // don't write". This is the key defense against the 凭证丢失 bug.
+      console.warn(
+        `[store] withExistingStoreLock: readStore() returned null but file ` +
+        `exists — likely transiently locked by antivirus or in a broken ` +
+        `state. Skipping write to avoid clobbering credentials.json.`,
+      );
+      return null;
+    }
+    const result = await fn(store);
+    // Only persist if fn returned a truthy value (meaning a real mutation
+    // happened). Returning false means "no change" (e.g. id not found),
+    // so skip the write to avoid needless disk churn + AV interference.
+    if (result === false) return result as T;
     await writeStore(store);
     return result;
   });
@@ -818,6 +922,24 @@ async function writeStore(store: StoreV2): Promise<void> {
       `A backup was saved as ${STORE_FILE}.broken-{timestamp}. ` +
       `Either restore that backup manually, or run \`zcode-proxy auth logout\` ` +
       `to discard the unreadable file before saving new credentials.`,
+    );
+  }
+  // === DEFENSE-IN-DEPTH LOGGING (凭证丢失 bug) ===
+  // If we're about to write a store with ZERO accounts, log a warning so the
+  // user has visibility into when this happens. We do NOT refuse the write
+  // because there's a legitimate path: removeAccount on the last account.
+  // The actual BUG prevention happens upstream in withExistingStoreLock,
+  // which refuses to write when readStore() returned null (the dangerous
+  // case where switchAccount etc. would silently clobber a populated store).
+  //
+  // This log is still useful: if the user sees "writeStore: writing EMPTY
+  // store" in the logs without having explicitly removed their last account,
+  // they know something is wrong and can investigate.
+  if (store.accounts.length === 0) {
+    console.warn(
+      `[store] writeStore: writing EMPTY store to ${STORE_FILE}. ` +
+      `If you didn't intend to delete all accounts, this is a bug — ` +
+      `check the previous log lines for "withExistingStoreLock" warnings.`,
     );
   }
   // Encrypt OUTSIDE the mutex: crypto is CPU-bound and doesn't touch the file,
@@ -1127,13 +1249,22 @@ function inferPlan(cred: Credential): "coding-plan" | "start-plan" {
   return "coding-plan";
 }
 
-/** Switch the active credential by account id.
- * Returns false if the account doesn't exist OR is disabled (vceshi0.0.6+).
+/**
+ * Switch the active credential by account id.
+ * Returns:
+ *   - true  : account found and activated
+ *   - false : account not found OR is disabled (vceshi0.0.6+)
+ *   - null  : store could not be read (e.g. transiently locked by AV). The
+ *             caller should treat this as a transient failure and either
+ *             retry or surface to the user. Importantly, NO WRITE happened —
+ *             the on-disk store is untouched, which is the key defense
+ *             against the "账号全没" bug.
+ *
  * Callers should distinguish these cases by checking the disabled flag in the
  * listAccounts response before calling switchAccount, if they need to.
  */
-export async function switchAccount(id: string): Promise<boolean> {
-  return withStoreLock((store) => {
+export async function switchAccount(id: string): Promise<boolean | null> {
+  return withExistingStoreLock((store) => {
     const found = store.accounts.find(a => a.id === id);
     if (!found) return false;
     // vceshi0.0.6+: refuse to activate a disabled credential. The dashboard
@@ -1145,9 +1276,17 @@ export async function switchAccount(id: string): Promise<boolean> {
   });
 }
 
-/** Remove an account by id. If the active account is removed, falls back to the first remaining. */
-export async function removeAccount(id: string): Promise<boolean> {
-  return withStoreLock((store) => {
+/**
+ * Remove an account by id. If the active account is removed, falls back to
+ * the first remaining.
+ *
+ * Returns:
+ *   - true  : account was found and removed
+ *   - false : account not found (no change)
+ *   - null  : store could not be read (transient failure, no write happened)
+ */
+export async function removeAccount(id: string): Promise<boolean | null> {
+  return withExistingStoreLock((store) => {
     const idx = store.accounts.findIndex(a => a.id === id);
     if (idx < 0) return false;
     store.accounts.splice(idx, 1);
@@ -1158,9 +1297,12 @@ export async function removeAccount(id: string): Promise<boolean> {
   });
 }
 
-/** Update an account's human-readable label. */
-export async function setAccountLabel(id: string, label: string): Promise<boolean> {
-  return withStoreLock((store) => {
+/**
+ * Update an account's human-readable label.
+ * Returns true/false as expected, OR null if store could not be read.
+ */
+export async function setAccountLabel(id: string, label: string): Promise<boolean | null> {
+  return withExistingStoreLock((store) => {
     const account = store.accounts.find(a => a.id === id);
     if (!account) return false;
     account.label = label.trim() || account.label;
@@ -1168,9 +1310,9 @@ export async function setAccountLabel(id: string, label: string): Promise<boolea
   });
 }
 
-/** Update an account's plan. */
-export async function setAccountPlan(id: string, plan: "coding-plan" | "start-plan"): Promise<boolean> {
-  return withStoreLock((store) => {
+/** Update an account's plan. Returns null if store could not be read. */
+export async function setAccountPlan(id: string, plan: "coding-plan" | "start-plan"): Promise<boolean | null> {
+  return withExistingStoreLock((store) => {
     const account = store.accounts.find(a => a.id === id);
     if (!account) return false;
     account.credential.plan = plan;
@@ -1188,8 +1330,8 @@ export async function setAccountPlan(id: string, plan: "coding-plan" | "start-pl
  * fetch-time errors at request time, which is more useful to the user
  * than a silent rejection at config time.
  */
-export async function setAccountProxy(id: string, proxy: string): Promise<boolean> {
-  return withStoreLock((store) => {
+export async function setAccountProxy(id: string, proxy: string): Promise<boolean | null> {
+  return withExistingStoreLock((store) => {
     const account = store.accounts.find(a => a.id === id);
     if (!account) return false;
     const trimmed = (proxy ?? "").trim();
@@ -1211,8 +1353,8 @@ export async function setAccountProxy(id: string, proxy: string): Promise<boolea
  * the auto-generated `label` for display. The name shows up in the account
  * list "名称" column when set, otherwise the auto-generated label is shown.
  */
-export async function setAccountName(id: string, name: string): Promise<boolean> {
-  return withStoreLock((store) => {
+export async function setAccountName(id: string, name: string): Promise<boolean | null> {
+  return withExistingStoreLock((store) => {
     const account = store.accounts.find(a => a.id === id);
     if (!account) return false;
     const trimmed = (name ?? "").trim();
@@ -1233,8 +1375,8 @@ export async function setAccountName(id: string, name: string): Promise<boolean>
  * the dashboard may do a basic format check, but we accept any string to
  * accommodate edge cases (e.g. upstream returning a non-standard email format).
  */
-export async function setAccountEmail(id: string, email: string): Promise<boolean> {
-  return withStoreLock((store) => {
+export async function setAccountEmail(id: string, email: string): Promise<boolean | null> {
+  return withExistingStoreLock((store) => {
     const account = store.accounts.find(a => a.id === id);
     if (!account) return false;
     const trimmed = (email ?? "").trim();
@@ -1258,8 +1400,8 @@ export async function setAccountEmail(id: string, email: string): Promise<boolea
  * requests continue) but the next auto-switch will skip it. The dashboard
  * should warn the user when disabling the active account.
  */
-export async function setAccountDisabled(id: string, disabled: boolean): Promise<boolean> {
-  return withStoreLock((store) => {
+export async function setAccountDisabled(id: string, disabled: boolean): Promise<boolean | null> {
+  return withExistingStoreLock((store) => {
     const account = store.accounts.find(a => a.id === id);
     if (!account) return false;
     if (disabled) {

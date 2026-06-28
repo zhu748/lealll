@@ -405,6 +405,48 @@ const configWriteMutex = createMutex();
 const persistConfig = (config: ProxyConfig, configPath: string): Promise<void> =>
   configWriteMutex.run(() => atomicWriteFile(configPath, configToYaml(config)));
 
+/**
+ * Translate a store mutation result into an HTTP response.
+ *
+ * After the 凭证丢失 bug fix, switchAccount / setAccount* / removeAccount can
+ * return THREE values:
+ *   - true  : mutation succeeded → caller continues normally
+ *   - false : account not found (or disabled, for switchAccount) → 404
+ *   - null  : store could not be read (transient AV lock / IO error) → 503
+ *
+ * The 503 path is NEW — previously the store would silently fall back to an
+ * empty store and clobber the user's credentials. Now we refuse the write
+ * and tell the dashboard "try again in a moment". The dashboard should
+ * surface this as a transient error, NOT a "not found" error.
+ *
+ * Returns null when the caller should continue (success), or a Response
+ * when the caller should return immediately.
+ *
+ * NOTE: jsonResp is defined later in this file but is hoisted (function
+ * declaration), so we can reference it here.
+ */
+function handleMutationResult(
+  result: boolean | null,
+  notFoundMessage = "Account not found",
+): Response | null {
+  if (result === true) return null; // success — caller continues
+  if (result === null) {
+    return jsonResp(
+      {
+        error: {
+          type: "store_unavailable",
+          message:
+            "Credential store is temporarily unreadable (possibly locked by " +
+            "antivirus or another process). Please wait a few seconds and try again. " +
+            "No changes were made — your credentials are safe.",
+        },
+      },
+      503,
+    );
+  }
+  return errorResponse(404, "not_found", notFoundMessage);
+}
+
 // Log buffer for streaming — uses a monotonic sequence number per entry
 // so that SSE clients can track their position even when the underlying
 // array is trimmed. The old approach used array indices, which became
@@ -425,21 +467,68 @@ const logWaiters: Array<{ resolve: (value: unknown) => void }> = [];
 // G3: File logging — when set, each log entry is also appended to this file.
 // Set via config.logging.file or env var ZCODE_PROXY_LOG_FILE.
 let logFilePath: string | undefined;
-import { appendFileSync, mkdirSync } from "node:fs";
+// === CRITICAL FIX (管理面板刷新卡顿) ===
+// Buffered async file logging — replaces the old `appendFileSync` per-log
+// write which blocked the event loop on Windows. See appendLog() for the
+// full rationale.
+const logFileBuffer: string[] = [];
+let logFileFlushInterval: ReturnType<typeof setInterval> | null = null;
+import { appendFile as appendFileAsync } from "node:fs/promises";
+import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+
+/**
+ * Flush the log file buffer to disk asynchronously. Called by the interval
+ * timer (every 500ms) and on process exit (best-effort). Errors are logged
+ * to console.warn but don't break the buffer — we just keep accumulating.
+ */
+async function flushLogFile(): Promise<void> {
+  if (logFileBuffer.length === 0 || !logFilePath) return;
+  // Snapshot and clear the buffer atomically — if the write fails, we've
+  // already lost the entries (can't re-append because new entries may have
+  // been pushed during the await). This is acceptable: file logging is
+  // best-effort, the in-memory ring buffer + SSE clients still get all logs.
+  const snapshot = logFileBuffer.splice(0, logFileBuffer.length);
+  try {
+    await appendFileAsync(logFilePath, snapshot.join(""));
+  } catch (err) {
+    // Don't spam console — just warn once per failed flush.
+    console.warn(`[admin] Could not flush log file ${logFilePath}: ${(err as Error).message}`);
+  }
+}
 
 /**
  * Set the file path for persistent log output. Called from index.ts after
  * config is loaded. Each appendLog() call will also write the entry as a
- * JSON line to this file. Set to undefined to disable file logging.
+ * JSON line to this file (buffered + async, see appendLog). Set to
+ * undefined to disable file logging.
  */
 export function setLogFilePath(path: string | undefined): void {
+  // If we're switching paths or disabling, flush any pending entries first.
+  // (Best-effort — don't block on this.)
+  if (logFileBuffer.length > 0 && logFilePath) {
+    void flushLogFile();
+  }
+  // Clear any existing interval before switching.
+  if (logFileFlushInterval) {
+    clearInterval(logFileFlushInterval);
+    logFileFlushInterval = null;
+  }
   logFilePath = path;
   if (path) {
     // Ensure the parent directory exists
     try {
       mkdirSync(dirname(path), { recursive: true });
     } catch { /* may already exist */ }
+    // Start the async flush interval — every 500ms, drain the buffer.
+    // This replaces the per-log appendFileSync which was blocking the event
+    // loop on Windows (each sync write = 5-50ms with AV interference).
+    logFileFlushInterval = setInterval(flushLogFile, 500);
+    // Don't keep the process alive just for this interval — it should only
+    // fire while the server is running for other reasons.
+    if (typeof logFileFlushInterval.unref === "function") {
+      logFileFlushInterval.unref();
+    }
     appendLog("info", `File logging enabled: ${path}`);
   }
 }
@@ -492,13 +581,31 @@ export function appendLog(level: string, message: string) {
   logRingWrite = (logRingWrite + 1) % LOG_BUFFER_SIZE;
   if (logRingCount < LOG_BUFFER_SIZE) logRingCount++;
   // G3: File logging — append entry as JSON line if file path is set.
-  // Uses appendFileSync for simplicity (one write per log entry, no buffering).
-  // On a busy server this could be a bottleneck; for a local proxy tool the
-  // write volume is typically <50 lines/sec which is fine for sync writes.
+  //
+  // === CRITICAL FIX (管理面板刷新卡顿) ===
+  // Previously used `appendFileSync` which is SYNCHRONOUS — every console.log
+  // blocks the event loop until the disk write completes. On Windows with
+  // antivirus / Windows Search indexer running, each appendFileSync can take
+  // 5-50ms (vs <1ms on Linux). At 50 logs/sec that's 250ms-2.5s of event-loop
+  // blocking per second — the entire server freezes, manifesting as
+  // "管理面板刷新卡一会才能点击".
+  //
+  // Now we use a BUFFERED ASYNC write:
+  //   - Entries are pushed to an in-memory array (logFileBuffer)
+  //   - A setInterval flushes the buffer every 500ms via fs.promises.appendFile
+  //   - If the buffer grows too large (>1000 entries), we drop logs to avoid
+  //     memory bloat (file logging is best-effort, not critical)
+  //
+  // This reduces disk writes from N (per-log) to ~1 per 500ms, and each
+  // write is async so it doesn't block the event loop.
   if (logFilePath) {
-    try {
-      appendFileSync(logFilePath, JSON.stringify(entry) + "\n");
-    } catch { /* never let file logging break the request */ }
+    if (logFileBuffer.length < 1000) {
+      logFileBuffer.push(JSON.stringify(entry) + "\n");
+    }
+    // The flush is triggered by logFileFlushInterval (set up in setLogFilePath).
+    // If the interval isn't running yet (e.g. setLogFilePath hasn't been called
+    // or was called with a null path), fall back to nothing — entries will
+    // just accumulate in the buffer until the next flush.
   }
   // Push the new entry to every connected SSE client.
   //
@@ -756,9 +863,13 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
 
   // Get credentials (active credential summary)
   if (path === "/admin/api/credentials" && method === "GET") {
-    // Invalidate cache so external writes (e.g. start.bat adding a credential)
-    // are reflected on dashboard refresh.
-    invalidateStoreCache();
+    // NOTE: do NOT call invalidateStoreCache() here. readStore() already
+    // does a statSync-based mtime check (store.ts:441-447) that detects
+    // external writes (e.g. start.bat adding a credential). Calling
+    // invalidateStoreCache() forces a full disk read + AES-GCM decrypt on
+    // EVERY dashboard refresh, AND it makes concurrent reads miss the cache
+    // too — turning every refresh into a global cache-bust event. This was
+    // a major contributor to the "管理面板刷新卡一会" symptom.
     const cred = await loadCredential();
     if (!cred) return jsonResp({ credential: null });
     return jsonResp({
@@ -833,14 +944,13 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
 
   // List all stored accounts (multi-account support)
   //
-  // BUGFIX: invalidate the in-memory store cache before reading. The cache is
-  // process-local — if the user added a credential via start.bat (which runs
-  // `zcode-proxy auth login` in a separate process) while the proxy server
-  // was still running, the new credential is on disk but the cache still
-  // holds the old snapshot. Without this invalidation, refreshing the
-  // dashboard would NOT show the new credential until the proxy was restarted.
+  // NOTE: do NOT call invalidateStoreCache() here. readStore() already
+  // does a statSync-based mtime check that detects external writes (e.g.
+  // start.bat adding a credential while the proxy is running). The explicit
+  // invalidate was a performance footgun — it forced a full disk read +
+  // AES-GCM decrypt on every dashboard refresh, and made concurrent reads
+  // miss the cache too. Removing it cuts ~5-20ms off every /admin refresh.
   if (path === "/admin/api/accounts" && method === "GET") {
-    invalidateStoreCache();
     const result = await listAccounts();
     return jsonResp(result);
   }
@@ -853,7 +963,9 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
       const body = parsed.body;
       if (!body.id) return errorResponse(400, "missing_param", "id is required");
       const ok = await switchAccount(body.id);
-      if (!ok) return errorResponse(404, "not_found", "Account not found");
+      // Handle null (store temporarily unreadable) vs false (not found) vs true
+      const errResp = handleMutationResult(ok);
+      if (errResp) return errResp;
       // Hot-swap the in-memory credential and sync plan
       const cred = await loadCredential();
       let planSynced = false;
@@ -895,7 +1007,8 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
         return errorResponse(400, "missing_param", "id and label are required");
       }
       const ok = await setAccountLabel(body.id, body.label);
-      if (!ok) return errorResponse(404, "not_found", "Account not found");
+      const errResp = handleMutationResult(ok);
+      if (errResp) return errResp;
       return jsonResp({ ok: true });
     } catch (err) {
       return errorResponse(500, "update_failed", (err as Error).message);
@@ -915,7 +1028,8 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
         return errorResponse(400, "invalid_param", "plan must be coding-plan or start-plan");
       }
       const ok = await setAccountPlan(body.id, body.plan);
-      if (!ok) return errorResponse(404, "not_found", "Account not found");
+      const errResp = handleMutationResult(ok);
+      if (errResp) return errResp;
 
       // If the updated account is the currently active one, hot-swap the
       // in-memory credential so running requests immediately use the new
@@ -998,7 +1112,8 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
         }
       }
       const success = await setAccountProxy(body.id, body.proxy);
-      if (!success) return errorResponse(404, "not_found", "Account not found");
+      const errResp = handleMutationResult(success);
+      if (errResp) return errResp;
 
       // If the updated account is the currently active one, hot-swap the
       // in-memory credential so running requests immediately use (or stop
@@ -1194,7 +1309,8 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
     const id = path.slice("/admin/api/accounts/".length);
     if (!id) return errorResponse(400, "missing_param", "account id required");
     const ok = await removeAccount(id);
-    if (!ok) return errorResponse(404, "not_found", "Account not found");
+    const errResp = handleMutationResult(ok);
+    if (errResp) return errResp;
     // Hot-swap the in-memory credential if active changed
     const cred = await loadCredential();
     if (cred) opts.auth.setOAuthCredential(cred);
@@ -1353,12 +1469,14 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
       // Update name if provided (including empty string to clear)
       if (body.name !== undefined) {
         const ok = await setAccountName(body.id, body.name);
-        if (!ok) return errorResponse(404, "not_found", "Account not found");
+        const errResp = handleMutationResult(ok);
+        if (errResp) return errResp;
       }
       // Update email if provided (including empty string to clear)
       if (body.email !== undefined) {
         const ok = await setAccountEmail(body.id, body.email);
-        if (!ok) return errorResponse(404, "not_found", "Account not found");
+        const errResp = handleMutationResult(ok);
+        if (errResp) return errResp;
       }
 
       // If the active account was edited, hot-swap the in-memory credential so
@@ -1387,9 +1505,9 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
       if (!id) {
         return errorResponse(400, "missing_param", "id query param is required");
       }
-      // Invalidate cache so external writes (e.g. start.bat adding a credential)
-      // are reflected — otherwise we might return 404 for a just-added account.
-      invalidateStoreCache();
+      // NOTE: do NOT call invalidateStoreCache() here — readStore() already
+      // detects external writes via mtime check. Removing this cuts latency
+      // on this endpoint and avoids causing concurrent reads to miss cache.
       const account = await exportSingleAccount(id);
       if (!account) {
         return errorResponse(404, "not_found", "Account not found");
@@ -1415,7 +1533,8 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
         return errorResponse(400, "invalid_param", "disabled must be a boolean");
       }
       const ok = await setAccountDisabled(body.id, body.disabled);
-      if (!ok) return errorResponse(404, "not_found", "Account not found");
+      const errResp = handleMutationResult(ok);
+      if (errResp) return errResp;
       invalidateStoreCache();
       appendLog("info", `Account ${body.id} ${body.disabled ? "disabled" : "enabled"}`);
       return jsonResp({ ok: true, disabled: body.disabled });
@@ -2146,13 +2265,20 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
         }, 30_000);
 
         // v0.1.5+ SHORTER maxTimeout: was 1 hour (way too long — leaked
-        // waiters up to 1h per disconnected client). 10 minutes is plenty
-        // for a dashboard log viewer session; the client auto-reconnects
-        // via EventSource's built-in retry after we close.
+        // waiters up to 1h per disconnected client). 10 minutes was still
+        // too long — leaked waiters block `for (const w of logWaiters)`
+        // iteration in appendLog() for the full window, and on Windows
+        // where abrupt disconnects (F5 refresh, tab close, laptop sleep)
+        // aren't always detected immediately, this caused "运行久了刷新卡顿".
+        //
+        // 2 minutes is plenty for a dashboard log viewer session; the client
+        // auto-reconnects via EventSource's built-in retry after we close.
+        // Even with 10 leaked waiters, the worst-case iteration cost in
+        // appendLog drops from 10min × N to 2min × N — a 5x improvement.
         maxTimeout = setTimeout(() => {
           doCleanup();
           try { controller.close(); } catch { /* already closed */ }
-        }, 600_000);
+        }, 120_000);
       },
       cancel() {
         // Cleanup if the client disconnects early

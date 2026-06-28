@@ -244,8 +244,16 @@ describe("credential auto-switching", () => {
     expect(seenApiKeys.slice(0, 5).every(k => k === "key-AAA")).toBe(true);
     // After switch, remaining 7 should all be B (no cycling back to A)
     expect(seenApiKeys.slice(5).every(k => k === "key-BBB")).toBe(true);
-    // Final response is 529 (exhausted)
-    expect(resp.status).toBe(529);
+    // === UPDATED (命令行还在继续重试 fix) ===
+    // Previously: 529 (retryable) — caused infinite client retry loops.
+    // The user reported "命令行还在继续重试" because Claude Code etc. kept
+    // re-sending the request after the proxy had exhausted all credentials.
+    //
+    // Now: 503 (non-retryable) with Retry-After: 300 — tells well-behaved
+    // clients to STOP retrying for 5 minutes, giving the user time to add
+    // a new credential or wait for upstream quota reset.
+    expect(resp.status).toBe(503);
+    expect(resp.headers.get("retry-after")).toBe("300");
   });
 
   it("switches at threshold=1 (switch on every failure)", async () => {

@@ -1,5 +1,67 @@
 # zcode-proxy 使用说明
 
+> **v0.2.0.7 — 重大修复：凭证丢失 bug + 命令行无限重试 + 管理面板刷新卡顿**
+>
+> 本次发版修复了用户在 Windows 长时间运行后报告的三个关联问题：账号突然全部消失、管理面板切不动账号、命令行客户端一直在重试。同时大幅优化了管理面板刷新卡顿。
+>
+> **本次改动**
+>
+> **1. 修复"账号全没"毁灭性 bug（核心修复）**
+>
+> 之前的 `withStoreLock` 在 `readStore()` 因任何原因返回 null 时（Windows 杀毒软件临时锁文件、IO 错误、跨进程竞争等），会用 `{accounts: []}` 覆盖写入磁盘——**静默蒸发所有账号，无任何错误日志**。retry 循环每次切凭证都会触发这个路径，所以一旦撞上 AV 锁文件，3 次切换就把所有账号清空。
+>
+> v0.2.0.7 修复：拆分 `withStoreLock` 为两个版本：
+> - `withStoreLock`（保留空回退）：仅供 `saveCredential` / `importAccounts` 使用，因为这两个操作的本意就是新建 store
+> - `withExistingStoreLock`（无空回退）：供 `switchAccount` / `removeAccount` / `setAccount*` 使用——读不到 store 就**不写盘**
+>
+> 新函数还区分两种 null 场景：
+> - 文件不存在 → 返回 false（账号 id 找不到 → 404 not found）
+> - 文件存在但读不到 → 返回 null（transient 故障 → 503，拒绝写入）
+>
+> 这样即使 AV 把文件锁住，最多是切换失败返回 503，**绝对不会清空账号**。
+>
+> **2. 修复"命令行还在继续重试"**
+>
+> 之前所有凭证都失败后，代理返回 529（可重试状态码）给客户端。Claude Code / Codex 等客户端看到 529 就重发请求，代理又跑一遍 retry 循环又返回 529……无限循环。用户报告"命令行还在继续重试"就是这样来的。
+>
+> v0.2.0.7 修复：当 `totalAvailableCredentials > 1` 且所有凭证都试过时，返回 **503 + `Retry-After: 300`**（5 分钟）。503 是非可重试状态码，配合 Retry-After 头部告诉客户端"5 分钟内别再试了"。单凭证场景仍返回 529（可能是临时上游过载，重试合理）。
+>
+> **3. 修复"切换失败"**
+>
+> 这是问题 1 的连带症状：账号被清空后，dashboard 调 `switchAccount(id)` 找不到账号返回 false → 404。现在账号不会再被清空，切换路径恢复正常。同时新增 503 响应路径，让 dashboard 在 store 临时不可读时给出明确提示"凭证库暂时不可读，请稍后再试，您的凭证安全"。
+>
+> **4. 修复"管理面板运行久了刷新卡顿"**
+>
+> 多个性能问题叠加导致运行越久越卡：
+>
+> - **忙等自旋阻塞事件循环 750ms**：`readStoreUncached` 在 Windows AV 锁文件时用 `while (Date.now() < end) { /* spin */ }` 同步忙等，最长 50+100+150+200+250 = 750ms 期间整个 Bun 事件循环冻结，所有 HTTP 请求、SSE 推送、定时器全部停摆。改为 `await new Promise(r => setTimeout(r, ms))` 异步等待，让出事件循环。
+>
+> - **3 处冗余 `invalidateStoreCache()`**：`GET /admin/api/credentials`、`GET /admin/api/accounts`、`GET /admin/api/accounts/export-single` 每次刷新都强制清缓存 + 全量解密，但 `readStore()` 本来就有 `statSync` mtime 检查能自动检测外部写入。移除这三处冗余调用，每次刷新省 5-20ms。
+>
+> - **`appendFileSync` 同步写日志**：开启文件日志时，每条 `console.log` 都同步写盘，Windows + AV 干预下单次 5-50ms，50 条/秒就是 250ms-2.5s/秒的事件循环阻塞。改为 500ms 缓冲异步写（内存攒批 + `fs.promises.appendFile`），写入次数从 N 降到 ~1/500ms。
+>
+> - **SSE waiter 泄漏窗口 10 分钟**：`maxTimeout` 从 10 分钟降到 2 分钟，减少泄漏 waiter 阻塞 `appendLog` 迭代的窗口期 5 倍。
+>
+> - **前端 13 个串行 await**：`initDashboard` 改为 `Promise.all` 并发（2 批：关键 UI 优先加载，次要内容后台加载），首屏可交互时间减半。
+>
+> - **2 秒 stats 轮询**：改为 5 秒，减少 60% 后端轮询压力。
+>
+> - **新增 `visibilitychange` 监听器**：标签页隐藏时停止所有轮询 + 关闭 SSE 连接，可见时恢复。这是"运行久了"卡顿的关键缓解——之前后台标签页会持续轮询 5s + 10s 两个 interval，跟实际代理请求抢 I/O。
+>
+> **5. AuthManager 新增 `getAvailableCredentialCount()`**
+>
+> 让 retry 循环能区分"只有 1 个凭证"（返回 529）和"多凭证全失败"（返回 503）两种场景。
+>
+> **影响谁**
+>
+> - Windows 长时间运行的用户：再也不用担心账号突然消失，命令行客户端也不会无限重试。
+> - 所有用户：管理面板刷新明显变快，尤其运行久了之后。
+> - 单凭证用户：行为不变（仍返回 529 重试，因为是临时过载）。
+>
+> **升级建议**
+>
+> 强烈建议所有 Windows 用户升级。如果你之前遇到过"账号全没"问题，升级后即使再遇到 AV 锁文件也不会丢账号，最多是切换临时失败。
+
 > **v0.2.0.6 — Token 计数修复：cache token 读取 + Anthropic SSE 协议合规 + thinking 计数显示**
 >
 > 本次发版聚焦于"日志里 token 计数显示偏小"的诊断与修复。v0.2.0.4 给 system 块和最后一块用户消息加了 `cache_control: ephemeral`（对齐 ZCode 客户端 wire shape）后，prompt cache 开始命中——但日志的 token 计数没跟上这个变化，导致用户看到 `in: 1152 out: 4413` 这种"看起来丢了几万 token"的怪现象。同时 thinking 开启后日志缺少思考 token 显示，TTFB 90 秒但 out 只有 529 让人困惑。
