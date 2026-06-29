@@ -1244,6 +1244,10 @@ td input{font-family:var(--font-mono)}
           <span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg></span>
           <span class="nav-text">代理规则</span>
         </div>
+        <div class="nav-item" data-page="proxy-pool">
+          <span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg></span>
+          <span class="nav-text">代理池</span>
+        </div>
       </div>
       <div class="nav-section">
         <div class="nav-section-title">凭证</div>
@@ -1260,7 +1264,7 @@ td input{font-family:var(--font-mono)}
     <div class="sidebar-footer">
       <div class="version">
         <span class="dot"></span>
-        <span>v0.2.1.0</span>
+        <span>v0.2.1.1</span>
       </div>
       <div class="logout-btn" onclick="doLogout()">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
@@ -1985,6 +1989,156 @@ td input{font-family:var(--font-mono)}
         </div>
       </div>
 
+      <!-- ============================================================ Proxy Pool ============================================================ -->
+      <div class="page" id="page-proxy-pool">
+        <div class="main-header">
+          <div class="header-left">
+            <h1>代理池</h1>
+            <div class="subtitle">全局共享出站代理池，优先级低于单账号代理设置</div>
+          </div>
+        </div>
+
+        <!-- Configuration card -->
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">
+              <span class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></span>
+              代理池配置
+            </div>
+          </div>
+          <div class="card-body">
+            <div class="hint">
+              <span class="hint-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></span>
+              <div>
+                代理池为所有账号提供共享出站代理。<strong>优先级</strong>：单账号代理设置 &gt; 代理池 &gt; 直连。
+                当请求遇到 405/WAF 网关拦截时，会自动轮询切换到池中其他代理重试（最多 <code class="code-inline">maxRotations</code> 次）。
+              </div>
+            </div>
+            <div class="form-row" style="margin-top:12px">
+              <div class="form-group">
+                <label class="form-label">启用代理池</label>
+                <label class="switch" style="display:inline-flex;align-items:center;gap:8px;">
+                  <input type="checkbox" id="ppEnabled" style="width:auto">
+                  <span>开启后所有未单独配置代理的账号将使用池中代理</span>
+                </label>
+              </div>
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label">自动更新间隔（分钟）</label>
+                <input id="ppRefreshInterval" type="number" min="0" max="1440" value="5" style="width:120px">
+                <span style="font-size:12px;color:var(--text-3);margin-left:8px">0 = 禁用自动更新（默认 5 分钟）</span>
+              </div>
+              <div class="form-group">
+                <label class="form-label">WAF 拦截时最大轮询次数</label>
+                <input id="ppMaxRotations" type="number" min="0" max="20" value="3" style="width:120px">
+                <span style="font-size:12px;color:var(--text-3);margin-left:8px">0 = 禁用代理轮询重试</span>
+              </div>
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label">WAF 拦截自动轮询</label>
+                <label class="switch" style="display:inline-flex;align-items:center;gap:8px;">
+                  <input type="checkbox" id="ppRotateOnGatewayBlock" style="width:auto">
+                  <span>遇到 405/阿里云 WAF 拦截时自动切换代理重试</span>
+                </label>
+              </div>
+            </div>
+            <div class="form-group">
+              <label class="form-label">代理列表来源 URL（每行一个，定时拉取）</label>
+              <textarea id="ppSourceUrls" rows="3" placeholder="https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/all/data.txt" style="width:100%;font-family:var(--font-mono);font-size:12px;resize:vertical"></textarea>
+            </div>
+          </div>
+          <div class="card-actions">
+            <button class="btn btn-primary" onclick="saveProxyPoolConfig()">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/></svg>
+              保存配置
+            </button>
+            <button class="btn btn-ghost" onclick="loadProxyPool()">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>
+              重新加载
+            </button>
+          </div>
+        </div>
+
+        <!-- Import card -->
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">
+              <span class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg></span>
+              导入代理
+            </div>
+          </div>
+          <div class="card-body">
+            <div class="form-group">
+              <label class="form-label">从 URL 一键导入</label>
+              <div style="display:flex;gap:8px;align-items:flex-end">
+                <input id="ppImportUrl" placeholder="https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/all/data.txt" style="flex:1;font-family:var(--font-mono);font-size:12px">
+                <button class="btn btn-primary btn-sm" onclick="importProxyPoolFromUrl()">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                  导入
+                </button>
+              </div>
+              <div style="font-size:12px;color:var(--text-3);margin-top:4px">从远端 txt 列表拉取并导入（同 URL 再次导入会替换该来源的旧代理）</div>
+            </div>
+            <hr style="border:none;border-top:1px solid var(--border);margin:16px 0">
+            <div class="form-group">
+              <label class="form-label">手动添加 / 从 txt 文件导入</label>
+              <textarea id="ppImportText" rows="6" placeholder="每行一个代理，支持格式：&#10;1.2.3.4:8080&#10;http://user:pass@5.6.7.8:3128&#10;socks4://9.10.11.12:1080&#10;socks5://9.10.11.12:1080&#10;# 开头的行会被忽略" style="width:100%;font-family:var(--font-mono);font-size:12px;resize:vertical"></textarea>
+            </div>
+            <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+              <button class="btn btn-primary btn-sm" onclick="importProxyPoolFromText(false)">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                追加导入
+              </button>
+              <button class="btn btn-ghost btn-sm" onclick="importProxyPoolFromText(true)">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+                替换导入（清空已有）
+              </button>
+              <label class="btn btn-ghost btn-sm" style="cursor:pointer">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                上传 txt 文件
+                <input type="file" accept=".txt,text/plain" style="display:none" onchange="uploadProxyPoolFile(event)">
+              </label>
+            </div>
+          </div>
+        </div>
+
+        <!-- Pool table card -->
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">
+              <span class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg></span>
+              代理列表 <span class="tag" id="ppPoolCount">0</span>
+            </div>
+            <div style="display:flex;gap:8px;align-items:center">
+              <button class="btn btn-primary btn-sm" onclick="refreshProxyPool()">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+                立即刷新全部来源
+              </button>
+              <button class="btn btn-ghost btn-sm" onclick="clearProxyPool()">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+                清空全部
+              </button>
+            </div>
+          </div>
+          <div class="card-body" style="padding-bottom:0">
+            <div class="hint" id="ppLastRefreshInfo" style="display:none">
+              <span class="hint-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg></span>
+              <div id="ppLastRefreshText">—</div>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>代理 URL</th><th>来源</th><th>添加时间</th><th>失败次数</th><th>最近使用</th><th style="text-align:right">操作</th></tr></thead>
+              <tbody id="ppProxies">
+                <tr><td colspan="6"><div class="empty-state"><div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg></div><div class="empty-text">加载中...</div></div></td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
       <!-- ============================================================ Debug Dumps ============================================================ -->
       <div class="page" id="page-debug">
         <div class="main-header">
@@ -2392,6 +2546,7 @@ async function initDashboard(){
     loadResponsesThinking(),
     loadStats(),
     loadDebugDumps(),
+    loadProxyPool(),
   ]).catch(e => console.error('initDashboard batch 2 failed:', e));
   connectLogStream();
   // Sync the log-page debug toggle with the server's current state, so
@@ -2879,8 +3034,8 @@ async function changeProxy(id,proxy){
   // Legacy inline-edit path — kept for backward compat but no longer wired up
   // to any UI element. New dashboard uses openProxyModal() instead.
   const trimmed=(proxy||'').trim();
-  if(trimmed && !/^(https?|socks5h?):\/\/[^\s]+$/i.test(trimmed)){
-    toast('代理格式无效，需为 http(s):// 或 socks5:// 开头','error');
+  if(trimmed && !/^(https?|socks4a?|socks5h?):\/\/[^\s]+$/i.test(trimmed)){
+    toast('代理格式无效，需为 http(s)://、socks4(a):// 或 socks5(h):// 开头','error');
     loadAccountsList();
     return;
   }
@@ -3160,7 +3315,7 @@ function closeModal(containerId){
 // Per-account proxy modal (v2.1.4.1test6+)
 // ============================================================
 // Replaces the inline proxy input with a full modal dialog. The modal lets
-// users pick proxy type (none/http/https/socks5/socks5h), enter host/port/
+// users pick proxy type (none/http/https/socks4/socks4a/socks5/socks5h), enter host/port/
 // user/pass separately, test connectivity, and save. Internally we still
 // store a single URL string on Credential.proxy — the modal just parses
 // and assembles that URL for the user.
@@ -3191,7 +3346,7 @@ function buildProxyUrlFromModal(){
     // URL-encode user/pass to handle special chars (@, :, /, etc.)
     auth=encodeURIComponent(user)+(pass?(':'+encodeURIComponent(pass)):'')+'@';
   }
-  // Default port hints: http(s)→80/443 typically omitted; socks5→1080.
+  // Default port hints: http(s)→80/443 typically omitted; socks4/socks5→1080.
   // We don't auto-fill — let the user specify. Empty port is allowed.
   const portPart=port?(':'+port):'';
   return `${type}://${auth}${host}${portPart}`;
@@ -3206,7 +3361,7 @@ function parseProxyUrl(url){
   const empty={type:'none',host:'',port:'',user:'',pass:''};
   if(!url||!url.trim())return empty;
   const trimmed=url.trim();
-  const m=/^(https?|socks5h?):\/\/(?:([^:@/]+)(?::([^@/]*))?@)?([^:/]+)(?::(\d+))?\/?$/i.exec(trimmed);
+  const m=/^(https?|socks4a?|socks5h?):\/\/(?:([^:@/]+)(?::([^@/]*))?@)?([^:/]+)(?::(\d+))?\/?$/i.exec(trimmed);
   if(!m)return empty; // unrecognized format → reset to none
   return {
     type:m[1].toLowerCase(),
@@ -4413,6 +4568,216 @@ function toast(msg,type='success'){
     }
   },3000);
 }
+
+// --- Proxy Pool (v0.2.2+) ---
+// Global shared outbound proxy pool. Priority: per-account proxy > pool > direct.
+// See src/proxy/proxy-pool.ts for the backend implementation.
+let ppPoolState=null;
+
+async function loadProxyPool(){
+  try{
+    const r=await fetch(API+'/admin/api/proxy-pool',{headers:authHeaders()});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    ppPoolState=await r.json();
+    renderProxyPool();
+  }catch(e){
+    console.error('loadProxyPool failed:',e);
+    toast('加载代理池失败','error');
+  }
+}
+
+function renderProxyPool(){
+  if(!ppPoolState)return;
+  const c=ppPoolState.config||{};
+  document.getElementById('ppEnabled').checked=!!c.enabled;
+  document.getElementById('ppRefreshInterval').value=c.refreshIntervalMin ?? 5;
+  document.getElementById('ppMaxRotations').value=c.maxRotations ?? 3;
+  document.getElementById('ppRotateOnGatewayBlock').checked=c.rotateOnGatewayBlock !== false;
+  document.getElementById('ppSourceUrls').value=(c.sourceUrls||[]).join('\n');
+
+  const proxies=ppPoolState.proxies||[];
+  document.getElementById('ppPoolCount').textContent=String(proxies.length);
+
+  // Last refresh info
+  const info=document.getElementById('ppLastRefreshInfo');
+  const infoText=document.getElementById('ppLastRefreshText');
+  if(ppPoolState.lastRefreshResult&&ppPoolState.lastRefreshResult.at){
+    const r=ppPoolState.lastRefreshResult;
+    const at=new Date(r.at).toLocaleString();
+    let txt=`上次更新：${at} — 新增 ${r.added}，删除 ${r.removed}，总计 ${r.total}`;
+    if(r.errors&&Object.keys(r.errors).length>0){
+      txt+='；错误：'+Object.entries(r.errors).map(([u,e])=>`${shortenUrl(u)} (${e})`).join('，');
+    }
+    infoText.textContent=txt;
+    info.style.display='flex';
+  }else{
+    info.style.display='none';
+  }
+
+  const tbody=document.getElementById('ppProxies');
+  if(proxies.length===0){
+    tbody.innerHTML=`<tr><td colspan="6"><div class="empty-state"><div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg></div><div class="empty-text">代理池为空 — 在上方导入代理或配置来源 URL</div></div></td></tr>`;
+    return;
+  }
+  tbody.innerHTML=proxies.map(p=>{
+    const addedAt=p.addedAt?new Date(p.addedAt).toLocaleString():'-';
+    const lastUsed=p.lastUsedAt?new Date(p.lastUsedAt).toLocaleString():'-';
+    const failures=p.failures||0;
+    const sourceLabel=formatProxySource(p.source);
+    const failBadge=failures>0?`<span class="badge badge-${failures>3?'danger':'warn'}">${failures}</span>`:'0';
+    return `<tr>
+      <td style="font-family:var(--font-mono);font-size:12px;word-break:break-all">${escapeHtml(p.url)}</td>
+      <td>${escapeHtml(sourceLabel)}</td>
+      <td style="font-size:12px;color:var(--text-3)">${escapeHtml(addedAt)}</td>
+      <td style="text-align:center">${failBadge}</td>
+      <td style="font-size:12px;color:var(--text-3)">${escapeHtml(lastUsed)}</td>
+      <td style="text-align:right">
+        <button class="btn btn-ghost btn-sm" onclick="removeProxyPoolEntry('${escapeHtml(p.id)}')">删除</button>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+function shortenUrl(u){
+  try{return new URL(u).host}catch{return u.length>40?u.slice(0,40)+'...':u}
+}
+
+function formatProxySource(source){
+  if(source==='manual')return '手动';
+  if(source.startsWith('url:'))return 'URL: '+shortenUrl(source.slice(4));
+  return source;
+}
+
+async function saveProxyPoolConfig(){
+  const config={
+    enabled:document.getElementById('ppEnabled').checked,
+    refreshIntervalMin:parseInt(document.getElementById('ppRefreshInterval').value,10)||0,
+    maxRotations:parseInt(document.getElementById('ppMaxRotations').value,10)||0,
+    rotateOnGatewayBlock:document.getElementById('ppRotateOnGatewayBlock').checked,
+    sourceUrls:document.getElementById('ppSourceUrls').value
+      .split(/\r?\n/).map(s=>s.trim()).filter(s=>s.length>0),
+  };
+  try{
+    const r=await fetch(API+'/admin/api/proxy-pool/config',{
+      method:'PUT',headers:authHeaders(),body:JSON.stringify(config),
+    });
+    if(!r.ok){
+      const e=await r.json().catch(()=>({}));
+      throw new Error(e.error?.message||'HTTP '+r.status);
+    }
+    const data=await r.json();
+    ppPoolState={...ppPoolState,config:data.config};
+    renderProxyPool();
+    toast('代理池配置已保存');
+  }catch(e){
+    console.error('saveProxyPoolConfig failed:',e);
+    toast('保存配置失败：'+e.message,'error');
+  }
+}
+
+async function importProxyPoolFromUrl(){
+  const url=document.getElementById('ppImportUrl').value.trim();
+  if(!url){toast('请输入 URL','warn');return}
+  try{
+    const r=await fetch(API+'/admin/api/proxy-pool/import-url',{
+      method:'POST',headers:authHeaders(),body:JSON.stringify({url}),
+    });
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const data=await r.json();
+    if(data.error){
+      toast(`导入失败：${data.error}`,'error');
+    }else{
+      toast(`导入完成：新增 ${data.added}，删除 ${data.removed}，总计 ${data.total}（拉取 ${data.fetched} 条）`);
+      document.getElementById('ppImportUrl').value='';
+    }
+    await loadProxyPool();
+  }catch(e){
+    console.error('importProxyPoolFromUrl failed:',e);
+    toast('导入失败：'+e.message,'error');
+  }
+}
+
+async function importProxyPoolFromText(replace){
+  const text=document.getElementById('ppImportText').value;
+  if(!text.trim()){toast('请输入代理内容','warn');return}
+  try{
+    const r=await fetch(API+'/admin/api/proxy-pool/import-text',{
+      method:'POST',headers:authHeaders(),body:JSON.stringify({text,replace}),
+    });
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const data=await r.json();
+    toast(`${replace?'替换':'追加'}导入：新增 ${data.added}，删除 ${data.removed}，总计 ${data.total}`);
+    document.getElementById('ppImportText').value='';
+    await loadProxyPool();
+  }catch(e){
+    console.error('importProxyPoolFromText failed:',e);
+    toast('导入失败：'+e.message,'error');
+  }
+}
+
+async function uploadProxyPoolFile(event){
+  const file=event.target.files[0];
+  if(!file)return;
+  try{
+    const text=await file.text();
+    document.getElementById('ppImportText').value=text;
+    toast(`已加载文件 ${file.name}（${text.length} 字节），点击"追加导入"或"替换导入"应用`);
+  }catch(e){
+    toast('读取文件失败：'+e.message,'error');
+  }
+  event.target.value=''; // reset so the same file can be re-selected
+}
+
+async function refreshProxyPool(){
+  try{
+    const r=await fetch(API+'/admin/api/proxy-pool/refresh',{
+      method:'POST',headers:authHeaders(),
+    });
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const data=await r.json();
+    let msg=`刷新完成：新增 ${data.added}，删除 ${data.removed}，总计 ${data.total}`;
+    if(data.errors&&Object.keys(data.errors).length>0){
+      msg+='；'+Object.keys(data.errors).length+' 个来源失败';
+      toast(msg,'warn');
+    }else{
+      toast(msg);
+    }
+    await loadProxyPool();
+  }catch(e){
+    console.error('refreshProxyPool failed:',e);
+    toast('刷新失败：'+e.message,'error');
+  }
+}
+
+async function removeProxyPoolEntry(id){
+  try{
+    const r=await fetch(API+'/admin/api/proxy-pool/proxy',{
+      method:'DELETE',headers:authHeaders(),body:JSON.stringify({id}),
+    });
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    toast('已删除');
+    await loadProxyPool();
+  }catch(e){
+    console.error('removeProxyPoolEntry failed:',e);
+    toast('删除失败：'+e.message,'error');
+  }
+}
+
+async function clearProxyPool(){
+  if(!confirm('确定要清空代理池中的所有代理吗？配置（来源 URL、刷新间隔等）会保留。'))return;
+  try{
+    const r=await fetch(API+'/admin/api/proxy-pool/clear',{
+      method:'POST',headers:authHeaders(),
+    });
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const data=await r.json();
+    toast(`已清空 ${data.removed} 条代理`);
+    await loadProxyPool();
+  }catch(e){
+    console.error('clearProxyPool failed:',e);
+    toast('清空失败：'+e.message,'error');
+  }
+}
 </script>
 
 <!-- ============================================================ -->
@@ -4436,6 +4801,8 @@ function toast(msg,type='success'){
           <option value="none">无代理（直连）</option>
           <option value="http">HTTP</option>
           <option value="https">HTTPS</option>
+          <option value="socks4">SOCKS4</option>
+          <option value="socks4a">SOCKS4a（远端 DNS）</option>
           <option value="socks5">SOCKS5</option>
           <option value="socks5h">SOCKS5h（远端 DNS）</option>
         </select>

@@ -17,6 +17,15 @@ import { timingSafeEqual } from "../utils/crypto.js";
 import { atomicWriteFile, createMutex } from "../utils/fs.js";
 import { MODELS as GLM_CATALOG } from "../provider/models.js";
 import { stringify as stringifyYaml } from "yaml";
+import {
+  getPoolState,
+  updatePoolConfig,
+  importFromText,
+  importFromUrl,
+  refreshFromSources,
+  removeProxy,
+  clearProxies,
+} from "../proxy/proxy-pool.js";
 // Inline the dashboard HTML at build time so it works inside a
 // `bun build --compile` single-file executable. Runtime `readFileSync`
 // would resolve to the exe's virtual root (e.g. B:\~BUN\root\) and fail
@@ -1089,15 +1098,15 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
           return errorResponse(
             400,
             "invalid_param",
-            "proxy must be a valid URL with scheme http://, https://, socks5://, or socks5h://",
+            "proxy must be a valid URL with scheme http://, https://, socks4://, socks4a://, socks5://, or socks5h://",
           );
         }
-        const allowedProtocols = ["http:", "https:", "socks5:", "socks5h:"];
+        const allowedProtocols = ["http:", "https:", "socks4:", "socks4a:", "socks5:", "socks5h:"];
         if (!allowedProtocols.includes(proxyUrl.protocol)) {
           return errorResponse(
             400,
             "invalid_param",
-            "proxy must be a valid URL with scheme http://, https://, socks5://, or socks5h://",
+            "proxy must be a valid URL with scheme http://, https://, socks4://, socks4a://, socks5://, or socks5h://",
           );
         }
         // Reject hosts containing HTML/JS metacharacters — these can never
@@ -1173,15 +1182,15 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
         return errorResponse(
           400,
           "invalid_param",
-          "proxy must be a valid URL with scheme http://, https://, socks5://, or socks5h://",
+          "proxy must be a valid URL with scheme http://, https://, socks4://, socks4a://, socks5://, or socks5h://",
         );
       }
-      const allowedProtocols = ["http:", "https:", "socks5:", "socks5h:"];
+      const allowedProtocols = ["http:", "https:", "socks4:", "socks4a:", "socks5:", "socks5h:"];
       if (!allowedProtocols.includes(proxyUrl.protocol)) {
         return errorResponse(
           400,
           "invalid_param",
-          "proxy must be a valid URL with scheme http://, https://, socks5://, or socks5h://",
+          "proxy must be a valid URL with scheme http://, https://, socks4://, socks4a://, socks5://, or socks5h://",
         );
       }
       if (/[<>'"\s]/.test(proxyUrl.host)) {
@@ -2387,6 +2396,157 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
     clearDebugDumps();
     appendLog("info", "Debug dumps cleared by admin");
     return jsonResp({ ok: true });
+  }
+
+  // =====================================================================
+  // Global Proxy Pool (v0.2.2+)
+  // =====================================================================
+  // All routes under /admin/api/proxy-pool/* manage the global proxy pool.
+  // The pool provides a fallback outbound proxy shared across all accounts;
+  // per-account `cred.proxy` overrides still take priority over the pool.
+  // See src/proxy/proxy-pool.ts for the full design.
+  if (path === "/admin/api/proxy-pool" && method === "GET") {
+    try {
+      const state = await getPoolState();
+      return jsonResp(state);
+    } catch (err) {
+      return errorResponse(500, "proxy_pool_error", (err as Error).message);
+    }
+  }
+
+  if (path === "/admin/api/proxy-pool/config" && method === "PUT") {
+    try {
+      const parsed = await readJsonBody<{
+        enabled?: boolean;
+        refreshIntervalMin?: number;
+        sourceUrls?: string[];
+        rotateOnGatewayBlock?: boolean;
+        maxRotations?: number;
+      }>(req);
+      if (!parsed.ok) return parsed.error;
+      const body = parsed.body;
+      const patch: Record<string, unknown> = {};
+      if (typeof body.enabled === "boolean") patch.enabled = body.enabled;
+      if (typeof body.refreshIntervalMin === "number" && body.refreshIntervalMin >= 0) {
+        patch.refreshIntervalMin = Math.floor(body.refreshIntervalMin);
+      }
+      if (Array.isArray(body.sourceUrls)) {
+        // Validate each URL.
+        const urls: string[] = [];
+        for (const u of body.sourceUrls) {
+          if (typeof u !== "string") continue;
+          const trimmed = u.trim();
+          if (!trimmed) continue;
+          try {
+            // Reject obviously-invalid URLs.
+            new URL(trimmed);
+            urls.push(trimmed);
+          } catch {
+            return errorResponse(400, "invalid_param", `Invalid source URL: ${trimmed}`);
+          }
+        }
+        patch.sourceUrls = urls;
+      }
+      if (typeof body.rotateOnGatewayBlock === "boolean") patch.rotateOnGatewayBlock = body.rotateOnGatewayBlock;
+      if (typeof body.maxRotations === "number" && body.maxRotations >= 0) {
+        patch.maxRotations = Math.floor(body.maxRotations);
+      }
+      const newConfig = await updatePoolConfig(patch);
+      appendLog("info", `Proxy pool config updated (enabled=${newConfig.enabled}, interval=${newConfig.refreshIntervalMin}min, sources=${newConfig.sourceUrls.length})`);
+      return jsonResp({ ok: true, config: newConfig });
+    } catch (err) {
+      return errorResponse(500, "proxy_pool_error", (err as Error).message);
+    }
+  }
+
+  // Import proxies from a raw text block (paste or txt file upload).
+  // Body: { text: string, replace?: boolean }
+  // Returns: { ok: true, added, removed, total }
+  if (path === "/admin/api/proxy-pool/import-text" && method === "POST") {
+    try {
+      const parsed = await readJsonBody<{ text?: string; replace?: boolean }>(req);
+      if (!parsed.ok) return parsed.error;
+      const body = parsed.body;
+      if (typeof body.text !== "string") {
+        return errorResponse(400, "missing_param", "text is required");
+      }
+      const result = await importFromText(body.text, body.replace === true);
+      appendLog("info", `Proxy pool import (text): +${result.added} -${result.removed} =${result.total}`);
+      return jsonResp({ ok: true, ...result });
+    } catch (err) {
+      return errorResponse(500, "proxy_pool_error", (err as Error).message);
+    }
+  }
+
+  // Import proxies from a remote URL (one-shot fetch, not auto-refresh).
+  // Body: { url: string }
+  // Returns: { ok: true, added, removed, total, fetched, error? }
+  if (path === "/admin/api/proxy-pool/import-url" && method === "POST") {
+    try {
+      const parsed = await readJsonBody<{ url?: string }>(req);
+      if (!parsed.ok) return parsed.error;
+      const body = parsed.body;
+      if (typeof body.url !== "string" || !body.url.trim()) {
+        return errorResponse(400, "missing_param", "url is required");
+      }
+      const trimmed = body.url.trim();
+      try { new URL(trimmed); } catch {
+        return errorResponse(400, "invalid_param", "url is not a valid URL");
+      }
+      const fetchImpl = opts.fetchImpl ?? fetch;
+      const result = await importFromUrl(trimmed, fetchImpl);
+      if (result.error) {
+        appendLog("warn", `Proxy pool import (URL ${trimmed}) failed: ${result.error}`);
+        return jsonResp({ ok: false, ...result }, 200);
+      }
+      appendLog("info", `Proxy pool import (URL ${trimmed}): +${result.added} -${result.removed} =${result.total} (fetched ${result.fetched})`);
+      return jsonResp({ ok: true, ...result });
+    } catch (err) {
+      return errorResponse(500, "proxy_pool_error", (err as Error).message);
+    }
+  }
+
+  // Refresh from ALL configured source URLs (manual trigger).
+  // Returns: { ok: true, added, removed, total, at, errors? }
+  if (path === "/admin/api/proxy-pool/refresh" && method === "POST") {
+    try {
+      const fetchImpl = opts.fetchImpl ?? fetch;
+      const result = await refreshFromSources(fetchImpl);
+      appendLog("info", `Proxy pool refresh: +${result.added} -${result.removed} =${result.total}` + (result.errors ? ` (errors: ${Object.keys(result.errors).length})` : ""));
+      return jsonResp({ ok: true, ...result });
+    } catch (err) {
+      return errorResponse(500, "proxy_pool_error", (err as Error).message);
+    }
+  }
+
+  // Remove a single proxy by id.
+  // Body: { id: string }
+  if (path === "/admin/api/proxy-pool/proxy" && method === "DELETE") {
+    try {
+      const parsed = await readJsonBody<{ id?: string }>(req);
+      if (!parsed.ok) return parsed.error;
+      const body = parsed.body;
+      if (typeof body.id !== "string" || !body.id.trim()) {
+        return errorResponse(400, "missing_param", "id is required");
+      }
+      const ok = await removeProxy(body.id);
+      if (!ok) return errorResponse(404, "not_found", "Proxy not found in pool");
+      appendLog("info", `Proxy pool entry removed: ${body.id}`);
+      return jsonResp({ ok: true });
+    } catch (err) {
+      return errorResponse(500, "proxy_pool_error", (err as Error).message);
+    }
+  }
+
+  // Clear all proxies (config preserved).
+  if (path === "/admin/api/proxy-pool/clear" && method === "POST") {
+    try {
+      const result = await clearProxies();
+      appendLog("info", `Proxy pool cleared: ${result.removed} entries removed`);
+      return jsonResp({ ok: true, ...result });
+    } catch (err) {
+      return errorResponse(500, "proxy_pool_error", (err as Error).message);
+    }
   }
 
   return null; // Not an admin route

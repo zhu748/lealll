@@ -6,6 +6,7 @@ import { loadConfig } from "./config/loader.js";
 import { EXAMPLE_CONFIG_YAML } from "./config/template.js";
 import { AuthManager } from "./auth/manager.js";
 import { startServer } from "./server/server.js";
+import { initPool } from "./proxy/proxy-pool.js";
 import { loadCredential, saveCredential, clearCredentialAsync, getStorePath, exportAccounts, listAccounts } from "./auth/store.js";
 import { ZaiOAuthClient, BigmodelOAuthClient } from "./auth/oauth.js";
 import { KeyResolver } from "./auth/resolver.js";
@@ -15,7 +16,7 @@ import type { ProviderId } from "./provider/types.js";
 import { spawn } from "node:child_process";
 import { existsSync, writeFileSync } from "node:fs";
 
-const VERSION = "0.2.1.0";
+const VERSION = "0.2.1.1";
 
 // ---------------------------------------------------------------------------
 // Process-level error handlers — installed ONCE before main() so they cover
@@ -307,6 +308,15 @@ async function serve(configPath?: string): Promise<void> {
   console.log(`  plan: ${config.plan}`);
   console.log(`  auth mode: ${config.auth.mode}`);
   console.log(`  models: ${config.models.length} available`);
+
+  // Initialize the global proxy pool (reads ~/.zcode-proxy/proxy-pool.json,
+  // schedules auto-refresh if URLs are configured + pool is enabled). Best-
+  // effort: errors here don't stop the server.
+  try {
+    await initPool();
+  } catch (e) {
+    console.warn(`[proxy-pool] init failed (non-fatal): ${(e as Error).message}`);
+  }
   // Helpful access hint: when bound to 0.0.0.0, the user must use 127.0.0.1
   // (or localhost, or the machine's LAN IP) to reach the proxy. Browsers on
   // Windows especially refuse to connect to http://0.0.0.0:port — this is

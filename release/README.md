@@ -1,5 +1,49 @@
 # zcode-proxy 使用说明
 
+> **v0.2.1.1 — 全局代理池 + WAF 拦截自动轮询重试**
+>
+> 新增全局共享出站代理池，支持手动导入、txt 文件上传、URL 一键导入与定时自动刷新。当请求遇到 405/阿里云 WAF 拦截时，自动轮询切换到池中其他代理重试。
+>
+> **本次改动**
+>
+> **1. 全局代理池模块（`src/proxy/proxy-pool.ts`）**
+>
+> 新增持久化代理池（`~/.zcode-proxy/proxy-pool.json`），支持 6 种协议：`http`、`https`、`socks4`、`socks4a`、`socks5`、`socks5h`。优先级：单账号代理设置 > 代理池 > 直连。
+>
+> 三种导入方式：
+> - 手动粘贴文本（每行一个代理，支持注释行 `#`）
+> - 上传 txt 文件
+> - URL 一键导入（如 `https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/all/data.txt`）
+>
+> 自动定时刷新（默认 5 分钟，可配 0 = 禁用）。手动刷新返回新增/删除/总数统计。
+>
+> **2. WAF 拦截自动轮询重试**
+>
+> 当上游返回 405/403/200+HTML 且检测到阿里云 WAF 拦截特征时，自动切换到池中其他代理重试（最多 `maxRotations` 次，默认 3）。每次轮询的代理会被标记失败次数，方便在面板识别坏代理。轮询在初始请求和 retry 循环中都生效。
+>
+> **3. 管理面板新增「代理池」栏目**
+>
+> 侧边栏新增「代理池」页面，包含：
+> - 配置卡片（启用开关、刷新间隔、WAF 轮询开关与次数、来源 URL 列表）
+> - 导入卡片（URL 导入、文本粘贴、txt 文件上传、追加/替换模式）
+> - 代理列表表格（URL、来源、添加时间、失败次数、最近使用、删除）
+> - 「立即刷新全部来源」按钮，刷新后 toast 显示新增/删除/总数
+>
+> **4. Bug 修复**
+>
+> - 修复 `refreshFromSources` 在某个 URL 来源拉取失败时会清空该来源已有代理的 bug（现在保留已有代理，只跳过本次拉取）
+> - WAF 轮询循环现在正确读取 `maxRotations` 配置（之前硬编码为 5）
+>
+> **5. socks4/socks4a 协议支持**
+>
+> 单账号代理设置和代理池都新增 `socks4://` 和 `socks4a://` 协议支持（Bun 原生 fetch 已支持）。单账号代理弹窗新增 SOCKS4 和 SOCKS4a 选项。
+>
+> **6. Admin API 新增 7 个端点**
+>
+> `GET /admin/api/proxy-pool`、`PUT /admin/api/proxy-pool/config`、`POST /admin/api/proxy-pool/import-text`、`POST /admin/api/proxy-pool/import-url`、`POST /admin/api/proxy-pool/refresh`、`DELETE /admin/api/proxy-pool/proxy`、`POST /admin/api/proxy-pool/clear`
+
+---
+
 > **v0.2.1.0 — 流式翻译路径 token 计数修复（cache_read_input_tokens + reasoning_tokens 透传）**
 >
 > 修复 v0.2.0.6 引入的 token 计数 bug：当客户端使用 OpenAI Chat Completions 或 Responses API 协议接入代理、且 `stream:true` 时，dashboard 严重低估输入 token（少约 35 倍），且不显示 thinking 量标记 `(th:M)`。Anthropic 直通路径不受影响，计数一直正确。

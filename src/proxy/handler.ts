@@ -26,6 +26,7 @@ import { translateResponseAnthropicToResponses, anthropicSseToResponsesSse } fro
 import { saveTurn } from "../translator/responses-store.js";
 import { anthropicSseToOpenaiSse } from "../translator/sse-translator.js";
 import type { OpenAIChatRequest, OpenAIResponseRequest, AnthropicMessagesResponse } from "../translator/types.js";
+import { pickProxy, markProxyFailed, getMaxRotations } from "./proxy-pool.js";
 import { recordStat, recordDebugDump, appendLog } from "../admin/api.js";
 import { sleep } from "../utils/sleep.js";
 import { exportAccounts, switchAccount, maskApiKey } from "../auth/store.js";
@@ -379,6 +380,18 @@ export async function proxyRequest(
   // already wires it to the real fetch (no throwaway Request needed).
   let lastSentBeta: string | null = null;
 
+  // === Global proxy pool integration ===
+  // Resolution order (per the user spec "优先级低于单账号设置的代理"):
+  //   1. cred.proxy (per-account override) — highest priority
+  //   2. proxy pool (pickProxy round-robin) — fallback when no per-account proxy
+  //   3. direct connection (no proxy)
+  //
+  // The currentRequestProxy is tracked per-request so that on a 405/WAF block
+  // we can rotate to a DIFFERENT pool proxy and retry. Proxies already tried
+  // in this request are kept in `triedPoolProxies` so we don't cycle back.
+  let currentRequestProxy: string | undefined = undefined;
+  const triedPoolProxies = new Set<string>();
+
   // Fetch + SSE error detection in one shot. Used for both the initial fetch
   // AND every retry, so SSE errors hidden in 200 streams are caught on every
   // attempt — not just the first one.
@@ -393,6 +406,11 @@ export async function proxyRequest(
   // call (not captured in a closure) so a credential switch mid-retry picks
   // up the new account's proxy automatically — without this, switching from
   // a proxied account to a direct one would keep using the old proxy.
+  //
+  // Global proxy pool (v0.2.2+): when `cred.proxy` is NOT set, we consult
+  // the pool (pickProxy) for a fallback proxy. The picked proxy is stored
+  // in `currentRequestProxy` so the WAF-rotation path can advance to the
+  // next one on retry.
   const fetchUpstreamDetected = async (captcha?: Record<string, string>, isInitialAttempt: boolean = false): Promise<Response> => {
     const req = buildUpstreamReq(captcha);
     lastSentBeta = req.headers.get("anthropic-beta");
@@ -439,8 +457,30 @@ export async function proxyRequest(
       ...(translateMode ? {} : { decompress: false }),
       signal: ctrl.signal,
     };
+    // === Proxy resolution (v0.2.2+ global pool) ===
+    // Priority: cred.proxy (per-account) > pool (round-robin) > direct.
     if (cred.proxy) {
       fetchOpts.proxy = cred.proxy;
+    } else {
+      // Pool consultation is best-effort: if the pool is disabled or empty,
+      // pickProxy returns null and we fall through to a direct connection.
+      // The `currentRequestProxy` value persists across retries of THIS
+      // request unless the WAF-rotation path explicitly advances it.
+      if (!currentRequestProxy) {
+        try {
+          const picked = await pickProxy(triedPoolProxies);
+          if (picked) {
+            currentRequestProxy = picked;
+            triedPoolProxies.add(picked);
+          }
+        } catch (e) {
+          // Pool must NEVER break the request — log and fall through.
+          console.log(`${reqId} proxy pool pick failed: ${(e as Error).message}`);
+        }
+      }
+      if (currentRequestProxy) {
+        fetchOpts.proxy = currentRequestProxy;
+      }
     }
     let resp: Response;
     try {
@@ -589,24 +629,114 @@ export async function proxyRequest(
   // 200 + HTML upstream responses.
   const wafCheck = await checkWafBlock(upstreamResp);
   if (wafCheck.wafBlocked) {
+    // === v0.2.2+ Proxy rotation on WAF block ===
+    // The original behavior was: STOP all retries immediately. Hammering the
+    // WAF from a blacklisted IP makes the blacklist worse.
+    //
+    // With the global proxy pool, we have a third option: rotate to a
+    // DIFFERENT proxy and retry. The new IP may not be blacklisted. We try
+    // up to `pool.config.maxRotations` (default 3) different proxies before
+    // giving up. Each tried proxy is added to `triedPoolProxies` so we don't
+    // cycle back to it within the same request.
+    //
+    // Conditions for rotation:
+    //   1. We were using a pool proxy (currentRequestProxy is set AND came
+    //      from the pool, not from cred.proxy — per-account proxy rotation
+    //      is a separate concern and we don't touch it here).
+    //   2. The pool still has untried proxies.
+    //   3. We haven't exceeded maxRotations.
+    //
+    // If rotation is not possible (no pool, no untried proxies, or per-account
+    // proxy was in use), we fall back to the original "stop & return 503" path.
     const ct = upstreamResp.headers.get("content-type") ?? "";
     console.error(
       `${reqId} ⚠️  ALIYUN WAF BLOCK DETECTED — status=${upstreamResp.status}, ` +
-      `content-type=${ct}. STOPPING all retries. Your IP may have been blacklisted. ` +
-      `Recommend: 1) Change IP (restart router / use proxy), 2) Wait 24h, 3) Reduce request frequency.`,
+      `content-type=${ct}. Will attempt proxy rotation if pool has alternatives.`,
     );
-    try { upstreamResp.body?.cancel(); } catch (e) { /* v0.2.0.8: surface cancel failures for diagnostics — cancel() shouldn't throw, but if Bun's internal stream state is weird we want a trace */ void e; }
-    printRow(reqId, format, meta, upstreamResp.status, started, headersAt, 0, 0, 0);
-    return errorResponse(
-      503,
-      "waf_blocked",
-      "Request blocked by Aliyun WAF (status=" + upstreamResp.status + "). " +
-      "Your IP is likely blacklisted. Stop retrying immediately, change IP, and wait before retrying. " +
-      "See: https://errors.aliyun.com",
-    );
+
+    // Mark the current pool proxy as failed (best-effort).
+    if (currentRequestProxy) {
+      try { await markProxyFailed(currentRequestProxy); } catch { /* non-fatal */ }
+    }
+
+    // Try rotating through up to maxRotations different pool proxies.
+    // maxRotations comes from the pool config (default 3); read it fresh
+    // so a dashboard config change takes effect immediately.
+    const maxRotations = await getMaxRotations().catch(() => 3);
+    let rotated = false;
+    if (maxRotations > 0) {
+      for (let rot = 0; rot < maxRotations; rot++) {
+      // If we were using a per-account proxy (cred.proxy), there's no pool
+      // rotation to do — bail and surface the WAF error.
+      if (cred.proxy) break;
+
+      // Force pickProxy to skip the current proxy by clearing
+      // currentRequestProxy and adding it to the tried set (already done).
+      currentRequestProxy = undefined;
+      let nextProxy: string | null = null;
+      try {
+        nextProxy = await pickProxy(triedPoolProxies);
+      } catch (e) {
+        console.log(`${reqId} proxy pool rotation failed: ${(e as Error).message}`);
+        break;
+      }
+      if (!nextProxy) {
+        // No more untried proxies in the pool — give up.
+        console.log(`${reqId} proxy pool exhausted after ${rot} rotation(s) — surfacing WAF error`);
+        break;
+      }
+      currentRequestProxy = nextProxy;
+      triedPoolProxies.add(nextProxy);
+      console.log(`${reqId} WAF rotation ${rot + 1}/${maxRotations}: switching to proxy ${nextProxy}`);
+
+      // Cancel the old response body before refetching.
+      try { upstreamResp.body?.cancel(); } catch (e) { void e; }
+
+      // Refetch with the new proxy. Captcha is refreshed per-fetch; for
+      // start-plan we get a fresh token, for coding-plan we skip it.
+      try {
+        const rotCaptcha = await refreshCaptchaHeaders();
+        upstreamResp = await fetchUpstreamDetected(rotCaptcha);
+        headersAt = Date.now();
+      } catch (err) {
+        console.log(`${reqId} WAF rotation ${rot + 1} fetch failed: ${(err as Error).message}`);
+        // Network error with this proxy — try the next one.
+        try { await markProxyFailed(nextProxy); } catch { /* non-fatal */ }
+        continue;
+      }
+
+      // Re-check the new response for WAF block. If it's still blocked,
+      // loop and try the next proxy. If it's NOT a WAF block, we're done.
+      const rotWafCheck = await checkWafBlock(upstreamResp);
+      if (!rotWafCheck.wafBlocked) {
+        upstreamResp = rotWafCheck.response;
+        console.log(`${reqId} WAF rotation ${rot + 1} succeeded — request now proceeds with proxy ${nextProxy}`);
+        rotated = true;
+        break;
+      }
+      // Still blocked — mark this proxy failed and try the next one.
+      try { await markProxyFailed(nextProxy); } catch { /* non-fatal */ }
+      console.log(`${reqId} WAF rotation ${rot + 1} still blocked on proxy ${nextProxy}`);
+      }
+    }
+
+    if (!rotated) {
+      // All rotations failed (or none were possible). Return the WAF error.
+      try { upstreamResp.body?.cancel(); } catch (e) { void e; }
+      printRow(reqId, format, meta, upstreamResp.status, started, headersAt, 0, 0, 0);
+      return errorResponse(
+        503,
+        "waf_blocked",
+        "Request blocked by Aliyun WAF (status=" + upstreamResp.status + "). " +
+        "Your IP is likely blacklisted. Stop retrying immediately, change IP, and wait before retrying. " +
+        "See: https://errors.aliyun.com",
+      );
+    }
+    // Rotated successfully — fall through to normal response handling.
+  } else {
+    // Not a WAF block — use the reconstructed response (fresh readable body).
+    upstreamResp = wafCheck.response;
   }
-  // Not a WAF block — use the reconstructed response (fresh readable body).
-  upstreamResp = wafCheck.response;
 
   if (upstreamResp.status === 401 && currentPlan === "start-plan") {
     printRow(reqId, format, meta, 401, started, headersAt, 0, 0, 0);
@@ -907,25 +1037,85 @@ export async function proxyRequest(
         // (same rationale as the pre-loop check; hammering the WAF makes
         // the blacklist worse). checkWafBlock returns a fresh response on
         // the non-WAF path so downstream code can read the body normally.
+        //
+        // v0.2.2+: with the global proxy pool, we now attempt proxy rotation
+        // before giving up (same logic as the pre-loop WAF handler). If a
+        // different pool proxy succeeds, the rotated response replaces the
+        // blocked one and the retry loop continues normally.
         const retryWafCheck = await checkWafBlock(upstreamResp);
         if (retryWafCheck.wafBlocked) {
           const ct = upstreamResp.headers.get("content-type") ?? "";
           console.error(
             `${reqId} ⚠️  ALIYUN WAF BLOCK DETECTED on retry ${attempt} — status=${upstreamResp.status}, ` +
-            `content-type=${ct}. STOPPING all retries. Your IP may have been blacklisted. ` +
-            `Recommend: 1) Change IP (restart router / use proxy), 2) Wait 24h, 3) Reduce request frequency.`,
+            `content-type=${ct}. Attempting proxy rotation...`,
           );
-          try { upstreamResp.body?.cancel(); } catch (e) { /* v0.2.0.8: surface cancel failures for diagnostics — cancel() shouldn't throw, but if Bun's internal stream state is weird we want a trace */ void e; }
-          printRow(reqId, format, meta, upstreamResp.status, started, headersAt, 0, 0, 0);
-          return errorResponse(
-            503,
-            "waf_blocked",
-            "Request blocked by Aliyun WAF (status=" + upstreamResp.status + "). " +
-            "Your IP is likely blacklisted. Stop retrying immediately, change IP, and wait before retrying. " +
-            "See: https://errors.aliyun.com",
-          );
+
+          // Mark current pool proxy failed (best-effort).
+          if (currentRequestProxy) {
+            try { await markProxyFailed(currentRequestProxy); } catch { /* non-fatal */ }
+          }
+
+          // Try up to maxRotations different pool proxies (from pool config).
+          let retryRotated = false;
+          if (!cred.proxy) { // only rotate when using the pool, not per-account proxy
+            const retryMaxRotations = await getMaxRotations().catch(() => 3);
+            if (retryMaxRotations > 0) {
+              for (let rot = 0; rot < retryMaxRotations; rot++) {
+              currentRequestProxy = undefined;
+              let nextProxy: string | null = null;
+              try {
+                nextProxy = await pickProxy(triedPoolProxies);
+              } catch (e) {
+                console.log(`${reqId} retry proxy pool rotation failed: ${(e as Error).message}`);
+                break;
+              }
+              if (!nextProxy) {
+                console.log(`${reqId} retry proxy pool exhausted after ${rot} rotation(s)`);
+                break;
+              }
+              currentRequestProxy = nextProxy;
+              triedPoolProxies.add(nextProxy);
+              console.log(`${reqId} retry WAF rotation ${rot + 1}/${retryMaxRotations}: switching to proxy ${nextProxy}`);
+
+              try { upstreamResp.body?.cancel(); } catch (e) { void e; }
+              try {
+                const rotCaptcha = await refreshCaptchaHeaders();
+                upstreamResp = await fetchUpstreamDetected(rotCaptcha);
+                headersAt = Date.now();
+              } catch (err) {
+                console.log(`${reqId} retry WAF rotation ${rot + 1} fetch failed: ${(err as Error).message}`);
+                try { await markProxyFailed(nextProxy); } catch { /* non-fatal */ }
+                continue;
+              }
+              const rotWafCheck = await checkWafBlock(upstreamResp);
+              if (!rotWafCheck.wafBlocked) {
+                upstreamResp = rotWafCheck.response;
+                console.log(`${reqId} retry WAF rotation ${rot + 1} succeeded — proxy ${nextProxy}`);
+                retryRotated = true;
+                break;
+              }
+              try { await markProxyFailed(nextProxy); } catch { /* non-fatal */ }
+              console.log(`${reqId} retry WAF rotation ${rot + 1} still blocked on ${nextProxy}`);
+              }
+            }
+          }
+
+          if (!retryRotated) {
+            try { upstreamResp.body?.cancel(); } catch (e) { void e; }
+            printRow(reqId, format, meta, upstreamResp.status, started, headersAt, 0, 0, 0);
+            return errorResponse(
+              503,
+              "waf_blocked",
+              "Request blocked by Aliyun WAF (status=" + upstreamResp.status + "). " +
+              "Your IP is likely blacklisted. Stop retrying immediately, change IP, and wait before retrying. " +
+              "See: https://errors.aliyun.com",
+            );
+          }
+          // Rotated successfully — fall through; the new upstreamResp is the
+          // rotated (non-WAF) response.
+        } else {
+          upstreamResp = retryWafCheck.response;
         }
-        upstreamResp = retryWafCheck.response;
       } catch (err) {
         // Network error during retry — log the ACTUAL error so users can
         // diagnose (the old code just said "network error" with no detail).

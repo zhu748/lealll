@@ -1342,7 +1342,7 @@ export async function setAccountPlan(id: string, plan: "coding-plan" | "start-pl
  * will fall back to a direct connection.
  *
  * v0.2.0.8 SSRF guard: we now validate the scheme (`http://`, `https://`,
- * `socks5://`, `socks5h://`) and reject hostnames that resolve to internal
+ * `socks4://`, `socks4a://`, `socks5://`, `socks5h://`) and reject hostnames that resolve to internal
  * addresses (127.0.0.0/8, ::1, 169.254.0.0/16 link-local, 10/8, 172.16/12,
  * 192.168/16, 0.0.0.0, and cloud metadata endpoints like 169.254.169.254).
  * This prevents a compromised admin credential from exfiltrating all upstream
@@ -1411,10 +1411,10 @@ export function validateProxyUrl(url: string): { ok: true } | { ok: false; messa
     return { ok: false, message: `Invalid proxy URL: "${url}" is not a valid URL` };
   }
   const scheme = parsed.protocol.toLowerCase();
-  if (scheme !== "http:" && scheme !== "https:" && scheme !== "socks5:" && scheme !== "socks5h:") {
+  if (scheme !== "http:" && scheme !== "https:" && scheme !== "socks4:" && scheme !== "socks4a:" && scheme !== "socks5:" && scheme !== "socks5h:") {
     return {
       ok: false,
-      message: `Proxy URL scheme "${parsed.protocol}" is not allowed. Use http://, https://, socks5://, or socks5h://`,
+      message: `Proxy URL scheme "${parsed.protocol}" is not allowed. Use http://, https://, socks4://, socks4a://, socks5://, or socks5h://`,
     };
   }
   const host = parsed.hostname;
