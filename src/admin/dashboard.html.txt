@@ -2109,6 +2109,10 @@ td input{font-family:var(--font-mono)}
                 <label style="font-size:12px;color:var(--text-3)">分批:</label>
                 <input id="ppBatchSize" type="number" min="1" max="50" value="5" style="width:60px;font-size:12px" title="全部检测时每批并发数">
               </div>
+              <label style="display:inline-flex;align-items:center;gap:4px;font-size:12px;color:var(--text-2);cursor:pointer" title="检测失败的代理自动从池中删除">
+                <input type="checkbox" id="ppAutoRemoveFailed" style="width:auto">
+                失败自动删除
+              </label>
               <button class="btn btn-primary btn-sm" onclick="testAllProxies()" id="ppTestAllBtn">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
                 全部检测
@@ -4842,9 +4846,11 @@ async function testAllProxies(){
     return;
   }
   const batchSize=Math.max(1,Math.min(50,parseInt(document.getElementById('ppBatchSize').value,10)||5));
+  const autoRemove=document.getElementById('ppAutoRemoveFailed').checked;
   const proxies=ppPoolState.proxies;
   const total=proxies.length;
   let tested=0,okCount=0,failCount=0;
+  const failedIds=[]; // collect failed proxy ids for auto-removal
 
   ppTestAllRunning=true;
   const btn=document.getElementById('ppTestAllBtn');
@@ -4869,23 +4875,45 @@ async function testAllProxies(){
         if(!r.ok)throw new Error('HTTP '+r.status);
         const data=await r.json();
         ppTestResults[p.id]=data;
-        if(data.ok)okCount++;else failCount++;
+        if(data.ok){okCount++;}else{failCount++;failedIds.push(p.id);}
       }catch(e){
         ppTestResults[p.id]={ok:false,error:e.message,latencyMs:0};
         failCount++;
+        failedIds.push(p.id);
       }
       tested++;
       progressText.textContent=`检测中... ${tested}/${total}（成功 ${okCount}，失败 ${failCount}）`;
-      // Re-render after each batch completes (not per-proxy, to avoid flicker)
     });
     await Promise.all(promises);
     renderProxyPool();
   }
 
+  // Auto-remove failed proxies if the option is checked
+  let removedCount=0;
+  if(autoRemove&&failedIds.length>0){
+    progressText.textContent=`正在删除 ${failedIds.length} 个失败代理...`;
+    const removePromises=failedIds.map(async id=>{
+      try{
+        const r=await fetch(API+'/admin/api/proxy-pool/proxy',{
+          method:'DELETE',headers:authHeaders(),
+          body:JSON.stringify({id}),
+        });
+        if(r.ok){removedCount++;delete ppTestResults[id];}
+      }catch(e){/* ignore individual removal errors */}
+    });
+    await Promise.all(removePromises);
+    // Reload pool state to reflect removals
+    await loadProxyPool();
+  }
+
   ppTestAllRunning=false;
   if(btn)btn.disabled=false;
   progress.style.display='none';
-  toast(`检测完成：共 ${total} 个，成功 ${okCount}，失败 ${failCount}`,okCount>0?'success':'warn');
+  let msg=`检测完成：共 ${total} 个，成功 ${okCount}，失败 ${failCount}`;
+  if(autoRemove&&removedCount>0){
+    msg+=`；已自动删除 ${removedCount} 个失败代理`;
+  }
+  toast(msg,okCount>0?'success':'warn');
 }
 </script>
 
