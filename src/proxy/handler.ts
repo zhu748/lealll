@@ -27,6 +27,7 @@ import { saveTurn } from "../translator/responses-store.js";
 import { anthropicSseToOpenaiSse } from "../translator/sse-translator.js";
 import type { OpenAIChatRequest, OpenAIResponseRequest, AnthropicMessagesResponse } from "../translator/types.js";
 import { pickProxy, markProxyFailed, getMaxRotations, getCurrentWorkingProxy, setCurrentWorkingProxy } from "./proxy-pool.js";
+import { wrapFetchWithSocksBridge } from "./proxied-fetch.js";
 import { recordStat, recordDebugDump, appendLog } from "../admin/api.js";
 import { sleep } from "../utils/sleep.js";
 import { exportAccounts, switchAccount, maskApiKey } from "../auth/store.js";
@@ -98,7 +99,16 @@ export async function proxyRequest(
   opts: ProxyHandlerOptions,
 ): Promise<Response> {
   const { config, auth } = opts;
-  const fetchImpl = opts.fetchImpl ?? fetch;
+  // wrapFetchWithSocksBridge transparently routes SOCKS proxies (socks4://,
+  // socks4a://, socks5://, socks5h://) through a local HTTP-CONNECT→SOCKS
+  // bridge. Bun's native fetch only supports HTTP/HTTPS proxies and would
+  // otherwise throw `UnsupportedProxyProtocol` for SOCKS URLs — breaking
+  // both the per-account `cred.proxy` and the global proxy pool entries
+  // that use a SOCKS scheme. HTTP/HTTPS proxies and direct connections
+  // pass through unchanged. The injected `opts.fetchImpl` (used by tests)
+  // is wrapped so mock fetches still receive the bridge URL for SOCKS
+  // proxies (and the original proxy URL for HTTP proxies).
+  const fetchImpl = wrapFetchWithSocksBridge(opts.fetchImpl ?? fetch);
   const started = Date.now();
   const reqId = nextReqId();
 

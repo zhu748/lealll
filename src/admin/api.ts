@@ -13,6 +13,7 @@ import { KeyResolver } from "../auth/resolver.js";
 import { queryQuota } from "../auth/quota.js";
 import { readZCodeImport, detectZCodeProvider, listAvailableZCodeImports } from "../auth/zcode-config.js";
 import { errorResponse } from "../proxy/handler.js";
+import { wrapFetchWithSocksBridge, makeProxiedFetcher } from "../proxy/proxied-fetch.js";
 import { timingSafeEqual } from "../utils/crypto.js";
 import { atomicWriteFile, createMutex } from "../utils/fs.js";
 import { MODELS as GLM_CATALOG } from "../provider/models.js";
@@ -337,11 +338,10 @@ function probeStartPlanActivation(
 ): void {
   if (cred.plan !== "start-plan" || !cred.jwt) return;
   // Honour a per-account outbound proxy if configured, matching the quota
-  // handler's accountFetch construction.
-  const accountFetch = (cred.proxy && cred.proxy.trim()
-    ? ((input: RequestInfo | URL, init?: RequestInit) =>
-        fetchImpl(input, { ...init, ...(cred.proxy ? { proxy: cred.proxy } : {}) } as any))
-    : fetchImpl) as typeof fetch;
+  // handler's accountFetch construction. SOCKS proxies are routed through
+  // the local HTTP-CONNECT→SOCKS bridge transparently via makeProxiedFetcher
+  // (Bun's native fetch only supports HTTP proxies — see proxied-fetch.ts).
+  const accountFetch = makeProxiedFetcher(cred.proxy, fetchImpl);
   const tag = cred.apiKey.slice(0, 8);
   queryQuota(cred, accountFetch, appVersion)
     .then((r) => {
@@ -1301,7 +1301,10 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), 10_000);
       // Use injected fetchImpl if provided (for tests); fall back to global.
-      const fetchImpl = opts.fetchImpl ?? fetch;
+      // wrapFetchWithSocksBridge transparently routes SOCKS proxies through
+      // a local HTTP-CONNECT→SOCKS bridge (Bun's native fetch would throw
+      // UnsupportedProxyProtocol for socks4:// / socks5:// schemes).
+      const fetchImpl = wrapFetchWithSocksBridge(opts.fetchImpl ?? fetch);
       try {
         // Bun native: fetch(url, { proxy, signal })
         const resp = await fetchImpl(target, {
@@ -1378,12 +1381,11 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
       }
       const cred = acct.credential;
       // Honour a per-account outbound proxy if configured, matching how real
-      // LLM requests are routed (proxy-test handler uses the same { proxy } opt).
+      // LLM requests are routed (proxy-test handler uses the same wrap).
+      // makeProxiedFetcher transparently routes SOCKS proxies through the
+      // local HTTP-CONNECT→SOCKS bridge.
       const baseFetch = opts.fetchImpl ?? fetch;
-      const accountFetch = (cred.proxy && cred.proxy.trim()
-        ? ((input: RequestInfo | URL, init?: RequestInit) =>
-            baseFetch(input, { ...init, ...(cred.proxy ? { proxy: cred.proxy } : {}) } as any))
-        : baseFetch) as typeof fetch;
+      const accountFetch = makeProxiedFetcher(cred.proxy, baseFetch);
       const result = await queryQuota(cred, accountFetch, opts.config.identity?.appVersion);
       // Cache the fresh result (even on failure — saves the upstream from
       // immediate re-hammering when the failure is durable like a 403).
@@ -2666,7 +2668,9 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
       const started = Date.now();
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), 10_000);
-      const fetchImpl = opts.fetchImpl ?? fetch;
+      // wrapFetchWithSocksBridge transparently routes SOCKS proxies through
+      // the local HTTP-CONNECT→SOCKS bridge.
+      const fetchImpl = wrapFetchWithSocksBridge(opts.fetchImpl ?? fetch);
       try {
         const resp = await fetchImpl(target, {
           method: "HEAD",

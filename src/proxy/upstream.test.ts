@@ -1105,7 +1105,11 @@ describe("proxyRequest — per-account outbound proxy (v2.1.4.1test5)", () => {
     expect(initKeys).not.toContain("proxy");
   });
 
-  it("passes socks5:// proxy URL through unchanged", async () => {
+  it("routes socks5:// proxy through the local SOCKS bridge", async () => {
+    // Bun's native fetch throws UnsupportedProxyProtocol for SOCKS proxies.
+    // The handler transparently wraps fetchImpl with wrapFetchWithSocksBridge,
+    // so a SOCKS proxy URL is translated to http://127.0.0.1:<port> (a local
+    // HTTP-CONNECT→SOCKS bridge) before reaching the underlying fetch.
     let receivedProxy: string | undefined;
     const fetchMock = mock(async (_req: Request, init?: any): Promise<Response> => {
       receivedProxy = init?.proxy;
@@ -1124,7 +1128,12 @@ describe("proxyRequest — per-account outbound proxy (v2.1.4.1test5)", () => {
     const clientReq = makeClientReq('{"model":"glm-4.6","messages":[{"role":"user","content":"Hi"}]}');
     await proxyRequest(clientReq, "anthropic", { config: testConfig, auth, fetchImpl: fetchMock as any });
 
-    expect(receivedProxy).toBe("socks5://10.0.0.1:1080");
+    // The original SOCKS URL must NOT be passed to fetch (that would trigger
+    // UnsupportedProxyProtocol). Instead, fetch sees an http://127.0.0.1:<port>
+    // bridge URL.
+    expect(receivedProxy).toBeDefined();
+    expect(receivedProxy).not.toBe("socks5://10.0.0.1:1080");
+    expect(receivedProxy!.startsWith("http://127.0.0.1:")).toBe(true);
   });
 
   it("preserves decompress: false alongside proxy for Anthropic format", async () => {

@@ -49,6 +49,7 @@ import { homedir } from "node:os";
 import { atomicWriteFile, createMutex } from "../utils/fs.js";
 import { validateProxyUrl } from "../auth/store.js";
 import { PROXY_POOL as PROXY_POOL_CONST } from "../utils/constants.js";
+import { wrapFetchWithSocksBridge } from "./proxied-fetch.js";
 
 // --------------------------------------------------------------------
 // Types
@@ -1100,6 +1101,11 @@ async function runTestJob(
 ): Promise<void> {
   const failedIds: string[] = [];
   const total = proxies.length;
+  // Wrap fetchImpl once so every proxy in the batch (HTTP, HTTPS, or SOCKS)
+  // is handled correctly. SOCKS proxies are transparently routed through
+  // the local HTTP-CONNECT→SOCKS bridge (Bun's native fetch would otherwise
+  // throw UnsupportedProxyProtocol for socks4:// / socks5:// schemes).
+  const wrappedFetch = wrapFetchWithSocksBridge(fetchImpl);
 
   for (let i = 0; i < total; i += job.batchSize) {
     // If job was cancelled (a new job started), stop early.
@@ -1112,7 +1118,7 @@ async function runTestJob(
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), 10_000);
       try {
-        const resp = await fetchImpl(target, {
+        const resp = await wrappedFetch(target, {
           method: "HEAD",
           signal: ctrl.signal,
           redirect: "follow",

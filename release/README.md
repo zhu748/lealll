@@ -1,5 +1,24 @@
 # zcode-proxy 使用说明
 
+> **v0.2.1.5 — 修复 SOCKS4/SOCKS5 代理无法使用的问题**
+>
+> 之前版本中，所有 SOCKS 协议代理（`socks4://`、`socks4a://`、`socks5://`、`socks5h://`）在 dashboard 测试和实际请求转发时都会报错 `UnsupportedProxyProtocol fetching "https://api.z.ai/"`，导致 SOCKS 代理完全不可用。本版本通过引入本地 HTTP-CONNECT→SOCKS 桥彻底修复了这个问题。
+>
+> **本次改动**
+>
+> - **根因**：Bun 原生 `fetch(url, { proxy })` 只支持 HTTP/HTTPS 代理，遇到 SOCKS scheme 直接抛 `UnsupportedProxyProtocol`。原代码在 4 处调用点（dashboard 单代理测试、代理池批量测试、配额查询、上游 LLM 转发）都直接把 SOCKS URL 透传给 fetch，所以全部失败。
+> - **新增 `src/proxy/socks-bridge.ts`**：在 `127.0.0.1` 的 OS 随机端口启动一个迷你 HTTP CONNECT 代理，接受 fetch 的 CONNECT 请求，对目标做 SOCKS4/4a/5/5h 握手（含 user/pass 认证），然后纯字节透传。按 SOCKS URL 引用计数缓存复用，60s 空闲后自动关闭。完全在进程本地，不可达外部网络。
+> - **新增 `src/proxy/proxied-fetch.ts`**：`proxiedFetch` / `wrapFetchWithSocksBridge` / `makeProxiedFetcher` 三个包装器，按 scheme 路由：HTTP/HTTPS 走 Bun 原生，SOCKS 走桥。已注入所有 4 处调用点，HTTP 代理路径完全未变（零回归）。
+> - **Bug 修复（tunneling 阶段）**：原 `failConnection` 在 tunneling 阶段被调用时会向已建立 TLS 的 socket 写入 502 HTTP 响应字节，污染客户端的 TLS 流。改为仅在 pre-tunnel 阶段（read-connect / socks-handshake）才回 502，tunneling 阶段直接 `cleanupConn` 静默关闭。
+> - **`cleanupConn` 幂等化**：多个 close/error 回调可能对同一连接触发多次，原实现会重复 `end()` 同一 socket。加了幂等检查。
+> - **调试日志**：可通过环境变量 `ZCODE_PROXY_SOCKS_DEBUG=1` 启用 per-connection 调试日志（bridge 创建/释放、CONNECT 目标、tunnel 建立等），生产默认关闭。
+> - **测试覆盖**：新增 28 个测试（21 个单元测试覆盖路由逻辑 + 7 个端到端测试用真实本地 SOCKS5/SOCKS4a 服务器打到 `www.example.com`，包含 user/pass 认证、错误密码、bridge 复用、tunneling 阶段不污染 TLS 等场景）。全部 677 个测试通过，TypeScript 零错误。
+> - **影响**：所有用户（特别是使用 SOCKS5 代理的国内用户）现在可以正常配置和使用 SOCKS 代理，包括单账号代理、代理池、配额查询、上游转发全部链路。已配置 HTTP/HTTPS 代理的用户完全不受影响。
+>
+> **升级建议**：所有使用 SOCKS 代理的用户立即升级到 v0.2.1.5。使用 HTTP 代理或直连的用户可选升级。
+
+---
+
 > **v0.2.1.4 — 完整对齐 zcode cache_control 指纹（基于 6 请求实测样本）**
 >
 > 基于 zcode 桌面客户端 6 个连续请求的完整流程抓包，实现了 cc 指纹的 1:1 对齐。v0.2.1.3 的"保守跳过"策略被替换为精确的三规则模型，cache 命中率恢复到 v0.2.0.8 水平甚至更好。
