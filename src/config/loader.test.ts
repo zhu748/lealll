@@ -346,4 +346,55 @@ responsesThinking:
     const cfg = loadConfig(path);
     expect(cfg.responsesThinking!.models).toEqual(["glm-5.2", "glm-4.6"]);
   });
+
+  it("server.sseHeartbeatMs: defaults to 15000 when not set", () => {
+    const path = writeYaml(`
+auth:
+  mode: apikey
+  apiKey: "abc"
+`);
+    const cfg = loadConfig(path);
+    expect(cfg.server.sseHeartbeatMs).toBe(15000);
+  });
+
+  it("server.sseHeartbeatMs: YAML override works", () => {
+    const path = writeYaml(`
+server:
+  sseHeartbeatMs: 30000
+auth:
+  mode: apikey
+  apiKey: "abc"
+`);
+    const cfg = loadConfig(path);
+    expect(cfg.server.sseHeartbeatMs).toBe(30000);
+  });
+
+  it("server.sseHeartbeatMs: env var overrides YAML", () => {
+    process.env.ZCODE_PROXY_SSE_HEARTBEAT_MS = "5000";
+    try {
+      const path = writeYaml(`
+server:
+  sseHeartbeatMs: 30000
+auth:
+  mode: apikey
+  apiKey: "abc"
+`);
+      const cfg = loadConfig(path);
+      expect(cfg.server.sseHeartbeatMs).toBe(5000);
+    } finally {
+      delete process.env.ZCODE_PROXY_SSE_HEARTBEAT_MS;
+    }
+  });
+
+  it("server.sseHeartbeatMs: 0 disables heartbeat", () => {
+    const path = writeYaml(`
+server:
+  sseHeartbeatMs: 0
+auth:
+  mode: apikey
+  apiKey: "abc"
+`);
+    const cfg = loadConfig(path);
+    expect(cfg.server.sseHeartbeatMs).toBe(0);
+  });
 });

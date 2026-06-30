@@ -1,5 +1,39 @@
 # zcode-proxy 使用说明
 
+> **v0.2.1.7 — SSE heartbeat 保活:解决 Cloudflare 524 超时 + 修复压缩流 bug + admin API 增强**
+>
+> 解决 Cloudflare 524 超时问题:当代理部署在 CF 后面时,GLM-5.2 thinking 模式经常需要 60-180 秒才吐第一个 SSE event,超过 CF 的 100 秒 Proxy Read Timeout,CF 直接返回 524 切断连接。本版本通过在等待上游首字节期间定期 flush SSE 标准注释行(`: keepalive\n\n`)保活,完全解决此问题。
+>
+> **本次改动**
+>
+> - **新增 SSE heartbeat 保活机制** (`src/proxy/handler.ts` 的 `createSseHeartbeatTransform`):
+>   - 在等待上游首个 chunk 期间,每 15 秒(可配置)往客户端 flush 一行 SSE 标准注释 `: keepalive\n\n`。注释行是 SSE 协议规范的一部分,所有合规客户端(Anthropic SDK / OpenAI SDK / Cherry Studio / Claude Code / Codex / curl)都静默忽略。TCP 层有真实字节流过,CF 重置 100 秒计时器。
+>   - 上游首个真实 chunk 一到,heartbeat 立即停止,**之后整个流期间零开销**。
+>   - 客户端断开时自动清理定时器,无泄漏。
+>   - 在三条 SSE 转发路径上插入(translateMode openai-responses / openai / 非 translateMode passthrough),位置在 stats transform 之后(更靠近客户端)。
+> - **修复压缩流 bug**:`passthrough` 模式下 fetch 用 `decompress: false`,upstreamResp.body 是原始压缩字节流(gzip/br/deflate)。如果在此压缩流中间插入明文 `: keepalive\n\n`,客户端解压会报 `Z_DATA_ERROR`。修复方式:passthrough 分支检查 `content-encoding` 头,有压缩时自动禁用 heartbeat。translateMode 两个分支不受影响(Bun 自动解压 + 翻译器输出明文 + translatedSseResponse 不设 content-encoding)。
+> - **新增配置项 `server.sseHeartbeatMs`**:
+>   - 默认 15000ms(15 秒),设为 0 禁用。
+>   - YAML 配置:`server.sseHeartbeatMs: 15000`
+>   - 环境变量:`ZCODE_PROXY_SSE_HEARTBEAT_MS=15000`
+>   - 推荐范围 10s-30s。低于 5s 浪费带宽,高于 60s 在 CF 后面失去意义。
+> - **修复 admin API 的 server 字段处理**:
+>   - `configToYaml` 之前只序列化 `server.port` + `server.host`,丢弃 `upstreamTimeoutMs` / `trustProxy` / `sseHeartbeatMs`。通过 dashboard 保存配置后这些字段会从 YAML 消失,重启后恢复默认。现已完整序列化所有 server 字段。
+>   - PUT `/admin/api/config` 之前对 `server` 字段做浅合并,部分更新(如只发 `sseHeartbeatMs`)会丢失 `port` / `host` 等其他字段。现已改为 deep-merge。
+>   - PUT 热更新逻辑之前完全忽略 `server` 字段,`sseHeartbeatMs` 改完需要重启才生效。现已支持热更新(`upstreamTimeoutMs` / `trustProxy` / `sseHeartbeatMs` 立即生效,`port` / `host` 仍需重启)。
+> - **新增 10 个测试**:`src/proxy/handler-heartbeat.test.ts`(6 个,覆盖静默期 flush / 首 chunk 停止 / intervalMs=0 透传 / 注释行格式 / 定时器清理 / 错误处理)+ `src/config/loader.test.ts`(4 个,覆盖默认值 / YAML 覆盖 / env 覆盖 / 0 禁用)。全部 684 个测试通过,TypeScript 零错误。
+> - **影响**:
+>   - Cloudflare / 反向代理后部署的所有用户:524 超时问题消失。
+>   - 所有 SSE 客户端兼容:无需改动,自动忽略注释行。
+>   - 流量开销:每分钟静默期约 78 字节,可忽略。
+>   - TTFB 之后零开销:heartbeat 已停止。
+>   - passthrough + 压缩流:heartbeat 自动禁用(罕见边缘场景,不影响功能)。
+>   - non-stream 请求(`stream: false`):不受 heartbeat 保护(客户端期望 JSON 不是 SSE,无法插入注释行)。如果遇到 non-stream 的 CF 524,建议客户端改用 `stream: true`。
+>
+> **升级建议**:所有在 Cloudflare 或其他反向代理(有 Proxy Read Timeout)后部署的用户立即升级到 v0.2.1.7。直连部署(无反向代理)的用户可选升级(heartbeat 无害但非必需)。
+
+---
+
 > **v0.2.1.6 — 扩展 WAF 拦截检测 + 默认重试加入 429**
 >
 > 修复两个生产反馈问题:(1) Render 部署时遇到一种伪装成 nginx 标准错误页的 405 拦截,旧版 WAF 检测无法识别,导致代理池不轮换、错误页直接透传给客户端;(2) GLM 上游对超并发返回 429 `{"code":3010,"msg":"model admission concurrency limit exceeded"}`,旧版默认只重试 529,429 直接报错给用户。

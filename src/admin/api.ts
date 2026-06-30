@@ -845,6 +845,20 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
       if (authBody) {
         newConfig.auth = { ...opts.config.auth, ...authBody };
       }
+      // v0.2.1.7: deep-merge server so partial updates (e.g. only sending
+      // sseHeartbeatMs) don't drop port / host / upstreamTimeoutMs / trustProxy.
+      // port + host changes require restart; other server fields are hot-swappable.
+      if (newServer) {
+        newConfig.server = {
+          ...opts.config.server,
+          ...newServer,
+          // Ensure port is always a valid number (fallback to existing)
+          port: typeof newServer.port === "number" ? newServer.port
+            : (typeof newServer.port === "string" ? parseInt(String(newServer.port), 10) : opts.config.server.port),
+          // Ensure host is always a string (fallback to existing)
+          host: typeof newServer.host === "string" ? newServer.host : opts.config.server.host,
+        };
+      }
       if (body.retry) {
         newConfig.retry = {
           ...opts.config.retry,
@@ -933,6 +947,15 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
       if (body.providers) {
         opts.config.providers = newConfig.providers;
       }
+      // v0.2.1.7: server hot-swappable fields (NOT port/host — those need
+      // restart, tracked in restartFields above). upstreamTimeoutMs,
+      // trustProxy, and sseHeartbeatMs all affect per-request behavior and
+      // are safe to hot-swap.
+      if (newServer) {
+        if (newConfig.server.upstreamTimeoutMs !== undefined) opts.config.server.upstreamTimeoutMs = newConfig.server.upstreamTimeoutMs;
+        if (newConfig.server.trustProxy !== undefined) opts.config.server.trustProxy = newConfig.server.trustProxy;
+        if (newConfig.server.sseHeartbeatMs !== undefined) opts.config.server.sseHeartbeatMs = newConfig.server.sseHeartbeatMs;
+      }
 
       appendLog("info", "Configuration updated via admin dashboard");
       return jsonResp({
@@ -940,7 +963,7 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
         requiresRestart: restartFields.length > 0,
         restartFields,
         // hotApplied: fields that were applied to the live config without restart
-        hotApplied: ["provider", "plan", "defaultModel", "models", "identity", "logging", "retry", "routingRules", "modelMappings", "responsesThinking", "thinkingLevel", ...(authBody ? ["auth"] : []), ...(body.providers ? ["providers"] : [])],
+        hotApplied: ["provider", "plan", "defaultModel", "models", "identity", "logging", "retry", "routingRules", "modelMappings", "responsesThinking", "thinkingLevel", ...(authBody ? ["auth"] : []), ...(body.providers ? ["providers"] : []), ...(newServer ? ["server"] : [])],
       });
     } catch (err) {
       return errorResponse(500, "save_failed", (err as Error).message);
@@ -2965,7 +2988,18 @@ function configToYaml(config: ProxyConfig): string {
   // and avoids the brittle manual string concatenation that previously broke on
   // URLs containing ':' and other reserved characters.
   const obj: Record<string, unknown> = {
-    server: { port: config.server.port, host: config.server.host },
+    server: {
+      port: config.server.port,
+      host: config.server.host,
+      // v0.2.1.7: persist all server fields so dashboard saves don't
+      // drop upstreamTimeoutMs / trustProxy / sseHeartbeatMs. Previously
+      // only port+host were serialized, causing these fields to vanish
+      // from config.yaml on the next save (and revert to defaults on
+      // restart).
+      ...(config.server.upstreamTimeoutMs !== undefined ? { upstreamTimeoutMs: config.server.upstreamTimeoutMs } : {}),
+      ...(config.server.trustProxy !== undefined ? { trustProxy: config.server.trustProxy } : {}),
+      ...(config.server.sseHeartbeatMs !== undefined ? { sseHeartbeatMs: config.server.sseHeartbeatMs } : {}),
+    },
     auth: {
       mode: config.auth.mode,
       ...(config.auth.apiKey ? { apiKey: config.auth.apiKey } : {}),

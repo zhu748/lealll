@@ -91,3 +91,39 @@ export const SSE = {
     '"usage"',
   ] as const,
 } as const;
+
+/**
+ * SSE heartbeat tunables.
+ *
+ * Problem: Cloudflare (and other reverse proxies) impose a Proxy Read
+ * Timeout — CF Free/Pro/Lite/Business = 100s, Enterprise up to 6000s.
+ * When the upstream LLM takes longer than that to emit the FIRST byte
+ * (common with GLM-5.2 thinking mode, which can sit silent for 60-180s
+ * before the first SSE event), CF returns 524 to the client and tears
+ * down the connection.
+ *
+ * Solution: while we're waiting for the upstream's first SSE chunk,
+ * periodically flush a no-op SSE comment line (`: keepalive\n\n`) to
+ * the client. SSE comment lines are part of the spec (RFC) and silently
+ * ignored by every conformant SSE client (Anthropic SDK, OpenAI SDK,
+ * Cherry Studio, Claude Code, Codex, curl). The bytes keep the TCP
+ * connection active, which resets CF's idle timer.
+ *
+ * Once the upstream emits its first real chunk, the heartbeat stops
+ * immediately and never re-fires for the rest of the stream — so it
+ * adds zero overhead after TTFB.
+ *
+ * Tuning:
+ *   - 15s default: well under CF's 100s limit, low overhead (~6 packets
+ *     per minute of silence), and matches what OpenAI/Anthropic themselves
+ *     use for their own SSE endpoints.
+ *   - Set to 0 (or via env ZCODE_PROXY_SSE_HEARTBEAT_MS=0) to disable.
+ *   - Lowering below ~5s is wasteful; raising above ~60s defeats the
+ *     purpose if the upstream is behind CF.
+ */
+export const SSE_HEARTBEAT = {
+  /** Default heartbeat interval in milliseconds. */
+  DEFAULT_INTERVAL_MS: 15_000,
+  /** SSE comment line flushed to the client on each tick. */
+  COMMENT_LINE: ": keepalive\n\n",
+} as const;

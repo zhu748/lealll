@@ -25,6 +25,7 @@ const ENV = {
   RETRY_EMPTY_STREAM_SWITCH_THRESHOLD: "ZCODE_RETRY_EMPTY_STREAM_SWITCH_THRESHOLD",
   UPSTREAM_TIMEOUT_MS: "ZCODE_UPSTREAM_TIMEOUT_MS",
   TRUST_PROXY: "ZCODE_PROXY_TRUST_PROXY",
+  SSE_HEARTBEAT_MS: "ZCODE_PROXY_SSE_HEARTBEAT_MS",
 } as const;
 
 const DEFAULTS = {
@@ -61,6 +62,9 @@ const DEFAULTS = {
   // maxRetries is increased, switchThreshold=2 just triggers earlier.
   RETRY_CREDENTIAL_SWITCH_THRESHOLD: 2,
   RETRY_EMPTY_STREAM_SWITCH_THRESHOLD: 3,
+  // SSE heartbeat default — well under Cloudflare's 100s Proxy Read Timeout.
+  // See src/utils/constants.ts SSE_HEARTBEAT for rationale.
+  SSE_HEARTBEAT_MS: 15_000,
 };
 
 /** Printable-ASCII gate copied from the ZCode bundle's `rYn` helper. */
@@ -89,6 +93,15 @@ export function loadConfig(path: string): ProxyConfig {
   // from the TCP socket (Bun's server.requestIP), which cannot be spoofed.
   const trustProxyRaw = process.env[ENV.TRUST_PROXY] ?? parsed?.server?.trustProxy;
   const trustProxy = trustProxyRaw === true || trustProxyRaw === "true" || trustProxyRaw === "1";
+
+  // sseHeartbeatMs: interval for no-op SSE comment lines flushed to the
+  // client while waiting for the upstream's first byte. Keeps the
+  // connection alive across reverse proxies with a Proxy Read Timeout
+  // (Cloudflare Free/Pro = 100s). Default 15s. 0 = disabled.
+  const sseHeartbeatMs = resolveNonNegativeInt(
+    process.env[ENV.SSE_HEARTBEAT_MS] ?? parsed?.server?.sseHeartbeatMs,
+    DEFAULTS.SSE_HEARTBEAT_MS,
+  );
 
   // --- auth ---
   const proxyApiKey = process.env[ENV.PROXY_API_KEY] ?? parsed?.auth?.proxyApiKey;
@@ -198,7 +211,7 @@ export function loadConfig(path: string): ProxyConfig {
     : "max";
 
   const config: ProxyConfig = {
-    server: { port, host, upstreamTimeoutMs: upstreamTimeoutMs || undefined, trustProxy },
+    server: { port, host, upstreamTimeoutMs: upstreamTimeoutMs || undefined, trustProxy, sseHeartbeatMs },
     auth: { proxyApiKey, mode, apiKey, oauthCredentialsPath },
     provider,
     plan,

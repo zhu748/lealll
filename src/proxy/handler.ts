@@ -32,7 +32,7 @@ import { recordStat, recordDebugDump, appendLog } from "../admin/api.js";
 import { sleep } from "../utils/sleep.js";
 import { exportAccounts, switchAccount, maskApiKey } from "../auth/store.js";
 import { recordHeaders } from "../utils/header-debug.js";
-import { RETRY as RETRY_CONST, PROXY_POOL as PROXY_POOL_CONST, WAF as WAF_CONST, SSE as SSE_CONST } from "../utils/constants.js";
+import { RETRY as RETRY_CONST, PROXY_POOL as PROXY_POOL_CONST, WAF as WAF_CONST, SSE as SSE_CONST, SSE_HEARTBEAT as SSE_HEARTBEAT_CONST } from "../utils/constants.js";
 
 /** Options for the proxy handler. */
 export interface ProxyHandlerOptions {
@@ -1600,7 +1600,11 @@ export async function proxyRequest(
         // tee()+parallel reader — avoids buffering the whole stream when the
         // stats reader falls behind (see createStatsTransform docs).
         const stats = createStatsTransform(reqId, format, meta, upstreamResp.status, started, null, maskApiKey(cred.apiKey), totalCaptchaMs);
-        return translatedSseResponse(translated.pipeThrough(stats.transform));
+        // v0.2.1.7: heartbeat AFTER stats (closer to client). Stats sees
+        // only real upstream bytes; heartbeat comment lines flow straight
+        // to the client without stats inspecting them.
+        const heartbeat = createSseHeartbeatTransform(config.server.sseHeartbeatMs ?? 0);
+        return translatedSseResponse(translated.pipeThrough(stats.transform).pipeThrough(heartbeat));
       }
       return await translatedResponsesBatchResponse(
         clientReq, upstreamResp, meta.model, reqId, format, meta, started, headersAt,
@@ -1615,7 +1619,9 @@ export async function proxyRequest(
       const translated = anthropicSseToOpenaiSse(upstreamResp.body, meta.model);
       // v0.2.0.8: inline stats transform (see createStatsTransform docs).
       const stats = createStatsTransform(reqId, format, meta, upstreamResp.status, started, null, maskApiKey(cred.apiKey), totalCaptchaMs);
-      return translatedSseResponse(translated.pipeThrough(stats.transform));
+      // v0.2.1.7: heartbeat AFTER stats — see openai-responses branch above.
+      const heartbeat = createSseHeartbeatTransform(config.server.sseHeartbeatMs ?? 0);
+      return translatedSseResponse(translated.pipeThrough(stats.transform).pipeThrough(heartbeat));
     }
     return await translatedBatchResponse(clientReq, upstreamResp, meta.model, reqId, format, meta, started, headersAt, maskApiKey(cred.apiKey), totalCaptchaMs);
   }
@@ -1623,8 +1629,34 @@ export async function proxyRequest(
   if (isSSE && upstreamResp.body) {
     // v0.2.0.8: inline stats transform — pass content-encoding so compressed
     // streams skip SSE parsing (we'd only see gzip bytes, not SSE events).
-    const stats = createStatsTransform(reqId, format, meta, upstreamResp.status, started, upstreamResp.headers.get("content-encoding"), maskApiKey(cred.apiKey), totalCaptchaMs);
-    return passthroughResponse(upstreamResp, upstreamResp.body.pipeThrough(stats.transform));
+    const contentEncoding = upstreamResp.headers.get("content-encoding");
+    const stats = createStatsTransform(reqId, format, meta, upstreamResp.status, started, contentEncoding, maskApiKey(cred.apiKey), totalCaptchaMs);
+    // v0.2.1.7: heartbeat AFTER stats — keeps the client connection alive
+    // across CF's 100s Proxy Read Timeout when upstream is slow to TTFB
+    // (e.g. GLM-5.2 thinking mode sitting silent for 60-180s).
+    //
+    // CRITICAL: heartbeat is DISABLED when the upstream response is
+    // compressed (content-encoding: gzip/br/deflate). In passthrough mode
+    // (decompress: false), upstreamResp.body is raw compressed bytes and
+    // passthroughResponse preserves the content-encoding header — the
+    // client decompresses on its end. Injecting plaintext ": keepalive\n\n"
+    // into a compressed stream would corrupt the client's decompression
+    // (Z_DATA_ERROR), destroying the entire response.
+    //
+    // translateMode branches above are unaffected: Bun auto-decompresses
+    // (no decompress:false), translators output plaintext SSE, and
+    // translatedSseResponse doesn't set content-encoding — so heartbeat
+    // is always safe there.
+    //
+    // Trade-off: passthrough + compressed SSE loses CF 524 protection.
+    // In practice z.ai/bigmodel SSE responses are rarely compressed (SSE
+    // is streaming; compression introduces buffering latency), so this
+    // is a rare edge case. If you hit it, the fix is to use stream:true
+    // on the client (which may route through translation mode) or disable
+    // compression on the upstream.
+    const heartbeatInterval = contentEncoding ? 0 : (config.server.sseHeartbeatMs ?? 0);
+    const heartbeat = createSseHeartbeatTransform(heartbeatInterval);
+    return passthroughResponse(upstreamResp, upstreamResp.body.pipeThrough(stats.transform).pipeThrough(heartbeat));
   }
 
   // Non-streaming anthropic passthrough — try to extract usage from the response
@@ -2495,6 +2527,102 @@ function createStatsTransform(
 
   return { transform, done };
 }
+
+/**
+ * SSE heartbeat transform — keeps the client connection alive while the
+ * upstream is slow to emit its first byte.
+ *
+ * Why this exists: Cloudflare (and other reverse proxies) impose a Proxy
+ * Read Timeout (CF Free/Pro = 100s). GLM-5.2 thinking mode can sit silent
+ * for 60-180s before the first SSE event. Without heartbeat, CF returns
+ * 524 to the client and tears down the connection.
+ *
+ * Mechanism: while no real chunk has arrived from upstream yet, flush a
+ * no-op SSE comment line (`: keepalive\n\n`) to the client every
+ * `intervalMs`. SSE comment lines are spec-compliant and silently ignored
+ * by every conformant client. The bytes keep TCP active, resetting CF's
+ * idle timer.
+ *
+ * Once the first real chunk arrives, the heartbeat stops immediately and
+ * never re-fires — zero overhead after TTFB.
+ *
+ * Pipeline order: this transform is placed BEFORE createStatsTransform
+ * (i.e. closer to the client). Reason: stats parses SSE events to count
+ * tokens; if heartbeat comment lines flowed through stats, they'd be
+ * harmlessly ignored (stats only looks at `event:` / `data:` lines), but
+ * it's cleaner to keep heartbeat bytes out of stats entirely. Putting
+ * heartbeat upstream-of-stats means stats sees only real upstream bytes.
+ *
+ * Wait — actually the opposite order is better: stats should see what the
+ * CLIENT sees (including heartbeat), so stats' TTFB measurement reflects
+ * when the client first saw bytes. So we place heartbeat AFTER stats
+ * (closer to client). stats' TTFB is then "time to first real upstream
+ * chunk", which is what we want to measure; heartbeat bytes flow to the
+ * client without stats seeing them. This is the chosen order.
+ *
+ * Cancellation: if the client disconnects mid-stream, the underlying
+ * Response stream is cancelled, which propagates a cancel signal up the
+ * pipeline. We also guard the interval with a `closed` flag and clear it
+ * in cancel() to prevent timer leaks. As a belt-and-suspenders defense,
+ * if enqueue throws (stream errored/closed), we clear the interval.
+ *
+ * @param intervalMs Heartbeat interval in ms. 0 or negative = disabled
+ *                  (the transform becomes a pure passthrough).
+ */
+function createSseHeartbeatTransform(intervalMs: number): TransformStream<Uint8Array, Uint8Array> {
+  // Disabled / invalid interval — pure passthrough, no timer.
+  if (!intervalMs || intervalMs <= 0) {
+    return new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) { controller.enqueue(chunk); },
+    });
+  }
+
+  const commentBytes = new TextEncoder().encode(SSE_HEARTBEAT_CONST.COMMENT_LINE);
+  let firstChunkSeen = false;
+  let closed = false;
+  let timer: ReturnType<typeof setInterval> | null = null;
+
+  const flushHeartbeat = (controller: TransformStreamDefaultController<Uint8Array>): void => {
+    if (closed || firstChunkSeen) return;
+    try {
+      controller.enqueue(commentBytes);
+    } catch {
+      // Stream errored or closed — stop the timer to prevent leak.
+      if (timer) { clearInterval(timer); timer = null; }
+    }
+  };
+
+  return new TransformStream<Uint8Array, Uint8Array>({
+    start(controller) {
+      // Kick off the heartbeat immediately. We use setInterval (not
+      // setTimeout chain) because it's cheaper and Bun's timer impl
+      // doesn't drift under load the way recursive setTimeout can.
+      timer = setInterval(() => flushHeartbeat(controller), intervalMs);
+      // Don't keep the event loop alive solely for heartbeat — if the
+      // only thing pending is our timer, the process should be able to
+      // exit. The real request pipeline (fetch response body) holds the
+      // loop alive anyway.
+      if (timer && typeof timer.unref === "function") timer.unref();
+    },
+    transform(chunk, controller) {
+      // First real chunk from upstream — stop the heartbeat forever.
+      if (!firstChunkSeen) {
+        firstChunkSeen = true;
+        if (timer) { clearInterval(timer); timer = null; }
+      }
+      controller.enqueue(chunk);
+    },
+    flush() {
+      // flush fires on normal stream end OR when the downstream cancels
+      // (client disconnect) — both cases mean we should stop the timer.
+      closed = true;
+      if (timer) { clearInterval(timer); timer = null; }
+    },
+  });
+}
+
+/** Exported for testing — see handler.test.ts "SSE heartbeat" describe block. */
+export const _testing = { createSseHeartbeatTransform };
 
 /**
  * Inlined SSE parser for createStatsTransform — mirrors the logic in

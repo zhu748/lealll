@@ -196,6 +196,29 @@ export interface ProxyConfig {
      * X-Real-IP takes precedence, then the first entry of X-Forwarded-For.
      */
     trustProxy?: boolean;
+    /**
+     * SSE heartbeat interval in milliseconds.
+     *
+     * When the proxy is deployed behind a reverse proxy with a Proxy Read
+     * Timeout (Cloudflare Free/Pro/Business = 100s, Enterprise ≤ 6000s),
+     * long "thinking" requests where the upstream LLM takes >100s to emit
+     * the first byte will be killed by CF with a 524 error.
+     *
+     * To prevent this, the proxy periodically flushes a no-op SSE comment
+     * line (`: keepalive\n\n`) to the client while waiting for the upstream's
+     * first chunk. SSE comment lines are spec-compliant and silently ignored
+     * by all conformant SSE clients (Anthropic SDK, OpenAI SDK, Cherry
+     * Studio, Claude Code, Codex, curl). The bytes keep TCP active and
+     * reset CF's idle timer.
+     *
+     * Once the first real chunk arrives, the heartbeat stops immediately
+     * and never re-fires — zero overhead after TTFB.
+     *
+     * Default: 15000 (15s). Set to 0 to disable. Env var:
+     * ZCODE_PROXY_SSE_HEARTBEAT_MS. Recommended range: 10s–30s. Below 5s
+     * is wasteful; above 60s defeats the purpose if upstream is behind CF.
+     */
+    sseHeartbeatMs?: number;
   };
   auth: AuthConfig;
   /** Active upstream provider. */
