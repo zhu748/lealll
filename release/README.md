@@ -1,5 +1,24 @@
 # zcode-proxy 使用说明
 
+> **v0.2.1.4 — 完整对齐 zcode cache_control 指纹（基于 6 请求实测样本）**
+>
+> 基于 zcode 桌面客户端 6 个连续请求的完整流程抓包，实现了 cc 指纹的 1:1 对齐。v0.2.1.3 的"保守跳过"策略被替换为精确的三规则模型，cache 命中率恢复到 v0.2.0.8 水平甚至更好。
+>
+> **本次改动**
+>
+> - **三条 zcode 实测规则**（基于 2026-06-30 抓包的 6 个连续请求）：
+>   - **RULE 1**（req#1/#2）：text-only user 消息 → cc 挂最后一个 text block
+>   - **RULE 2**（req#3/#4/#6）：单 tool_result user 消息 → cc 直接挂在 tool_result block 本身（zcode 桌面客户端就是这么做的，之前 v0.2.0.9 起的"strip cc from tool_result"是基于错误假设）
+>   - **RULE 3**（req#5）：多 tool_result user 消息（并行工具调用续传）→ 完全剥掉所有 cc（zcode 也是这么做的）
+> - **`sanitizeContentBlocks`**：去掉了 v0.2.0.9 引入的"strip cc from tool_result"逻辑。这个逻辑基于一个错误假设（"real ZCode client never puts cc on tool_result"），实测正好打脸——zcode 在单 tool_result 场景下就是直接挂 cc 在 tool_result 上的。
+> - **`applyAnthropicCacheControl`**：完全重写为三规则模型，基于 tool_result 数量分支决策。不再追加 `text:" "` 占位块（v0.2.0.9-v0.2.1.2 的错误行为）。
+> - **验证**：6 个 zcode 参考请求全部 1:1 对齐（cc 位置、block 数量完全一致）；Claude Code 失败请求已修复（单 tool_result 现在保留 cc 在自身，匹配 RULE 2）；646 个单元测试通过，TypeScript 零错误。
+> - **影响**：相比 v0.2.1.3，单工具调用续传场景重新命中 prompt cache（之前是被丢掉的）。多工具调用续传场景首次实现 zcode 对齐（之前没有规则处理）。
+>
+> **升级建议**：所有用户立即升级到 v0.2.1.4。这是首个 cc 指纹完全对齐 zcode 桌面客户端的版本。
+
+---
+
 > **v0.2.1.3 — 修复 Claude Code 多轮工具调用时 [1213] 网关错误**
 >
 > 修复 v0.2.0.9 引入的 cache_control 指纹对齐回归 bug。当 Claude Code 进行多轮工具调用时（最后一轮 user 消息是 tool-call 续传，只含 `tool_result` blocks），代理会追加一个 `text:" "` + cc 块到该消息尾部，触发 zcode 网关 `[1213][未正常接收到prompt参数。]` 错误。

@@ -383,10 +383,12 @@ describe("transformRequestBody — strip thinking blocks from messages (Anthropi
     expect(parsed.messages[0].content[1].id).toBe("t1");
     expect(parsed.messages[0].content[1].name).toBe("Bash");
     expect(parsed.messages[0].content[1].input).toEqual({ cmd: "ls" });
-    // tool_result preserved, cache_control NOT attached to it (gateway rejects)
+    // tool_result preserved. v0.2.1.4+: real ZCode client attaches cc directly
+    // to a single tool_result in the last user message (verified req#3/#4/#6
+    // in the 6-request zcode flow capture). The proxy now mirrors this.
     expect(parsed.messages[1].content[0].type).toBe("tool_result");
     expect(parsed.messages[1].content[0].tool_use_id).toBe("t1");
-    expect(parsed.messages[1].content[0].cache_control).toBeUndefined();
+    expect(parsed.messages[1].content[0].cache_control).toEqual({ type: "ephemeral" });
   });
 
   it("does NOT touch string content (no thinking blocks possible)", () => {
@@ -1587,19 +1589,32 @@ describe("transformRequestBody — document block conversion + is_error:false st
   });
 });
 
-// v0.2.1+: cache_control fingerprint alignment vs real ZCode desktop client.
-// Captured real ZCode sample (2026-06-28): the client places cc on a near-empty
-// text block at the tail of the LAST **user** message, and NEVER on tool_result
-// blocks or assistant messages. Claude Code, by contrast, frequently puts cc on
-// tool_result blocks (the last tool_result of an agentic turn). The proxy must
-// strip cc from tool_result blocks AND ensure cc lands only on the last user
-// message — never on assistant (which was the pre-v0.2.1 behavior via fallthrough).
-describe("transformRequestBody — cache_control fingerprint alignment (v0.2.1+)", () => {
-  it("strips cache_control from tool_result blocks (real ZCode never sends it there)", () => {
-    // Claude Code often attaches cc to the final tool_result of an agentic turn.
-    // Real ZCode client never does this — cc is always on a text block at the
-    // tail of the last user message. Stripping tool_result cc is required for
-    // fingerprint alignment.
+// v0.2.1.4+: cache_control fingerprint alignment vs real ZCode desktop client.
+// Verified against a 6-request complete flow capture (2026-06-30):
+//   - RULE 1: text-only last user msg → cc on last text block (req#1, req#2)
+//   - RULE 2: single tool_result in last user msg → cc ON the tool_result itself
+//             (req#3, req#4, req#6 — zcode attaches cc directly to tool_result)
+//   - RULE 3: multiple tool_results in last user msg → strip ALL cc (req#5 —
+//             zcode drops cc entirely for parallel tool continuations)
+//
+// Pre-v0.2.1.4 versions made wrong assumptions:
+//   - v0.2.0.9–v0.2.1.3: stripped cc from tool_result (broke single-tool cache
+//     hits, based on a misread of an earlier sample)
+//   - v0.2.0.9–v0.2.1.2: also appended text+cc to tool_result user msgs
+//     (caused gateway [1213] error, fixed in v0.2.1.3)
+describe("transformRequestBody — cache_control fingerprint alignment (v0.2.1.4+ zcode-aligned)", () => {
+  it("KEEPS cache_control on single tool_result in last user msg (v0.2.1.4+ zcode alignment)", () => {
+    // v0.2.1.4+ — verified against real ZCode desktop client wire capture
+    // (2026-06-30, 6-request complete flow log): when the last user message
+    // has a SINGLE tool_result, the real zcode client attaches cc directly
+    // to the tool_result block itself (req#3/#4/#6 all show this pattern).
+    //
+    // Pre-v0.2.1.4 behavior was to strip cc from tool_result (based on a
+    // wrong assumption in v0.2.0.9). This broke cache hits for the most
+    // common single-tool-call continuation pattern.
+    //
+    // The proxy now mirrors zcode: if Claude Code already has cc on the
+    // tool_result, leave it; if not, attach it.
     const body = JSON.stringify({
       model: "glm-5.2",
       max_tokens: 1000,
@@ -1613,7 +1628,7 @@ describe("transformRequestBody — cache_control fingerprint alignment (v0.2.1+)
         {
           role: "user",
           content: [
-            // Claude Code's tool_result with cc attached — must be stripped.
+            // Claude Code's tool_result WITH cc attached — must be PRESERVED.
             {
               tool_use_id: "call_1",
               type: "tool_result",
@@ -1627,30 +1642,20 @@ describe("transformRequestBody — cache_control fingerprint alignment (v0.2.1+)
     const out = transformRequestBody(body, { format: "anthropic" });
     const parsed = JSON.parse(out as string);
 
-    // The tool_result block must NOT carry cache_control after transform.
     const lastUser = parsed.messages[parsed.messages.length - 1];
     expect(lastUser.role).toBe("user");
     const toolResultBlock = lastUser.content.find((b: any) => b.type === "tool_result");
     expect(toolResultBlock).toBeDefined();
-    expect(toolResultBlock.cache_control).toBeUndefined();
+    // cc MUST remain on the tool_result — matches zcode wire shape.
+    expect(toolResultBlock.cache_control).toEqual({ type: "ephemeral" });
+    // No text block appended.
+    expect(lastUser.content.length).toBe(1);
   });
 
-  it("SKIPS cache_control when last user msg has tool_result (v0.2.1.3+ fix for gateway 1213)", () => {
-    // v0.2.0.9–v0.2.1.2 regression: when Claude Code's last user message was
-    // a tool-call continuation (only tool_result blocks, no text), the proxy
-    // appended a single-space text block carrying cc to mirror what the
-    // developer thought was the real ZCode cc-anchor pattern.
-    //
-    // This was a MISREADING of the zcode reference sample: msg[122]'s cc
-    // anchor is on a user message with ONLY text blocks, NOT on a user
-    // message that also contains tool_result. The zcode gateway rejects
-    // the appended-text+cc-on-tool-result-user-msg pattern with
-    // `[1213][未正常接收到prompt参数。]`.
-    //
-    // v0.2.1.3+ fix: when the last user message contains ANY tool_result
-    // block, SKIP cache_control injection entirely. Better to miss the cache
-    // optimization than to fail the request. The next turn (when the user
-    // sends a text-only message) picks up cc normally.
+  it("ATTACHES cache_control to single tool_result when client didn't send it (v0.2.1.4+)", () => {
+    // If Claude Code's tool_result has NO cc (some clients don't add it),
+    // the proxy attaches cc to match zcode's wire shape. This is the active
+    // injection case (vs the idempotent "keep" case above).
     const body = JSON.stringify({
       model: "glm-5.2",
       max_tokens: 1000,
@@ -1664,6 +1669,7 @@ describe("transformRequestBody — cache_control fingerprint alignment (v0.2.1+)
         {
           role: "user",
           content: [
+            // No cc on the tool_result — proxy should attach it.
             { tool_use_id: "call_1", type: "tool_result", content: "file1.js" },
           ],
         },
@@ -1674,29 +1680,76 @@ describe("transformRequestBody — cache_control fingerprint alignment (v0.2.1+)
 
     const lastUser = parsed.messages[parsed.messages.length - 1];
     expect(lastUser.role).toBe("user");
+    expect(lastUser.content.length).toBe(1); // no text block appended
+    expect(lastUser.content[0].type).toBe("tool_result");
+    // cc was attached by the proxy to match zcode.
+    expect(lastUser.content[0].cache_control).toEqual({ type: "ephemeral" });
+  });
 
-    // The tool_result block must remain unchanged (no cc on it — Claude
-    // Code's original cc was already stripped by sanitizeContentBlocks).
-    const toolResultBlock = lastUser.content.find((b: any) => b.type === "tool_result");
-    expect(toolResultBlock).toBeDefined();
-    expect(toolResultBlock.cache_control).toBeUndefined();
+  it("STRIPS cache_control from ALL blocks when last user msg has multiple tool_results (v0.2.1.4+)", () => {
+    // v0.2.1.4+ — verified against zcode req#5: when the last user message
+    // has 2+ tool_result blocks (parallel tool continuation, e.g. two Read
+    // calls returning results in the same turn), the real zcode client
+    // drops cc ENTIRELY — no cc on any tool_result, no cc on any text block.
+    //
+    // Forwarding cc on multiple tool_results is a fingerprint mismatch and
+    // risks gateway rejection. The proxy strips all cc from such messages.
+    const body = JSON.stringify({
+      model: "glm-5.2",
+      max_tokens: 1000,
+      thinking: { type: "enabled" },
+      messages: [
+        { role: "user", content: "first question" },
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "let me read both files" },
+            { type: "tool_use", id: "call_1", name: "Read", input: { file_path: "a.txt" } },
+            { type: "tool_use", id: "call_2", name: "Read", input: { file_path: "b.txt" } },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            // Two tool_results — Claude Code may have put cc on the last one.
+            {
+              tool_use_id: "call_1",
+              type: "tool_result",
+              content: "content of a",
+            },
+            {
+              tool_use_id: "call_2",
+              type: "tool_result",
+              content: "content of b",
+              cache_control: { type: "ephemeral" }, // Claude Code's cc — must be stripped
+            },
+          ],
+        },
+      ],
+    });
+    const out = transformRequestBody(body, { format: "anthropic" });
+    const parsed = JSON.parse(out as string);
 
-    // NO new text block should have been appended. The user message's
-    // content array length must be unchanged (still just 1 tool_result).
-    expect(lastUser.content.length).toBe(1);
-
-    // NO block anywhere in the last user message should carry cache_control.
+    const lastUser = parsed.messages[parsed.messages.length - 1];
+    expect(lastUser.role).toBe("user");
+    expect(lastUser.content.length).toBe(2); // unchanged: 2 tool_results
+    // NO block in this user message should carry cc — zcode drops cc entirely
+    // for multi-tool_result messages.
     for (const block of lastUser.content) {
       expect(block.cache_control).toBeUndefined();
     }
   });
 
-  it("SKIPS cache_control when last user msg has tool_result + text (v0.2.1.3+ fix)", () => {
-    // Even when the last user message has a text block alongside tool_result,
-    // we still skip cc — the zcode reference NEVER attaches cc to a user
-    // message that also contains tool_result, regardless of where the text
-    // block sits. Attaching cc to the text block in such a message also
-    // triggers the gateway 1213 error.
+  it("ATTACHES cc to last text block when last user msg has tool_result + text (v0.2.1.4+ edge case)", () => {
+    // Edge case: when the last user message has exactly ONE tool_result AND
+    // a text block, the proxy follows RULE 2 (single tool_result → cc on
+    // the tool_result). The text block is left without cc.
+    //
+    // This matches zcode's behavior: cc goes on the tool_result, not on a
+    // text block in the same message. (Verified by extrapolation from the
+    // 6-request capture — zcode never sends tool_result + text in the same
+    // user message in the sample, but the rule is consistent: single
+    // tool_result → cc on tool_result.)
     const body = JSON.stringify({
       model: "glm-5.2",
       max_tokens: 1000,
@@ -1723,10 +1776,12 @@ describe("transformRequestBody — cache_control fingerprint alignment (v0.2.1+)
     expect(lastUser.role).toBe("user");
     expect(lastUser.content.length).toBe(2); // unchanged: tool_result + text
 
-    // NO block in this user message should carry cc — skipping entirely.
-    for (const block of lastUser.content) {
-      expect(block.cache_control).toBeUndefined();
-    }
+    // cc on the tool_result (RULE 2).
+    expect(lastUser.content[0].type).toBe("tool_result");
+    expect(lastUser.content[0].cache_control).toEqual({ type: "ephemeral" });
+    // Text block has NO cc.
+    expect(lastUser.content[1].type).toBe("text");
+    expect(lastUser.content[1].cache_control).toBeUndefined();
   });
 
   it("NEVER attaches cache_control to assistant messages (no fallthrough)", () => {
