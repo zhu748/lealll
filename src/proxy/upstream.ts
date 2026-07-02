@@ -65,7 +65,7 @@
  *      The real client uses `os.version()` (OS product name). Fixed in
  *      identity.ts.
  *
- * `extraHeaders` is the ONLY way for internal subsystems (e.g. captcha solver)
+ * `extraHeaders` is the ONLY way for trusted internal subsystems
  * to inject headers upstream. It is reserved for proxy-internal use — never
  * for passthrough of client headers.
  *
@@ -74,6 +74,7 @@
  *   - x-session-id              ❌ (fabricated, never in real client)
  *   - x-query-id                ❌ (fabricated, never in real client)
  *   - x-zcode-trace-id          ❌ (fabricated, never in real client)
+ *   - x-aliyun-captcha-*        ❌ (provider headers are stripped before runtime)
  *   - X-ZCode-Agent             ❌ (only sent on glm connectivity probe)
  *   - accept                    ❌ (not on /v1/messages; was a v0.2.2 bug)
  *   - any x-stainless-*         ❌ (Anthropic SDK fingerprint)
@@ -87,6 +88,11 @@ import { credentialString } from "../auth/types.js";
 import { buildIdentityHeaders } from "./identity.js";
 
 const ANTHROPIC_VERSION = "2023-06-01";
+
+const ALIYUN_CAPTCHA_HEADERS = new Set([
+  "x-aliyun-captcha-verify-param",
+  "x-aliyun-captcha-verify-region",
+]);
 
 const STARTPLAN_ANTHROPIC_BASE = "https://zcode.z.ai/api/v1/zcode-plan/anthropic";
 
@@ -147,9 +153,8 @@ export function buildUpstreamURL(format: Format, provider: ProviderDef, plan: "c
  * This is a strict whitelist — no client header is read or passthrough'd.
  * See the module-level header comment for the full whitelist rationale.
  *
- * `extraHeaders` is layered LAST so internal subsystems (captcha) can
- * override transport headers if needed; it is never used for client
- * passthrough.
+ * `extraHeaders` is layered LAST so trusted internal subsystems can override
+ * transport headers if needed; it is never used for client passthrough.
  */
 export function buildUpstreamHeaders(
   format: Format,
@@ -224,12 +229,18 @@ export function buildUpstreamHeaders(
   // (as v0.2.2 did) overrode the runtime default `gzip, deflate, br` and
   // was itself a fingerprint mismatch.
 
-  // === Internal subsystems (captcha, etc.) ===
+  // === Trusted internal subsystems ===
   // Layered LAST so they can override anything above if explicitly needed.
   // Never used for client passthrough — that path does not exist.
   if (extraHeaders) {
     for (const [k, v] of Object.entries(extraHeaders)) {
-      headers[k.toLowerCase()] = v;
+      const lower = k.toLowerCase();
+      // Official ZCode start-plan chat requests do not carry Aliyun captcha
+      // verification headers. The desktop client explicitly strips these from
+      // provider headers before exposing them to the runtime registry, so keep
+      // them out even if an old internal caller still tries to pass them here.
+      if (ALIYUN_CAPTCHA_HEADERS.has(lower)) continue;
+      headers[lower] = v;
     }
   }
 

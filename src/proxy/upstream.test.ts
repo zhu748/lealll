@@ -432,19 +432,26 @@ describe("buildUpstreamRequest", () => {
     expect(upstream.headers.get("x-trace-id")).toBeNull();
   });
 
-  // v0.2.2+: extraHeaders (captcha injection) still works on top of the
-  // whitelist. This is the ONLY sanctioned way to add non-ZCode headers
-  // upstream — used by internal subsystems, never for client passthrough.
-  it("still allows extraHeaders (captcha) to layer on top of the whitelist (v0.2.2+)", () => {
+  // v0.2.2+: extraHeaders still works on top of the whitelist for trusted
+  // internal callers, but Aliyun captcha verification headers are explicitly
+  // stripped to match the official ZCode desktop client start-plan path.
+  it("allows trusted extraHeaders but strips Aliyun captcha headers", () => {
     const clientReq = makeClientReq("{}", { "x-client-leak": "should-not-passthrough" });
     const upstream = buildUpstreamRequest(
       clientReq, "anthropic", ZAI_PROVIDER, ZAI_CRED, "{}", IDENTITY,
       "coding-plan",
-      { "x-captcha-token": "solved-token-123" },
+      {
+        "x-internal-debug": "debug-token-123",
+        "x-aliyun-captcha-verify-param": "should-not-send",
+        "x-aliyun-captcha-verify-region": "cn-shanghai",
+      },
     );
 
-    // The captcha header should be present (injected via extraHeaders).
-    expect(upstream.headers.get("x-captcha-token")).toBe("solved-token-123");
+    // Trusted internal header should be present (injected via extraHeaders).
+    expect(upstream.headers.get("x-internal-debug")).toBe("debug-token-123");
+    // Official ZCode chat requests do not carry Aliyun captcha headers.
+    expect(upstream.headers.get("x-aliyun-captcha-verify-param")).toBeNull();
+    expect(upstream.headers.get("x-aliyun-captcha-verify-region")).toBeNull();
     // The client's custom header should NOT be present (whitelist blocks it).
     expect(upstream.headers.get("x-client-leak")).toBeNull();
   });
@@ -982,20 +989,18 @@ describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
       plan: "start-plan",
     };
     const originalFetch = globalThis.fetch;
-    globalThis.fetch = (async (req: Request | string): Promise<Response> => {
+    const globalFetchMock = mock(async (req: Request | string): Promise<Response> => {
       const url = typeof req === "string" ? req : req.url;
-      if (url.includes("/client/configs")) {
-        return new Response(JSON.stringify({ data: { configs: { captcha: { enabled: false } } } }), {
-          status: 200, headers: { "content-type": "application/json" },
-        });
-      }
       throw new Error(`unexpected global fetch in test: ${url}`);
-    }) as typeof fetch;
+    });
+    globalThis.fetch = globalFetchMock as unknown as typeof fetch;
 
     try {
       const fetchMock = mock(async (req: Request): Promise<Response> => {
         expect(req.url).toBe("https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages");
         expect(req.headers.get("authorization")).toBe("Bearer jwt-mock");
+        expect(req.headers.get("x-aliyun-captcha-verify-param")).toBeNull();
+        expect(req.headers.get("x-aliyun-captcha-verify-region")).toBeNull();
         const reqBody = JSON.parse(await req.text());
         expect(reqBody.messages).toBeDefined();
         // vceshi0.1.7+: injectZCodeThinkingFormat forces max_tokens=64000
@@ -1025,6 +1030,8 @@ describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
 
       const resp = await proxyRequest(clientReq, "openai", { config: startPlanConfig, auth, fetchImpl: fetchMock as any });
       expect(fetchMock).toHaveBeenCalledTimes(1);
+      // Official ZCode start-plan chat does not fetch client captcha config.
+      expect(globalFetchMock).toHaveBeenCalledTimes(0);
       expect(resp.status).toBe(200);
       expect(resp.headers.get("content-type")).toBe("application/json");
       const body = await resp.json();

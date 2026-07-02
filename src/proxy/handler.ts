@@ -17,7 +17,6 @@ import { getProvider } from "../provider/providers.js";
 import { listModelIds } from "../provider/models.js";
 import { buildUpstreamRequest } from "./upstream.js";
 import { transformRequestBodyObj } from "./body-transformer.js";
-import { detectCaptchaChallenge, getCaptchaToken, invalidateCaptchaToken, RETRY_HEADERS } from "./captcha.js";
 import { detectSseErrorAndConvert } from "./sse-error-detector.js";
 import { anthropicSseToBatchMessage } from "./sse-to-batch.js";
 import { translateRequestOpenAIToAnthropic, translateResponseAnthropicToOpenAI } from "../translator/openai-to-anthropic.js";
@@ -289,7 +288,7 @@ export async function proxyRequest(
   // as config.plan but is updated whenever the credential is switched mid-retry
   // (vceshi0.0.5+ fix for the "cross-plan credential switch" bug). Without this,
   // switching from a coding-plan cred to a start-plan cred (or vice versa) would
-  // keep using the old plan's upstream URL, auth headers, and captcha logic —
+  // keep using the old plan's upstream URL, auth headers, and body transforms —
   // guaranteeing the retried request fails the same way.
   let currentPlan: "coding-plan" | "start-plan" = config.plan;
   const effectivePlanForCred = (c: Credential): "coding-plan" | "start-plan" => {
@@ -379,40 +378,13 @@ export async function proxyRequest(
     }
   }
 
-  let captchaHeaders: Record<string, string> | undefined;
-  // Track cumulative captcha solve time for this request (G4: TTFB split).
-  // Each captcha solve takes 20-40s; knowing how much of TTFB is captcha
-  // vs actual upstream latency is critical for diagnosing slow start-plan
-  // requests.
+  // Official ZCode start-plan chat requests do NOT solve or send Aliyun
+  // captcha headers. The desktop client sends the JWT-bearing request directly
+  // to /api/v1/zcode-plan/anthropic/v1/messages; if Aliyun returns a WAF HTML
+  // page, we surface it as a WAF block instead of trying to synthesize captcha
+  // tokens. Keep the metric for existing log/TTFB columns; it stays 0 on the
+  // official path.
   let totalCaptchaMs = 0;
-  // v0.1.8+ EVERY FETCH GETS A FRESH TOKEN.
-  //
-  // Aliyun verifyParam is consumed on EVERY upstream response — not just on
-  // 403 captcha failure. Even a successful 200 / 529 / 429 response consumes
-  // the token. Reusing the same token on retry → 403 "captcha verify failed"
-  // (code 3007).
-  //
-  // v0.1.7 had a per-request cache that reused the token on 529 retries,
-  // assuming "529 means captcha passed". WRONG — zcode.z.ai consumes the
-  // token regardless of the response status. This caused 3007 errors on
-  // every retry after the first attempt.
-  //
-  // v0.1.8 fix: NO per-request cache. Every fetchUpstreamDetected() call
-  // solves a fresh token. This adds ~20-40s per retry (JSDOM solve time),
-  // but it's the only correct behavior given Aliyun's one-shot semantics.
-  //
-  // handleCaptchaChallenge() is kept as a fast-path for 403 (re-solve +
-  // immediate retry without waiting for the next loop iteration), but it
-  // no longer caches the result.
-  if (currentPlan === "start-plan") {
-    try {
-      const token = await getCaptchaToken(reqId);
-      totalCaptchaMs += token.solveMs;
-      captchaHeaders = { [RETRY_HEADERS.PARAM]: token.verifyParam, [RETRY_HEADERS.REGION]: token.region };
-    } catch {
-      // Will solve on 403 fallback below
-    }
-  }
 
   // Factory that builds a FRESH Request object for each fetch call.
   // Request bodies are single-use — once fetch() consumes the body, the same
@@ -421,7 +393,7 @@ export async function proxyRequest(
   // request would succeed or fail, then every retry would throw that error,
   // get caught by the catch block, and get converted to a synthetic 502 —
   // making retries completely ineffective.
-  const buildUpstreamReq = (captcha?: Record<string, string>) =>
+  const buildUpstreamReq = (extraHeaders?: Record<string, string>) =>
     buildUpstreamRequest(
       clientReq,
       upstreamFormat,
@@ -430,7 +402,7 @@ export async function proxyRequest(
       transformedBody,
       config.identity,
       currentPlan,
-      captcha,
+      extraHeaders,
       opts.resolveClientIp,
       config.server.trustProxy,
     );
@@ -504,8 +476,8 @@ export async function proxyRequest(
   // the pool (pickProxy) for a fallback proxy. The picked proxy is stored
   // in `currentRequestProxy` so the WAF-rotation path can advance to the
   // next one on retry.
-  const fetchUpstreamDetected = async (captcha?: Record<string, string>, isInitialAttempt: boolean = false): Promise<Response> => {
-    const req = buildUpstreamReq(captcha);
+  const fetchUpstreamDetected = async (extraHeaders?: Record<string, string>, isInitialAttempt: boolean = false): Promise<Response> => {
+    const req = buildUpstreamReq(extraHeaders);
     lastSentBeta = req.headers.get("anthropic-beta");
 
     // v0.2.0.9+: header debug logging — record the inbound client request
@@ -514,7 +486,7 @@ export async function proxyRequest(
     // upstream" and verify the translation pipeline has no header defects.
     //
     // Only the FIRST fetch attempt per request is recorded. Retries and
-    // captcha re-solve fetches pass isInitialAttempt=false (the default),
+    // proxy-rotation fetches pass isInitialAttempt=false (the default),
     // so they skip this block entirely — one pair per request, no noise
     // from retries. This is the user-requested behaviour: "重试的不记录".
     //
@@ -642,106 +614,14 @@ export async function proxyRequest(
     return resp;
   };
 
-  // Get a FRESH captcha token for every fetch attempt. No cache.
-  //
-  // v0.1.8+: Aliyun verifyParam is consumed on EVERY upstream response (200,
-  // 529, 429, 403 — all of them). Reusing a token on retry → 3007 error.
-  // So every call to refreshCaptchaHeaders() solves a fresh token.
-  //
-  // This adds ~20-40s per retry (JSDOM solve time), but it's mandatory.
-  // The solveMutex in captcha.ts serializes solves so only one JSDOM
-  // exists at a time (prevents OOM).
-  //
-  // Called before EVERY fetch attempt (initial + retries). The mutex
-  // ensures concurrent requests solve sequentially, not in parallel.
-  //
-  // v0.2.2+ FIX: distinguish hard fails (config unavailable, network down)
-  // from soft fails (transient solve error). Hard fails throw a tagged
-  // error that bubbles up to break the retry loop — without this, the
-  // loop would burn 120s of captcha timeouts PER credential switch,
-  // sometimes running 10+ minutes before surfacing the error to the
-  // client. The "captcha_config_unavailable" tag is detected in the
-  // catch block of fetchUpstreamDetected / handleCaptchaChallenge.
-  const CAPTCHA_CONFIG_UNAVAILABLE = "captcha_config_unavailable";
-  const refreshCaptchaHeaders = async (): Promise<Record<string, string> | undefined> => {
-    if (currentPlan !== "start-plan") return undefined;
-    try {
-      const token = await getCaptchaToken(reqId);
-      totalCaptchaMs += token.solveMs;
-      return { [RETRY_HEADERS.PARAM]: token.verifyParam, [RETRY_HEADERS.REGION]: token.region };
-    } catch (err) {
-      // v0.2.2+: distinguish three failure modes:
-      //   1. configFetchFailed=true → network error fetching the captcha
-      //      config from zcode.z.ai. Retrying won't help — hard-fail the
-      //      retry loop to avoid burning 15s × N retries on a dead network.
-      //   2. "captcha_disabled_by_config" → the upstream returned a config
-      //      with captcha disabled (or missing fields). This is the test
-      //      environment / "upstream doesn't require captcha" case. Soft-fail:
-      //      skip captcha headers, let the upstream decide.
-      //   3. Any other error → transient solve failure (SDK timeout, JSDOM
-      //      hiccup). Soft-fail: the resulting 403 will trigger
-      //      handleCaptchaChallenge's re-solve path which has its own budget.
-      const taggedErr = err as Error & { configFetchFailed?: boolean };
-      if (taggedErr.configFetchFailed === true) {
-        const wrapped = new Error(`${CAPTCHA_CONFIG_UNAVAILABLE}: ${(err as Error).message}`);
-        (wrapped as Error & { captchaConfigUnavailable?: boolean }).captchaConfigUnavailable = true;
-        throw wrapped;
-      }
-      // Soft fail (cases 2 and 3) — return undefined and let the fetch proceed.
-      return undefined;
-    }
-  };
-
-  // Handle a 403 captcha challenge by re-solving and retrying with a fresh
-  // token. Returns the new response, or a synthetic 503 if re-solve fails.
-  // Used both for the initial fetch AND for retry-loop fetches — without
-  // this, a retry that returns 403 would leak through to the client.
-  //
-  // v0.1.8+: NO per-request cache. The re-solved token is used only for
-  // this single fetch — the next retry will solve again via
-  // refreshCaptchaHeaders(). This is intentional: Aliyun tokens are
-  // one-shot, caching them invites 3007 errors.
-  const handleCaptchaChallenge = async (resp: Response): Promise<Response> => {
-    try { resp.body?.cancel(); } catch {}
-    console.log(`${reqId} captcha challenge (403), re-solving...`);
-    invalidateCaptchaToken(); // no-op in v0.1.8+, kept for API compat
-    try {
-      const fresh = await getCaptchaToken(reqId);
-      totalCaptchaMs += fresh.solveMs;
-      console.log(`${reqId} captcha re-solved (token ${fresh.verifyParam.length} chars, ${fresh.solveMs}ms), retrying...`);
-      const freshCaptcha = {
-        [RETRY_HEADERS.PARAM]: fresh.verifyParam,
-        [RETRY_HEADERS.REGION]: fresh.region,
-      };
-      const newResp = await fetchUpstreamDetected(freshCaptcha);
-      headersAt = Date.now();
-      return newResp;
-    } catch (err) {
-      console.log(`${reqId} captcha re-solve failed: ${(err as Error).message}`);
-      // Return a synthetic 503 so caller can decide what to do
-      return errorResponse(503, "captcha_solver_failed", (err as Error).message);
-    }
-  };
-
   let upstreamResp: Response;
   try {
-    // Always refresh captcha token right before the fetch — the token we
-    // got at the start of this function might have expired by now if there
-    // was any await in between (config loading, body parsing, etc.).
-    captchaHeaders = await refreshCaptchaHeaders();
     // isInitialAttempt=true: this is the FIRST fetch for this request.
     // Header debug logging (if enabled) records inbound + upstream headers
     // here. Retries below call fetchUpstreamDetected without this flag, so
     // only the first attempt is logged.
-    upstreamResp = await fetchUpstreamDetected(captchaHeaders, true);
+    upstreamResp = await fetchUpstreamDetected(undefined, true);
   } catch (err) {
-    // v0.2.2+: hard-fail captcha config errors with a specific status code
-    // so the client (Claude Code, OpenAI SDK) doesn't waste retry budget.
-    const isCaptchaConfigHardFail = (err as Error & { captchaConfigUnavailable?: boolean }).captchaConfigUnavailable === true;
-    if (isCaptchaConfigHardFail) {
-      printRow(reqId, format, meta, 503, started, Date.now(), 0, 0, 0);
-      return errorResponse(503, "captcha_config_unavailable", (err as Error).message);
-    }
     printRow(reqId, format, meta, 502, started, Date.now(), 0, 0, 0);
     return errorResponse(502, "upstream_unreachable", (err as Error).message);
   }
@@ -827,11 +707,10 @@ export async function proxyRequest(
       // Cancel the old response body before refetching.
       try { upstreamResp.body?.cancel(); } catch (e) { void e; }
 
-      // Refetch with the new proxy. Captcha is refreshed per-fetch; for
-      // start-plan we get a fresh token, for coding-plan we skip it.
+      // Refetch with the new proxy. Keep the same official header shape — no
+      // captcha headers are added on start-plan.
       try {
-        const rotCaptcha = await refreshCaptchaHeaders();
-        upstreamResp = await fetchUpstreamDetected(rotCaptcha);
+        upstreamResp = await fetchUpstreamDetected();
         headersAt = Date.now();
       } catch (err) {
         console.log(`${reqId} WAF rotation ${rot + 1} fetch failed: ${(err as Error).message}`);
@@ -878,23 +757,10 @@ export async function proxyRequest(
     return errorResponse(401, "start_plan_jwt_invalid", "Start-plan JWT was rejected. Re-run: zcode-proxy auth login");
   }
 
-  // start-plan: on 403 captcha challenge, force re-solve and retry once.
-  // This handles the INITIAL response. Retries that return 403 are handled
-  // inside the retry loop below via the same handleCaptchaChallenge() helper.
-  if (currentPlan === "start-plan" && (upstreamResp.status === 403 || detectCaptchaChallenge(upstreamResp))) {
-    upstreamResp = await handleCaptchaChallenge(upstreamResp);
-    // If captcha re-solve itself failed, bail out
-    if (upstreamResp.status === 503 && upstreamResp.headers.get("content-type")?.includes("application/json")) {
-      try {
-        const body = await upstreamResp.text();
-        const parsed = JSON.parse(body);
-        if (parsed?.error?.type === "captcha_solver_failed") {
-          printRow(reqId, format, meta, 503, started, Date.now(), 0, 0, 0);
-          return upstreamResp;
-        }
-      } catch { /* not a captcha_solver_failed response — continue */ }
-    }
-  }
+  // Official start-plan path: do not answer 403s by synthesizing Aliyun
+  // captcha headers. If the response is an Aliyun WAF HTML page, checkWafBlock
+  // above already converts it to a clear waf_blocked error. Non-WAF 403s are
+  // forwarded normally so the caller sees the real upstream/auth failure.
 
   // SSE error detection for the initial response is already handled inside
   // fetchUpstreamDetected() above. The standalone detection block that used
@@ -988,10 +854,9 @@ export async function proxyRequest(
     // v0.2.2+ FIX (infinite retry loop): hard cap on total attempts.
     // `extraAttemptsFromSwitches` increments on every credential switch,
     // so under concurrent dashboard imports / large credential pools the
-    // loop could run far longer than the operator intended — each extra
-    // attempt also waits ~20-40s for a fresh captcha solve (start-plan).
-    // Cap at max(config.retry.maxRetries * 4 + 10, MAX_TOTAL_ATTEMPTS_CAP)
-    // to guarantee termination in bounded time.
+    // loop could run far longer than the operator intended. Cap at
+    // max(config.retry.maxRetries * 4 + 10, MAX_TOTAL_ATTEMPTS_CAP) to
+    // guarantee termination in bounded time.
     const MAX_TOTAL_ATTEMPTS = Math.min(
       config.retry.maxRetries * RETRY_CONST.MAX_TOTAL_ATTEMPTS_FACTOR + RETRY_CONST.MAX_TOTAL_ATTEMPTS_FLAT,
       RETRY_CONST.MAX_TOTAL_ATTEMPTS_CAP,
@@ -1165,25 +1030,10 @@ export async function proxyRequest(
       try {
         // Build a FRESH Request for each retry — never reuse upstreamReq.
         // fetchUpstreamDetected also runs SSE error detection so 200 streams
-        // with hidden errors get caught on every attempt.
-        //
-        // CRITICAL for start-plan: refresh captcha token before each retry.
-        // The token from the initial fetch might have expired during the
-        // backoff sleep (TTL is only 45s). Using a stale token returns 403
-        // "captcha verify failed" — which is NOT a retryable status, so it
-        // would break out of the loop and leak the 403 to the client.
-        const retryCaptcha = await refreshCaptchaHeaders();
-        upstreamResp = await fetchUpstreamDetected(retryCaptcha);
+        // with hidden errors get caught on every attempt. Official ZCode
+        // start-plan retries do not attach Aliyun captcha headers either.
+        upstreamResp = await fetchUpstreamDetected();
         headersAt = Date.now();
-
-        // If the retry itself returns 403 (captcha challenge), try to
-        // re-solve and retry once before giving up. This handles the case
-        // where the token expired between refreshCaptchaHeaders() and the
-        // upstream actually validating it (rare but possible under load).
-        if (currentPlan === "start-plan" && (upstreamResp.status === 403 || detectCaptchaChallenge(upstreamResp))) {
-          console.log(`${reqId} retry ${attempt} got 403 captcha challenge, re-solving...`);
-          upstreamResp = await handleCaptchaChallenge(upstreamResp);
-        }
 
         // vceshi0.0.8+: also check for WAF block on retry — if the IP got
         // blacklisted DURING the retry loop, we need to bail immediately
@@ -1232,8 +1082,7 @@ export async function proxyRequest(
 
               try { upstreamResp.body?.cancel(); } catch (e) { void e; }
               try {
-                const rotCaptcha = await refreshCaptchaHeaders();
-                upstreamResp = await fetchUpstreamDetected(rotCaptcha);
+                upstreamResp = await fetchUpstreamDetected();
                 headersAt = Date.now();
               } catch (err) {
                 console.log(`${reqId} retry WAF rotation ${rot + 1} fetch failed: ${(err as Error).message}`);
@@ -1270,15 +1119,6 @@ export async function proxyRequest(
           upstreamResp = retryWafCheck.response;
         }
       } catch (err) {
-        // v0.2.2+: captcha config hard-fail breaks the retry loop immediately.
-        // Retrying is pointless — each retry would burn another 120s waiting
-        // for a captcha config that won't suddenly become available.
-        const isCaptchaConfigHardFail = (err as Error & { captchaConfigUnavailable?: boolean }).captchaConfigUnavailable === true;
-        if (isCaptchaConfigHardFail) {
-          console.log(`${reqId} captcha config unavailable — breaking retry loop`);
-          printRow(reqId, format, meta, 503, started, Date.now(), 0, 0, 0);
-          return errorResponse(503, "captcha_config_unavailable", (err as Error).message);
-        }
         // Network error during retry — log the ACTUAL error so users can
         // diagnose (the old code just said "network error" with no detail).
         const errMsg = (err as Error).message ?? String(err);
@@ -1784,7 +1624,7 @@ function stripUndefinedStringFields(node: unknown): number {
 export async function checkWafBlock(resp: Response): Promise<{ wafBlocked: true } | { wafBlocked: false; response: Response }> {
   // Fast path: status codes that the WAF typically uses.
   // 405 = Method Not Allowed (the classic WAF block)
-  // 403 = Forbidden (captcha challenge or WAF block)
+  // 403 = Forbidden (sometimes used by WAF or upstream auth failures)
   // 200 = sometimes the WAF returns 200 + HTML instead of an error status
   const isSuspectStatus = resp.status === 405 || resp.status === 403 || resp.status === 200;
   if (!isSuspectStatus) return { wafBlocked: false, response: resp };

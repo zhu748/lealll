@@ -1,5 +1,22 @@
 # zcode-proxy 使用说明
 
+> **v0.2.1.8 — 对齐 ZCode 官方 start-plan 发送路径:移除非官方 Aliyun Captcha 头**
+>
+> 本版本根据 ZCode 桌面客户端 `app.asar` 逆向结果,将 start-plan 主聊天请求对齐为官方合法发送方式:直接使用 start-plan JWT 请求 `zcode.z.ai` 网关,不再预先获取/注入 Aliyun Captcha 验证头。
+>
+> **本次改动**
+>
+> - **对齐官方 start-plan 请求路径**:`POST https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages`,认证方式保持 `Authorization: Bearer <start-plan JWT>`。
+> - **移除 start-plan 主链路 Captcha 解题流程**:不再请求 `/api/v1/client/configs`,不再调用本地 JSDOM Aliyun Captcha solver,不再为每次请求/重试生成 `verifyParam`。
+> - **硬过滤 Aliyun Captcha 头**:即使旧内部路径误传 `x-aliyun-captcha-verify-param` / `x-aliyun-captcha-verify-region`,上游请求构造层也会剥离,防止偏离官方客户端指纹。
+> - **403 处理对齐官方行为**:不再把 start-plan 的 403 当作验证码挑战自动补头重试。若返回 Aliyun WAF HTML 页面,仍由 WAF 检测给出 `waf_blocked`;非 WAF 403 则透传真实上游/auth 错误。
+> - **测试覆盖**:新增/更新测试确认 start-plan 不会访问 captcha config,不会发送 Aliyun Captcha 头,同时保留原有 ZCode identity 请求头顺序。全部 684 个测试通过,TypeScript 零错误。
+> - **影响**:start-plan 用户的请求形态更接近官方 ZCode 客户端;如果仍被 Aliyun WAF 拦截,问题更可能来自 IP/网络/TLS 或请求体细节,而不是缺少验证码头。
+>
+> **升级建议**:所有使用 start-plan 的用户建议升级到 v0.2.1.8。此前遇到 Aliyun 验证配置获取失败、验证码解题超时或 WAF 拦截的用户尤其建议升级。
+
+---
+
 > **v0.2.1.7 — SSE heartbeat 保活:解决 Cloudflare 524 超时 + 修复压缩流 bug + admin API 增强**
 >
 > 解决 Cloudflare 524 超时问题:当代理部署在 CF 后面时,GLM-5.2 thinking 模式经常需要 60-180 秒才吐第一个 SSE event,超过 CF 的 100 秒 Proxy Read Timeout,CF 直接返回 524 切断连接。本版本通过在等待上游首字节期间定期 flush SSE 标准注释行(`: keepalive\n\n`)保活,完全解决此问题。
