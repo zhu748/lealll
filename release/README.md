@@ -1,5 +1,23 @@
 # zcode-proxy 使用说明
 
+> **v0.2.1.9 — start-plan 隐藏预验证与 Render Chromium 部署修复**
+>
+> 本版本把 start-plan 请求路径重新对齐到 ZCode 桌面端的隐藏 renderer 预验证流程:发送模型请求前默认刷新 Aliyun 无痕验证码运行态 header,并在遇到 `3007 captcha verify failed` 时自动使用 Chrome CDP 重新解验后重试。
+>
+> **本次改动**
+>
+> - **start-plan 默认预验证**:每次请求前都会刷新 Aliyun runtime captcha headers,匹配 ZCode 客户端隐藏页面的 pre-send 行为。仅在诊断时可通过 `ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT=0` 关闭。
+> - **3007 自动恢复**:上游返回验证码失败后,自动走 Chrome solver 重新获取验证参数并重试,避免用户手动打开浏览器反复处理。
+> - **Chrome 指纹更稳定**:Chrome CDP solver 默认使用持久 profile,保留浏览器/device 状态,降低重复验证概率;仍可用 `ZCODE_CAPTCHA_CHROME_EPHEMERAL=1` 切回一次性 profile。
+> - **Render 部署可用性修复**:Docker 镜像内置 Chromium + Xvfb,Render 启动脚本会在无 DISPLAY 环境自动启动虚拟显示,并默认使用 `ZCODE_CAPTCHA_SOLVER=chrome`,避免云端退回 JSDOM 后触发 3007。
+> - **Linux/容器兼容**:补齐常见 Chromium/Chrome 路径探测,容器环境自动添加 `--no-sandbox` / `--disable-dev-shm-usage` 等参数。
+> - **凭证存储稳定性**:凭证加密 key 固定化,原子写入和串行化写入保护仍保留,避免 Windows 重启后因 key drift 或并发写导致 `~/.zcode-proxy` 凭证看起来"消失"。
+> - **测试覆盖**:新增 start-plan preflight 开关与请求链路测试。全部 702 个测试通过,TypeScript 零错误。
+>
+> **升级建议**:所有使用 start-plan、Render/Docker 部署或遇到 `3007 captcha verify failed` 的用户建议升级到 v0.2.1.9。
+
+---
+
 > **v0.2.1.8 — 对齐 ZCode 官方 start-plan 发送路径:移除非官方 Aliyun Captcha 头**
 >
 > 本版本根据 ZCode 桌面客户端 `app.asar` 逆向结果,将 start-plan 主聊天请求对齐为官方合法发送方式:直接使用 start-plan JWT 请求 `zcode.z.ai` 网关,不再预先获取/注入 Aliyun Captcha 验证头。

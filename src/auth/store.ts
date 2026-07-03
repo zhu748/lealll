@@ -37,8 +37,23 @@ import type { Credential } from "./types.js";
  * is harmless (reads return null, writes are silently no-oped by the upper
  * layer's try/catch).
  */
-const STORE_DIR = process.env.ZCODE_PROXY_STORE_DIR ?? join(homedir(), ".zcode-proxy");
-const STORE_FILE = join(STORE_DIR, "credentials.json");
+function resolveStoreDir(): string {
+  return process.env.ZCODE_PROXY_STORE_DIR ?? join(homedir(), ".zcode-proxy");
+}
+
+let STORE_DIR = resolveStoreDir();
+let STORE_FILE = join(STORE_DIR, "credentials.json");
+
+function refreshStorePathFromEnv(): void {
+  const nextDir = resolveStoreDir();
+  if (nextDir === STORE_DIR) return;
+  STORE_DIR = nextDir;
+  STORE_FILE = join(STORE_DIR, "credentials.json");
+  cachedStore = undefined;
+  cachedStoreMtimeMs = -1;
+  undecryptableFilePresent = false;
+  lastReadStoreNullReason = null;
+}
 /**
  * Optional env var: if set, its value is used as a legacy seed for decrypt
  * fallback (lets users recover credentials.json encrypted by an old version
@@ -86,6 +101,26 @@ let cachedStoreMtimeMs = -1;
  * successful readStoreUncached() (the file was deleted or fixed).
  */
 let undecryptableFilePresent = false;
+
+type StoreNullReason =
+  | "missing"
+  | "empty"
+  | "read_error"
+  | "invalid_json"
+  | "decrypt_failed"
+  | "plaintext_disallowed"
+  | "unsupported_format";
+
+let lastReadStoreNullReason: StoreNullReason | null = null;
+
+function markStoreNull(reason: StoreNullReason): null {
+  lastReadStoreNullReason = reason;
+  return null;
+}
+
+function clearStoreNullReason(): void {
+  lastReadStoreNullReason = null;
+}
 
 /** One stored account record (without encryption — encryption wraps the whole file). */
 export interface StoredAccount {
@@ -432,11 +467,11 @@ function defaultLabel(cred: Credential, createdAt: number): string {
  * compared to the JSON parse + AES-256-GCM decrypt we'd otherwise do (~1ms).
  */
 async function readStore(): Promise<StoreV2 | null> {
+  refreshStorePathFromEnv();
   if (cachedStore !== undefined) {
     // Cache populated — check mtime to detect external writes.
-    // Skip the stat if we know the file doesn't exist (cachedStore === null
-    // and cachedStoreMtimeMs === 0 means "loaded, file didn't exist").
-    if (cachedStoreMtimeMs === 0) return cachedStore;
+    // Even when cachedStore === null, still stat: a separate CLI process may
+    // have created credentials.json after the server started with no store.
     try {
       const st = statSync(STORE_FILE);
       if (st.mtimeMs === cachedStoreMtimeMs) {
@@ -466,9 +501,12 @@ async function readStore(): Promise<StoreV2 | null> {
   if (cachedStore !== undefined) return cachedStore;
   cachedStore = await readStoreUncached();
   // Capture mtime AFTER the successful read so subsequent reads can detect
-  // external writes. If the file doesn't exist, set 0 (skip-stat fast path).
+  // external writes. If the file doesn't exist, set 0 as the "missing" marker.
   if (cachedStore === null) {
-    cachedStoreMtimeMs = 0;
+    // 0 means "confirmed missing"; -1 means "null because the file exists
+    // but could not be read/parsed/decrypted". The latter must be retried
+    // on the next access and must never be treated as a safe empty store.
+    cachedStoreMtimeMs = lastReadStoreNullReason === "missing" ? 0 : -1;
   } else {
     try {
       cachedStoreMtimeMs = statSync(STORE_FILE).mtimeMs;
@@ -488,6 +526,7 @@ async function readStore(): Promise<StoreV2 | null> {
  * After this call, the next readStore() will re-read from disk + re-decrypt.
  */
 export function invalidateStoreCache(): void {
+  refreshStorePathFromEnv();
   cachedStore = undefined;
   cachedStoreMtimeMs = -1;
 }
@@ -499,7 +538,7 @@ async function readStoreUncached(): Promise<StoreV2 | null> {
     // read would leave undecryptableFilePresent=true forever, locking the user
     // out of saving new credentials even after the file was deleted externally.
     undecryptableFilePresent = false;
-    return null;
+    return markStoreNull("missing");
   }
 
   // Read with retry — on Windows, the file can be transiently locked by
@@ -537,7 +576,7 @@ async function readStoreUncached(): Promise<StoreV2 | null> {
       // process deleted it) — retry won't help, treat as "no file".
       if (code === "ENOENT") {
         undecryptableFilePresent = false;
-        return null;
+        return markStoreNull("missing");
       }
       if (code === "EPERM" || code === "EBUSY" || code === "EACCES") {
         // ASYNC sleep — yields to the event loop so other requests aren't
@@ -555,9 +594,9 @@ async function readStoreUncached(): Promise<StoreV2 | null> {
     // so the user can diagnose (AV lock vs permission vs disk failure).
     console.warn(`[store] Could not read credentials.json after retries: ${(readErr as Error)?.message ?? readErr}`);
     // Do NOT backupCorruptedStore here — we don't have content to back up,
-    // and the file may just be transiently locked. Return null (treat as
-    // empty) without setting the guard, so the next read can try again.
-    return null;
+    // and the file may just be transiently locked. Do mark the null reason
+    // so callers refuse to overwrite an existing-but-unreadable store.
+    return markStoreNull("read_error");
   }
 
   // EMPTY FILE DEFENSE: if the file is empty or whitespace-only, it was
@@ -571,7 +610,7 @@ async function readStoreUncached(): Promise<StoreV2 | null> {
   if (raw.trim() === "") {
     console.warn(`[store] credentials.json is empty (likely from a crashed write). Treating as no store — next save will create a fresh one.`);
     undecryptableFilePresent = false;
-    return null;
+    return markStoreNull("empty");
   }
 
   let parsed: unknown;
@@ -586,7 +625,7 @@ async function readStoreUncached(): Promise<StoreV2 | null> {
     console.warn(`[store] File size: ${raw.length} bytes, first 100 chars: ${JSON.stringify(raw.slice(0, 100))}`);
     backupCorruptedStore(raw);
     undecryptableFilePresent = true;
-    return null;
+    return markStoreNull("invalid_json");
   }
 
   // Both v1 and v2 wrap the actual data in an `encrypted` blob.
@@ -618,7 +657,7 @@ async function readStoreUncached(): Promise<StoreV2 | null> {
       console.warn(`[store] The unreadable file has been backed up. The store will be treated as empty for reads, but saveCredential() will refuse to overwrite until you explicitly clear it (zcode-proxy auth logout) — this prevents accidental data loss.`);
       backupCorruptedStore(raw);
       undecryptableFilePresent = true;
-      return null;
+      return markStoreNull("decrypt_failed");
     }
 
     if ((parsed as any).version === 2) {
@@ -628,6 +667,7 @@ async function readStoreUncached(): Promise<StoreV2 | null> {
       // be able to READ but not WRITE (the guard from the initial failed read
       // would persist forever, locking them out of saving any changes).
       undecryptableFilePresent = false;
+      clearStoreNullReason();
       return JSON.parse(json) as StoreV2;
     }
 
@@ -652,6 +692,7 @@ async function readStoreUncached(): Promise<StoreV2 | null> {
       // so the current request can proceed. Next read will re-migrate.
       console.warn(`[store] Could not persist v1→v2 migration: ${(e as Error).message}`);
     }
+    clearStoreNullReason();
     return migrated;
   }
 
@@ -664,6 +705,8 @@ async function readStoreUncached(): Promise<StoreV2 | null> {
   // (or use a temp HOME + ZCODE_PROXY_CREDENTIAL_SECRET).
   if (process.env.ZCODE_PROXY_ALLOW_PLAINTEXT_STORE === "1"
       && parsed && (parsed as any).version === 2 && Array.isArray((parsed as any).accounts)) {
+    undecryptableFilePresent = false;
+    clearStoreNullReason();
     return parsed as StoreV2;
   }
 
@@ -671,10 +714,11 @@ async function readStoreUncached(): Promise<StoreV2 | null> {
   if (parsed && (parsed as any).version === 2 && Array.isArray((parsed as any).accounts)) {
     console.warn("[store] Refusing to load plaintext credentials.json without ZCODE_PROXY_ALLOW_PLAINTEXT_STORE=1.");
     console.warn("[store] Either delete the file and re-login, or set the env var (test/debug only).");
-    return null;
+    return markStoreNull("plaintext_disallowed");
   }
 
-  return null;
+  console.warn("[store] credentials.json has an unsupported format. Refusing to treat it as an empty store.");
+  return markStoreNull("unsupported_format");
 }
 
 /**
@@ -813,7 +857,20 @@ async function withStoreLock<T>(
     // check is sufficient for cross-process correctness; the explicit
     // invalidate was a performance footgun.
     let store = await readStore();
-    if (!store) store = { version: 2, activeId: null, accounts: [] };
+    if (!store) {
+      const reason = lastReadStoreNullReason;
+      const canCreateFresh = reason === "missing" || reason === "empty" || !existsSync(STORE_FILE);
+      if (!canCreateFresh) {
+        throw new Error(
+          `Refusing to create a fresh credential store because ${STORE_FILE} ` +
+          `exists but could not be safely read (${reason ?? "unknown"}). ` +
+          `This prevents overwriting existing credentials. Retry after a moment; ` +
+          `if the file is corrupted, back it up and run \`zcode-proxy auth logout\` ` +
+          `before saving new credentials.`,
+        );
+      }
+      store = { version: 2, activeId: null, accounts: [] };
+    }
     const result = await fn(store);
     await writeStore(store);
     return result;
@@ -901,6 +958,7 @@ async function withExistingStoreLock<T>(
  * in-memory copy (matches the old behavior for read-only filesystems).
  */
 async function writeStore(store: StoreV2): Promise<void> {
+  refreshStorePathFromEnv();
   // Guard against the "silent overwrite" footgun: if a previous read found
   // credentials.json on disk but couldn't decrypt it (e.g. encryption key
   // changed after a binary update), the original file is preserved as a
@@ -974,6 +1032,7 @@ async function writeStore(store: StoreV2): Promise<void> {
     console.warn(`[store] Set ZCODE_PROXY_STORE_DIR to a writable path (e.g. /data/.zcode-proxy on Render with a disk, or /tmp/.zcode-proxy for ephemeral storage).`);
   }
   cachedStore = store; // keep cache in sync with what we intended to write
+  clearStoreNullReason();
   // Capture the post-write mtime so subsequent reads see "fresh" without
   // having to re-stat (we know we just wrote it).
   try {
@@ -1057,11 +1116,12 @@ export async function loadCredential(): Promise<Credential | null> {
  * clearCredentialAsync() acquires storeWriteMutex BEFORE the unlink, so
  * any in-flight writeStore() finishes (or hasn't started) before we delete.
  * After the unlink, the cache is reset to null (file gone) and mtime to 0
- * (skip-stat fast path on next readStore).
+ * (the "confirmed missing" marker).
  *
  * @throws on persistent EPERM/EBUSY after retries (same as sync version).
  */
 export async function clearCredentialAsync(): Promise<void> {
+  refreshStorePathFromEnv();
   await storeWriteMutex.run(async () => {
     if (!existsSync(STORE_FILE)) {
       // File already gone — just reset state.
@@ -1069,6 +1129,7 @@ export async function clearCredentialAsync(): Promise<void> {
       cachedStoreMtimeMs = 0;
       cachedKey = null;
       undecryptableFilePresent = false;
+      lastReadStoreNullReason = "missing";
       return;
     }
     // Windows: unlink can fail with EPERM/EBUSY/EACCES if AV / indexer /
@@ -1099,9 +1160,10 @@ export async function clearCredentialAsync(): Promise<void> {
     }
     if (lastErr) throw lastErr;
     cachedStore = null;       // file gone, cache reflects that
-    cachedStoreMtimeMs = 0;   // skip-stat fast path on next readStore
+    cachedStoreMtimeMs = 0;   // confirmed missing marker
     cachedKey = null;
     undecryptableFilePresent = false;
+    lastReadStoreNullReason = "missing";
   });
 }
 
@@ -1115,6 +1177,7 @@ export async function clearCredentialAsync(): Promise<void> {
  * protection because they run serially (no concurrent writers).
  */
 export function clearCredential(): void {
+  refreshStorePathFromEnv();
   if (existsSync(STORE_FILE)) {
     // Windows: unlinkSync can fail with EPERM/EBUSY/EACCES if another process
     // (antivirus, Windows Search indexer, backup tool) briefly has the file
@@ -1163,14 +1226,16 @@ export function clearCredential(): void {
     if (lastErr) throw lastErr;
   }
   cachedStore = null; // invalidate store cache
-  cachedStoreMtimeMs = 0; // skip-stat fast path
+  cachedStoreMtimeMs = 0; // confirmed missing marker
   cachedKey = null;   // invalidate key cache (will be repopulated with the same fixed key)
   // Clear the guard flag — once the user has explicitly cleared credentials,
   // they're free to save new ones without the "refusing to overwrite" error.
   undecryptableFilePresent = false;
+  lastReadStoreNullReason = "missing";
 }
 
 export function getStorePath(): string {
+  refreshStorePathFromEnv();
   return STORE_FILE;
 }
 

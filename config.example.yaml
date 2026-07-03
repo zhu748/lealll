@@ -101,10 +101,36 @@ identity:
   # Must be printable ASCII; non-conforming values fall back to the default.
   # Default: "3.1.8" (current ZCode release). Override to match your real client.
   appVersion: "3.1.8"
+  # Release channel header. ZCode 3.1.8 production builds send "production".
+  # Env var: ZCODE_RELEASE_CHANNEL.
+  releaseChannel: "production"
   # X-Title header value. Default "Z Code@electron" (what the real client sends).
   sourceTitle: "Z Code@electron"
   # HTTP-Referer URL. Default "https://zcode.z.ai".
   refererOrigin: "https://zcode.z.ai"
+  # X-ZCode-Agent header for start-plan requests. Default "glm".
+  # Env var: ZCODE_AGENT.
+  zcodeAgent: "glm"
+
+# Start-plan captcha behavior:
+# - By default the proxy matches ZCode's real start-plan path: before each
+#   model request, the hidden renderer refreshes provider runtime captcha
+#   headers with Aliyun traceless verification. Set
+#   ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT=0/false/off/never only for diagnostics
+#   to send first and solve after upstream returns 3007.
+# - ZCODE_CAPTCHA_SOLVER=auto (default) prefers a real Chrome/Edge CDP page,
+#   matching ZCode's Electron renderer, and falls back to the bundled JSDOM
+#   solver. Use ZCODE_CAPTCHA_SOLVER=jsdom only for no-browser diagnostics.
+#   The proxy starts a temporary 127.0.0.1 no-CSP captcha host page by default;
+#   override it only for debugging with ZCODE_CAPTCHA_CHROME_URL.
+# - Chrome CDP reuses a persistent profile at ~/.zcode-proxy/captcha-chrome-profile
+#   to keep a stable browser/device state like ZCode's Electron renderer. Override
+#   with ZCODE_CAPTCHA_CHROME_USER_DATA_DIR, or set ZCODE_CAPTCHA_CHROME_EPHEMERAL=1
+#   to go back to one temporary profile per solve.
+# - ZCODE_CAPTCHA_LANGUAGE can force Aliyun's SDK language to "cn" or "en";
+#   when unset, the proxy follows the host locale like the official client.
+# - Set ZCODE_CAPTCHA_CHROME_INTERACTIVE=1 to show that Chrome window when
+#   Aliyun escalates to an interactive challenge.
 
 logging:
   level: info

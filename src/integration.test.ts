@@ -42,6 +42,7 @@ beforeAll(() => {
       const rawBody = await req.text();
       let parsed: { stream?: boolean; model?: string } = {};
       try { parsed = JSON.parse(rawBody); } catch {}
+      const responseModel = parsed.model ?? "glm-4.6";
 
       if (url.pathname.includes("/v1/messages")) {
         if (parsed.stream) {
@@ -55,7 +56,7 @@ beforeAll(() => {
           // message_delta only carries output_tokens. This verifies the proxy's
           // parseSse correctly reads input_tokens from message_start.message.usage.
           const sse = [
-            'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_int","model":"glm-4.6","usage":{"input_tokens":10,"output_tokens":0}}}\n\n',
+            `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg_int", model: responseModel, usage: { input_tokens: 10, output_tokens: 0 } } })}\n\n`,
             'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
             'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Integration test response"}}\n\n',
             'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
@@ -69,7 +70,7 @@ beforeAll(() => {
           type: "message",
           role: "assistant",
           content: [{ type: "text", text: "Integration test response" }],
-          model: "glm-4.6",
+          model: responseModel,
           stop_reason: "end_turn",
           stop_sequence: null,
           usage: { input_tokens: 10, output_tokens: 8 },
@@ -81,7 +82,7 @@ beforeAll(() => {
           id: "chatcmpl-int-test",
           object: "chat.completion",
           created: Date.now(),
-          model: "glm-4.6",
+          model: responseModel,
           choices: [{
             index: 0,
             message: { role: "assistant", content: "OpenAI integration response" },
@@ -365,6 +366,24 @@ describe("integration: OpenAI Responses API", () => {
     expect(body.object).toBe("response");
     // The response should echo the substituted model (or at least be a valid response)
     expect(body.output.length).toBeGreaterThan(0);
+  });
+
+  it("keeps official uppercase GLM start-plan model ids instead of falling back", async () => {
+    // ZCode desktop's preset start-plan models are "GLM-5.2" and
+    // "GLM-5-Turbo". The proxy must treat these as GLM ids case-insensitively
+    // instead of rewriting them to defaultModel.
+    const resp = await fetch(proxyUrl("/v1/responses"), {
+      method: "POST",
+      headers: authHeader(),
+      body: JSON.stringify({
+        model: "GLM-5.2",
+        input: [{ type: "message", role: "user", content: "Hi from Codex" }],
+      }),
+    });
+    expect(resp.status).toBe(200);
+    const body = await resp.json();
+    expect(body.object).toBe("response");
+    expect(body.model).toBe("GLM-5.2");
   });
 
   it("merges consecutive same-role user messages (Codex sends multiple user turns)", async () => {

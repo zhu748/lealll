@@ -119,7 +119,8 @@ codex --model glm-4.6
 | **Filesystem** | Free tier is read-only except `/tmp`. `render-start.sh` auto-detects writability and falls back to `/tmp/zcode-proxy` if `/data` isn't writable. On paid tier with a persistent disk mounted at `/data`, OAuth credentials survive restarts. |
 | **Config file** | Auto-seeded from `config.example.yaml` (with placeholder API key stripped) into `$ZCODE_PROXY_CONFIG`. Real secrets come from env vars, which override YAML. |
 | **Health check** | `/healthz`, `/health`, and `/` are exempt from `proxyApiKey` so Render's probes succeed without auth headers. |
-| **OAuth login** | Not supported on Render (no browser). Use `auth.mode: apikey` + `ZCODE_API_KEY` env var. |
+| **OAuth login** | Browser login is not supported on Render. Generate/export OAuth credentials locally, then inject `ZCODE_OAUTH_CREDENTIAL`, or use `auth.mode: apikey` + `ZCODE_API_KEY`. |
+| **Start-plan captcha** | The Docker image includes Chromium + Xvfb. Render starts a virtual display so the default start-plan preflight uses the Chrome CDP path instead of the weaker JSDOM fallback. |
 | **Auto-deploy** | Enabled by default in `render.yaml`. Push to `main` → Render rebuilds. |
 | **Sleep behavior** | Free tier sleeps after 15 min of inactivity. First request after sleep takes ~30s. Use Starter plan for always-on. |
 
@@ -173,9 +174,17 @@ docker run --rm -p 8080:8080 \
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ZCODE_APP_VERSION` | `3.1.1` | `User-Agent: ZCode/{version}` sent to upstream. Must be printable ASCII. |
-| `ZCODE_SOURCE_TITLE` | `cli` | `X-Title: Z Code@{title}` sent to upstream. |
+| `ZCODE_APP_VERSION` | `3.1.8` | `User-Agent: ZCode/{version}` sent to upstream. The start-plan captcha config request also sends this as `app_version`, matching the official client. Must be printable ASCII. |
+| `ZCODE_SOURCE_TITLE` | `Z Code@electron` | `X-Title` sent to upstream. |
 | `ZCODE_REFERER_ORIGIN` | `https://zcode.z.ai` | `HTTP-Referer` URL sent to upstream. |
+| `ZCODE_AGENT` | `glm` | `X-ZCode-Agent` sent on start-plan requests to mirror the official GLM agent provider. |
+| `ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT` | enabled | Start-plan refreshes Aliyun runtime captcha headers before every model request, matching ZCode's hidden renderer pre-send path. Set to `0`, `false`, `off`, or `never` only for diagnostics to send first and solve after upstream returns `3007`. |
+| `ZCODE_CAPTCHA_SOLVER` | `auto` | Captcha solver strategy: `auto` prefers a real Chrome/Edge CDP page (matching ZCode's Electron renderer) and falls back to JSDOM, `chrome` forces Chrome/Edge, `jsdom` forces the single-binary fallback. |
+| `ZCODE_CAPTCHA_LANGUAGE` | host locale | Optional Aliyun SDK language override: `cn` or `en`. When unset, Chinese host locales use `cn`; all others use `en`, matching the official client's locale behavior. |
+| `ZCODE_CAPTCHA_CHROME_INTERACTIVE` | `0` | Set to `1` to show the Chrome captcha fallback window on screen when Aliyun escalates from traceless verification to an interactive challenge. |
+| `ZCODE_CAPTCHA_CHROME_URL` | temporary `127.0.0.1` page | Optional captcha host page for the Chrome solver. Leave unset unless debugging; the proxy starts a local no-CSP page automatically. |
+| `ZCODE_CAPTCHA_CHROME_USER_DATA_DIR` | `~/.zcode-proxy/captcha-chrome-profile` | Persistent Chrome/Edge profile used by the start-plan captcha solver, so the browser/device state is stable like ZCode's Electron renderer. |
+| `ZCODE_CAPTCHA_CHROME_EPHEMERAL` | `0` | Set to `1` to use one temporary Chrome profile per captcha solve. This is less ZCode-like and may trigger more checks. |
 
 #### Retry policy (optional)
 
@@ -579,9 +588,11 @@ curl http://localhost:8080/v1/models \
 | `auth.apiKey` | `ZCODE_API_KEY` | — | Upstream API key |
 | `auth.proxyApiKey` | `ZCODE_PROXY_API_KEY` | — | Client auth key |
 | `provider` | `ZCODE_PROVIDER` | `zai` | Upstream provider |
-| `identity.appVersion` | `ZCODE_APP_VERSION` | `3.1.1` | `User-Agent: ZCode/{version}` |
-| `identity.sourceTitle` | `ZCODE_SOURCE_TITLE` | `cli` | `X-Title: Z Code@{title}` |
+| `identity.appVersion` | `ZCODE_APP_VERSION` | `3.1.8` | `User-Agent: ZCode/{version}` |
+| `identity.sourceTitle` | `ZCODE_SOURCE_TITLE` | `Z Code@electron` | `X-Title` |
 | `identity.refererOrigin` | `ZCODE_REFERER_ORIGIN` | `https://zcode.z.ai` | `HTTP-Referer` URL |
+| `identity.zcodeAgent` | `ZCODE_AGENT` | `glm` | `X-ZCode-Agent` for start-plan requests |
+| — | `ZCODE_CAPTCHA_LANGUAGE` | host locale | Optional Aliyun SDK language override: `cn` or `en` |
 | — | `ZCODE_PROXY_LEGACY_SEED` | unset | Manual one-time recovery seed for credentials.json encrypted by an older version. See Security Notes. `ZCODE_PROXY_CREDENTIAL_SECRET` is intentionally NOT consulted — it was the #1 cause of credential loss on restart. |
 | — | `ZCODE_PROXY_ALLOW_PLAINTEXT_STORE` | unset | Set to `1` to allow loading a plaintext credentials.json (debug/test only) |
 | — | `ZCODE_PROXY_CORS_ALLOWLIST` | unset | Comma-separated allowed origins for `Access-Control-Allow-Origin`. When unset, any origin is echoed (legacy permissive behavior). When set, only listed origins get `Access-Control-Allow-Origin: <origin>`; all others get `null`. |

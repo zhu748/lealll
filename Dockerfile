@@ -29,14 +29,23 @@ FROM oven/bun:1.2-slim AS runtime
 # tini: minimal init for proper SIGTERM forwarding + zombie reaping.
 # Render sends SIGTERM on scale-down; without tini, Bun might exit uncleanly
 # and lose in-flight SSE responses.
+# Chromium + Xvfb: start-plan captcha preflight needs a real browser runtime.
+# Xvfb lets Chromium run non-headless inside Render's container, which is
+# closer to ZCode Electron than the JSDOM fallback and avoids default 3007s.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends tini \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        chromium \
+        fonts-liberation \
+        tini \
+        xvfb \
     && rm -rf /var/lib/apt/lists/*
 
 # Render injects PORT at runtime. We default to 8080 for local `docker run`.
 ENV ZCODE_PROXY_PORT=8080 \
     ZCODE_PROXY_CONFIG=/data/config.yaml \
     ZCODE_PROXY_STORE_DIR=/data/.zcode-proxy \
+    ZCODE_CAPTCHA_CHROME_PATH=/usr/bin/chromium \
     NODE_ENV=production
 
 # Non-root user. uid 1001 avoids colliding with any host-assigned uid in

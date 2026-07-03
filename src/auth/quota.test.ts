@@ -79,8 +79,8 @@ describe("queryQuota — start-plan", () => {
     expect(result.planName).toBe("Start Plan");
     expect(result.expireTime).toBe(1799000000);
     expect(result.limits).toHaveLength(2);
-    // start-plan auth = raw jwt, no Bearer; app_version query must be present
-    expect(captured.every((c) => c.headers["Authorization"] === "theJwtToken")).toBe(true);
+    // start-plan billing auth mirrors current ZCode desktop: Bearer JWT.
+    expect(captured.every((c) => c.headers["Authorization"] === "Bearer theJwtToken")).toBe(true);
     expect(captured.every((c) => c.url.includes("app_version=2.1.0"))).toBe(true);
   });
 

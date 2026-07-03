@@ -1,67 +1,31 @@
 /**
- * Aliyun Captcha V3 solver — in-process jsdom (single binary).
+ * Aliyun Captcha V3 solver.
  *
- * The AliyunCaptcha.js SDK is bundled as a text import (no runtime dependency
- * on the alicdn CDN — the CDN is the #1 source of solve failures in restricted
- * networks, and a local file path would break under `bun build --compile`).
- * Solve attempts are retried, and errors from the SDK's `getInstance`
- * callback are propagated rather than silently swallowed (a swallowed error
- * there means `success`/`fail` never fires and we hang until the outer
- * timeout rejects).
+ * Official ZCode runs AliyunCaptcha in the Electron renderer. To mirror that,
+ * the default `auto` strategy prefers a real Chrome/Edge CDP page when one is
+ * available, then falls back to the bundled in-process JSDOM solver. Set
+ * `ZCODE_CAPTCHA_SOLVER=jsdom` only when you need a single-binary/no-browser
+ * diagnostic path.
  *
- * Static `import { JSDOM, VirtualConsole } from "jsdom"` (not dynamic) —
- * dynamic `await import("jsdom")` returns a namespace `{ default: {...} }`
- * for the CJS package under `bun build --compile`, leaving the named exports
- * undefined. Static import lets Bun's bundler fully inline jsdom (including
- * its internal `xhr-sync-worker.js` via `require.resolve`) into the binary,
- * so the compiled exe has zero runtime dependency on node_modules.
+ * Captcha verify params are treated as one-shot: whenever start-plan needs
+ * a runtime captcha token (on upstream 3007, or when explicit preflight is
+ * enabled), the solve result is used only for the immediate retry/attempt.
+ * The mutex below serializes solves only to keep memory bounded; it never
+ * shares a solved token between callers.
  *
- * === OPTIMIZATION HISTORY (v0.1.5+) ===
+ * The client config request mirrors the desktop host bundle:
+ *   GET /api/v1/client/configs?app_version={appVersion}&platform={platform-arch}
+ * with no auth headers. The returned captcha config is cached briefly by
+ * appVersion/platform, but the solved Aliyun verify param is never cached.
  *
- * 1. MUTEX on getCaptchaToken — previously N concurrent start-plan requests
- *    that all hit a token cache miss would each spin up a separate JSDOM
- *    instance (50-100MB each). 4 concurrent = 400MB peak. A single mutex
- *    serializes solve attempts so only ONE JSDOM exists at a time. The
- *    second+ caller waits ~10-40s for the first to complete, then benefits
- *    from the freshly-cached token — zero JSDOM cost.
- *
- * 2. DOUBLE-CHECKED LOCKING — after acquiring the mutex, we re-check
- *    cachedToken. The first caller already solved it while we were waiting;
- *    we can return immediately without spawning another JSDOM.
- *
- * 3. ERROR CLASSIFICATION — config-fetch failures (network, JSON parse) are
- *    NOT retried (the upstream is unreachable, retrying wastes time). Only
- *    actual solve failures (SDK timeout, instance init error) trigger the
- *    retry loop. This cuts "config unavailable" retry storms from 3×40s
- *    = 120s to a single 40s attempt.
- *
- * 4. INVARIANT-VALIDATING INVALIDATE — invalidateCaptchaToken() now also
- *    clears a "solving" flag so that a re-solve triggered by a 403 doesn't
- *    race with an in-flight solve from a previous request that's about to
- *    finish. The previous race: req A starts solve → req B gets 403,
- *    invalidateCaptchaToken (sets cachedToken=null) → req A's solve
- *    completes, sets cachedToken=A's result → req B starts its own solve,
- *    overwrites cachedToken. Result: req B burned another JSDOM for nothing.
- *
- * 5. JSDOM RESOURCE CLEANUP — solveInJsdom now wraps everything in a
- *    try/finally that explicitly closes the window AND aborts pending
- *    timers / event listeners. JSDOM instances that fail to close leak
- *    their timer queue forever (memory grows ~1MB/h per leaked instance).
- *
- * 6. SOLVE TIMEOUT HONESTY — the SDK load timeout (SDK_LOAD_TIMEOUT_MS)
- *    and the solve timeout (SOLVE_TIMEOUT_MS) are now independent. If the
- *    SDK fails to load (e.g. the bundled JS is corrupt), we fail fast
- *    instead of waiting for the solve timeout.
- *
- * 7. SOLVE IN-FLIGHT COALESCING — if invalidateCaptchaToken() is called
- *    WHILE a solve is in flight (e.g. concurrent 403 + the original solve
- *    hasn't finished), we set a "pendingInvalidate" flag. The in-flight
- *    solve's result is discarded (not cached), and the next
- *    getCaptchaToken() call starts a fresh solve. Without this, the
- *    stale result from the in-flight solve would be cached and used,
- *    defeating the invalidate.
+ * The AliyunCaptcha.js SDK is bundled as a text import for the JSDOM path
+ * (no runtime dependency on the alicdn CDN, and no runtime node_modules
+ * dependency after `bun build --compile`).
  */
 import { JSDOM, VirtualConsole } from "jsdom";
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
 import ALIYUN_SDK_LOCAL from "./AliyunCaptcha.js.txt" with { type: "text" };
 import { createMutex } from "../utils/fs.js";
 import type { AsyncMutex } from "../utils/fs.js";
@@ -84,9 +48,95 @@ const SDK_LOAD_TIMEOUT_MS = Number(process.env.ZCODE_CAPTCHA_SDK_LOAD_MS || 20_0
 /** Config-fetch timeout (ms). The configs API is fast; 15s is generous
  *  for slow networks. Overridable via env. */
 const CONFIG_FETCH_TIMEOUT_MS = Number(process.env.ZCODE_CAPTCHA_CONFIG_TIMEOUT_MS || 15_000);
+const CHROME_SOLVE_TIMEOUT_MS = Number(process.env.ZCODE_CAPTCHA_CHROME_TIMEOUT_MS || 70_000);
+const CHROME_INTERACTIVE = process.env.ZCODE_CAPTCHA_CHROME_INTERACTIVE === "1";
+const ALIYUN_SDK_URL = "https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js";
+export type CaptchaSolverStrategy = "auto" | "chrome" | "jsdom";
+type CaptchaLanguage = "cn" | "en";
 
-interface FetchedCaptchaConfig { enabled: boolean; prefix: string; sceneId: string; region: string; }
-let cachedConfig: { value: FetchedCaptchaConfig | null; expiresAt: number } = { value: null, expiresAt: 0 };
+interface FetchedCaptchaConfig {
+  enabled: boolean;
+  prefix: string;
+  sceneId: string;
+  region: string;
+}
+
+interface CaptchaRuntimeOptions {
+  appVersion?: string;
+  platform?: string;
+  language?: string;
+  solver?: CaptchaSolverStrategy;
+}
+
+let cachedConfigs = new Map<string, { value: FetchedCaptchaConfig | null; expiresAt: number }>();
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+export function extractAliyunCaptchaVerifyParam(value: unknown): string | undefined {
+  if (!isRecord(value)) return undefined;
+  const raw = typeof value.captchaVerifyParam === "string"
+    ? value.captchaVerifyParam
+    : typeof value.CaptchaVerifyParam === "string"
+      ? value.CaptchaVerifyParam
+      : undefined;
+  const param = raw?.trim();
+  return param || undefined;
+}
+
+function readAliyunVerifyCode(value: Record<string, unknown>): string | undefined {
+  return typeof value.verifyCode === "string"
+    ? value.verifyCode
+    : typeof value.VerifyCode === "string"
+      ? value.VerifyCode
+      : undefined;
+}
+
+export function isAliyunCaptchaTerminalPass(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  const verifyCode = readAliyunVerifyCode(value);
+  return (value.success === true && value.verifyResult === true) || verifyCode === "T006";
+}
+
+export function isAliyunCaptchaDeferredInteractive(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  const verifyCode = readAliyunVerifyCode(value);
+  if (value.success === true && value.verifyResult === false) return true;
+  if (isAliyunCaptchaTerminalPass(value)) {
+    return extractAliyunCaptchaVerifyParam(value) === undefined;
+  }
+  return verifyCode === "F001" || value.code === "F001";
+}
+
+export function resolveCaptchaSolverStrategy(raw = process.env.ZCODE_CAPTCHA_SOLVER): CaptchaSolverStrategy {
+  const value = (raw || "auto").trim().toLowerCase();
+  return value === "chrome" || value === "jsdom" ? value : "auto";
+}
+
+export function resolveClientPlatformKey(): string {
+  return `${process.platform}-${process.arch}`;
+}
+
+export function buildCaptchaConfigUrl(options?: { appVersion?: string; platform?: string }): string {
+  const url = new URL(CONFIGS_API);
+  url.searchParams.set("app_version", options?.appVersion?.trim() || "3.1.8");
+  url.searchParams.set("platform", options?.platform?.trim() || resolveClientPlatformKey());
+  return url.toString();
+}
+
+export function resolveCaptchaLanguage(raw = process.env.ZCODE_CAPTCHA_LANGUAGE): CaptchaLanguage {
+  const value = raw?.trim().toLowerCase();
+  if (value === "cn" || value === "zh" || value === "zh-cn") return "cn";
+  if (value === "en" || value === "en-us") return "en";
+  try {
+    const locale = Intl.DateTimeFormat().resolvedOptions().locale;
+    if (locale.toLowerCase().startsWith("zh")) return "cn";
+  } catch {
+    /* keep default */
+  }
+  return "en";
+}
 
 /**
  * v0.1.6+ FIX: NO token cache.
@@ -103,7 +153,9 @@ let cachedConfig: { value: FetchedCaptchaConfig | null; expiresAt: number } = { 
  *   - getCaptchaToken() ALWAYS solves a fresh token (no cache)
  *   - solveMutex serializes solves so only ONE JSDOM exists at a time
  *     (prevents OOM from N concurrent JSDOM instances)
- *   - handler.ts caches the token PER-REQUEST (retry reuses, 403 re-solves)
+ *   - handler.ts keeps the solved token only for the immediate upstream
+ *     attempt that follows; retries and 3007 responses solve a fresh token,
+ *     matching ZCode's provider-runtime-headers refresh semantics
  *
  * This means concurrent requests each get their own token (safe), at the
  * cost of serialized solve latency (N requests = N × ~20s solve time).
@@ -138,19 +190,19 @@ export function invalidateCaptchaToken(): void {
   // solves fresh. Handler.ts's per-request cache is cleared separately.
 }
 
-async function fetchCaptchaConfig(reqId?: string): Promise<FetchedCaptchaConfig | null> {
-  if (cachedConfig.value && cachedConfig.expiresAt > Date.now()) return cachedConfig.value;
+async function fetchCaptchaConfig(reqId?: string, opts?: CaptchaRuntimeOptions): Promise<FetchedCaptchaConfig | null> {
+  const url = buildCaptchaConfigUrl({ appVersion: opts?.appVersion, platform: opts?.platform });
+  const cached = cachedConfigs.get(url);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
   const tag = reqId ? `${reqId} ` : "";
   try {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), CONFIG_FETCH_TIMEOUT_MS);
     try {
-      const resp = await fetch(`${CONFIGS_API}?app_version=3.1.1&platform=win32-x64`, {
-        signal: ctrl.signal,
-      });
+      const resp = await fetch(url, { signal: ctrl.signal });
       const json = (await resp.json()) as { data?: { configs?: { captcha?: FetchedCaptchaConfig } } };
       const cfg = json?.data?.configs?.captcha ?? null;
-      cachedConfig = { value: cfg, expiresAt: Date.now() + 60000 };
+      cachedConfigs.set(url, { value: cfg, expiresAt: Date.now() + 60000 });
       return cfg;
     } finally {
       clearTimeout(timer);
@@ -177,20 +229,23 @@ async function fetchCaptchaConfig(reqId?: string): Promise<FetchedCaptchaConfig 
  * Serialized via solveMutex so only one JSDOM exists at a time (prevents
  * OOM from N concurrent JSDOM instances, each 50-100MB).
  *
- * handler.ts is responsible for caching the token PER-REQUEST (so retries
- * within the same request reuse the token, but different requests get
- * different tokens).
+ * handler.ts is responsible for carrying the token to the immediate upstream
+ * attempt. Retries solve again because the verifyParam is consumed by the
+ * attempt that used it.
  *
  * @throws Error if the config is unavailable OR all solve retries fail.
  *         Callers (handler.ts) catch this and return 503 to the client.
  */
-export async function getCaptchaToken(reqId?: string): Promise<{ verifyParam: string; region: string; solveMs: number }> {
+export async function getCaptchaToken(
+  reqId?: string,
+  opts?: CaptchaRuntimeOptions,
+): Promise<{ verifyParam: string; region: string; solveMs: number }> {
   const tag = reqId ? `${reqId} ` : "";
   const solveStart = Date.now();
   return solveMutex.run(async () => {
     let cfg: FetchedCaptchaConfig | null;
     try {
-      cfg = await fetchCaptchaConfig(reqId);
+      cfg = await fetchCaptchaConfig(reqId, opts);
     } catch (err) {
       // Config FETCH failed (network error) — re-throw with the tag so
       // handler.ts can hard-fail the retry loop. We DON'T catch this
@@ -206,7 +261,7 @@ export async function getCaptchaToken(reqId?: string): Promise<{ verifyParam: st
       throw new Error("captcha_disabled_by_config");
     }
 
-    const verifyParam = await solveInJsdomWithRetry(cfg, reqId);
+    const verifyParam = await solveInJsdomWithRetry(cfg, reqId, opts?.solver, resolveCaptchaLanguage(opts?.language));
     const solveMs = Date.now() - solveStart;
     console.log(`${tag}captcha solved in ${solveMs}ms`);
     return { verifyParam, region: cfg.region, solveMs };
@@ -231,9 +286,38 @@ export async function getCaptchaToken(reqId?: string): Promise<{ verifyParam: st
  * guard only fires at 50s, by which point the inner path has definitely
  * failed. This is a pure safety net, not a behavior change.
  */
-async function solveInJsdomWithRetry(cfg: FetchedCaptchaConfig, reqId?: string): Promise<string> {
+async function solveInJsdomWithRetry(
+  cfg: FetchedCaptchaConfig,
+  reqId?: string,
+  solverOverride?: CaptchaSolverStrategy,
+  language: CaptchaLanguage = resolveCaptchaLanguage(),
+): Promise<string> {
   const tag = reqId ? `${reqId} ` : "";
   let lastErr: Error | null = null;
+  const solver = solverOverride ?? resolveCaptchaSolverStrategy();
+  let chromeTried = false;
+  let chromeErr: Error | null = null;
+  const tryChrome = async (reason: string): Promise<string> => {
+    chromeTried = true;
+    console.log(`${tag}[captcha] using Chrome CDP solver (${reason})...`);
+    return await solveInChromeCdp(cfg, language);
+  };
+  if (solver === "chrome") {
+    return await tryChrome(solverOverride ? "forced" : "ZCODE_CAPTCHA_SOLVER=chrome");
+  }
+  if (
+    solver === "auto"
+    && process.env.ZCODE_CAPTCHA_AUTO_PREFER_CHROME !== "0"
+    && findChromeExecutable()
+  ) {
+    try {
+      return await tryChrome("auto, official-style browser path");
+    } catch (err) {
+      chromeErr = err as Error;
+      if (process.env.ZCODE_CAPTCHA_JSDOM_FALLBACK === "0") throw err;
+      console.warn(`${tag}[captcha] Chrome CDP solve failed; trying JSDOM fallback: ${chromeErr.message}`);
+    }
+  }
   for (let attempt = 1; attempt <= SOLVE_RETRIES; attempt++) {
     try {
       // v0.2.0.8: outer hard-timeout race. If solveInJsdom's internal
@@ -242,7 +326,7 @@ async function solveInJsdomWithRetry(cfg: FetchedCaptchaConfig, reqId?: string):
       // JSDOM instance (50-100MB each).
       const HARD_GUARD_MS = SOLVE_TIMEOUT_MS + SDK_LOAD_TIMEOUT_MS + 10_000;
       const result = await Promise.race([
-        solveInJsdom(cfg),
+        solveInJsdom(cfg, language),
         new Promise<never>((_, reject) => {
           setTimeout(
             () => reject(new Error(`captcha hard-guard timeout after ${HARD_GUARD_MS}ms (inner timeouts failed to fire — JSDOM may be stuck)`)),
@@ -268,7 +352,348 @@ async function solveInJsdomWithRetry(cfg: FetchedCaptchaConfig, reqId?: string):
       }
     }
   }
-  throw new Error(`captcha solve failed after ${SOLVE_RETRIES} attempts: ${lastErr?.message ?? "unknown"}`);
+  if (solver !== "jsdom" && !chromeTried && process.env.ZCODE_CAPTCHA_CHROME_FALLBACK !== "0") {
+    try {
+      console.log(`${tag}[captcha] jsdom solve failed; trying Chrome CDP fallback...`);
+      return await solveInChromeCdp(cfg, language);
+    } catch (err) {
+      throw new Error(
+        `captcha solve failed after ${SOLVE_RETRIES} jsdom attempts and Chrome fallback: ` +
+        `${(err as Error).message}; last jsdom error: ${lastErr?.message ?? "unknown"}`,
+      );
+    }
+  }
+  throw new Error(
+    `captcha solve failed after ${SOLVE_RETRIES} attempts: ${lastErr?.message ?? "unknown"}` +
+    `${chromeErr ? `; earlier Chrome error: ${chromeErr.message}` : ""}`,
+  );
+}
+
+function findChromeExecutable(): string | null {
+  const envPath = process.env.ZCODE_CAPTCHA_CHROME_PATH?.trim();
+  const candidates = [
+    envPath,
+    "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+    "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+    "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+    "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+    "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
+    "/usr/bin/microsoft-edge",
+    "/usr/bin/microsoft-edge-stable",
+  ].filter((p): p is string => !!p);
+  return candidates.find(p => existsSync(p)) ?? null;
+}
+
+function defaultStoreDir(): string {
+  return process.env.ZCODE_PROXY_STORE_DIR?.trim() || join(homedir(), ".zcode-proxy");
+}
+
+function resolveChromeUserDataDir(): { dir: string; ephemeral: boolean } {
+  const configured = process.env.ZCODE_CAPTCHA_CHROME_USER_DATA_DIR?.trim();
+  if (configured) return { dir: configured, ephemeral: false };
+  if (process.env.ZCODE_CAPTCHA_CHROME_EPHEMERAL === "1") {
+    return { dir: mkdtempSync(join(tmpdir(), "zcode-captcha-cdp-")), ephemeral: true };
+  }
+  return { dir: join(defaultStoreDir(), "captcha-chrome-profile"), ephemeral: false };
+}
+
+async function waitForCdpJson(port: number, path: string): Promise<any> {
+  const deadline = Date.now() + 15_000;
+  let last = "";
+  while (Date.now() < deadline) {
+    try {
+      const resp = await fetch(`http://127.0.0.1:${port}${path}`);
+      if (resp.ok) return await resp.json();
+      last = await resp.text();
+    } catch (err) {
+      last = (err as Error).message;
+    }
+    await new Promise(r => setTimeout(r, 200));
+  }
+  throw new Error(`Chrome CDP did not become ready: ${last}`);
+}
+
+async function solveInChromeCdp(cfg: FetchedCaptchaConfig, language: CaptchaLanguage): Promise<string> {
+  const chrome = findChromeExecutable();
+  if (!chrome) throw new Error("Chrome/Edge executable not found; set ZCODE_CAPTCHA_CHROME_PATH");
+
+  const port = 9300 + Math.floor(Math.random() * 1000);
+  const { dir: userDataDir, ephemeral } = resolveChromeUserDataDir();
+  mkdirSync(userDataDir, { recursive: true });
+  let hostServer: ReturnType<typeof Bun.serve> | null = null;
+  let chromePageUrl = process.env.ZCODE_CAPTCHA_CHROME_URL?.trim();
+  if (!chromePageUrl) {
+    hostServer = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch() {
+        return new Response("<!doctype html><html><head><meta charset='utf-8'></head><body></body></html>", {
+          headers: { "content-type": "text/html; charset=utf-8" },
+        });
+      },
+    });
+    chromePageUrl = `http://127.0.0.1:${hostServer.port}/captcha-host`;
+  }
+  const chromeArgs = [
+    chrome,
+    `--remote-debugging-port=${port}`,
+    `--user-data-dir=${userDataDir}`,
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--ignore-certificate-errors",
+    "--window-size=1280,720",
+    CHROME_INTERACTIVE ? "--window-position=120,80" : "--window-position=-32000,-32000",
+    chromePageUrl,
+  ];
+  if (process.platform === "linux") {
+    chromeArgs.splice(1, 0, "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu");
+    if (!process.env.DISPLAY && !CHROME_INTERACTIVE) {
+      chromeArgs.splice(1, 0, "--headless=new");
+    }
+  }
+  const proc = Bun.spawn(chromeArgs, { stdout: "ignore", stderr: "ignore" });
+
+  let ws: WebSocket | null = null;
+  try {
+    const tabs = await waitForCdpJson(port, "/json/list");
+    const tab = tabs.find((t: any) =>
+      t.webSocketDebuggerUrl
+      && t.type === "page"
+      && typeof t.url === "string"
+      && (t.url === chromePageUrl || t.url.startsWith(chromePageUrl)),
+    ) ?? tabs.find((t: any) =>
+      t.webSocketDebuggerUrl
+      && t.type === "page"
+      && typeof t.url === "string"
+      && !t.url.startsWith("chrome://"),
+    ) ?? tabs.find((t: any) => t.webSocketDebuggerUrl) ?? tabs[0];
+    if (!tab?.webSocketDebuggerUrl) throw new Error("Chrome CDP target not found");
+
+    ws = new WebSocket(tab.webSocketDebuggerUrl);
+    let id = 0;
+    const pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>();
+    ws.onmessage = ev => {
+      const msg = JSON.parse(String(ev.data));
+      if (!msg.id || !pending.has(msg.id)) return;
+      const p = pending.get(msg.id)!;
+      pending.delete(msg.id);
+      msg.error ? p.reject(new Error(JSON.stringify(msg.error))) : p.resolve(msg.result);
+    };
+    await new Promise<void>((resolve, reject) => {
+      if (!ws) return reject(new Error("WebSocket not initialized"));
+      ws.onopen = () => resolve();
+      ws.onerror = () => reject(new Error("Chrome CDP websocket error"));
+    });
+    const send = (method: string, params: Record<string, unknown> = {}) => new Promise<any>((resolve, reject) => {
+      if (!ws) return reject(new Error("Chrome CDP websocket closed"));
+      const msgId = ++id;
+      pending.set(msgId, { resolve, reject });
+      ws.send(JSON.stringify({ id: msgId, method, params }));
+    });
+
+    await send("Runtime.enable");
+    await send("Page.enable").catch(() => {});
+    await send("Page.setBypassCSP", { enabled: true }).catch(() => {});
+    await new Promise(r => setTimeout(r, 2500));
+
+    const expression = `(() => new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("Chrome captcha solve timeout")), ${CHROME_SOLVE_TIMEOUT_MS});
+      let settled = false;
+      let instance = null;
+      let deferredInteractiveStarted = false;
+      let sdkLoadedAt = 0;
+      const done = (value) => { clearTimeout(timeout); resolve(JSON.stringify(value)); };
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        done(value);
+      };
+      const fail = (err) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      };
+      const readVerifyCode = (err) => {
+        if (!err || typeof err !== "object") return "";
+        return typeof err.verifyCode === "string" ? err.verifyCode : typeof err.VerifyCode === "string" ? err.VerifyCode : "";
+      };
+      const isDeferredInteractive = (err) => {
+        if (!err || typeof err !== "object") return false;
+        const verifyCode = readVerifyCode(err);
+        if (err.success === true && err.verifyResult === false) return true;
+        if ((err.success === true && err.verifyResult === true) || verifyCode === "T006") {
+          return !extractVerifyParam(err);
+        }
+        return verifyCode === "F001" || err.code === "F001";
+      };
+      const extractVerifyParam = (value) => {
+        if (!value || typeof value !== "object") return "";
+        const param = typeof value.captchaVerifyParam === "string"
+          ? value.captchaVerifyParam
+          : typeof value.CaptchaVerifyParam === "string"
+            ? value.CaptchaVerifyParam
+            : "";
+        return param.trim();
+      };
+      const loadSdk = () => new Promise((resolveLoad, rejectLoad) => {
+        const sdkLoadError = (script, ev) => {
+          let entries = [];
+          try {
+            entries = performance.getEntriesByName(script.src).map((entry) => ({
+              name: entry.name,
+              entryType: entry.entryType,
+              duration: entry.duration,
+              transferSize: entry.transferSize,
+              decodedBodySize: entry.decodedBodySize,
+              initiatorType: entry.initiatorType,
+            }));
+          } catch {}
+          return new Error("Failed to load Aliyun captcha script: " + JSON.stringify({
+            type: ev && ev.type,
+            src: script && script.src,
+            entries,
+          }));
+        };
+        if (typeof window.initAliyunCaptcha === "function") {
+          resolveLoad();
+          return;
+        }
+        let script = document.querySelector('script[src="${ALIYUN_SDK_URL}"]');
+        if (script) {
+          script.addEventListener("load", () => resolveLoad(), { once: true });
+          script.addEventListener("error", (ev) => rejectLoad(sdkLoadError(script, ev)), { once: true });
+          return;
+        }
+        script = document.createElement("script");
+        script.src = ${JSON.stringify(ALIYUN_SDK_URL)};
+        script.async = true;
+        script.onload = () => {
+          sdkLoadedAt = Date.now();
+          resolveLoad();
+        };
+        script.onerror = (ev) => rejectLoad(sdkLoadError(script, ev));
+        document.head.appendChild(script);
+      });
+      const waitAfterSdkLoad = () => new Promise((resolveWait) => {
+        if (!sdkLoadedAt) {
+          resolveWait();
+          return;
+        }
+        const elapsed = Date.now() - sdkLoadedAt;
+        const delay = Math.max(0, 2000 - elapsed);
+        setTimeout(resolveWait, delay);
+      });
+      const tryInteractive = () => {
+        if (deferredInteractiveStarted) return;
+        deferredInteractiveStarted = true;
+        try {
+          if (instance && typeof instance.show === "function") {
+            instance.show();
+            return;
+          }
+          const button = document.querySelector("#captcha-button");
+          if (button && typeof button.click === "function") {
+            button.click();
+            return;
+          }
+          fail(new Error("Aliyun SDK requested interactive captcha but no show/button is available"));
+        } catch (err) {
+          fail(err);
+        }
+      };
+      (async () => {
+        const hostId = "zcode-aliyun-captcha-container";
+        const elementId = "zcode-aliyun-captcha-element";
+        const buttonId = "zcode-aliyun-captcha-button";
+        let host = document.getElementById(hostId);
+        if (!host) {
+          host = document.createElement("div");
+          host.id = hostId;
+          host.setAttribute("aria-hidden", "true");
+          host.style.cssText = "position:fixed;left:0;top:0;z-index:2147483647;height:0;width:0;overflow:visible";
+          document.body.appendChild(host);
+        }
+        host.replaceChildren();
+        const el = document.createElement("div");
+        el.id = elementId;
+        el.style.cssText = "position:absolute;left:0;top:0;height:0;width:0;overflow:visible";
+        host.appendChild(el);
+        const btn = document.createElement("button");
+        btn.id = buttonId;
+        btn.type = "button";
+        btn.tabIndex = -1;
+        btn.setAttribute("aria-hidden", "true");
+        btn.style.cssText = "position:fixed;left:50%;top:50%;height:1px;width:1px;transform:translate(-50%,-50%);border:0;padding:0;opacity:0";
+        host.appendChild(btn);
+
+        window.AliyunCaptchaConfig = { region: ${JSON.stringify(cfg.region)}, prefix: ${JSON.stringify(cfg.prefix)} };
+        await loadSdk();
+        await waitAfterSdkLoad();
+        if (typeof window.initAliyunCaptcha !== "function") {
+          throw new Error("Aliyun SDK did not expose initAliyunCaptcha");
+        }
+        window.initAliyunCaptcha({
+          SceneId: ${JSON.stringify(cfg.sceneId)},
+          mode: "popup",
+          language: ${JSON.stringify(language)},
+          element: "#" + elementId,
+          button: "#" + buttonId,
+          captchaLogoImg: "",
+          showErrorTip: false,
+          getInstance: (inst) => {
+            instance = inst;
+            try {
+              if (typeof inst.startTracelessVerification === "function") {
+                inst.startTracelessVerification();
+                return;
+              }
+              tryInteractive();
+            } catch (err) { fail(err); }
+          },
+          success: (param) => finish({ ok: true, param }),
+          fail: (err) => {
+            const param = extractVerifyParam(err);
+            if (param) {
+              finish({ ok: true, param, source: "fail-terminal-pass" });
+              return;
+            }
+            if (isDeferredInteractive(err)) {
+              tryInteractive();
+              return;
+            }
+            finish({ ok: false, err });
+          },
+          onError: (err) => finish({ ok: false, err }),
+        });
+      })().catch(fail);
+    }))()`;
+    const result = await send("Runtime.evaluate", {
+      expression,
+      awaitPromise: true,
+      returnByValue: true,
+      timeout: CHROME_SOLVE_TIMEOUT_MS + 10_000,
+    });
+    if (result.exceptionDetails) {
+      throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text ?? "Chrome solve exception");
+    }
+    const raw = result.result?.value;
+    const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+    if (!parsed?.ok || typeof parsed.param !== "string" || parsed.param.length === 0) {
+      throw new Error(`Chrome captcha solve failed: ${JSON.stringify(parsed)}`);
+    }
+    return parsed.param;
+  } finally {
+    try { ws?.close(); } catch {}
+    try { proc.kill(); } catch {}
+    try { hostServer?.stop(true); } catch {}
+    if (ephemeral) {
+      try { rmSync(userDataDir, { recursive: true, force: true }); } catch {}
+    }
+  }
 }
 
 /**
@@ -276,7 +701,7 @@ async function solveInJsdomWithRetry(cfg: FetchedCaptchaConfig, reqId?: string):
  * event listeners) are explicitly cleaned up in finally — JSDOM instances
  * that fail to close leak their internal timer queue indefinitely.
  */
-async function solveInJsdom(cfg: FetchedCaptchaConfig): Promise<string> {
+async function solveInJsdom(cfg: FetchedCaptchaConfig, language: CaptchaLanguage): Promise<string> {
   const vc = new VirtualConsole();
   // Silence the SDK's verbose console.log noise — we only care about
   // errors, which surface via the reject path.
@@ -333,43 +758,80 @@ async function solveInJsdom(cfg: FetchedCaptchaConfig): Promise<string> {
     });
 
     return await new Promise<string>((resolve, reject) => {
+      let settled = false;
+      let captchaInstance: any = null;
+      let interactiveAttempted = false;
+      const clearSolveTimer = (): void => {
+        if (solveTimeout) clearTimeout(solveTimeout);
+        solveTimeout = null;
+      };
+      const resolveOnce = (param: string): void => {
+        if (settled) return;
+        settled = true;
+        clearSolveTimer();
+        resolve(param);
+      };
+      const rejectOnce = (err: Error): void => {
+        if (settled) return;
+        settled = true;
+        clearSolveTimer();
+        reject(err);
+      };
+      const triggerCaptcha = (inst: any, preferInteractive: boolean): void => {
+        const fn = preferInteractive
+          ? inst?.show
+          : inst?.startTracelessVerification || inst?.show;
+        if (typeof fn === "function") {
+          fn.call(inst);
+          return;
+        }
+        const button = w.document?.querySelector?.("#captcha-button");
+        if (preferInteractive && button && typeof button.click === "function") {
+          button.click();
+          return;
+        }
+        rejectOnce(new Error("Aliyun SDK instance has no startTracelessVerification or show method"));
+      };
       solveTimeout = setTimeout(
-        () => reject(new Error(`captcha solve timeout after ${SOLVE_TIMEOUT_MS}ms`)),
+        () => rejectOnce(new Error(`captcha solve timeout after ${SOLVE_TIMEOUT_MS}ms`)),
         SOLVE_TIMEOUT_MS,
       );
       w.initAliyunCaptcha({
-        SceneId: cfg.sceneId, mode: "popup", region: cfg.region, prefix: cfg.prefix, language: "en",
+        SceneId: cfg.sceneId, mode: "popup", region: cfg.region, prefix: cfg.prefix, language,
         element: "#captcha-element", button: "#captcha-button", captchaLogoImg: "", showErrorTip: false,
         getInstance: (inst: any) => {
-          const fn = inst.startTracelessVerification || inst.show;
-          if (typeof fn !== "function") {
-            if (solveTimeout) clearTimeout(solveTimeout);
-            solveTimeout = null;
-            reject(new Error("Aliyun SDK instance has no startTracelessVerification or show method"));
-            return;
-          }
+          captchaInstance = inst;
           try {
-            fn.call(inst);
+            triggerCaptcha(inst, false);
           } catch (err) {
-            if (solveTimeout) clearTimeout(solveTimeout);
-            solveTimeout = null;
-            reject(new Error(`Aliyun SDK startTracelessVerification threw: ${(err as Error).message}`));
+            rejectOnce(new Error(`Aliyun SDK startTracelessVerification threw: ${(err as Error).message}`));
           }
         },
         success: (param: string) => {
-          if (solveTimeout) clearTimeout(solveTimeout);
-          solveTimeout = null;
-          resolve(param);
+          const trimmed = param.trim();
+          if (trimmed) resolveOnce(trimmed);
+          else rejectOnce(new Error("Aliyun SDK success returned an empty verify param"));
         },
         fail: (err: unknown) => {
-          if (solveTimeout) clearTimeout(solveTimeout);
-          solveTimeout = null;
-          reject(new Error(`SDK fail: ${JSON.stringify(err)}`));
+          const param = extractAliyunCaptchaVerifyParam(err);
+          if (param) {
+            resolveOnce(param);
+            return;
+          }
+          if (isAliyunCaptchaDeferredInteractive(err) && !interactiveAttempted) {
+            interactiveAttempted = true;
+            try {
+              triggerCaptcha(captchaInstance, true);
+              return;
+            } catch (showErr) {
+              rejectOnce(new Error(`Aliyun SDK interactive fallback threw: ${(showErr as Error).message}`));
+              return;
+            }
+          }
+          rejectOnce(new Error(`SDK fail: ${JSON.stringify(err)}`));
         },
         onError: (err: unknown) => {
-          if (solveTimeout) clearTimeout(solveTimeout);
-          solveTimeout = null;
-          reject(new Error(`SDK error: ${JSON.stringify(err)}`));
+          rejectOnce(new Error(`SDK error: ${JSON.stringify(err)}`));
         },
       });
     });

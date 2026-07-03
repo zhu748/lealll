@@ -14,14 +14,17 @@
  *
  * === WHY EACH TRANSFORM EXISTS ===
  *
- * 1. `transformUnsupportedAnthropicFields` — Claude Code sends
- *    `thinking:{type:"adaptive"}`, `context_management`, `output_config`.
- *    GLM only accepts `thinking:{type:"enabled"|"disabled"}` and has no
- *    equivalent for the other two. Sending them → 3001.
+ * 1. `transformUnsupportedAnthropicFields` — Claude Code may send
+ *    `thinking:{type:"adaptive"}`, `context_management`, and arbitrary
+ *    `output_config`. We normalize client-supplied thinking to
+ *    `enabled|disabled`, drop context management, then later re-add only the
+ *    ZCode-supported `output_config.effort` shape when thinking is enabled.
  *
- * 2. `relocateSystemMessages` — Claude Code puts system text in
- *    `messages[].role:"system"`. Anthropic API requires system in top-level
- *    `system` field. GLM rejects `role:"system"` in messages → 3001.
+ * 2. System handling — older versions relocated `messages[].role:"system"`
+ *    to top-level `system`; current ZCode desktop keeps some system messages
+ *    in `messages[]` (for example shell-change notices). The current path
+ *    preserves those messages and lets `alignZCodeRequestFormat` inject the
+ *    official top-level ZCode system blocks.
  *
  * 3. `stripThinkingBlocksFromMessages` — When thinking is enabled, GLM
  *    returns thinking_delta SSE events. Claude Code captures these and
@@ -29,11 +32,10 @@
  *    the NEXT turn's assistant message. GLM does NOT accept these as
  *    content blocks → 3001 on turn 2+. Without this, only turn 1 succeeds.
  *
- * 4. `ensureAssistantTextBlock` — After #3 strips thinking blocks, an
- *    assistant message may be left with ONLY tool_use blocks. ZCode gateway
- *    requires every assistant message to have at least one text block → 3001
- *    if missing. We insert `text:" "` (single space, NOT empty — empty text
- *    also 3001s) at the front.
+ * 4. Assistant tool_use-only messages — older versions inserted a placeholder
+ *    text block after #3. Current ZCode captures showed assistant messages
+ *    with only `tool_use` blocks are valid, so this placeholder insertion is
+ *    intentionally disabled.
  *
  * 5. `normalizeAllMessageContent` — Claude Code and the Responses API
  *    translator both produce `content: "string"` for simple text. ZCode
@@ -41,49 +43,46 @@
  *    on string content. EMPTY strings become empty text blocks → also 3001,
  *    so empty strings are converted to `text:" "` (non-empty placeholder).
  *
- * 6. `normalizeToolResultContent` — Same as #5 but for `tool_result.content`.
- *    Claude Code sends `content:"file1\nfile2"` (string). ZCode gateway
- *    requires array → 3001. Empty output → `text:" "`.
+ * 6. `tool_result.content` — older versions converted tool_result string
+ *    content to arrays. Current ZCode desktop sends `tool_result.content` as
+ *    a string, so the normalizer intentionally leaves it in string form.
  *
- * 7. `sanitizeContentBlocks` — Strips two fields:
- *    a. `cache_control` — In start-plan mode, stripped from ALL blocks
- *       (including text). ZCode gateway rejects cache_control on ANY block.
- *       In coding-plan mode, stripped from non-text blocks only (direct GLM
- *       API accepts cache_control on text for prompt caching).
- *       DO NOT re-add cache_control in start-plan — it WILL 3001.
- *    b. `is_error` (tool_result only) — Claude Code adds `is_error:false`.
- *       ZCode gateway doesn't accept this field → 3001. Strip in both modes.
+ * 7. `sanitizeContentBlocks` — Strips `is_error:false` from tool_result
+ *    blocks while preserving `is_error:true`. It no longer strips
+ *    `cache_control`; ZCode's current cache-control shape is enforced with
+ *    full message context by `applyAnthropicCacheControl`.
  *
- * 8. `applyAnthropicCacheControl` — In coding-plan mode, adds cache_control
- *    to the last text block of the last non-system message (for prompt
- *    caching). In start-plan mode, this is a NO-OP — see #7a above.
+ * 8. `applyAnthropicCacheControl` — Enforces the real ZCode cache-control
+ *    placement on the last user message in both coding-plan and start-plan:
+ *    text-only → last text block, single tool_result → that tool_result,
+ *    multiple tool_results → no cache_control on that message.
  *
- * 9. `applyAnthropicUserId` — In OAuth mode, injects `metadata.user_id`.
- *    ZCode gateway expects this for tracking. No-op in apikey mode.
+ * 9. `applyAnthropicUserId` — In OAuth/coding-plan mode, injects
+ *    `metadata.user_id` for tracking. Start-plan deliberately skips it
+ *    because the zcode-plan gateway rejects that metadata shape.
  *
  * === TRANSFORM ORDER MATTERS ===
  *
  * The transforms run in a specific order (see `transformRequestBodyObj`):
- *   thinking fields → thinking block strip → document block convert →
- *   content normalize → sanitize (is_error:false) → cache_control add →
+ *   start-plan system prelude → unsupported field normalization →
+ *   ZCode thinking/max_tokens injection → thinking block strip → document
+ *   block convert → content normalize → sanitize (is_error:false) →
+ *   cache_control placement → coding-plan metadata.user_id injection →
  *   align ZCode format (system inject + identity rewrite + key reorder)
  *
- * Reordering will break things. For example, `sanitizeContentBlocks` MUST
- * run AFTER `applyAnthropicCacheControl` would have run (it's the safety
- * net), but since `applyAnthropicCacheControl` is no-op in start-plan,
- * `sanitizeContentBlocks` is the only cc authority there. In coding-plan,
- * `sanitizeContentBlocks` strips non-text cc first, then
- * `applyAnthropicCacheControl` adds cc to text only — so even if a future
- * edit accidentally adds cc to a non-text block, sanitize would catch it
- * on the NEXT request (but not this one, since sanitize runs before add).
+ * Reordering will break things. In particular, cache-control placement must
+ * run after content normalization and after sanitize has removed rejected
+ * tool_result flags, while `alignZCodeRequestFormat` must remain last because
+ * it rebuilds the top-level object in ZCode's final wire order.
  *
  * === DEBUGGING 3001 ===
  *
  * If 3001 still occurs:
  *   1. Check the proxy console for `transformed request summary:` line.
  *      It shows every message's role + block types + cc markers + tool_result
- *      content format. ANY `+cc` on non-text blocks, ANY `/str` on tool_result,
- *      ANY `/+err` on tool_result indicates a regression.
+ *      content format. For current ZCode alignment, single `tool_result+cc`
+ *      and `/str` content can be correct; multiple tool_results with cc, or
+ *      `is_error:false` surviving the transform, indicate a regression.
  *   2. Check the dumped `zcode-proxy-debug-<reqId>.json` file in the proxy's
  *      working directory — it contains the FULL transformed request body.
  *   3. The `anthropic-beta sent:` line should show `(none)` — since v0.2.0.6

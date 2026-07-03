@@ -71,6 +71,8 @@ services:
         value: "5"
       - key: ZCODE_RETRY_STATUSES
         value: "529,429"
+      - key: ZCODE_CAPTCHA_SOLVER
+        value: chrome     # Render Docker image includes Chromium + Xvfb for start-plan preflight
     # Persistent disk — only supported on paid plans. On free tier, comment
     # this out; the proxy will fall back to /tmp/zcode-proxy (ephemeral).
     # disk:

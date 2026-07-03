@@ -29,7 +29,8 @@
  *   2. X-RELEASE-CHANNEL: the previous revision did NOT emit this header.
  *      The real client emits it conditionally — present when the channel
  *      value is non-empty (outer code: `r ? { "X-Release-Channel": r } : {}`),
- *      absent otherwise. Stable builds send "stable". We now mirror that.
+ *      absent otherwise. The 3.1.8 production bundle sets this to
+ *      "production". We now mirror that.
  *
  *   3. X-OS-VERSION FUNCTION: the previous revision used `os.release()`,
  *      which returns the kernel version string (e.g. "5.10.134-..." on

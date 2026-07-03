@@ -4,7 +4,7 @@
  */
 import { describe, it, expect, mock } from "bun:test";
 import { buildUpstreamRequest, buildUpstreamURL, buildAuthHeaders, buildUpstreamHeaders } from "./upstream.js";
-import { proxyRequest, errorResponse } from "./handler.js";
+import { proxyRequest, errorResponse, startPlanCaptchaPreflightEnabled } from "./handler.js";
 import { ZAI_PROVIDER, BIGMODEL_PROVIDER } from "../provider/providers.js";
 import type { Credential } from "../auth/types.js";
 import type { ProxyConfig, ProxyIdentity } from "../config/types.js";
@@ -18,6 +18,33 @@ const IDENTITY: ProxyIdentity = {
   sourceTitle: "cli",
   refererOrigin: "https://zcode.z.ai",
 };
+
+describe("start-plan captcha preflight switch", () => {
+  it("defaults to the official ZCode pre-send runtime header refresh behavior", () => {
+    const original = process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
+    try {
+      delete process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
+      expect(startPlanCaptchaPreflightEnabled()).toBe(true);
+
+      process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = "0";
+      expect(startPlanCaptchaPreflightEnabled()).toBe(false);
+      process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = "false";
+      expect(startPlanCaptchaPreflightEnabled()).toBe(false);
+      process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = "off";
+      expect(startPlanCaptchaPreflightEnabled()).toBe(false);
+      process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = "never";
+      expect(startPlanCaptchaPreflightEnabled()).toBe(false);
+
+      process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = "1";
+      expect(startPlanCaptchaPreflightEnabled()).toBe(true);
+      process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = "always";
+      expect(startPlanCaptchaPreflightEnabled()).toBe(true);
+    } finally {
+      if (original === undefined) delete process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
+      else process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = original;
+    }
+  });
+});
 
 function makeClientReq(body: string, headers: Record<string, string> = {}): Request {
   return new Request("http://localhost:8080/v1/messages", {
@@ -134,7 +161,7 @@ describe("buildAuthHeaders", () => {
     expect(tzIdx).toBeLessThan(osCatIdx);
   });
 
-  it("does NOT send fabricated trace headers (real ZCode client omits them)", () => {
+  it("does NOT include dynamic attribution headers in the legacy auth-only helper", () => {
     const h = buildAuthHeaders("anthropic", ZAI_CRED, IDENTITY) as unknown as Record<string, string | undefined>;
     expect(h["x-session-id"]).toBeUndefined();
     expect(h["x-query-id"]).toBeUndefined();
@@ -181,7 +208,7 @@ describe("buildUpstreamRequest", () => {
     // v0.2.3+: accept-encoding is auto-added by fetch (not set by us).
     // It may or may not appear depending on Bun's Headers behavior, but we
     // never set it to "gzip" anymore.
-    // Fabricated trace headers must NOT be present on the wire.
+    // Coding-plan does not get start-plan attribution headers.
     expect(upstream.headers.get("x-session-id")).toBeNull();
     expect(upstream.headers.get("x-query-id")).toBeNull();
     expect(upstream.headers.get("x-zcode-trace-id")).toBeNull();
@@ -371,7 +398,8 @@ describe("buildUpstreamRequest", () => {
     //   content-type, x-api-key/auth, anthropic-version, user-agent,
     //   http-referer, x-title, x-zcode-app-version, x-platform,
     //   [x-release-channel], x-client-language, x-client-timezone,
-    //   x-os-category, [x-os-version], x-request-id
+    //   x-os-category, [x-os-version], [x-zcode-agent start-plan only],
+    //   x-request-id
     // Plus transport-level (auto-added by fetch/HTTP):
     //   host, content-length, accept-encoding
     const EXPECTED_HEADERS = new Set([
@@ -433,9 +461,10 @@ describe("buildUpstreamRequest", () => {
   });
 
   // v0.2.2+: extraHeaders still works on top of the whitelist for trusted
-  // internal callers, but Aliyun captcha verification headers are explicitly
-  // stripped to match the official ZCode desktop client start-plan path.
-  it("allows trusted extraHeaders but strips Aliyun captcha headers", () => {
+  // internal callers. Aliyun captcha verification headers are stripped outside
+  // start-plan so downstream clients cannot spoof them into normal provider
+  // traffic.
+  it("allows trusted extraHeaders but strips Aliyun captcha headers outside start-plan", () => {
     const clientReq = makeClientReq("{}", { "x-client-leak": "should-not-passthrough" });
     const upstream = buildUpstreamRequest(
       clientReq, "anthropic", ZAI_PROVIDER, ZAI_CRED, "{}", IDENTITY,
@@ -449,11 +478,32 @@ describe("buildUpstreamRequest", () => {
 
     // Trusted internal header should be present (injected via extraHeaders).
     expect(upstream.headers.get("x-internal-debug")).toBe("debug-token-123");
-    // Official ZCode chat requests do not carry Aliyun captcha headers.
+    // Non-start-plan chat requests do not carry Aliyun captcha headers.
     expect(upstream.headers.get("x-aliyun-captcha-verify-param")).toBeNull();
     expect(upstream.headers.get("x-aliyun-captcha-verify-region")).toBeNull();
     // The client's custom header should NOT be present (whitelist blocks it).
     expect(upstream.headers.get("x-client-leak")).toBeNull();
+  });
+
+  it("allows trusted start-plan runtime Aliyun captcha headers", () => {
+    const clientReq = makeClientReq("{}", {
+      "x-aliyun-captcha-verify-param": "client-spoof-ignored",
+    });
+    const upstream = buildUpstreamRequest(
+      clientReq, "anthropic", ZAI_PROVIDER,
+      { apiKey: "jwt-in-api-key", jwt: "jwt-for-start-plan", provider: "zai", plan: "start-plan" },
+      "{}",
+      IDENTITY,
+      "start-plan",
+      {
+        "x-aliyun-captcha-verify-param": "fresh-runtime-token",
+        "x-aliyun-captcha-verify-region": "cn-shanghai",
+      },
+    );
+
+    expect(upstream.headers.get("x-aliyun-captcha-verify-param")).toBe("fresh-runtime-token");
+    expect(upstream.headers.get("x-aliyun-captcha-verify-region")).toBe("cn-shanghai");
+    expect(upstream.headers.get("authorization")).toBe("Bearer jwt-for-start-plan");
   });
 
   // v0.2.3+: COMPLETE WIRE ORDER test — verifies the exact header sequence
@@ -474,7 +524,8 @@ describe("buildUpstreamRequest", () => {
   //   11. x-client-timezone
   //   12. x-os-category
   //   13. [x-os-version]       (only when non-empty)
-  //   14. x-request-id
+  //   14. [x-zcode-agent]      (start-plan only)
+  //   15. x-request-id
   it("emits headers in the EXACT real ZCode client wire order (v0.2.3+, coding-plan)", () => {
     // Use an identity WITH releaseChannel set to verify its position in the
     // wire order. Without it, the test would still pass even if
@@ -528,7 +579,11 @@ describe("buildUpstreamRequest", () => {
       "x-client-timezone",
       "x-os-category",
       "x-os-version",
+      "x-zcode-agent",
       "x-request-id",
+      "x-zcode-trace-id",
+      "x-query-id",
+      "x-session-id",
     ];
 
     const actualOrder = Object.keys(h);
@@ -536,7 +591,63 @@ describe("buildUpstreamRequest", () => {
 
     // Verify the JWT auth value.
     expect(h["authorization"]).toBe("Bearer jwt-token-xyz");
+    expect(h["x-zcode-agent"]).toBe("glm");
+    expect(h["x-request-id"]).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+    expect(h["x-zcode-trace-id"]).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+    expect(h["x-query-id"]).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+    expect(h["x-session-id"]).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
     // x-api-key must NOT be present in start-plan+jwt mode.
+    expect(h["x-api-key"]).toBeUndefined();
+  });
+
+  it("keeps start-plan session and trace stable per credential while query/request ids are fresh", () => {
+    // Real ZCode creates a stable `sess_${uuid}` session and trace context for
+    // the runtime session, then sends the prefix-stripped values as headers.
+    // A new user query gets a fresh query id.
+    const jwtCred: Credential = {
+      apiKey: "k-stable",
+      secret: "s",
+      jwt: "jwt-stable-token",
+      provider: "zai",
+      userId: "user-stable",
+    };
+    const h1 = buildUpstreamHeaders("anthropic", jwtCred, IDENTITY, "start-plan");
+    const h2 = buildUpstreamHeaders("anthropic", jwtCred, IDENTITY, "start-plan");
+
+    expect(h1["x-session-id"]).toBe(h2["x-session-id"]);
+    expect(h1["x-zcode-trace-id"]).toBe(h2["x-zcode-trace-id"]);
+    expect(h1["x-query-id"]).not.toBe(h2["x-query-id"]);
+    expect(h1["x-request-id"]).not.toBe(h2["x-request-id"]);
+  });
+
+  it("uses start-plan apiKey as Bearer auth when jwt field is absent", () => {
+    // The real ZCode provider stores zcodejwttoken in provider.apiKey and then
+    // normalizes that value into Authorization: Bearer <jwt>. Support the same
+    // shape for manual/API-key mode credentials that do not have a separate jwt field.
+    const h = buildUpstreamHeaders(
+      "anthropic",
+      { apiKey: "jwt-from-api-key", provider: "zai" },
+      IDENTITY,
+      "start-plan",
+    );
+
+    expect(h["authorization"]).toBe("Bearer jwt-from-api-key");
+    expect(h["x-zcode-agent"]).toBe("glm");
+    expect(h["x-zcode-trace-id"]).toBeTruthy();
+    expect(h["x-api-key"]).toBeUndefined();
+  });
+
+  it("does not double-prefix start-plan Bearer auth", () => {
+    const h = buildUpstreamHeaders(
+      "anthropic",
+      { apiKey: "dummy", jwt: "Bearer jwt-already-prefixed", provider: "zai" },
+      IDENTITY,
+      "start-plan",
+    );
+
+    expect(h["authorization"]).toBe("Bearer jwt-already-prefixed");
+    expect(h["x-zcode-agent"]).toBe("glm");
+    expect(h["x-zcode-trace-id"]).toBeTruthy();
     expect(h["x-api-key"]).toBeUndefined();
   });
 
@@ -922,7 +1033,7 @@ describe("proxyRequest — OpenAI translation mode (coding-plan)", () => {
     expect(body.error.type).toBe("invalid_json");
   });
 
-  it("returns 502 translation_failed when upstream returns non-JSON in translation mode", async () => {
+  it("preserves synthetic 529 when detector converts malformed JSON 200 in translation mode", async () => {
     const fetchMock = mock(async (): Promise<Response> => {
       return new Response("not json", { status: 200, headers: { "content-type": "application/json" } });
     });
@@ -930,12 +1041,12 @@ describe("proxyRequest — OpenAI translation mode (coding-plan)", () => {
     const clientReq = makeOpenAIReq('{"model":"glm-4.6","messages":[]}');
 
     const resp = await proxyRequest(clientReq, "openai", { config: testConfig, auth, fetchImpl: fetchMock as any });
-    expect(resp.status).toBe(502);
+    expect(resp.status).toBe(529);
     const body = await resp.json();
-    expect(body.error.type).toBe("translation_failed");
+    expect(body.error.type).toBe("upstream_error");
   });
 
-  it("returns 502 translation_failed when upstream returns non-2xx in translation mode", async () => {
+  it("preserves upstream status when upstream returns non-2xx in translation mode", async () => {
     const fetchMock = mock(async (): Promise<Response> => {
       return new Response('{"error":"bad request"}', { status: 400, headers: { "content-type": "application/json" } });
     });
@@ -943,9 +1054,9 @@ describe("proxyRequest — OpenAI translation mode (coding-plan)", () => {
     const clientReq = makeOpenAIReq('{"model":"glm-4.6","messages":[]}');
 
     const resp = await proxyRequest(clientReq, "openai", { config: testConfig, auth, fetchImpl: fetchMock as any });
-    expect(resp.status).toBe(502);
+    expect(resp.status).toBe(400);
     const body = await resp.json();
-    expect(body.error.type).toBe("translation_failed");
+    expect(body.error.type).toBe("upstream_error");
   });
 });
 
@@ -989,6 +1100,8 @@ describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
       plan: "start-plan",
     };
     const originalFetch = globalThis.fetch;
+    const originalPreflight = process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
+    process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = "0";
     const globalFetchMock = mock(async (req: Request | string): Promise<Response> => {
       const url = typeof req === "string" ? req : req.url;
       throw new Error(`unexpected global fetch in test: ${url}`);
@@ -999,6 +1112,9 @@ describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
       const fetchMock = mock(async (req: Request): Promise<Response> => {
         expect(req.url).toBe("https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages");
         expect(req.headers.get("authorization")).toBe("Bearer jwt-mock");
+        expect(req.headers.get("x-zcode-trace-id")).toMatch(/^[0-9a-f-]{36}$/i);
+        expect(req.headers.get("x-query-id")).toMatch(/^[0-9a-f-]{36}$/i);
+        expect(req.headers.get("x-session-id")).toMatch(/^[0-9a-f-]{36}$/i);
         expect(req.headers.get("x-aliyun-captcha-verify-param")).toBeNull();
         expect(req.headers.get("x-aliyun-captcha-verify-region")).toBeNull();
         const reqBody = JSON.parse(await req.text());
@@ -1030,7 +1146,7 @@ describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
 
       const resp = await proxyRequest(clientReq, "openai", { config: startPlanConfig, auth, fetchImpl: fetchMock as any });
       expect(fetchMock).toHaveBeenCalledTimes(1);
-      // Official ZCode start-plan chat does not fetch client captcha config.
+      // Explicit opt-out mode sends the first request without captcha headers.
       expect(globalFetchMock).toHaveBeenCalledTimes(0);
       expect(resp.status).toBe(200);
       expect(resp.headers.get("content-type")).toBe("application/json");
@@ -1039,6 +1155,61 @@ describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
       expect(body.choices[0].message.content).toBe("start-plan reply");
     } finally {
       globalThis.fetch = originalFetch;
+      if (originalPreflight === undefined) delete process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
+      else process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = originalPreflight;
+    }
+  });
+
+  it("uses the active credential plan even when config.plan is stale", async () => {
+    const originalPreflight = process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
+    process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = "0";
+    const staleConfig: ProxyConfig = {
+      ...testConfig,
+      // Simulates config.yaml still saying coding-plan after a start-plan account
+      // became active. The request must follow the credential, not the stale config.
+      plan: "coding-plan",
+    };
+
+    const fetchMock = mock(async (req: Request): Promise<Response> => {
+      expect(req.url).toBe("https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages");
+      expect(req.headers.get("authorization")).toBe("Bearer jwt-from-active-account");
+      expect(req.headers.get("x-api-key")).toBeNull();
+      const reqBody = JSON.parse(await req.text());
+      expect(reqBody.max_tokens).toBe(64000);
+      return new Response(JSON.stringify({
+        id: "msg_sp_plan",
+        type: "message",
+        role: "assistant",
+        content: [{ type: "text", text: "credential plan wins" }],
+        model: "glm-4.6",
+        stop_reason: "end_turn",
+        stop_sequence: null,
+        usage: { input_tokens: 5, output_tokens: 3 },
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    });
+
+    const auth = new AuthManager({ mode: "oauth", provider: "zai" });
+    auth.setOAuthCredential({
+      apiKey: "dummy",
+      provider: "zai",
+      plan: "start-plan",
+      jwt: "jwt-from-active-account",
+    });
+    const clientReq = new Request("http://localhost:8080/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: '{"model":"glm-4.6","messages":[{"role":"user","content":"hi"}]}',
+    });
+
+    try {
+      const resp = await proxyRequest(clientReq, "openai", { config: staleConfig, auth, fetchImpl: fetchMock as any });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(resp.status).toBe(200);
+      const body = await resp.json();
+      expect(body.choices[0].message.content).toBe("credential plan wins");
+    } finally {
+      if (originalPreflight === undefined) delete process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
+      else process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = originalPreflight;
     }
   });
 });

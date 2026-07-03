@@ -48,14 +48,20 @@ export interface ProxyIdentity {
    * Reverse-engineered from app.asar Mf() (offset 886853), 2026-06-28:
    * the real client emits this header ONLY when the channel value is
    * non-empty (the outer code is `r ? { "X-Release-Channel": r } : {}`).
-   * Stable builds send "stable", test builds send "test". When unset /
-   * empty, the header is omitted entirely (NOT sent with an empty value).
+   * ZCode 3.1.8 production builds send "production"; test builds send
+   * "test". When unset / empty, the header is omitted entirely (NOT sent
+   * with an empty value).
    *
-   * We mirror that: when this field is undefined or empty, no
-   * X-Release-Channel header is emitted. Setting it to "stable" matches
-   * the production client's wire shape.
+   * We default to "production" to match the shipped desktop client's wire
+   * shape, while still allowing YAML/env override for test builds.
    */
   releaseChannel?: string;
+  /**
+   * ZCode agent marker used by the official GLM agent provider. Only sent on
+   * start-plan /v1/messages requests, where the desktop agent path identifies
+   * itself as `X-ZCode-Agent: glm`.
+   */
+  zcodeAgent?: string;
 }
 
 /** Retry configuration for upstream requests. */

@@ -32,7 +32,11 @@
  *   11. X-Client-Timezone        : {Intl timeZone}              (e.g. Asia/Shanghai)
  *   12. X-Os-Category            : macos | windows | linux
  *   13. X-Os-Version             : {os.version()}               (ONLY when non-empty)
- *   14. x-request-id             : <fresh UUIDv4 per request>
+ *   14. X-ZCode-Agent            : glm                           (start-plan only)
+ *   15. x-request-id             : <fresh UUIDv4 per request>
+ *   16. x-zcode-trace-id         : <stable UUIDv4 per credential>  (start-plan only)
+ *   17. x-query-id               : <fresh UUIDv4 per request>      (start-plan only)
+ *   18. x-session-id             : <stable UUIDv4 per credential>  (start-plan only)
  *
  * Auto-added by fetch/transport (do NOT set manually):
  *   - host (from URL)
@@ -65,17 +69,21 @@
  *      The real client uses `os.version()` (OS product name). Fixed in
  *      identity.ts.
  *
- * `extraHeaders` is the ONLY way for trusted internal subsystems
- * to inject headers upstream. It is reserved for proxy-internal use — never
- * for passthrough of client headers.
+* `extraHeaders` is the ONLY way for trusted internal subsystems
+* to inject headers upstream. It is reserved for proxy-internal use — never
+* for passthrough of client headers. The start-plan captcha preflight uses
+* this hook to mirror ZCode's provider-runtime-headers refresh, where the
+* host responds with freshly solved runtime headers before each model attempt.
  *
  * CONFIRMED NOT SENT (real client wire capture, 2026-06-28):
  *   - anthropic-beta            ❌ (never; SDK/CC-CLI artifact)
- *   - x-session-id              ❌ (fabricated, never in real client)
- *   - x-query-id                ❌ (fabricated, never in real client)
- *   - x-zcode-trace-id          ❌ (fabricated, never in real client)
- *   - x-aliyun-captcha-*        ❌ (provider headers are stripped before runtime)
- *   - X-ZCode-Agent             ❌ (only sent on glm connectivity probe)
+ *   - x-session-id              ✅ start-plan only, dynamic attribution
+ *   - x-query-id                ✅ start-plan only, dynamic attribution
+ *   - x-zcode-trace-id          ✅ start-plan only, dynamic attribution
+ *   - x-aliyun-captcha-*        ❌ from downstream clients; ✅ only when
+ *                                  injected by our start-plan runtime-header
+ *                                  refresh path with a freshly solved token
+ *   - X-ZCode-Agent             ✅ start-plan only (official GLM agent provider)
  *   - accept                    ❌ (not on /v1/messages; was a v0.2.2 bug)
  *   - any x-stainless-*         ❌ (Anthropic SDK fingerprint)
  *   - any x-claude-* / x-claude-code-*  ❌ (Claude Code CLI fingerprint)
@@ -95,6 +103,45 @@ const ALIYUN_CAPTCHA_HEADERS = new Set([
 ]);
 
 const STARTPLAN_ANTHROPIC_BASE = "https://zcode.z.ai/api/v1/zcode-plan/anthropic";
+
+function normalizeBearerHeader(token: string | undefined): string | undefined {
+  const trimmed = token?.trim();
+  if (!trimmed) return undefined;
+  return /^Bearer\s+/i.test(trimmed) ? trimmed : `Bearer ${trimmed}`;
+}
+
+interface StartPlanAttributionContext {
+  sessionId: string;
+  traceId: string;
+}
+
+const startPlanAttributionByCredential = new Map<string, StartPlanAttributionContext>();
+
+function startPlanCredentialKey(cred: Credential): string {
+  return `${cred.provider}:${cred.userId ?? cred.email ?? cred.jwt ?? cred.apiKey}`;
+}
+
+function getStartPlanAttributionContext(cred: Credential): StartPlanAttributionContext {
+  const key = startPlanCredentialKey(cred);
+  let cached = startPlanAttributionByCredential.get(key);
+  if (!cached) {
+    cached = {
+      sessionId: crypto.randomUUID(),
+      traceId: crypto.randomUUID(),
+    };
+    startPlanAttributionByCredential.set(key, cached);
+  }
+  return cached;
+}
+
+function buildStartPlanAttributionHeaders(cred: Credential): Record<string, string> {
+  const ctx = getStartPlanAttributionContext(cred);
+  return {
+    "x-zcode-trace-id": ctx.traceId,
+    "x-query-id": crypto.randomUUID(),
+    "x-session-id": ctx.sessionId,
+  };
+}
 
 /**
  * Derive the client IP for logging/diagnostics (NOT for session IDs — see
@@ -163,7 +210,10 @@ export function buildUpstreamHeaders(
   plan: "coding-plan" | "start-plan" = "coding-plan",
   extraHeaders?: Record<string, string>,
 ): Record<string, string> {
-  const credStr = plan === "start-plan" && cred.jwt ? cred.jwt : credentialString(cred);
+  const credStr = credentialString(cred);
+  const startPlanAuthorization = plan === "start-plan"
+    ? normalizeBearerHeader(cred.jwt ?? credStr)
+    : undefined;
   const id = buildIdentityHeaders(identity);
 
   // Build the ordered whitelist. Order matches the real ZCode desktop
@@ -189,8 +239,12 @@ export function buildUpstreamHeaders(
 
   // === 2. auth (x-api-key OR authorization, mutually exclusive) ===
   if (format === "anthropic") {
-    if (plan === "start-plan" && cred.jwt) {
-      headers["authorization"] = `Bearer ${cred.jwt}`;
+    if (plan === "start-plan") {
+      // Official start-plan providers store the JWT in provider.apiKey and the
+      // runtime converts it to Authorization: Bearer <jwt>. Our imported OAuth
+      // credentials keep the same value in cred.jwt; manual/API-key mode may
+      // only have it as apiKey, so normalize either source here.
+      if (startPlanAuthorization) headers["authorization"] = startPlanAuthorization;
     } else {
       headers["x-api-key"] = credStr;
     }
@@ -221,8 +275,29 @@ export function buildUpstreamHeaders(
     headers["x-os-version"] = id["X-Os-Version"];
   }
 
-  // === 14. x-request-id (LAST — fresh UUIDv4 per request) ===
+  // === 14. X-ZCode-Agent (start-plan only) ===
+  // The official desktop GLM agent provider attaches this marker to its
+  // provider headers. Keep coding-plan unchanged, but mirror the start-plan
+  // agent path because zcode.z.ai applies a stricter gateway policy there.
+  if (plan === "start-plan") {
+    const agent = identity.zcodeAgent?.trim() || "glm";
+    headers["x-zcode-agent"] = agent;
+  }
+
+  // === 15. x-request-id (LAST — fresh UUIDv4 per request) ===
   headers["x-request-id"] = crypto.randomUUID();
+
+  // === 16-18. Start-plan attribution headers ===
+  // The current ZCode GLM adapter merges createModelRequestAttributionHeaders()
+  // into every model request. It always includes x-request-id and
+  // x-zcode-trace-id, plus session/query when a ZCode task context exists.
+  // Official ZCode creates session ids as `sess_${uuid}` and query ids as
+  // `query_${uuid}`, then strips those prefixes before sending headers. We
+  // mirror the observable wire shape: stable session/trace IDs per upstream
+  // credential, plus a fresh query id for each request attempt.
+  if (plan === "start-plan") {
+    Object.assign(headers, buildStartPlanAttributionHeaders(cred));
+  }
 
   // NOTE: accept-encoding and host and content-length are NOT set here —
   // they are auto-added by fetch/transport. Hardcoding accept-encoding:gzip
@@ -235,11 +310,12 @@ export function buildUpstreamHeaders(
   if (extraHeaders) {
     for (const [k, v] of Object.entries(extraHeaders)) {
       const lower = k.toLowerCase();
-      // Official ZCode start-plan chat requests do not carry Aliyun captcha
-      // verification headers. The desktop client explicitly strips these from
-      // provider headers before exposing them to the runtime registry, so keep
-      // them out even if an old internal caller still tries to pass them here.
-      if (ALIYUN_CAPTCHA_HEADERS.has(lower)) continue;
+      // Aliyun captcha headers are never passed through from the downstream
+      // client. For start-plan only, handler.ts may inject freshly solved
+      // runtime headers during preflight or after a 3007 challenge, matching
+      // the official provider-runtime-headers refresh path. The verify param
+      // is one-shot, so callers must pass a fresh value for every attempt.
+      if (ALIYUN_CAPTCHA_HEADERS.has(lower) && plan !== "start-plan") continue;
       headers[lower] = v;
     }
   }
@@ -249,10 +325,10 @@ export function buildUpstreamHeaders(
 
 /**
  * Backwards-compatible auth-headers builder. Returns the identity + auth +
- * anthropic-version headers (NO content-type, NO x-request-id, NO transport
- * headers). Kept for callers (and tests) that only need the auth + identity
- * portion. Returned key order matches buildUpstreamHeaders (within the
- * subset returned).
+ * anthropic-version headers (NO content-type, NO request/trace attribution,
+ * NO transport headers). Kept for callers (and tests) that only need the auth
+ * + identity portion. Returned key order matches buildUpstreamHeaders (within
+ * the subset returned).
  */
 export function buildAuthHeaders(
   format: Format,
@@ -261,8 +337,8 @@ export function buildAuthHeaders(
   plan: "coding-plan" | "start-plan" = "coding-plan",
   /**
    * Retained for API stability (callers in handler.ts pass it) but no longer
-   * used — the real ZCode client does NOT send x-session-id / x-query-id /
-   * x-zcode-trace-id headers (verified against app.asar, 2026-06).
+   * used by this legacy helper. Full upstream requests add start-plan
+   * attribution in buildUpstreamHeaders().
    */
   clientFingerprintStr?: string,
 ): Record<string, string> {
@@ -272,7 +348,7 @@ export function buildAuthHeaders(
   const full = buildUpstreamHeaders(format, cred, identity, plan);
   const stripped: Record<string, string> = {};
   for (const [k, v] of Object.entries(full)) {
-    if (k === "content-type" || k === "x-request-id") continue;
+    if (k === "content-type" || k === "x-request-id" || k === "x-zcode-trace-id" || k === "x-query-id" || k === "x-session-id") continue;
     stripped[k] = v;
   }
   return stripped;

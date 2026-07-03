@@ -26,6 +26,8 @@ beforeEach(() => {
   delete process.env.ZCODE_APP_VERSION;
   delete process.env.ZCODE_SOURCE_TITLE;
   delete process.env.ZCODE_REFERER_ORIGIN;
+  delete process.env.ZCODE_RELEASE_CHANNEL;
+  delete process.env.ZCODE_AGENT;
   delete process.env.ZCODE_RETRY_MAX;
   delete process.env.ZCODE_RETRY_INITIAL_DELAY_MS;
   delete process.env.ZCODE_RETRY_MAX_DELAY_MS;
@@ -170,6 +172,8 @@ auth:
     expect(cfg.identity.appVersion).toBe("3.1.8");
     expect(cfg.identity.sourceTitle).toBe("Z Code@electron");
     expect(cfg.identity.refererOrigin).toBe("https://zcode.z.ai");
+    expect(cfg.identity.releaseChannel).toBe("production");
+    expect(cfg.identity.zcodeAgent).toBe("glm");
   });
 
   it("identity: YAML values override defaults", () => {
@@ -181,11 +185,15 @@ identity:
   appVersion: "9.9.9"
   sourceTitle: "electron"
   refererOrigin: "https://example.com"
+  releaseChannel: "test"
+  zcodeAgent: "custom-agent"
 `);
     const cfg = loadConfig(path);
     expect(cfg.identity.appVersion).toBe("9.9.9");
     expect(cfg.identity.sourceTitle).toBe("electron");
     expect(cfg.identity.refererOrigin).toBe("https://example.com");
+    expect(cfg.identity.releaseChannel).toBe("test");
+    expect(cfg.identity.zcodeAgent).toBe("custom-agent");
   });
 
   it("identity: ZCODE_APP_VERSION env overrides YAML", () => {

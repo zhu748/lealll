@@ -18,24 +18,58 @@ import {
   exportSingleAccount,
   maskApiKey,
   invalidateStoreCache,
+  getStorePath,
   _resetKeyCacheForTesting,
 } from "./store.js";
-import { existsSync, writeFileSync, mkdirSync, readFileSync, readdirSync, unlinkSync } from "node:fs";
+import { existsSync, writeFileSync, mkdirSync, readFileSync, readdirSync, unlinkSync, mkdtempSync, rmSync } from "node:fs";
 import { join, dirname } from "node:path";
-import { homedir } from "node:os";
+import { tmpdir } from "node:os";
 import type { Credential } from "./types.js";
+
+let testStoreDir: string | null = null;
+
+function useIsolatedStoreDir(): void {
+  testStoreDir = mkdtempSync(join(tmpdir(), "zcode-proxy-store-"));
+  process.env.ZCODE_PROXY_STORE_DIR = testStoreDir;
+  invalidateStoreCache();
+}
+
+function cleanupIsolatedStoreDir(): void {
+  const dir = testStoreDir;
+  testStoreDir = null;
+  delete process.env.ZCODE_PROXY_STORE_DIR;
+  invalidateStoreCache();
+  if (dir) rmSync(dir, { recursive: true, force: true });
+}
+
+function storeDir(): string {
+  return dirname(getStorePath());
+}
 
 /** Test helper: remove all .broken-* backup files from the store dir. */
 function cleanupBrokenBackups(): void {
-  const storeDir = join(homedir(), ".zcode-proxy");
-  if (!existsSync(storeDir)) return;
+  const dir = storeDir();
+  if (!existsSync(dir)) return;
   try {
-    for (const f of readdirSync(storeDir)) {
+    for (const f of readdirSync(dir)) {
       if (f.startsWith("credentials.json.broken-")) {
-        try { unlinkSync(join(storeDir, f)); } catch {}
+        try { unlinkSync(join(dir, f)); } catch {}
       }
     }
   } catch {}
+}
+
+async function writeFixedKeyEncryptedStore(store: unknown): Promise<void> {
+  const crypto = await import("node:crypto");
+  const key = crypto.createHash("sha256").update("520").digest();
+  const iv = crypto.randomBytes(16);
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+  const enc = Buffer.concat([cipher.update(JSON.stringify(store), "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  const encrypted = Buffer.concat([iv, tag, enc]).toString("base64");
+  const storePath = getStorePath();
+  mkdirSync(dirname(storePath), { recursive: true });
+  writeFileSync(storePath, JSON.stringify({ version: 2, encrypted }), { mode: 0o600 });
 }
 
 // With the fixed-key scheme (SHA-256("520")), there's no per-test secret to
@@ -43,6 +77,7 @@ function cleanupBrokenBackups(): void {
 // to simulate files encrypted by older versions of this code.
 describe("credential store", () => {
   beforeEach(() => {
+    useIsolatedStoreDir();
     _resetKeyCacheForTesting();
     clearCredential();
     cleanupBrokenBackups();
@@ -54,6 +89,7 @@ describe("credential store", () => {
     _resetKeyCacheForTesting();
     delete process.env.ZCODE_PROXY_CREDENTIAL_SECRET;
     delete process.env.ZCODE_PROXY_LEGACY_SEED;
+    cleanupIsolatedStoreDir();
   });
 
   it("returns null when no credential stored", async () => {
@@ -110,6 +146,7 @@ describe("credential store", () => {
 
 describe("multi-account store", () => {
   beforeEach(() => {
+    useIsolatedStoreDir();
     _resetKeyCacheForTesting();
     clearCredential();
     // Also clean up any leftover .broken-* files from prior test runs
@@ -121,6 +158,7 @@ describe("multi-account store", () => {
     cleanupBrokenBackups();
     delete process.env.ZCODE_PROXY_CREDENTIAL_SECRET;
     delete process.env.ZCODE_PROXY_LEGACY_SEED;
+    cleanupIsolatedStoreDir();
   });
 
   it("saveCredential marks new account as active", async () => {
@@ -348,6 +386,53 @@ describe("multi-account store", () => {
     expect(keys).toEqual(["first-key", "second-key"]);
   });
 
+  it("detects credentials.json created after an earlier missing-store read", async () => {
+    // Regression for Windows startup: the server can start before any
+    // credentials exist, cache `null`, then a separate CLI process writes
+    // ~/.zcode-proxy/credentials.json. The cache must stat even cached-null
+    // results so the new file becomes visible without restarting.
+    expect(await loadCredential()).toBeNull();
+
+    await writeFixedKeyEncryptedStore({
+      version: 2,
+      activeId: "external",
+      accounts: [{
+        id: "external",
+        label: "external",
+        createdAt: Date.now(),
+        credential: { apiKey: "external-key", provider: "zai" },
+      }],
+    });
+
+    const loaded = await loadCredential();
+    expect(loaded).not.toBeNull();
+    expect(loaded!.apiKey).toBe("external-key");
+  });
+
+  it("refuses to overwrite an existing credentials.json that could not be safely read", async () => {
+    // If a file exists but the current build cannot parse it (future format,
+    // transient read failure, plaintext without debug flag, etc.), saving a
+    // new credential must NOT create a fresh empty store over the top.
+    const storePath = getStorePath();
+    mkdirSync(dirname(storePath), { recursive: true });
+    writeFileSync(storePath, JSON.stringify({
+      version: 99,
+      note: "future-format",
+      accounts: [{ id: "keep-me" }],
+    }), "utf-8");
+
+    invalidateStoreCache();
+    expect(await loadCredential()).toBeNull();
+
+    await expect(
+      saveCredential({ apiKey: "new-key-should-not-overwrite", provider: "zai" }),
+    ).rejects.toThrow(/Refusing to create a fresh credential store/);
+
+    const raw = readFileSync(storePath, "utf-8");
+    expect(raw).toContain("future-format");
+    expect(raw).not.toContain("new-key-should-not-overwrite");
+  });
+
   it("legacy fallback recovers credentials encrypted by an older version's seed-based key", async () => {
     // Simulates the upgrade scenario for users with EXISTING credentials.json
     // files encrypted by an older version of this code (which used
@@ -357,7 +442,7 @@ describe("multi-account store", () => {
     //   3. Multi-seed fallback tries the old seed → succeeds → file is re-encrypted
     //      with the fixed key on the next writeStore() call.
     //
-    // We can't easily change os.homedir() in a test, so we simulate the
+    // We simulate the
     // "different machine / different seed" scenario by:
     //   - Manually writing a credentials.json encrypted with a seed that ISN'T
     //     the current homedir seed (so the fixed key fails AND the current
@@ -383,8 +468,8 @@ describe("multi-account store", () => {
     const encrypted = Buffer.concat([iv, tag, enc]).toString("base64");
 
     // Write the legacy-encrypted credentials.json directly to disk.
-    const storePath = join(homedir(), ".zcode-proxy", "credentials.json");
-    mkdirSync(join(homedir(), ".zcode-proxy"), { recursive: true });
+    const storePath = getStorePath();
+    mkdirSync(storeDir(), { recursive: true });
     writeFileSync(storePath, JSON.stringify({ version: 2, encrypted }), { mode: 0o600 });
 
     // Step 1: without LEGACY_SEED, the fixed key + current homedir seeds all fail.
@@ -444,8 +529,8 @@ describe("multi-account store", () => {
     const tag = cipher.getAuthTag();
     const encrypted = Buffer.concat([iv, tag, enc]).toString("base64");
 
-    const storePath = join(homedir(), ".zcode-proxy", "credentials.json");
-    mkdirSync(join(homedir(), ".zcode-proxy"), { recursive: true });
+    const storePath = getStorePath();
+    mkdirSync(storeDir(), { recursive: true });
     writeFileSync(storePath, JSON.stringify({ version: 2, encrypted }), { mode: 0o600 });
 
     // Step 2: try to read — fixed key + all fallback candidates fail.
@@ -458,7 +543,7 @@ describe("multi-account store", () => {
     // Step 3: try to save a new credential — should THROW (guard active)
     await expect(
       saveCredential({ apiKey: "new-key", provider: "bigmodel" }),
-    ).rejects.toThrow(/Refusing to overwrite/);
+    ).rejects.toThrow(/could not be safely read/);
 
     // The original credentials.json should still exist on disk (not deleted)
     expect(existsSync(storePath)).toBe(true);
@@ -547,8 +632,8 @@ describe("multi-account store", () => {
     const enc = Buffer.concat([cipher.update(storeJson, "utf8"), cipher.final()]);
     const tag = cipher.getAuthTag();
     const encrypted = Buffer.concat([iv, tag, enc]).toString("base64");
-    const storePath = join(homedir(), ".zcode-proxy", "credentials.json");
-    mkdirSync(join(homedir(), ".zcode-proxy"), { recursive: true });
+    const storePath = getStorePath();
+    mkdirSync(storeDir(), { recursive: true });
     writeFileSync(storePath, JSON.stringify({ version: 2, encrypted }), { mode: 0o600 });
 
     // Without any env var: fixed key + homedir seeds all fail → null.
@@ -778,8 +863,8 @@ describe("multi-account store", () => {
     const enc = Buffer.concat([cipher.update(storeJson, "utf8"), cipher.final()]);
     const tag = cipher.getAuthTag();
     const encrypted = Buffer.concat([iv, tag, enc]).toString("base64");
-    const storePath = join(homedir(), ".zcode-proxy", "credentials.json");
-    mkdirSync(join(homedir(), ".zcode-proxy"), { recursive: true });
+    const storePath = getStorePath();
+    mkdirSync(storeDir(), { recursive: true });
     writeFileSync(storePath, JSON.stringify({ version: 2, encrypted }), { mode: 0o600 });
 
     // Step 1: without LEGACY_SEED, all keys fail → guard set.
@@ -791,7 +876,7 @@ describe("multi-account store", () => {
     // Attempting to save now should fail (guard active)
     await expect(
       saveCredential({ apiKey: "should-fail", provider: "zai" }),
-    ).rejects.toThrow(/Refusing to overwrite/);
+    ).rejects.toThrow(/could not be safely read/);
 
     // Step 2: set LEGACY_SEED → fallback finds the key → succeeds → guard clears.
     process.env.ZCODE_PROXY_LEGACY_SEED = oldSeed;
@@ -843,13 +928,13 @@ describe("multi-account store", () => {
     // atomicWriteFile approach creates a temp file then renames it, so on
     // success the temp is gone and only credentials.json remains.
     await saveCredential({ apiKey: "atomic-test-key", provider: "zai" });
-    const storeDir = dirname(join(homedir(), ".zcode-proxy", "credentials.json"));
-    const dirContents = await import("node:fs/promises").then(m => m.readdir(storeDir));
+    const dir = storeDir();
+    const dirContents = await import("node:fs/promises").then(m => m.readdir(dir));
     // No leftover .tmp-* files from atomicWriteFile
     const leftovers = dirContents.filter((f: string) => f.includes(".tmp-"));
     expect(leftovers).toEqual([]);
     // credentials.json exists and is valid JSON (not truncated)
-    const content = readFileSync(join(homedir(), ".zcode-proxy", "credentials.json"), "utf-8");
+    const content = readFileSync(getStorePath(), "utf-8");
     expect(() => JSON.parse(content)).not.toThrow();
   });
 
@@ -860,8 +945,8 @@ describe("multi-account store", () => {
     // truncate-then-write race). The new code should treat this as "no store"
     // and NOT back it up (backing up an empty file is pointless spam).
     clearCredential();
-    const storePath = join(homedir(), ".zcode-proxy", "credentials.json");
-    mkdirSync(join(homedir(), ".zcode-proxy"), { recursive: true });
+    const storePath = getStorePath();
+    mkdirSync(storeDir(), { recursive: true });
     writeFileSync(storePath, "", "utf-8");
 
     _resetKeyCacheForTesting();
@@ -870,7 +955,7 @@ describe("multi-account store", () => {
     expect(loaded).toBeNull();
 
     // No .broken-* file should have been created for an empty file
-    const dirContents = await import("node:fs/promises").then(m => m.readdir(join(homedir(), ".zcode-proxy")));
+    const dirContents = await import("node:fs/promises").then(m => m.readdir(storeDir()));
     const brokenFiles = dirContents.filter((f: string) => f.startsWith("credentials.json.broken-"));
     expect(brokenFiles).toEqual([]);
 
@@ -884,20 +969,20 @@ describe("multi-account store", () => {
     // Create 7 corrupted files by writing invalid JSON directly, then trigger
     // a read (which backs up + cleans up). Only the 5 most recent should remain.
     clearCredential();
-    const storeDir = join(homedir(), ".zcode-proxy");
-    mkdirSync(storeDir, { recursive: true });
+    const dir = storeDir();
+    mkdirSync(dir, { recursive: true });
 
     // Write 7 .broken-* files with different timestamps (100ms apart so mtime
     // ordering is stable)
     for (let i = 0; i < 7; i++) {
-      const bp = join(storeDir, `credentials.json.broken-${Date.now() + i * 1000}`);
+      const bp = join(dir, `credentials.json.broken-${Date.now() + i * 1000}`);
       writeFileSync(bp, `old-backup-${i}`, "utf-8");
       await new Promise(r => setTimeout(r, 20));
     }
 
     // Now write a corrupted credentials.json and read it — triggers
     // backupCorruptedStore which should clean up to 5 most recent
-    const storePath = join(storeDir, "credentials.json");
+    const storePath = getStorePath();
     writeFileSync(storePath, "{not valid json", "utf-8");
     _resetKeyCacheForTesting();
     invalidateStoreCache();
@@ -905,7 +990,7 @@ describe("multi-account store", () => {
 
     // Count .broken-* files — should be at most 5 (the 7 old ones + 1 new = 8,
     // but cleanup keeps only 5 most recent)
-    const dirContents = await import("node:fs/promises").then(m => m.readdir(storeDir));
+    const dirContents = await import("node:fs/promises").then(m => m.readdir(dir));
     const brokenFiles = dirContents.filter((f: string) => f.startsWith("credentials.json.broken-"));
     expect(brokenFiles.length).toBeLessThanOrEqual(5);
   });

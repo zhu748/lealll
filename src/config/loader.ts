@@ -16,6 +16,8 @@ const ENV = {
   APP_VERSION: "ZCODE_APP_VERSION",
   SOURCE_TITLE: "ZCODE_SOURCE_TITLE",
   REFERER_ORIGIN: "ZCODE_REFERER_ORIGIN",
+  RELEASE_CHANNEL: "ZCODE_RELEASE_CHANNEL",
+  ZCODE_AGENT: "ZCODE_AGENT",
   RETRY_MAX: "ZCODE_RETRY_MAX",
   RETRY_INITIAL_DELAY_MS: "ZCODE_RETRY_INITIAL_DELAY_MS",
   RETRY_MAX_DELAY_MS: "ZCODE_RETRY_MAX_DELAY_MS",
@@ -43,6 +45,8 @@ const DEFAULTS = {
   APP_VERSION: "3.1.8",
   SOURCE_TITLE: "Z Code@electron",
   REFERER_ORIGIN: "https://zcode.z.ai",
+  RELEASE_CHANNEL: "production",
+  ZCODE_AGENT: "glm",
   RETRY_MAX_RETRIES: 3,
   RETRY_INITIAL_DELAY_MS: 1000,
   RETRY_MAX_DELAY_MS: 8000,
@@ -147,6 +151,10 @@ export function loadConfig(path: string): ProxyConfig {
     sourceTitleYaml: parsed?.identity?.sourceTitle,
     refererEnv: process.env[ENV.REFERER_ORIGIN],
     refererYaml: parsed?.identity?.refererOrigin,
+    releaseChannelEnv: process.env[ENV.RELEASE_CHANNEL],
+    releaseChannelYaml: parsed?.identity?.releaseChannel,
+    zcodeAgentEnv: process.env[ENV.ZCODE_AGENT],
+    zcodeAgentYaml: parsed?.identity?.zcodeAgent,
   });
 
   // --- retry ---
@@ -272,9 +280,13 @@ interface IdentityInputs {
   sourceTitleYaml?: string;
   refererEnv?: string;
   refererYaml?: string;
+  releaseChannelEnv?: string;
+  releaseChannelYaml?: string;
+  zcodeAgentEnv?: string;
+  zcodeAgentYaml?: string;
 }
 
-/** Resolve identity fields (env > YAML > default). Non-ASCII `appVersion` silently falls back to the default. */
+/** Resolve identity fields (env > YAML > default). Non-ASCII values silently fall back to the default. */
 function resolveIdentity(inp: IdentityInputs): ProxyIdentity {
   const rawVersion = (inp.appVersionEnv ?? inp.appVersionYaml ?? DEFAULTS.APP_VERSION).trim();
   const appVersion = ASCII_PRINTABLE.test(rawVersion) ? rawVersion : DEFAULTS.APP_VERSION;
@@ -285,7 +297,13 @@ function resolveIdentity(inp: IdentityInputs): ProxyIdentity {
   const refererOrigin = (inp.refererEnv ?? inp.refererYaml ?? DEFAULTS.REFERER_ORIGIN).trim()
     || DEFAULTS.REFERER_ORIGIN;
 
-  return { appVersion, sourceTitle, refererOrigin };
+  const rawReleaseChannel = (inp.releaseChannelEnv ?? inp.releaseChannelYaml ?? DEFAULTS.RELEASE_CHANNEL).trim();
+  const releaseChannel = ASCII_PRINTABLE.test(rawReleaseChannel) ? rawReleaseChannel : DEFAULTS.RELEASE_CHANNEL;
+
+  const rawZCodeAgent = (inp.zcodeAgentEnv ?? inp.zcodeAgentYaml ?? DEFAULTS.ZCODE_AGENT).trim();
+  const zcodeAgent = ASCII_PRINTABLE.test(rawZCodeAgent) ? rawZCodeAgent : DEFAULTS.ZCODE_AGENT;
+
+  return { appVersion, sourceTitle, refererOrigin, releaseChannel, zcodeAgent };
 }
 
 /** Resolve retry configuration with env-var overrides and defaults. */

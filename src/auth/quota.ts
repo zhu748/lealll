@@ -8,10 +8,10 @@
  * - **start-plan** (zcode.z.ai, authenticates with the plan JWT):
  *     GET /api/v1/zcode-plan/billing/current  -> active plan + ends_at
  *     GET /api/v1/zcode-plan/billing/balance  -> total/used/remaining units
- *   Both require an `app_version` query param and `Authorization: <jwt>` (raw
- *   JWT, NO "Bearer" prefix — the client stores it as `zcodejwttoken`). Note
- *   this differs from upstream.ts which sends `Bearer {jwt}` to the LLM
- *   gateway; the billing API wants the bare token.
+ *   Both require an `app_version` query param and `Authorization: Bearer <jwt>`.
+ *   This matches the current ZCode desktop host process, which resolves the
+ *   saved `zcodejwttoken` into a Bearer authorization object before calling
+ *   billing/current and billing/balance.
  *
  * - **coding-plan** (api.z.ai for zai / open.bigmodel.cn for bigmodel,
  *   authenticates with the api key):
@@ -135,7 +135,7 @@ async function queryStartPlan(
     limits: [],
   };
 
-  const headers = { Authorization: cred.jwt! };
+  const headers = { Authorization: normalizeBearerHeader(cred.jwt!) };
 
   // billing/current — active plan + expiry
   const currentUrl = `${ZCODE_PLAN_BASE}/billing/current?app_version=${encodeURIComponent(appVersion)}`;
@@ -248,6 +248,11 @@ async function fetchJson(
     throw new Error(`quota request ${url} failed: ${resp.status}`);
   }
   return resp.json();
+}
+
+function normalizeBearerHeader(token: string): string {
+  const trimmed = token.trim();
+  return /^Bearer\s+/i.test(trimmed) ? trimmed : `Bearer ${trimmed}`;
 }
 
 /** Pick the active start-plan entry whose name/id reads as a start plan. */

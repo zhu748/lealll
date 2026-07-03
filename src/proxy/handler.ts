@@ -16,6 +16,7 @@ import type { Credential } from "../auth/types.js";
 import { getProvider } from "../provider/providers.js";
 import { listModelIds } from "../provider/models.js";
 import { buildUpstreamRequest } from "./upstream.js";
+import { getCaptchaToken, RETRY_HEADERS } from "./captcha.js";
 import { transformRequestBodyObj } from "./body-transformer.js";
 import { detectSseErrorAndConvert } from "./sse-error-detector.js";
 import { anthropicSseToBatchMessage } from "./sse-to-batch.js";
@@ -53,6 +54,12 @@ export interface ProxyHandlerOptions {
    * opted in.
    */
   resolveClientIp?: (req: Request) => string | undefined;
+}
+
+export function startPlanCaptchaPreflightEnabled(): boolean {
+  const raw = process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT?.trim().toLowerCase();
+  if (!raw) return true;
+  return raw !== "0" && raw !== "false" && raw !== "off" && raw !== "never";
 }
 
 /**
@@ -284,18 +291,23 @@ export async function proxyRequest(
     upstreamBodyObj = translated;
   }
 
-  // currentPlan tracks the effective plan for the CURRENT credential. It starts
-  // as config.plan but is updated whenever the credential is switched mid-retry
-  // (vceshi0.0.5+ fix for the "cross-plan credential switch" bug). Without this,
-  // switching from a coding-plan cred to a start-plan cred (or vice versa) would
-  // keep using the old plan's upstream URL, auth headers, and body transforms —
-  // guaranteeing the retried request fails the same way.
-  let currentPlan: "coding-plan" | "start-plan" = config.plan;
+  // currentPlan tracks the effective plan for the CURRENT credential. The
+  // credential must win over config.yaml in OAuth/store mode: if a start-plan
+  // account is active but config.yaml still says coding-plan, sending it to the
+  // coding endpoint (or using x-api-key instead of Authorization) can surface as
+  // upstream 403/3007 errors. In API-key mode, config.plan remains authoritative
+  // because the static credential object is created with a backward-compatible
+  // default plan of coding-plan.
   const effectivePlanForCred = (c: Credential): "coding-plan" | "start-plan" => {
+    if (auth.getMode() === "apikey") return config.plan;
     if (c.plan === "start-plan" || c.plan === "coding-plan") return c.plan;
     // Infer from JWT presence (matches store.ts inferPlan logic)
-    return c.jwt ? "start-plan" : "coding-plan";
+    return c.jwt ? "start-plan" : config.plan;
   };
+  let currentPlan: "coding-plan" | "start-plan" = effectivePlanForCred(cred);
+  if (currentPlan !== config.plan) {
+    console.log(`${reqId} plan resolved from active credential: ${config.plan} → ${currentPlan}`);
+  }
 
   let transformedObj = transformRequestBodyObj(upstreamBodyObj, { format: upstreamFormat, userId: cred.userId, startPlan: currentPlan === "start-plan", thinkingLevel: config.thinkingLevel === "high" ? "high" : "max" });
 
@@ -369,22 +381,41 @@ export async function proxyRequest(
     if (before > 0 || after > 0) {
       console.log(`${reqId} thinking blocks: ${before} → ${after} (stripped ${before - after})`);
     }
-    // Also log cache_control-on-tool_result strip counts — this was the
-    // root cause of the v2.1.3.4beta0 start-plan 3001.
+    // Also log cache_control-on-tool_result count changes. Current ZCode
+    // alignment may keep, add, or strip these depending on whether the last
+    // user message has one or multiple tool_result blocks.
     const ccBefore = countToolResultCacheControl(parsedBody);
     const ccAfter = countToolResultCacheControl(transformedObj);
     if (ccBefore > 0 || ccAfter > 0) {
-      console.log(`${reqId} tool_result+cache_control: ${ccBefore} → ${ccAfter} (stripped ${ccBefore - ccAfter})`);
+      const delta = ccAfter - ccBefore;
+      console.log(`${reqId} tool_result+cache_control: ${ccBefore} → ${ccAfter} (delta ${delta >= 0 ? "+" : ""}${delta})`);
     }
   }
 
-  // Official ZCode start-plan chat requests do NOT solve or send Aliyun
-  // captcha headers. The desktop client sends the JWT-bearing request directly
-  // to /api/v1/zcode-plan/anthropic/v1/messages; if Aliyun returns a WAF HTML
-  // page, we surface it as a WAF block instead of trying to synthesize captcha
-  // tokens. Keep the metric for existing log/TTFB columns; it stays 0 on the
-  // official path.
   let totalCaptchaMs = 0;
+  let captchaRetryHeaders: Record<string, string> | undefined;
+
+  const isCaptchaVerifyFailed = async (resp: Response): Promise<boolean> => {
+    if (currentPlan !== "start-plan" || resp.status !== 403) return false;
+    try {
+      const text = await resp.clone().text();
+      return /"code"\s*:\s*3007/.test(text) || /captcha verify failed/i.test(text);
+    } catch {
+      return false;
+    }
+  };
+
+  const refreshCaptchaHeaders = async (solver?: "chrome"): Promise<Record<string, string>> => {
+    const solved = await getCaptchaToken(reqId, {
+      appVersion: config.identity.appVersion,
+      solver,
+    });
+    totalCaptchaMs += solved.solveMs;
+    return {
+      [RETRY_HEADERS.PARAM]: solved.verifyParam,
+      [RETRY_HEADERS.REGION]: solved.region,
+    };
+  };
 
   // Factory that builds a FRESH Request object for each fetch call.
   // Request bodies are single-use — once fetch() consumes the body, the same
@@ -616,11 +647,30 @@ export async function proxyRequest(
 
   let upstreamResp: Response;
   try {
+    if (currentPlan === "start-plan" && startPlanCaptchaPreflightEnabled()) {
+      console.log(`${reqId} start-plan preflight: refreshing provider runtime captcha headers before model request...`);
+      try {
+        captchaRetryHeaders = await refreshCaptchaHeaders();
+      } catch (err) {
+        printRow(reqId, format, meta, 503, started, Date.now(), 0, 0, 0, false, 0, maskApiKey(cred.apiKey), totalCaptchaMs);
+        return errorResponse(503, "captcha_failed", (err as Error).message);
+      }
+    }
     // isInitialAttempt=true: this is the FIRST fetch for this request.
     // Header debug logging (if enabled) records inbound + upstream headers
     // here. Retries below call fetchUpstreamDetected without this flag, so
     // only the first attempt is logged.
-    upstreamResp = await fetchUpstreamDetected(undefined, true);
+    upstreamResp = await fetchUpstreamDetected(captchaRetryHeaders, true);
+    if (await isCaptchaVerifyFailed(upstreamResp)) {
+      console.log(`${reqId} start-plan captcha verify failed; solving Aliyun captcha with Chrome and retrying once...`);
+      try {
+        captchaRetryHeaders = await refreshCaptchaHeaders("chrome");
+        upstreamResp = await fetchUpstreamDetected(captchaRetryHeaders);
+      } catch (err) {
+        printRow(reqId, format, meta, 503, started, Date.now(), 0, 0, 0, false, 0, maskApiKey(cred.apiKey), totalCaptchaMs);
+        return errorResponse(503, "captcha_failed", (err as Error).message);
+      }
+    }
   } catch (err) {
     printRow(reqId, format, meta, 502, started, Date.now(), 0, 0, 0);
     return errorResponse(502, "upstream_unreachable", (err as Error).message);
@@ -737,7 +787,7 @@ export async function proxyRequest(
     if (!rotated) {
       // All rotations failed (or none were possible). Return the WAF error.
       try { upstreamResp.body?.cancel(); } catch (e) { void e; }
-      printRow(reqId, format, meta, upstreamResp.status, started, headersAt, 0, 0, 0);
+      printRow(reqId, format, meta, upstreamResp.status, started, headersAt, 0, 0, 0, false, 0, maskApiKey(cred.apiKey), totalCaptchaMs);
       return errorResponse(
         503,
         "waf_blocked",
@@ -753,7 +803,7 @@ export async function proxyRequest(
   }
 
   if (upstreamResp.status === 401 && currentPlan === "start-plan") {
-    printRow(reqId, format, meta, 401, started, headersAt, 0, 0, 0);
+    printRow(reqId, format, meta, 401, started, headersAt, 0, 0, 0, false, 0, maskApiKey(cred.apiKey), totalCaptchaMs);
     return errorResponse(401, "start_plan_jwt_invalid", "Start-plan JWT was rejected. Re-run: zcode-proxy auth login");
   }
 
@@ -1030,9 +1080,21 @@ export async function proxyRequest(
       try {
         // Build a FRESH Request for each retry — never reuse upstreamReq.
         // fetchUpstreamDetected also runs SSE error detection so 200 streams
-        // with hidden errors get caught on every attempt. Official ZCode
-        // start-plan retries do not attach Aliyun captcha headers either.
-        upstreamResp = await fetchUpstreamDetected();
+        // with hidden errors get caught on every attempt.
+        //
+        // start-plan alignment: the desktop agent refreshes provider runtime
+        // headers before every model attempt. Aliyun verify params are
+        // one-shot, so a retry after 529/429 must not reuse the token consumed
+        // by the previous attempt.
+        if (currentPlan === "start-plan" && startPlanCaptchaPreflightEnabled()) {
+          captchaRetryHeaders = await refreshCaptchaHeaders();
+        }
+        upstreamResp = await fetchUpstreamDetected(captchaRetryHeaders);
+        if (await isCaptchaVerifyFailed(upstreamResp)) {
+          console.log(`${reqId} start-plan captcha verify failed on retry ${attempt}; re-solving with Chrome...`);
+          captchaRetryHeaders = await refreshCaptchaHeaders("chrome");
+          upstreamResp = await fetchUpstreamDetected(captchaRetryHeaders);
+        }
         headersAt = Date.now();
 
         // vceshi0.0.8+: also check for WAF block on retry — if the IP got
@@ -1104,7 +1166,7 @@ export async function proxyRequest(
 
           if (!retryRotated) {
             try { upstreamResp.body?.cancel(); } catch (e) { void e; }
-            printRow(reqId, format, meta, upstreamResp.status, started, headersAt, 0, 0, 0);
+            printRow(reqId, format, meta, upstreamResp.status, started, headersAt, 0, 0, 0, false, 0, maskApiKey(cred.apiKey), totalCaptchaMs);
             return errorResponse(
               503,
               "waf_blocked",
@@ -1136,7 +1198,7 @@ export async function proxyRequest(
           continue;
         }
         console.log(`${reqId} fetch failed on final retry ${attempt}: ${errMsg}`);
-        printRow(reqId, format, meta, 502, started, Date.now(), 0, 0, 0);
+        printRow(reqId, format, meta, 502, started, Date.now(), 0, 0, 0, false, 0, maskApiKey(cred.apiKey), totalCaptchaMs);
         return errorResponse(502, "upstream_unreachable", errMsg);
       }
 
@@ -1295,7 +1357,7 @@ export async function proxyRequest(
       `${reqId} all credentials exhausted + upstream ${upstreamResp.status}, ` +
       `returning 503 (Retry-After: 300) to stop client retry loops`,
     );
-    printRow(reqId, format, meta, 503, started, headersAt, 0, 0, 0);
+    printRow(reqId, format, meta, 503, started, headersAt, 0, 0, 0, false, 0, maskApiKey(cred.apiKey), totalCaptchaMs);
     try { upstreamResp.body?.cancel(); } catch (e) { /* v0.2.0.8: surface cancel failures for diagnostics — cancel() shouldn't throw, but if Bun's internal stream state is weird we want a trace */ void e; }
     const body = JSON.stringify({
       error: {
@@ -1359,7 +1421,7 @@ export async function proxyRequest(
     const result = await anthropicSseToBatchMessage(upstreamResp.body, meta.model);
     if ("error" in result) {
       console.log(`${reqId} SSE->batch reassembly error: ${result.error}`);
-      printRow(reqId, format, meta, 502, started, headersAt, 0, 0, 0);
+      printRow(reqId, format, meta, 502, started, headersAt, 0, 0, 0, false, 0, maskApiKey(cred.apiKey), totalCaptchaMs);
       return errorResponse(502, "upstream_stream_error", result.error);
     }
     const json = JSON.stringify(result.message);
@@ -1429,8 +1491,8 @@ export async function proxyRequest(
   if (translateMode) {
     if (!upstreamResp.ok) {
       const errBody = await upstreamResp.text().catch(() => "");
-      printRow(reqId, format, meta, 502, started, headersAt, 0, 0, 0);
-      return errorResponse(502, "translation_failed", `upstream returned ${upstreamResp.status}: ${errBody.slice(0, 200)}`);
+      printRow(reqId, format, meta, upstreamResp.status, started, headersAt, 0, 0, 0, false, 0, maskApiKey(cred.apiKey), totalCaptchaMs);
+      return errorResponse(upstreamResp.status, "upstream_error", `upstream returned ${upstreamResp.status}: ${errBody.slice(0, 200)}`);
     }
     if (format === "openai-responses") {
       // Responses API translation: use the dedicated SSE / batch translators.
@@ -1788,9 +1850,10 @@ function countThinkingBlocks(body: unknown): number {
 }
 
 /**
- * Count `tool_result` blocks that carry a `cache_control` field. These get
- * stripped by sanitizeContentBlocks() because ZCode's start-plan gateway
- * rejects them with 3001. Used for diagnostic logging.
+ * Count `tool_result` blocks that carry a `cache_control` field. Current
+ * ZCode alignment keeps/adds this for a single tool_result in the last user
+ * message, and strips it for multiple tool_results in that same message.
+ * Used for diagnostic logging around cache-control placement changes.
  */
 function countToolResultCacheControl(body: unknown): number {
   if (!body || typeof body !== "object") return 0;
@@ -1833,8 +1896,8 @@ function summarizeBody(body: unknown): string {
   if (b.metadata) parts.push(`metadata=${JSON.stringify(b.metadata).slice(0, 80)}`);
 
   // Messages — role + content block types per message, with cache_control flags
-  // so we can see if cache_control is landing on tool_result blocks (which
-  // triggers ZCode gateway 3001).
+  // so we can see whether tool_result cache-control placement matches the
+  // current ZCode pattern (single tool_result keeps cc; multiple strip it).
   const messages = b.messages;
   if (Array.isArray(messages)) {
     const msgSummary = messages.map((m: unknown, i: number) => {
@@ -1851,7 +1914,8 @@ function summarizeBody(body: unknown): string {
         // Annotate cache_control presence so tool_result+cache_control is visible
         const cc = blk.cache_control ? "+cc" : "";
         // For tool_result blocks, show content format (str vs arr) and is_error
-        // presence — these are common 3001 triggers on ZCode gateway.
+        // presence. String content and is_error:true are valid ZCode shapes;
+        // is_error:false should have been stripped before upstream.
         let suffix = "";
         if (t === "tool_result") {
           if (typeof blk.content === "string") suffix = "/str";
@@ -2177,8 +2241,9 @@ export function globMatch(pattern: string, value: string): boolean {
  */
 function isKnownGlmModel(model: string): boolean {
   if (!model) return false;
-  if (model.startsWith("glm-")) return true;
-  return knownGlmModelSet.has(model);
+  const normalized = model.toLowerCase();
+  if (normalized.startsWith("glm-")) return true;
+  return knownGlmModelSet.has(normalized);
 }
 
 const knownGlmModelSet = new Set(listModelIds());

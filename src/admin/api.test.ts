@@ -24,7 +24,7 @@ import {
 } from "./api.js";
 import type { ProxyConfig } from "../config/types.js";
 import { AuthManager } from "../auth/manager.js";
-import { saveCredential, clearCredential, listAccounts, _resetKeyCacheForTesting } from "../auth/store.js";
+import { saveCredential, clearCredential, listAccounts, invalidateStoreCache, _resetKeyCacheForTesting } from "../auth/store.js";
 import type { Credential } from "../auth/types.js";
 
 // ---------------------------------------------------------------------------
@@ -77,14 +77,34 @@ async function callAdmin(req: Request, opts: AdminOptions): Promise<Response | n
 // Test isolation: reset module-level state between tests
 // ---------------------------------------------------------------------------
 
+let testStoreDir: string | null = null;
+
 beforeEach(() => {
+  testStoreDir = mkdtempSync(join(tmpdir(), "zcode-proxy-admin-store-"));
+  process.env.ZCODE_PROXY_STORE_DIR = testStoreDir;
+  invalidateStoreCache();
+  _resetKeyCacheForTesting();
+  clearCredential();
   _resetStatsForTesting();
   clearDebugDumps();
 });
 
 afterEach(() => {
+  if (testStoreDir) {
+    process.env.ZCODE_PROXY_STORE_DIR = testStoreDir;
+  }
+  invalidateStoreCache();
+  clearCredential();
+  _resetKeyCacheForTesting();
   _resetStatsForTesting();
   clearDebugDumps();
+  const dir = testStoreDir;
+  testStoreDir = null;
+  delete process.env.ZCODE_PROXY_STORE_DIR;
+  invalidateStoreCache();
+  if (dir) {
+    try { rmSync(dir, { recursive: true, force: true }); } catch {}
+  }
 });
 
 // ---------------------------------------------------------------------------
