@@ -3,6 +3,8 @@
  * @see .omo/plans/zcode-proxy.md Task 2
  */
 import { readFileSync, existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { parse } from "yaml";
 import type { ProxyConfig, ProviderEndpoints, ProxyIdentity, RetryConfig, RoutingRule, ModelMapping, ResponsesThinkingConfig } from "./types.js";
 
@@ -17,6 +19,7 @@ const ENV = {
   SOURCE_TITLE: "ZCODE_SOURCE_TITLE",
   REFERER_ORIGIN: "ZCODE_REFERER_ORIGIN",
   RELEASE_CHANNEL: "ZCODE_RELEASE_CHANNEL",
+  DEVICE_MID: "ZCODE_DEVICE_MID",
   ZCODE_AGENT: "ZCODE_AGENT",
   RETRY_MAX: "ZCODE_RETRY_MAX",
   RETRY_INITIAL_DELAY_MS: "ZCODE_RETRY_INITIAL_DELAY_MS",
@@ -164,6 +167,8 @@ export function loadConfig(path: string): ProxyConfig {
     refererYaml: parsed?.identity?.refererOrigin,
     releaseChannelEnv: process.env[ENV.RELEASE_CHANNEL],
     releaseChannelYaml: parsed?.identity?.releaseChannel,
+    deviceMidEnv: process.env[ENV.DEVICE_MID],
+    deviceMidYaml: parsed?.identity?.deviceMid,
     zcodeAgentEnv: process.env[ENV.ZCODE_AGENT],
     zcodeAgentYaml: parsed?.identity?.zcodeAgent,
   });
@@ -299,6 +304,8 @@ interface IdentityInputs {
   refererYaml?: string;
   releaseChannelEnv?: string;
   releaseChannelYaml?: string;
+  deviceMidEnv?: string;
+  deviceMidYaml?: string;
   zcodeAgentEnv?: string;
   zcodeAgentYaml?: string;
 }
@@ -317,10 +324,37 @@ function resolveIdentity(inp: IdentityInputs): ProxyIdentity {
   const rawReleaseChannel = (inp.releaseChannelEnv ?? inp.releaseChannelYaml ?? DEFAULTS.RELEASE_CHANNEL).trim();
   const releaseChannel = ASCII_PRINTABLE.test(rawReleaseChannel) ? rawReleaseChannel : DEFAULTS.RELEASE_CHANNEL;
 
+  const rawDeviceMid = (inp.deviceMidEnv ?? inp.deviceMidYaml ?? readExistingZCodeDeviceMid())?.trim() ?? "";
+  const deviceMid = rawDeviceMid && ASCII_PRINTABLE.test(rawDeviceMid) ? rawDeviceMid : undefined;
+
   const rawZCodeAgent = (inp.zcodeAgentEnv ?? inp.zcodeAgentYaml ?? DEFAULTS.ZCODE_AGENT).trim();
   const zcodeAgent = ASCII_PRINTABLE.test(rawZCodeAgent) ? rawZCodeAgent : DEFAULTS.ZCODE_AGENT;
 
-  return { appVersion, sourceTitle, refererOrigin, releaseChannel, zcodeAgent };
+  return { appVersion, sourceTitle, refererOrigin, releaseChannel, deviceMid, zcodeAgent };
+}
+
+function readExistingZCodeDeviceMid(): string | undefined {
+  for (const path of zcodeTelemetryStateCandidates()) {
+    try {
+      if (!existsSync(path)) continue;
+      const parsed = JSON.parse(readFileSync(path, "utf-8"));
+      return typeof parsed?.deviceMid === "string" ? parsed.deviceMid : undefined;
+    } catch {
+      /* ignore malformed or unreadable telemetry state */
+    }
+  }
+  return undefined;
+}
+
+function zcodeTelemetryStateCandidates(): string[] {
+  const candidates: string[] = [];
+  const base = process.env.ZCODE_DATA_BASE_DIR?.trim();
+  if (base) {
+    candidates.push(join(base, "v2", "telemetry-state.json"));
+    candidates.push(join(base, "telemetry-state.json"));
+  }
+  candidates.push(join(homedir(), ".zcode", "v2", "telemetry-state.json"));
+  return [...new Set(candidates)];
 }
 
 /** Resolve retry configuration with env-var overrides and defaults. */

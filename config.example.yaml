@@ -119,6 +119,9 @@ identity:
   # Release channel header. ZCode 3.2.5 production builds send "production".
   # Env var: ZCODE_RELEASE_CHANNEL.
   releaseChannel: "production"
+  # Optional X-Device-Mid. If omitted, the proxy tries to read the existing
+  # ZCode telemetry-state.json deviceMid. Env var: ZCODE_DEVICE_MID.
+  # deviceMid: ""
   # X-Title header value. Default "Z Code@electron" (what the real client sends).
   sourceTitle: "Z Code@electron"
   # HTTP-Referer URL. Default "https://zcode.z.ai".

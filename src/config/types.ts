@@ -57,6 +57,11 @@ export interface ProxyIdentity {
    */
   releaseChannel?: string;
   /**
+   * Optional device marker read from ZCode's telemetry-state.json or supplied
+   * explicitly. The desktop client emits this as `X-Device-Mid` when present.
+   */
+  deviceMid?: string;
+  /**
    * ZCode agent marker used by the official GLM agent provider. Only sent on
    * start-plan /v1/messages requests, where the desktop agent path identifies
    * itself as `X-ZCode-Agent: glm`.

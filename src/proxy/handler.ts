@@ -500,6 +500,10 @@ export async function proxyRequest(
   const refreshCaptchaHeaders = async (solver?: "chrome"): Promise<Record<string, string>> => {
     const solved = await (opts.captchaTokenProvider ?? getCaptchaToken)(reqId, {
       appVersion: config.identity.appVersion,
+      sourceTitle: config.identity.sourceTitle,
+      refererOrigin: config.identity.refererOrigin,
+      releaseChannel: config.identity.releaseChannel,
+      deviceMid: config.identity.deviceMid,
       solver,
     });
     totalCaptchaMs += solved.solveMs;

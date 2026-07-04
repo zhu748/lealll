@@ -8,6 +8,7 @@ import {
   _closeChromeSessionForTesting,
   _cleanupChromeSessionAfterUnexpectedCloseForTesting,
   _enqueueChromeSessionSolveForTesting,
+  buildCaptchaConfigHeaders,
   buildCaptchaConfigUrl,
   buildChromeDebugPortCandidates,
   extractAliyunCaptchaVerifyParam,
@@ -519,6 +520,80 @@ describe("ZCode captcha client config alignment", () => {
     const url = new URL(buildCaptchaConfigUrl());
     expect(url.searchParams.get("app_version")).toBe("3.2.5");
     expect(url.searchParams.get("platform")).toBe(resolveClientPlatformKey());
+  });
+
+  it("builds ZCode source headers for the client config request", () => {
+    const headers = buildCaptchaConfigHeaders({
+      appVersion: "3.2.5",
+      platform: "win32-x64",
+      sourceTitle: "Z Code@electron",
+      refererOrigin: "https://zcode.z.ai",
+      releaseChannel: "production",
+      deviceMid: "captcha-device-mid",
+    });
+
+    expect(headers["user-agent"]).toBe("ZCode/3.2.5");
+    expect(headers["http-referer"]).toBe("https://zcode.z.ai");
+    expect(headers["x-title"]).toBe("Z Code@electron");
+    expect(headers["x-zcode-app-version"]).toBe("3.2.5");
+    expect(headers["x-platform"]).toBe("win32-x64");
+    expect(headers["x-release-channel"]).toBe("production");
+    expect(headers["x-client-language"]).toBeTruthy();
+    expect(headers["x-client-timezone"]).toBeTruthy();
+    expect(headers["x-os-category"]).toMatch(/^(windows|macos|linux)$/);
+    expect(headers["x-device-mid"]).toBe("captcha-device-mid");
+    expect(headers["x-request-id"]).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+  });
+
+  it("sends ZCode source headers on the client config fetch", async () => {
+    const originalFetch = globalThis.fetch;
+    let seenUrl = "";
+    let seenHeaders = new Headers();
+    _clearCaptchaConfigCacheForTesting();
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      seenUrl = input instanceof Request ? input.url : String(input);
+      seenHeaders = new Headers(init?.headers);
+      return new Response(JSON.stringify({
+        data: {
+          configs: {
+            captcha: {
+              enabled: false,
+              prefix: "",
+              sceneId: "",
+              region: "cn-shanghai",
+            },
+          },
+        },
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as unknown as typeof fetch;
+
+    try {
+      await expect(getCaptchaToken("captcha-header-test", {
+        appVersion: "header-test-3.2.5",
+        platform: "win32-x64",
+        sourceTitle: "Z Code@electron",
+        refererOrigin: "https://zcode.z.ai",
+        releaseChannel: "production",
+        deviceMid: "fetch-device-mid",
+        solver: "jsdom",
+      })).rejects.toThrow(/captcha_disabled_by_config/);
+
+      const url = new URL(seenUrl);
+      expect(url.origin + url.pathname).toBe("https://zcode.z.ai/api/v1/client/configs");
+      expect(url.searchParams.get("app_version")).toBe("header-test-3.2.5");
+      expect(url.searchParams.get("platform")).toBe("win32-x64");
+      expect(seenHeaders.get("user-agent")).toBe("ZCode/header-test-3.2.5");
+      expect(seenHeaders.get("http-referer")).toBe("https://zcode.z.ai");
+      expect(seenHeaders.get("x-title")).toBe("Z Code@electron");
+      expect(seenHeaders.get("x-zcode-app-version")).toBe("header-test-3.2.5");
+      expect(seenHeaders.get("x-platform")).toBe("win32-x64");
+      expect(seenHeaders.get("x-release-channel")).toBe("production");
+      expect(seenHeaders.get("x-device-mid")).toBe("fetch-device-mid");
+      expect(seenHeaders.get("x-request-id")).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+    } finally {
+      _clearCaptchaConfigCacheForTesting();
+      globalThis.fetch = originalFetch;
+    }
   });
 
   it("normalizes official captcha language values", () => {

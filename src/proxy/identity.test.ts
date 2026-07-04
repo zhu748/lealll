@@ -90,7 +90,8 @@ describe("buildIdentityHeaders", () => {
     expect(osCatIdx).toBeGreaterThanOrEqual(0);
 
     // Verify the EXACT wire order: UA → Referer → Title → AppVer → Platform →
-    // [ReleaseChannel] → Language → Timezone → OsCategory → [OsVersion]
+    // [ReleaseChannel] → Language → Timezone → OsCategory → [OsVersion] →
+    // [DeviceMid]
     expect(uaIdx).toBeLessThan(refererIdx);
     expect(refererIdx).toBeLessThan(titleIdx);
     expect(titleIdx).toBeLessThan(appVerIdx);
@@ -161,5 +162,23 @@ describe("buildIdentityHeaders", () => {
     const osCatIdx = keys.indexOf("X-Os-Category");
     const osVerIdx = keys.indexOf("X-Os-Version");
     expect(osCatIdx).toBeLessThan(osVerIdx);
+  });
+
+  it("emits X-Device-Mid when configured", () => {
+    const h = buildIdentityHeaders({ ...BASE, deviceMid: "device-mid-test" });
+    expect(h["X-Device-Mid"]).toBe("device-mid-test");
+  });
+
+  it("does NOT emit X-Device-Mid when it is non-ASCII", () => {
+    const h = buildIdentityHeaders({ ...BASE, deviceMid: "设备" });
+    expect(h["X-Device-Mid"]).toBeUndefined();
+  });
+
+  it("places X-Device-Mid after X-Os-Version when configured", () => {
+    const h = buildIdentityHeaders({ ...BASE, deviceMid: "device-mid-test" });
+    const keys = Object.keys(h);
+    const osVerIdx = keys.indexOf("X-Os-Version");
+    const deviceIdx = keys.indexOf("X-Device-Mid");
+    expect(osVerIdx).toBeLessThan(deviceIdx);
   });
 });

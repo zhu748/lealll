@@ -282,7 +282,7 @@ export function buildUpstreamHeaders(
     headers["authorization"] = `Bearer ${credStr}`;
   }
 
-  // === 4-13. Identity block (in real client wire order) ===
+  // === 4-14. Identity block (in real client wire order) ===
   // Insert each identity header in order. Optional headers (X-Release-Channel,
   // X-Os-Version) are already absent from `id` when their value was empty
   // (buildIdentityHeaders handles that), so they simply don't appear in the
@@ -301,8 +301,11 @@ export function buildUpstreamHeaders(
   if (id["X-Os-Version"]) {
     headers["x-os-version"] = id["X-Os-Version"];
   }
+  if (id["X-Device-Mid"]) {
+    headers["x-device-mid"] = id["X-Device-Mid"];
+  }
 
-  // === 14. X-ZCode-Agent (start-plan only) ===
+  // === 15. X-ZCode-Agent (start-plan only) ===
   // The official desktop GLM agent provider attaches this marker to its
   // provider headers. Keep coding-plan unchanged, but mirror the start-plan
   // agent path because zcode.z.ai applies a stricter gateway policy there.
@@ -311,10 +314,10 @@ export function buildUpstreamHeaders(
     headers["x-zcode-agent"] = agent;
   }
 
-  // === 15. x-request-id (LAST — fresh UUIDv4 per request) ===
+  // === 16. x-request-id (LAST — fresh UUIDv4 per request) ===
   headers["x-request-id"] = crypto.randomUUID();
 
-  // === 16-18. Start-plan attribution headers ===
+  // === 17-19. Start-plan attribution headers ===
   // The current ZCode GLM adapter merges createModelRequestAttributionHeaders()
   // into every model request. It always includes x-request-id and
   // x-zcode-trace-id, plus session/query when a ZCode task context exists.

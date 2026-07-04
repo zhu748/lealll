@@ -553,8 +553,9 @@ describe("buildUpstreamRequest", () => {
   //   12. x-client-timezone
   //   13. x-os-category
   //   14. [x-os-version]       (only when non-empty)
-  //   15. [x-zcode-agent]      (start-plan only)
-  //   16. x-request-id
+  //   15. [x-device-mid]       (only when telemetry deviceMid is present)
+  //   16. [x-zcode-agent]      (start-plan only)
+  //   17. x-request-id
   it("emits headers in the EXACT real ZCode client wire order (v0.2.3+, coding-plan)", () => {
     // Use an identity WITH releaseChannel set to verify its position in the
     // wire order. Without it, the test would still pass even if
@@ -587,6 +588,30 @@ describe("buildUpstreamRequest", () => {
 
     const actualOrder = Object.keys(h);
     expect(actualOrder).toEqual(expectedOrder);
+  });
+
+  it("places x-device-mid after x-os-version when configured", () => {
+    const h = buildUpstreamHeaders("anthropic", ZAI_CRED, { ...IDENTITY, deviceMid: "device-mid-test" });
+    const expectedOrder = [
+      "content-type",
+      "x-api-key",
+      "anthropic-beta",
+      "anthropic-version",
+      "user-agent",
+      "http-referer",
+      "x-title",
+      "x-zcode-app-version",
+      "x-platform",
+      "x-client-language",
+      "x-client-timezone",
+      "x-os-category",
+      "x-os-version",
+      "x-device-mid",
+      "x-request-id",
+    ];
+
+    expect(Object.keys(h)).toEqual(expectedOrder);
+    expect(h["x-device-mid"]).toBe("device-mid-test");
   });
 
   it("emits headers in the EXACT real ZCode client wire order (v0.2.3+, start-plan with JWT)", () => {

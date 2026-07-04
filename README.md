@@ -597,6 +597,7 @@ curl http://localhost:8080/v1/models \
 | `identity.appVersion` | `ZCODE_APP_VERSION` | `3.2.5` | `User-Agent: ZCode/{version}` |
 | `identity.sourceTitle` | `ZCODE_SOURCE_TITLE` | `Z Code@electron` | `X-Title` |
 | `identity.refererOrigin` | `ZCODE_REFERER_ORIGIN` | `https://zcode.z.ai` | `HTTP-Referer` URL |
+| `identity.deviceMid` | `ZCODE_DEVICE_MID` | auto-read from ZCode telemetry | Optional `X-Device-Mid` |
 | `identity.zcodeAgent` | `ZCODE_AGENT` | `glm` | `X-ZCode-Agent` for start-plan requests |
 | `server.maxRequestBodyBytes` | `ZCODE_PROXY_MAX_REQUEST_BODY_BYTES` | `67108864` | Max client request body size in bytes; set `0` to disable. |
 | — | `ZCODE_CAPTCHA_LANGUAGE` | host locale | Optional Aliyun SDK language override: `cn` or `en` |

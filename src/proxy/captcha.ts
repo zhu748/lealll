@@ -15,8 +15,9 @@
  *
  * The client config request mirrors the desktop host bundle:
  *   GET /api/v1/client/configs?app_version={appVersion}&platform={platform-arch}
- * with no auth headers. The returned captcha config is cached briefly by
- * appVersion/platform, but the solved Aliyun verify param is never cached.
+ * with ZCode source headers and x-request-id, but no auth headers. The returned
+ * captcha config is cached briefly by appVersion/platform, but the solved
+ * Aliyun verify param is never cached.
  *
  * The AliyunCaptcha.js SDK is bundled as a text import for the JSDOM path
  * (no runtime dependency on the alicdn CDN, and no runtime node_modules
@@ -27,9 +28,11 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import ALIYUN_SDK_LOCAL from "./AliyunCaptcha.js.txt" with { type: "text" };
+import type { ProxyIdentity } from "../config/types.js";
 import { createMutex } from "../utils/fs.js";
 import type { AsyncMutex } from "../utils/fs.js";
 import { runtimeLog, runtimeWarn, runtimeError } from "../utils/log.js";
+import { buildIdentityHeaders } from "./identity.js";
 
 const CAPTCHA_HEADER = "x-aliyun-captcha-verify-param";
 const REGION_HEADER = "x-aliyun-captcha-verify-region";
@@ -76,6 +79,10 @@ interface FetchedCaptchaConfig {
 interface CaptchaRuntimeOptions {
   appVersion?: string;
   platform?: string;
+  sourceTitle?: string;
+  refererOrigin?: string;
+  releaseChannel?: string;
+  deviceMid?: string;
   language?: string;
   solver?: CaptchaSolverStrategy;
 }
@@ -336,6 +343,40 @@ export function buildCaptchaConfigUrl(options?: { appVersion?: string; platform?
   return url.toString();
 }
 
+export function buildCaptchaConfigHeaders(options?: Pick<CaptchaRuntimeOptions, "appVersion" | "platform" | "sourceTitle" | "refererOrigin" | "releaseChannel" | "deviceMid">): Record<string, string> {
+  const identity: ProxyIdentity = {
+    appVersion: options?.appVersion?.trim() || "3.2.5",
+    sourceTitle: options?.sourceTitle?.trim() || "Z Code@electron",
+    refererOrigin: options?.refererOrigin?.trim() || "https://zcode.z.ai",
+    releaseChannel: options?.releaseChannel === undefined ? "production" : options.releaseChannel,
+    deviceMid: options?.deviceMid,
+  };
+  const id = buildIdentityHeaders(identity);
+  const platform = options?.platform?.trim() || id["X-Platform"];
+  const headers: Record<string, string> = {};
+
+  headers["user-agent"] = id["User-Agent"];
+  headers["http-referer"] = id["HTTP-Referer"];
+  headers["x-title"] = id["X-Title"];
+  headers["x-zcode-app-version"] = id["X-ZCode-App-Version"];
+  headers["x-platform"] = platform;
+  if (id["X-Release-Channel"]) {
+    headers["x-release-channel"] = id["X-Release-Channel"];
+  }
+  headers["x-client-language"] = id["X-Client-Language"];
+  headers["x-client-timezone"] = id["X-Client-Timezone"];
+  headers["x-os-category"] = id["X-Os-Category"];
+  if (id["X-Os-Version"]) {
+    headers["x-os-version"] = id["X-Os-Version"];
+  }
+  if (id["X-Device-Mid"]) {
+    headers["x-device-mid"] = id["X-Device-Mid"];
+  }
+  headers["x-request-id"] = crypto.randomUUID();
+
+  return headers;
+}
+
 export function resolveCaptchaLanguage(raw = process.env.ZCODE_CAPTCHA_LANGUAGE): CaptchaLanguage {
   const value = raw?.trim().toLowerCase();
   if (value === "cn" || value === "zh" || value === "zh-cn") return "cn";
@@ -413,7 +454,10 @@ async function fetchCaptchaConfig(reqId?: string, opts?: CaptchaRuntimeOptions):
     const timer = setTimeout(() => ctrl.abort(), CONFIG_FETCH_TIMEOUT_MS);
     timer.unref?.();
     try {
-      const resp = await fetch(url, { signal: ctrl.signal });
+      const resp = await fetch(url, {
+        headers: buildCaptchaConfigHeaders(opts),
+        signal: ctrl.signal,
+      });
       if (!resp.ok) {
         void resp.body?.cancel().catch(() => {});
         throw new Error(`captcha config HTTP ${resp.status}`);

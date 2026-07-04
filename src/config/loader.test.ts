@@ -27,6 +27,8 @@ beforeEach(() => {
   delete process.env.ZCODE_SOURCE_TITLE;
   delete process.env.ZCODE_REFERER_ORIGIN;
   delete process.env.ZCODE_RELEASE_CHANNEL;
+  delete process.env.ZCODE_DEVICE_MID;
+  delete process.env.ZCODE_DATA_BASE_DIR;
   delete process.env.ZCODE_AGENT;
   delete process.env.ZCODE_RETRY_MAX;
   delete process.env.ZCODE_RETRY_INITIAL_DELAY_MS;
@@ -243,6 +245,7 @@ identity:
   sourceTitle: "electron"
   refererOrigin: "https://example.com"
   releaseChannel: "test"
+  deviceMid: "yaml-device-mid"
   zcodeAgent: "custom-agent"
 `);
     const cfg = loadConfig(path);
@@ -250,7 +253,35 @@ identity:
     expect(cfg.identity.sourceTitle).toBe("electron");
     expect(cfg.identity.refererOrigin).toBe("https://example.com");
     expect(cfg.identity.releaseChannel).toBe("test");
+    expect(cfg.identity.deviceMid).toBe("yaml-device-mid");
     expect(cfg.identity.zcodeAgent).toBe("custom-agent");
+  });
+
+  it("identity: ZCODE_DEVICE_MID env overrides YAML", () => {
+    const path = writeYaml(`
+auth:
+  mode: apikey
+  apiKey: "abc"
+identity:
+  deviceMid: "from-yaml"
+`);
+    process.env.ZCODE_DEVICE_MID = "from-env";
+    const cfg = loadConfig(path);
+    expect(cfg.identity.deviceMid).toBe("from-env");
+  });
+
+  it("identity: reads existing ZCode telemetry deviceMid when not configured", () => {
+    const base = join(TMP, "zcode-data");
+    mkdirSync(join(base, "v2"), { recursive: true });
+    writeFileSync(join(base, "v2", "telemetry-state.json"), JSON.stringify({ deviceMid: "telemetry-device-mid" }), "utf-8");
+    process.env.ZCODE_DATA_BASE_DIR = base;
+    const path = writeYaml(`
+auth:
+  mode: apikey
+  apiKey: "abc"
+`);
+    const cfg = loadConfig(path);
+    expect(cfg.identity.deviceMid).toBe("telemetry-device-mid");
   });
 
   it("identity: ZCODE_APP_VERSION env overrides YAML", () => {

@@ -32,10 +32,12 @@
  *    the NEXT turn's assistant message. GLM does NOT accept these as
  *    content blocks → 3001 on turn 2+. Without this, only turn 1 succeeds.
  *
- * 4. Assistant tool_use-only messages — older versions inserted a placeholder
- *    text block after #3. Current ZCode captures showed assistant messages
- *    with only `tool_use` blocks are valid, so this placeholder insertion is
- *    intentionally disabled.
+ * 4. Assistant tool_use-only messages — current ZCode captures showed
+ *    assistant messages that originally contain only `tool_use` blocks are
+ *    valid, so we leave those alone. If stripping a preceding `thinking`
+ *    block would create a new tool_use-only assistant message, we add a
+ *    single-space text block; that is a gateway compatibility fix for echoed
+ *    Claude Code thinking history, not a blanket normalization.
  *
  * 5. `normalizeAllMessageContent` — Claude Code and the Responses API
  *    translator both produce `content: "string"` for simple text. ZCode

@@ -10,6 +10,7 @@
 > - **ZCode thinking 行为对齐**:继续丢弃历史里的 `thinking/redacted_thinking` 块，只把 `thinking_delta` 统计到 reasoning tokens，避免下一轮请求携带上游不接受的思考块。
 > - **Claude Code cache_control 边界修复**:最后 user 消息同时包含单个 `tool_result` 和 text 时，只保留 `tool_result` 上的 cache anchor；多个 tool_result 时清掉整条消息的 cache_control，更贴近真实 ZCode 流程。
 > - **Anthropic beta 指纹修正**:上游固定发送 ZCode 客户端使用的 `mid-conversation-system-2026-04-07`，并阻止 Claude Code 的 `claude-code-*` beta 列表泄漏。
+> - **验证码配置请求头对齐**:验证码 `client/configs` 请求补齐 ZCode source headers、`x-request-id` 和可选 `X-Device-Mid`，更贴近桌面客户端取配置路径。
 > - **测试覆盖**:新增 custom tool、thinking token、cache_control 混合消息和 header 白名单回归测试；全量测试与类型检查通过。
 >
 > **升级建议**:建议使用 Codex Responses API、Claude Code、ZCode start-plan/coding-plan 代理或依赖 `apply_patch` 工具调用的用户升级到 v0.2.2.4。

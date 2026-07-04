@@ -17,6 +17,7 @@
  *   11. X-Client-Timezone       : {Intl timeZone}            (e.g. Asia/Shanghai)
  *   12. X-Os-Category           : macos | windows | linux
  *   13. X-Os-Version            : {os.version()}             (ONLY when non-empty)
+ *   14. X-Device-Mid            : {telemetry deviceMid}       (ONLY when present)
  *
  * IMPORTANT CORRECTIONS vs the previous revision of this file (verified
  * against the 2026-06-28 unpacking):
@@ -55,6 +56,8 @@
 import os from "node:os";
 import type { ProxyIdentity } from "../config/types.js";
 
+const ASCII_PRINTABLE = /^[\x20-\x7e]+$/;
+
 export interface IdentityHeaders {
   "User-Agent": string;
   "HTTP-Referer": string;
@@ -65,6 +68,7 @@ export interface IdentityHeaders {
   "X-Client-Timezone": string;
   "X-Os-Category": string;
   "X-Os-Version"?: string;
+  "X-Device-Mid"?: string;
   "X-Release-Channel"?: string;
 }
 
@@ -158,7 +162,7 @@ export function _resetIdentityEnvCacheForTesting(): void {
  *
  *   User-Agent → HTTP-Referer → X-Title → X-ZCode-App-Version → X-Platform →
  *   [X-Release-Channel] → X-Client-Language → X-Client-Timezone →
- *   X-Os-Category → [X-Os-Version]
+ *   X-Os-Category → [X-Os-Version] → [X-Device-Mid]
  *
  * Optional headers (X-Release-Channel, X-Os-Version) are OMITTED from the
  * returned object entirely when their value is empty/unset — the real
@@ -210,9 +214,17 @@ export function buildIdentityHeaders(id: ProxyIdentity): IdentityHeaders {
 
   // X-Os-Version: emit ONLY when os.version() returned a non-empty value.
   // Mirrors the real client's behavior on minimal containers where
-  // os.version() can return "". Wire position: LAST in the identity block.
+  // os.version() can return "".
   if (env.osVersion) {
     headers["X-Os-Version"] = env.osVersion;
+  }
+
+  // X-Device-Mid: optional telemetry marker from ZCode's local state.
+  // The desktop bundle appends it after X-Os-Version when readExistingDeviceMid()
+  // returns a printable value.
+  const deviceMid = id.deviceMid?.trim();
+  if (deviceMid && ASCII_PRINTABLE.test(deviceMid)) {
+    headers["X-Device-Mid"] = deviceMid;
   }
 
   return headers as IdentityHeaders;
