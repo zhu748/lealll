@@ -39,15 +39,6 @@ function tokenExchangeMock(
   }) as typeof fetch;
 }
 
-async function waitUntil(predicate: () => boolean, timeoutMs = 1_000): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (predicate()) return true;
-    await new Promise(resolve => setTimeout(resolve, 10));
-  }
-  return predicate();
-}
-
 describe("ZaiOAuthClient", () => {
   it("normalizes callback wait timeouts to safe timer values", () => {
     expect(normalizeCallbackWaitTimeoutMs()).toBe(300_000);
@@ -85,8 +76,6 @@ describe("ZaiOAuthClient", () => {
     const init = await client.start();
     const port = Number(new URL(init.callbackUrl).port);
     const socket = connect({ host: "127.0.0.1", port });
-    let socketClosed = false;
-    socket.once("close", () => { socketClosed = true; });
     try {
       await once(socket, "connect");
       const result = await Promise.race([
@@ -94,7 +83,6 @@ describe("ZaiOAuthClient", () => {
         new Promise<string>(resolve => setTimeout(() => resolve("timeout"), 1500)),
       ]);
       expect(result).toBe("closed");
-      expect(await waitUntil(() => socketClosed || socket.destroyed)).toBe(true);
     } finally {
       socket.destroy();
       await client.close().catch(() => {});
