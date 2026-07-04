@@ -1784,6 +1784,39 @@ describe("transformRequestBody — cache_control fingerprint alignment (v0.2.1.4
     expect(lastUser.content[1].cache_control).toBeUndefined();
   });
 
+  it("moves pre-existing text cache_control to the single tool_result in mixed last user messages", () => {
+    // Claude Code may send a single tool_result followed by a text block with
+    // cache_control. ZCode's inferred mixed-message rule keeps the prompt
+    // cache anchor on the single tool_result, not on the sibling text block.
+    const body = JSON.stringify({
+      model: "glm-5.2",
+      max_tokens: 1000,
+      thinking: { type: "enabled" },
+      messages: [
+        { role: "user", content: "first question" },
+        {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "call_1", name: "Bash", input: { cmd: "ls" } }],
+        },
+        {
+          role: "user",
+          content: [
+            { tool_use_id: "call_1", type: "tool_result", content: "file1.js" },
+            { type: "text", text: "what next?", cache_control: { type: "ephemeral" } },
+          ],
+        },
+      ],
+    });
+    const out = transformRequestBody(body, { format: "anthropic" });
+    const parsed = JSON.parse(out as string);
+
+    const lastUser = parsed.messages[parsed.messages.length - 1];
+    expect(lastUser.content[0].type).toBe("tool_result");
+    expect(lastUser.content[0].cache_control).toEqual({ type: "ephemeral" });
+    expect(lastUser.content[1].type).toBe("text");
+    expect(lastUser.content[1].cache_control).toBeUndefined();
+  });
+
   it("NEVER attaches cache_control to assistant messages (no fallthrough)", () => {
     // Pre-v0.2.1 bug: when the last user message had only tool_result blocks
     // (no text), applyAnthropicCacheControl would fall through to earlier

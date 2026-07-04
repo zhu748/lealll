@@ -21,22 +21,23 @@
  *
  *   1.  content-type             : application/json
  *   2.  x-api-key | authorization : <upstream credential>     (format-dependent, mutually exclusive)
- *   3.  anthropic-version        : 2023-06-01                  (Anthropic upstream only)
- *   4.  User-Agent               : ZCode/{appVersion}
- *   5.  HTTP-Referer             : https://zcode.z.ai
- *   6.  X-Title                  : Z Code@electron
- *   7.  X-ZCode-App-Version      : {appVersion}
- *   8.  X-Platform               : {platform}-{arch}           (e.g. win32-x64)
- *   9.  X-Release-Channel        : {channel}                   (ONLY when non-empty)
- *   10. X-Client-Language        : {Intl locale}                (e.g. zh-CN)
- *   11. X-Client-Timezone        : {Intl timeZone}              (e.g. Asia/Shanghai)
- *   12. X-Os-Category            : macos | windows | linux
- *   13. X-Os-Version             : {os.version()}               (ONLY when non-empty)
- *   14. X-ZCode-Agent            : glm                           (start-plan only)
- *   15. x-request-id             : <fresh UUIDv4 per request>
- *   16. x-zcode-trace-id         : <stable UUIDv4 per credential>  (start-plan only)
- *   17. x-query-id               : <fresh UUIDv4 per request>      (start-plan only)
- *   18. x-session-id             : <stable UUIDv4 per credential>  (start-plan only)
+ *   3.  anthropic-beta           : mid-conversation-system-2026-04-07 (Anthropic upstream only)
+ *   4.  anthropic-version        : 2023-06-01                  (Anthropic upstream only)
+ *   5.  User-Agent               : ZCode/{appVersion}
+ *   6.  HTTP-Referer             : https://zcode.z.ai
+ *   7.  X-Title                  : Z Code@electron
+ *   8.  X-ZCode-App-Version      : {appVersion}
+ *   9.  X-Platform               : {platform}-{arch}           (e.g. win32-x64)
+ *   10. X-Release-Channel        : {channel}                   (ONLY when non-empty)
+ *   11. X-Client-Language        : {Intl locale}                (e.g. zh-CN)
+ *   12. X-Client-Timezone        : {Intl timeZone}              (e.g. Asia/Shanghai)
+ *   13. X-Os-Category            : macos | windows | linux
+ *   14. X-Os-Version             : {os.version()}               (ONLY when non-empty)
+ *   15. X-ZCode-Agent            : glm                           (start-plan only)
+ *   16. x-request-id             : <fresh UUIDv4 per request>
+ *   17. x-zcode-trace-id         : <stable UUIDv4 per credential>  (start-plan only)
+ *   18. x-query-id               : <fresh UUIDv4 per request>      (start-plan only)
+ *   19. x-session-id             : <stable UUIDv4 per credential>  (start-plan only)
  *
  * Auto-added by fetch/transport (do NOT set manually):
  *   - host (from URL)
@@ -76,7 +77,7 @@
 * the operator opts into preflight with ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT=1.
  *
  * CONFIRMED NOT SENT (real client wire capture, 2026-06-28):
- *   - anthropic-beta            ❌ (never; SDK/CC-CLI artifact)
+ *   - anthropic-beta            ✅ fixed ZCode value only; downstream values are never passed through
  *   - x-session-id              ✅ start-plan only, dynamic attribution
  *   - x-query-id                ✅ start-plan only, dynamic attribution
  *   - x-zcode-trace-id          ✅ start-plan only, dynamic attribution
@@ -96,6 +97,7 @@ import { credentialString } from "../auth/types.js";
 import { buildIdentityHeaders } from "./identity.js";
 
 const ANTHROPIC_VERSION = "2023-06-01";
+const ANTHROPIC_BETA = "mid-conversation-system-2026-04-07";
 
 const ALIYUN_CAPTCHA_HEADERS = new Set([
   "x-aliyun-captcha-verify-param",
@@ -267,7 +269,13 @@ export function buildUpstreamHeaders(
     } else {
       headers["x-api-key"] = credStr;
     }
-    // === 3. anthropic-version (Anthropic upstream only) ===
+    // === 3. anthropic-beta (Anthropic upstream only) ===
+    // Real ZCode 3.1.8/3.2.5 sends exactly this beta flag on /v1/messages.
+    // Never pass through downstream beta lists (Claude Code sends many
+    // claude-code-* flags that are a fingerprint mismatch).
+    headers["anthropic-beta"] = ANTHROPIC_BETA;
+
+    // === 4. anthropic-version (Anthropic upstream only) ===
     headers["anthropic-version"] = ANTHROPIC_VERSION;
   } else {
     // OpenAI upstream: auth via Bearer, no anthropic-version

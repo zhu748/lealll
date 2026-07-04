@@ -61,6 +61,25 @@ describe("translateResponseAnthropicToResponses", () => {
     expect(fc.arguments).toBe(JSON.stringify({ cmd: "ls" }));
   });
 
+  it("translates declared custom tool_use blocks into custom_tool_call items", () => {
+    const resp = makeAnthropicResp({
+      content: [
+        { type: "tool_use", id: "call_patch", name: "apply_patch", input: { patch: "*** Begin Patch" } },
+      ],
+      stop_reason: "tool_use",
+    });
+    const result = translateResponseAnthropicToResponses(resp, "glm-4.6", null, {
+      customToolNames: ["apply_patch"],
+    });
+
+    expect(result.output.length).toBe(1);
+    expect(result.output[0].type).toBe("custom_tool_call");
+    const ctc = result.output[0] as Extract<typeof result.output[0], { type: "custom_tool_call" }>;
+    expect(ctc.call_id).toBe("call_patch");
+    expect(ctc.name).toBe("apply_patch");
+    expect(ctc.input).toBe("*** Begin Patch");
+  });
+
   it("carries usage stats and total_tokens", () => {
     const result = translateResponseAnthropicToResponses(makeAnthropicResp());
     expect(result.usage).toEqual({
@@ -263,6 +282,36 @@ describe("anthropicSseToResponsesSse", () => {
     expect(out).toContain('"name":"shell"');
     expect(out).toContain("event: response.function_call_arguments.delta");
     expect(out).toContain("event: response.function_call_arguments.done");
+    expect(out).toContain("event: response.output_item.done");
+    expect(out).toContain("event: response.completed");
+  });
+
+  it("emits custom_tool_call events for declared custom tools", async () => {
+    const anthropicSse = [
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_x","model":"glm-4.6","usage":{"input_tokens":10}}}\n\n',
+      'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_patch","name":"apply_patch","input":{}}}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"patch\\":"}}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\\"*** Begin Patch\\"}"}}\n\n',
+      'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":8}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ].join("");
+
+    const stream = anthropicSseToResponsesSse(
+      new Response(anthropicSse).body!,
+      "glm-4.6",
+      { customToolNames: ["apply_patch"] },
+    );
+    const out = await readStream(stream);
+
+    expect(out).toContain('"type":"custom_tool_call"');
+    expect(out).toContain('"call_id":"call_patch"');
+    expect(out).toContain('"name":"apply_patch"');
+    expect(out).toContain("event: response.custom_tool_call_input.delta");
+    expect(out).toContain("event: response.custom_tool_call_input.done");
+    expect(out).toContain('"input":"*** Begin Patch"');
+    expect(out).not.toContain("event: response.function_call_arguments.delta");
+    expect(out).not.toContain("event: response.function_call_arguments.done");
     expect(out).toContain("event: response.output_item.done");
     expect(out).toContain("event: response.completed");
   });

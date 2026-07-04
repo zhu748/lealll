@@ -87,6 +87,16 @@ export { globMatch } from "./model-routing.js";
 export { errorResponse } from "./translated-response.js";
 export { startPlanCaptchaPreflightEnabled } from "./runtime-options.js";
 
+function responsesCustomToolNames(body: unknown): string[] | undefined {
+  if (!body || typeof body !== "object") return undefined;
+  const tools = (body as OpenAIResponseRequest).tools;
+  if (!Array.isArray(tools)) return undefined;
+  const names = tools
+    .filter(tool => tool?.type === "custom" && typeof tool.name === "string" && tool.name.length > 0)
+    .map(tool => tool.name!);
+  return names.length > 0 ? names : undefined;
+}
+
 /** Options for the proxy handler. */
 export interface ProxyHandlerOptions {
   config: ProxyConfig;
@@ -526,12 +536,9 @@ export async function proxyRequest(
       config.server.trustProxy,
     );
 
-  // Track the last anthropic-beta header actually sent upstream. Since v0.2.0.6
-  // we strip anthropic-beta ENTIRELY (the real ZCode client sends none — see
-  // upstream.ts STRIP_HEADERS), so this is always null on the wire. Kept for
-  // diagnostic completeness: the `anthropic-beta sent:` log line confirms the
-  // header is absent, and if a future change re-enables beta this capture
-  // already wires it to the real fetch (no throwaway Request needed).
+  // Track the last anthropic-beta header actually sent upstream. We send the
+  // fixed ZCode beta value and never pass through downstream client beta lists
+  // (Claude Code sends many claude-code-* flags).
   let lastSentBeta: string | null = null;
 
   // === Global proxy pool integration ===
@@ -1681,8 +1688,9 @@ export async function proxyRequest(
     }
     if (format === "openai-responses") {
       // Responses API translation: use the dedicated SSE / batch translators.
+      const customToolNames = responsesCustomToolNames(parsedBody);
       if (isSSE && upstreamResp.body) {
-        const translated = anthropicSseToResponsesSse(upstreamResp.body, meta.model);
+        const translated = anthropicSseToResponsesSse(upstreamResp.body, meta.model, { customToolNames });
         // v0.2.0.8: pipe through an inline stats TransformStream instead of
         // tee()+parallel reader — avoids buffering the whole stream when the
         // stats reader falls behind (see createStatsTransform docs).
@@ -1696,6 +1704,7 @@ export async function proxyRequest(
         clientReq, upstreamResp, meta.model, reqId, format, meta, started, headersAt,
         (parsedBody as OpenAIResponseRequest | undefined)?.previous_response_id,
         (parsedBody as OpenAIResponseRequest | undefined)?.input,
+        customToolNames,
         currentCredentialStatsKey(),
         totalCaptchaMs,
         hadRetryAttempt,

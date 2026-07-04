@@ -186,6 +186,7 @@ export async function translatedResponsesBatchResponse(
   headersAt: number,
   previousResponseId: string | undefined,
   clientInput: unknown,
+  customToolNames?: string[],
   credKey?: string,
   captchaMs: number = 0,
   retried: boolean = false,
@@ -210,7 +211,12 @@ export async function translatedResponsesBatchResponse(
     return errorResponse(502, "translation_failed", `upstream returned non-JSON body: ${(err as Error).message}`);
   }
 
-  const responsesResp = translateResponseAnthropicToResponses(parsedAnthropic, model, previousResponseId ?? null);
+  const responsesResp = translateResponseAnthropicToResponses(
+    parsedAnthropic,
+    model,
+    previousResponseId ?? null,
+    { customToolNames },
+  );
   const normalizedInput = typeof clientInput === "string"
     ? [{ type: "message", role: "user", content: clientInput }]
     : Array.isArray(clientInput) ? clientInput : [];

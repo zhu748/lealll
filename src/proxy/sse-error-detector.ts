@@ -551,6 +551,8 @@ function isLegitimateProgressEvent(type: unknown): boolean {
     || type === "response.output_text.done"
     || type === "response.function_call_arguments.delta"
     || type === "response.function_call_arguments.done"
+    || type === "response.custom_tool_call_input.delta"
+    || type === "response.custom_tool_call_input.done"
     || type === "response.completed"
     || type === "response.incomplete"
     || type === "response.failed";

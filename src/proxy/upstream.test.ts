@@ -257,33 +257,29 @@ describe("buildUpstreamRequest", () => {
     expect(upstream.headers.get("content-type")).toBe("application/json");
   });
 
-  it("strips anthropic-beta header entirely (real ZCode client sends none)", () => {
-    // The real ZCode desktop client sends NO anthropic-beta header on normal
-    // /v1/messages traffic (verified against app.asar buildZCodeSourceHeaders,
-    // 2026-06). Beta flags are an Anthropic-SDK / Claude-Code-CLI artifact.
-    // Forwarding them — even claude-code-* — is a fingerprint mismatch, so we
-    // strip the header completely regardless of which flags it carries.
+  it("replaces downstream anthropic-beta with the fixed ZCode beta", () => {
+    // Real ZCode 3.1.8/3.2.5 sends exactly mid-conversation-system-2026-04-07
+    // on /v1/messages. Claude Code sends a long beta list with claude-code-*
+    // flags; those must never leak upstream.
     const clientReq = makeClientReq("{}", {
       "anthropic-beta": "claude-code-20250219,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24",
     });
     const upstream = buildUpstreamRequest(clientReq, "anthropic", ZAI_PROVIDER, ZAI_CRED, "{}", IDENTITY);
-    expect(upstream.headers.get("anthropic-beta")).toBeNull();
+    expect(upstream.headers.get("anthropic-beta")).toBe("mid-conversation-system-2026-04-07");
   });
 
-  it("strips anthropic-beta header entirely when no claude-code-* flags present", () => {
+  it("does not pass through non-ZCode anthropic-beta values", () => {
     const clientReq = makeClientReq("{}", {
       "anthropic-beta": "prompt-caching-2024-07-31,some-other-flag",
     });
     const upstream = buildUpstreamRequest(clientReq, "anthropic", ZAI_PROVIDER, ZAI_CRED, "{}", IDENTITY);
-    expect(upstream.headers.get("anthropic-beta")).toBeNull();
+    expect(upstream.headers.get("anthropic-beta")).toBe("mid-conversation-system-2026-04-07");
   });
 
-  it("strips a lone claude-code-* anthropic-beta flag too (no exceptions)", () => {
-    // Even when the ONLY flag is claude-code-*, we drop it — the real client
-    // never emits this header at all.
+  it("replaces a lone claude-code-* anthropic-beta flag too", () => {
     const clientReq = makeClientReq("{}", { "anthropic-beta": "claude-code-20250219" });
     const upstream = buildUpstreamRequest(clientReq, "anthropic", ZAI_PROVIDER, ZAI_CRED, "{}", IDENTITY);
-    expect(upstream.headers.get("anthropic-beta")).toBeNull();
+    expect(upstream.headers.get("anthropic-beta")).toBe("mid-conversation-system-2026-04-07");
   });
 
   it("strips client Authorization header (prevents credential leak)", () => {
@@ -425,8 +421,8 @@ describe("buildUpstreamRequest", () => {
 
     const upstream = buildUpstreamRequest(clientReq, "anthropic", ZAI_PROVIDER, ZAI_CRED, "{}", IDENTITY);
 
-    // === The whitelist (v0.2.3, matches real ZCode client wire capture): ===
-    //   content-type, x-api-key/auth, anthropic-version, user-agent,
+    // === The whitelist (matches real ZCode client wire capture): ===
+    //   content-type, x-api-key/auth, anthropic-beta, anthropic-version, user-agent,
     //   http-referer, x-title, x-zcode-app-version, x-platform,
     //   [x-release-channel], x-client-language, x-client-timezone,
     //   x-os-category, [x-os-version], [x-zcode-agent start-plan only],
@@ -437,6 +433,7 @@ describe("buildUpstreamRequest", () => {
       // Whitelist (explicit)
       "content-type",
       "x-api-key",            // anthropic coding-plan uses x-api-key
+      "anthropic-beta",
       "anthropic-version",
       "user-agent",
       "http-referer",
@@ -469,12 +466,12 @@ describe("buildUpstreamRequest", () => {
 
     // === Verify whitelist values are correct (not the client's) ===
     expect(upstream.headers.get("user-agent")).toBe("ZCode/test-1.0.0");    // not FakeClient/9.9
-    expect(upstream.headers.get("accept")).toBeNull();                      // v0.2.3: NOT sent
+    expect(upstream.headers.get("accept")).toBeNull();                      // not explicitly set
     expect(upstream.headers.get("content-type")).toBe("application/json");  // not text/plain
     expect(upstream.headers.get("x-api-key")).toBe("testkey.testsecret");   // not client-key
     expect(upstream.headers.get("authorization")).toBeNull();               // anthropic coding-plan uses x-api-key
     expect(upstream.headers.get("anthropic-version")).toBe("2023-06-01");   // not 9999-01-01
-    expect(upstream.headers.get("anthropic-beta")).toBeNull();              // never sent
+    expect(upstream.headers.get("anthropic-beta")).toBe("mid-conversation-system-2026-04-07");
 
     // === Verify client fingerprint headers are ALL absent ===
     expect(upstream.headers.get("x-claude-code-session-id")).toBeNull();
@@ -544,19 +541,20 @@ describe("buildUpstreamRequest", () => {
   // Real client wire order:
   //   1. content-type
   //   2. x-api-key | authorization
-  //   3. anthropic-version
-  //   4. user-agent
-  //   5. http-referer
-  //   6. x-title
-  //   7. x-zcode-app-version
-  //   8. x-platform
-  //   9. [x-release-channel]   (only when set)
-  //   10. x-client-language
-  //   11. x-client-timezone
-  //   12. x-os-category
-  //   13. [x-os-version]       (only when non-empty)
-  //   14. [x-zcode-agent]      (start-plan only)
-  //   15. x-request-id
+  //   3. anthropic-beta
+  //   4. anthropic-version
+  //   5. user-agent
+  //   6. http-referer
+  //   7. x-title
+  //   8. x-zcode-app-version
+  //   9. x-platform
+  //   10. [x-release-channel]   (only when set)
+  //   11. x-client-language
+  //   12. x-client-timezone
+  //   13. x-os-category
+  //   14. [x-os-version]       (only when non-empty)
+  //   15. [x-zcode-agent]      (start-plan only)
+  //   16. x-request-id
   it("emits headers in the EXACT real ZCode client wire order (v0.2.3+, coding-plan)", () => {
     // Use an identity WITH releaseChannel set to verify its position in the
     // wire order. Without it, the test would still pass even if
@@ -572,6 +570,7 @@ describe("buildUpstreamRequest", () => {
     const expectedOrder = [
       "content-type",
       "x-api-key",
+      "anthropic-beta",
       "anthropic-version",
       "user-agent",
       "http-referer",
@@ -599,6 +598,7 @@ describe("buildUpstreamRequest", () => {
     const expectedOrder = [
       "content-type",
       "authorization",       // start-plan with jwt uses Bearer
+      "anthropic-beta",
       "anthropic-version",
       "user-agent",
       "http-referer",

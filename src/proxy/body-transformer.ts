@@ -85,9 +85,10 @@
  *      `is_error:false` surviving the transform, indicate a regression.
  *   2. Check the dumped `zcode-proxy-debug-<reqId>.json` file in the proxy's
  *      working directory — it contains the FULL transformed request body.
- *   3. The `anthropic-beta sent:` line should show `(none)` — since v0.2.0.6
- *      we strip anthropic-beta entirely (the real ZCode client sends none),
- *      eliminating the header/body mismatch that was a 3001 cause.
+ *   3. The `anthropic-beta sent:` line should show the fixed ZCode value
+ *      `mid-conversation-system-2026-04-07`. Downstream beta lists are never
+ *      passed through, eliminating Claude Code header/body fingerprint
+ *      mismatches.
  *
  * @see _reverse/NOTEPAD.md "How Credential is Used for LLM Calls"
  */
@@ -325,18 +326,9 @@ function applyAnthropicCacheControl(
     // rejection.
     if (toolResultBlocks.length >= 2) {
       let changed = false;
-      for (const j of toolResultBlocks) {
-        const b = msg.content[j] as Record<string, unknown>;
-        if ("cache_control" in b) {
-          delete b.cache_control;
-          changed = true;
-        }
-      }
-      // Also strip cc from any text blocks in this message — zcode's
-      // multi-tool_result pattern has NO cc anywhere on the message.
       for (let j = 0; j < msg.content.length; j++) {
         const b = msg.content[j] as Record<string, unknown>;
-        if (isPlainObject(b) && b.type === "text" && "cache_control" in b) {
+        if (isPlainObject(b) && "cache_control" in b) {
           delete b.cache_control;
           changed = true;
         }
@@ -351,12 +343,21 @@ function applyAnthropicCacheControl(
     if (toolResultBlocks.length === 1) {
       const trIdx = toolResultBlocks[0];
       const tr = msg.content[trIdx] as Record<string, unknown>;
+      let changed = false;
+      for (let j = 0; j < msg.content.length; j++) {
+        if (j === trIdx) continue;
+        const b = msg.content[j] as Record<string, unknown>;
+        if (isPlainObject(b) && "cache_control" in b) {
+          delete b.cache_control;
+          changed = true;
+        }
+      }
       if (!tr.cache_control) {
         tr.cache_control = { type: "ephemeral" };
-        return true;
+        changed = true;
       }
       // Already has cc on the tool_result — message matches zcode wire shape.
-      return false;
+      return changed;
     }
 
     // === RULE 1: no tool_result (text-only or other blocks) → attach cc to last text block ===

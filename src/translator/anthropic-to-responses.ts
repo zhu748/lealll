@@ -35,6 +35,11 @@ import { SSE as SSE_CONST } from "../utils/constants.js";
 /** Default model name when upstream doesn't echo one back. */
 const DEFAULT_MODEL = "glm-4.6";
 
+export interface ResponsesTranslationOptions {
+  /** Names of Responses API custom tools, for example Codex's apply_patch. */
+  customToolNames?: Iterable<string>;
+}
+
 /** Generate a Responses-style id with the given prefix. */
 function genId(prefix: string): string {
   return `${prefix}_${Math.random().toString(36).slice(2, 12)}${Date.now().toString(36).slice(-4)}`;
@@ -46,9 +51,43 @@ function mapStopReasonToStatus(stopReason: string | null | undefined): "complete
   return "completed";
 }
 
+function customToolNameSet(opts?: ResponsesTranslationOptions): Set<string> {
+  return new Set(Array.from(opts?.customToolNames ?? [], name => name.toLowerCase()));
+}
+
+function isCustomToolName(customNames: Set<string>, name: unknown): name is string {
+  return typeof name === "string" && customNames.has(name.toLowerCase());
+}
+
+function extractCustomToolInput(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value && typeof value === "object") {
+    const obj = value as Record<string, unknown>;
+    if (typeof obj.patch === "string") return obj.patch;
+    const keys = Object.keys(obj);
+    if (keys.length === 1 && typeof obj[keys[0]] === "string") {
+      return obj[keys[0]] as string;
+    }
+  }
+  return value == null ? "" : JSON.stringify(value);
+}
+
+function extractCustomToolInputFromJson(json: string): string {
+  if (!json) return "";
+  try {
+    return extractCustomToolInput(JSON.parse(json));
+  } catch {
+    return json;
+  }
+}
+
 /** Build the canonical Responses `output[]` array from an Anthropic response. */
-export function buildResponsesOutput(resp: AnthropicMessagesResponse): ResponsesOutputItem[] {
+export function buildResponsesOutput(
+  resp: AnthropicMessagesResponse,
+  opts?: ResponsesTranslationOptions,
+): ResponsesOutputItem[] {
   const out: ResponsesOutputItem[] = [];
+  const customNames = customToolNameSet(opts);
   for (const block of resp.content ?? []) {
     if (block.type === "text") {
       out.push({
@@ -63,14 +102,26 @@ export function buildResponsesOutput(resp: AnthropicMessagesResponse): Responses
         }],
       });
     } else if (block.type === "tool_use") {
-      out.push({
-        type: "function_call",
-        id: genId("fc"),
-        call_id: (block as any).id,
-        name: (block as any).name,
-        arguments: JSON.stringify((block as any).input ?? {}),
-        status: "completed",
-      });
+      const name = (block as any).name;
+      if (isCustomToolName(customNames, name)) {
+        out.push({
+          type: "custom_tool_call",
+          id: genId("ctc"),
+          call_id: (block as any).id,
+          name,
+          input: extractCustomToolInput((block as any).input),
+          status: "completed",
+        });
+      } else {
+        out.push({
+          type: "function_call",
+          id: genId("fc"),
+          call_id: (block as any).id,
+          name,
+          arguments: JSON.stringify((block as any).input ?? {}),
+          status: "completed",
+        });
+      }
     }
     // Skip thinking blocks — Codex CLI doesn't render them and GLM's reasoning
     // summary format is incompatible with the Responses `reasoning` item shape.
@@ -83,8 +134,9 @@ export function translateResponseAnthropicToResponses(
   resp: AnthropicMessagesResponse,
   model: string = DEFAULT_MODEL,
   previousResponseId?: string | null,
+  opts?: ResponsesTranslationOptions,
 ): OpenAIResponse {
-  const output = buildResponsesOutput(resp);
+  const output = buildResponsesOutput(resp, opts);
   const status = mapStopReasonToStatus(resp.stop_reason);
   const inputTokens = resp.usage?.input_tokens ?? 0;
   const outputTokens = resp.usage?.output_tokens ?? 0;
@@ -158,6 +210,8 @@ interface StreamState {
   textItemOpened: boolean;
   /** For tool_use blocks: have we emitted the function_call item.added? */
   toolItemOpened: boolean;
+  /** Current tool output item kind, preserving Codex custom tools. */
+  currentToolKind: "function" | "custom" | null;
   /** Accumulated text for the current text block (for the .done event). */
   currentTextAccum: string;
   /** Accumulated JSON for the current tool_use block (for the .done event). */
@@ -166,9 +220,10 @@ interface StreamState {
   emittedItems: ResponsesOutputItem[];
   /** Whether response.completed has already been emitted. */
   completedSent: boolean;
+  customToolNames: Set<string>;
 }
 
-function initState(model: string): StreamState {
+function initState(model: string, opts?: ResponsesTranslationOptions): StreamState {
   return {
     responseId: genId("resp"),
     model,
@@ -185,10 +240,12 @@ function initState(model: string): StreamState {
     currentAnthropicBlockIndex: null,
     textItemOpened: false,
     toolItemOpened: false,
+    currentToolKind: null,
     currentTextAccum: "",
     currentToolArgsAccum: "",
     emittedItems: [],
     completedSent: false,
+    customToolNames: customToolNameSet(opts),
   };
 }
 
@@ -315,15 +372,24 @@ function closeTextItem(state: StreamState): string[] {
 function openToolItem(state: StreamState, block: { id: string; name: string }, anthropicBlockIndex: number = 0): string[] {
   const out: string[] = [];
   const outputIndex = state.nextOutputIndex;
-  const fcId = genId("fc");
-  const item: ResponsesOutputItem = {
-    type: "function_call",
-    id: fcId,
-    call_id: block.id,
-    name: block.name,
-    arguments: "",
-    status: "in_progress",
-  };
+  const isCustom = isCustomToolName(state.customToolNames, block.name);
+  const item: ResponsesOutputItem = isCustom
+    ? {
+      type: "custom_tool_call",
+      id: genId("ctc"),
+      call_id: block.id,
+      name: block.name,
+      input: "",
+      status: "in_progress",
+    }
+    : {
+      type: "function_call",
+      id: genId("fc"),
+      call_id: block.id,
+      name: block.name,
+      arguments: "",
+      status: "in_progress",
+    };
   out.push(formatSSE("response.output_item.added", {
     type: "response.output_item.added",
     output_index: outputIndex,
@@ -333,6 +399,7 @@ function openToolItem(state: StreamState, block: { id: string; name: string }, a
   state.currentBlockIndex = outputIndex;
   state.currentAnthropicBlockIndex = anthropicBlockIndex;
   state.toolItemOpened = true;
+  state.currentToolKind = isCustom ? "custom" : "function";
   state.currentToolArgsAccum = "";
   return out;
 }
@@ -342,14 +409,35 @@ function closeToolItem(state: StreamState): string[] {
   const out: string[] = [];
   const outputIndex = state.currentBlockIndex!;
   const finalArgs = state.currentToolArgsAccum;
-  out.push(formatSSE("response.function_call_arguments.done", {
-    type: "response.function_call_arguments.done",
-    output_index: outputIndex,
-    arguments: finalArgs,
-  }));
-  const itemRef = state.emittedItems[outputIndex] as Extract<ResponsesOutputItem, { type: "function_call" }>;
-  itemRef.arguments = finalArgs;
-  itemRef.status = "completed";
+  const itemRef = state.emittedItems[outputIndex];
+  if (state.currentToolKind === "custom" && itemRef?.type === "custom_tool_call") {
+    const finalInput = extractCustomToolInputFromJson(finalArgs);
+    if (finalInput.length > 0) {
+      out.push(formatSSE("response.custom_tool_call_input.delta", {
+        type: "response.custom_tool_call_input.delta",
+        output_index: outputIndex,
+        item_id: itemRef.id,
+        delta: finalInput,
+      }));
+    }
+    out.push(formatSSE("response.custom_tool_call_input.done", {
+      type: "response.custom_tool_call_input.done",
+      output_index: outputIndex,
+      item_id: itemRef.id,
+      input: finalInput,
+    }));
+    itemRef.input = finalInput;
+    itemRef.status = "completed";
+  } else {
+    out.push(formatSSE("response.function_call_arguments.done", {
+      type: "response.function_call_arguments.done",
+      output_index: outputIndex,
+      arguments: finalArgs,
+    }));
+    const functionItem = itemRef as Extract<ResponsesOutputItem, { type: "function_call" }>;
+    functionItem.arguments = finalArgs;
+    functionItem.status = "completed";
+  }
   out.push(formatSSE("response.output_item.done", {
     type: "response.output_item.done",
     output_index: outputIndex,
@@ -357,6 +445,7 @@ function closeToolItem(state: StreamState): string[] {
   }));
   state.nextOutputIndex++;
   state.toolItemOpened = false;
+  state.currentToolKind = null;
   state.currentToolArgsAccum = "";
   state.currentBlockIndex = null;
   state.currentAnthropicBlockIndex = null;
@@ -450,11 +539,13 @@ function translateStreamEvent(state: StreamState, sse: ParsedSSE): string[] {
         // name/id, so silently drop.
         if (state.toolItemOpened && state.currentAnthropicBlockIndex === idx) {
           state.currentToolArgsAccum += delta.partial_json ?? "";
-          out.push(formatSSE("response.function_call_arguments.delta", {
-            type: "response.function_call_arguments.delta",
-            output_index: state.currentBlockIndex,
-            delta: delta.partial_json ?? "",
-          }));
+          if (state.currentToolKind !== "custom") {
+            out.push(formatSSE("response.function_call_arguments.delta", {
+              type: "response.function_call_arguments.delta",
+              output_index: state.currentBlockIndex,
+              delta: delta.partial_json ?? "",
+            }));
+          }
         }
       } else if (delta?.type === "thinking_delta") {
         // v0.2.0.10: count thinking_delta chunks so the final response.completed
@@ -518,8 +609,9 @@ function translateStreamEvent(state: StreamState, sse: ParsedSSE): string[] {
 export function anthropicSseToResponsesSse(
   upstream: ReadableStream<Uint8Array>,
   model: string = DEFAULT_MODEL,
+  opts?: ResponsesTranslationOptions,
 ): ReadableStream<Uint8Array> {
-  const state = initState(model);
+  const state = initState(model, opts);
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   let buffer = "";

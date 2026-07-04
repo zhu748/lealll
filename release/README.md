@@ -1,5 +1,21 @@
 # zcode-proxy 使用说明
 
+> **v0.2.2.4 — Codex/Claude Code 到 ZCode 协议对齐增强**
+>
+> 本版本继续对齐 ZCode 客户端真实请求/响应格式，重点修复 Codex Responses 自定义工具回包、Claude Code cache_control 边界和 ZCode Anthropic beta 指纹。
+>
+> **本次改动**
+>
+> - **Codex custom tool 回包对齐**:Responses API 中 `apply_patch` 等 custom tool 现在会回成 `custom_tool_call` 和 `response.custom_tool_call_input.*` 事件，不再误当普通 `function_call`。
+> - **ZCode thinking 行为对齐**:继续丢弃历史里的 `thinking/redacted_thinking` 块，只把 `thinking_delta` 统计到 reasoning tokens，避免下一轮请求携带上游不接受的思考块。
+> - **Claude Code cache_control 边界修复**:最后 user 消息同时包含单个 `tool_result` 和 text 时，只保留 `tool_result` 上的 cache anchor；多个 tool_result 时清掉整条消息的 cache_control，更贴近真实 ZCode 流程。
+> - **Anthropic beta 指纹修正**:上游固定发送 ZCode 客户端使用的 `mid-conversation-system-2026-04-07`，并阻止 Claude Code 的 `claude-code-*` beta 列表泄漏。
+> - **测试覆盖**:新增 custom tool、thinking token、cache_control 混合消息和 header 白名单回归测试；全量测试与类型检查通过。
+>
+> **升级建议**:建议使用 Codex Responses API、Claude Code、ZCode start-plan/coding-plan 代理或依赖 `apply_patch` 工具调用的用户升级到 v0.2.2.4。
+
+---
+
 > **v0.2.2.3 — 验证码交互兜底与凭证持久化加固**
 >
 > 本版本聚焦长期运行稳定性,修复 Chrome 验证码交互兜底点击不到按钮的问题,并增强凭证文件在多进程同时写入时的保护。

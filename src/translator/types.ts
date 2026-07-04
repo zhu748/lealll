@@ -358,6 +358,14 @@ export type ResponsesOutputItem =
       status: "completed" | "in_progress" | "incomplete";
     }
   | {
+      type: "custom_tool_call";
+      id: string;
+      call_id: string;
+      name: string;
+      input: string;
+      status: "completed" | "in_progress" | "incomplete";
+    }
+  | {
       type: "reasoning";
       id: string;
       summary: Array<{ type: "summary_text"; text: string }>;
@@ -397,5 +405,7 @@ export type ResponsesStreamEvent =
   | { type: "response.output_text.done"; output_index: number; content_index: number; text: string }
   | { type: "response.function_call_arguments.delta"; output_index: number; delta: string }
   | { type: "response.function_call_arguments.done"; output_index: number; arguments: string }
+  | { type: "response.custom_tool_call_input.delta"; output_index: number; item_id: string; delta: string }
+  | { type: "response.custom_tool_call_input.done"; output_index: number; item_id: string; input: string }
   | { type: "response.completed"; response: OpenAIResponse }
   | { type: "response.failed"; response: OpenAIResponse };
