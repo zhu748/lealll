@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -439,6 +439,13 @@ describe("Chrome captcha helper configuration", () => {
 
     await expect(first).resolves.toBe("first");
     expect(await secondResult).toEqual({ ok: false, message: "Chrome CDP session is closed" });
+  });
+
+  it("uses the generated Chrome captcha button id for interactive fallback clicks", () => {
+    const source = readFileSync(join(import.meta.dir, "captcha.ts"), "utf8");
+
+    expect(source).toContain('const buttonId = "zcode-aliyun-captcha-button";');
+    expect(source).toContain('document.querySelector("#" + buttonId)');
   });
 
   it("cleans host server and ephemeral profile if Chrome spawn fails during startup", async () => {

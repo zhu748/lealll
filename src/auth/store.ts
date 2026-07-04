@@ -17,7 +17,7 @@
  *
  * @see .omo/plans/zcode-proxy.md Task 14
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, readdirSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, readdirSync, statSync, rmSync } from "node:fs";
 import { join, dirname, basename } from "node:path";
 import { homedir } from "node:os";
 import { randomBytes, createCipheriv, createDecipheriv, createHash } from "node:crypto";
@@ -992,6 +992,69 @@ function cleanupOldBrokenBackups(): void {
  */
 const storeWriteMutex = createMutex();
 
+const CROSS_PROCESS_LOCK_STALE_MS = 60_000;
+const CROSS_PROCESS_LOCK_WAIT_MS = 10_000;
+
+async function withCrossProcessStoreLock<T>(fn: () => Promise<T>): Promise<T> {
+  refreshStorePathFromEnv();
+  try {
+    mkdirSync(dirname(STORE_FILE), { recursive: true });
+  } catch (err) {
+    const message = (err as Error).message;
+    throw new Error(
+      `Could not persist credentials to ${STORE_FILE}: ${message}. ` +
+      `Set ZCODE_PROXY_STORE_DIR to a writable path.`,
+    );
+  }
+  const lockDir = `${STORE_FILE}.lock`;
+  const deadline = Date.now() + CROSS_PROCESS_LOCK_WAIT_MS;
+  let acquired = false;
+  let attempt = 0;
+
+  while (!acquired) {
+    try {
+      mkdirSync(lockDir);
+      acquired = true;
+      try {
+        writeFileSync(
+          join(lockDir, "owner.json"),
+          JSON.stringify({ pid: process.pid, createdAt: Date.now() }),
+          "utf-8",
+        );
+      } catch {
+        // The directory itself is the lock; owner metadata is best-effort.
+      }
+      break;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code !== "EEXIST") throw err;
+      try {
+        const st = statSync(lockDir);
+        if (Date.now() - st.mtimeMs > CROSS_PROCESS_LOCK_STALE_MS) {
+          rmSync(lockDir, { recursive: true, force: true });
+          continue;
+        }
+      } catch (statErr) {
+        const statCode = (statErr as NodeJS.ErrnoException)?.code;
+        if (statCode === "ENOENT") continue;
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(`Timed out waiting for credential store lock: ${lockDir}`);
+      }
+      const delay = Math.min(250, 25 * (++attempt));
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+
+  try {
+    return await fn();
+  } finally {
+    if (acquired) {
+      try { rmSync(lockDir, { recursive: true, force: true }); } catch {}
+    }
+  }
+}
+
 /**
  * Run `fn` while holding the store write lock. `fn` receives the current
  * store (freshly read from disk + decrypted) and may mutate it freely; the
@@ -1031,6 +1094,7 @@ async function withStoreLock<T>(
   fn: (store: StoreV2) => Promise<T> | T,
 ): Promise<T> {
   return storeWriteMutex.run(async () => {
+    return withCrossProcessStoreLock(async () => {
     // ALWAYS re-read inside the lock — the in-memory cache may be stale if
     // another process (CLI) wrote to the file. The cost is one disk read +
     // decrypt per mutation, acceptable for the low write frequency of a
@@ -1062,6 +1126,7 @@ async function withStoreLock<T>(
     const result = await fn(store);
     await writeStore(store);
     return result;
+    });
   });
 }
 
@@ -1096,6 +1161,7 @@ async function withExistingStoreLock<T>(
   opts: { allowEmptyWrite?: boolean } = {},
 ): Promise<T | null> {
   return storeWriteMutex.run(async () => {
+    return withCrossProcessStoreLock(async () => {
     const store = await readStore();
     if (!store) {
       // Distinguish "file doesn't exist" (genuine empty store → 404) from
@@ -1124,6 +1190,7 @@ async function withExistingStoreLock<T>(
     if (result === false) return result as T;
     await writeStore(store, { allowEmpty: opts.allowEmptyWrite });
     return result;
+    });
   });
 }
 
@@ -1336,6 +1403,7 @@ export async function loadCredential(): Promise<Credential | null> {
 export async function clearCredentialAsync(): Promise<void> {
   refreshStorePathFromEnv();
   await storeWriteMutex.run(async () => {
+    await withCrossProcessStoreLock(async () => {
     if (!existsSync(STORE_FILE)) {
       // File already gone — just reset state.
       cachedStore = null;
@@ -1381,6 +1449,7 @@ export async function clearCredentialAsync(): Promise<void> {
     cachedKey = null;
     undecryptableFilePresent = false;
     lastReadStoreNullReason = "missing";
+    });
   });
 }
 

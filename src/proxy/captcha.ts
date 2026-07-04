@@ -1257,7 +1257,7 @@ async function solveInChromeCdpSession(
             instance.show();
             return;
           }
-          const button = document.querySelector("#captcha-button");
+          const button = document.querySelector("#" + buttonId);
           if (button && typeof button.click === "function") {
             button.click();
             return;

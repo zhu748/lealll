@@ -1326,6 +1326,19 @@ describe("multi-account store", () => {
     expect(list.accounts).toHaveLength(keys.length);
   });
 
+  it("saveCredential clears a stale cross-process lock before writing", async () => {
+    const lockDir = `${getStorePath()}.lock`;
+    mkdirSync(lockDir, { recursive: true });
+    writeFileSync(join(lockDir, "owner.json"), JSON.stringify({ pid: 0 }), "utf-8");
+    const stale = new Date(Date.now() - 120_000);
+    utimesSync(lockDir, stale, stale);
+
+    await saveCredential({ apiKey: "after-stale-lock", provider: "zai" });
+
+    expect(existsSync(lockDir)).toBe(false);
+    expect((await loadCredential())?.apiKey).toBe("after-stale-lock");
+  });
+
   it("saveCredential uses atomic write (temp file + rename), not direct writeFileSync", async () => {
     // Verify the atomic-write path is active by checking that no partial /
     // temp files are left behind after a successful save. The old
