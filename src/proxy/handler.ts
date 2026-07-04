@@ -14,7 +14,7 @@ import type { ProxyConfig } from "../config/types.js";
 import type { AuthManager } from "../auth/manager.js";
 import type { Credential } from "../auth/types.js";
 import { getProvider } from "../provider/providers.js";
-import { buildUpstreamRequest } from "./upstream.js";
+import { buildUpstreamRequest, createStartPlanRequestAttributionContext } from "./upstream.js";
 import { getCaptchaToken, RETRY_HEADERS } from "./captcha.js";
 import { transformRequestBodyObj } from "./body-transformer.js";
 import { detectSseErrorAndConvert } from "./sse-error-detector.js";
@@ -477,6 +477,7 @@ export async function proxyRequest(
   let totalCaptchaMs = 0;
   let captchaRetryHeaders: Record<string, string> | undefined;
   let hadRetryAttempt = false;
+  const startPlanRequestAttributionContext = createStartPlanRequestAttributionContext();
 
   const checkCaptchaVerifyFailed = async (resp: Response): Promise<{ failed: boolean; response: Response }> => {
     if (currentPlan !== "start-plan" || resp.status !== 403) return { failed: false, response: resp };
@@ -547,6 +548,7 @@ export async function proxyRequest(
       extraHeaders,
       opts.resolveClientIp,
       config.server.trustProxy,
+      startPlanRequestAttributionContext,
     );
 
   // Track the last anthropic-beta header actually sent upstream. We send the

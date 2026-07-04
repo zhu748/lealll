@@ -6,7 +6,15 @@ import { describe, it, expect, mock } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildUpstreamRequest, buildUpstreamURL, buildAuthHeaders, buildUpstreamHeaders, _clearStartPlanAttributionContextsForTesting, _startPlanAttributionContextCountForTesting } from "./upstream.js";
+import {
+  buildUpstreamRequest,
+  buildUpstreamURL,
+  buildAuthHeaders,
+  buildUpstreamHeaders,
+  createStartPlanRequestAttributionContext,
+  _clearStartPlanAttributionContextsForTesting,
+  _startPlanAttributionContextCountForTesting,
+} from "./upstream.js";
 import { proxyRequest, errorResponse, startPlanCaptchaPreflightEnabled, _readResponseTextPreviewForTesting, _setRequestBodyIdleTimeoutForTesting } from "./handler.js";
 import { importFromText, updatePoolConfig, _resetForTesting as resetProxyPoolForTesting } from "./proxy-pool.js";
 import { ZAI_PROVIDER, BIGMODEL_PROVIDER } from "../provider/providers.js";
@@ -675,6 +683,26 @@ describe("buildUpstreamRequest", () => {
     expect(h1["x-session-id"]).toBe(h2["x-session-id"]);
     expect(h1["x-zcode-trace-id"]).toBe(h2["x-zcode-trace-id"]);
     expect(h1["x-query-id"]).not.toBe(h2["x-query-id"]);
+    expect(h1["x-request-id"]).not.toBe(h2["x-request-id"]);
+  });
+
+  it("keeps start-plan query id stable across attempts when a request context is supplied", () => {
+    // Real ZCode creates a status context once for the user query. Retry
+    // attempts call Fde(baseContext, attempt), which refreshes requestId only.
+    const jwtCred: Credential = {
+      apiKey: "k-attempt",
+      secret: "s",
+      jwt: "jwt-attempt-token",
+      provider: "zai",
+      userId: "user-attempt",
+    };
+    const requestContext = createStartPlanRequestAttributionContext();
+    const h1 = buildUpstreamHeaders("anthropic", jwtCred, IDENTITY, "start-plan", undefined, requestContext);
+    const h2 = buildUpstreamHeaders("anthropic", jwtCred, IDENTITY, "start-plan", undefined, requestContext);
+
+    expect(h1["x-session-id"]).toBe(h2["x-session-id"]);
+    expect(h1["x-zcode-trace-id"]).toBe(h2["x-zcode-trace-id"]);
+    expect(h1["x-query-id"]).toBe(h2["x-query-id"]);
     expect(h1["x-request-id"]).not.toBe(h2["x-request-id"]);
   });
 
@@ -1678,6 +1706,83 @@ describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
       const body = await resp.json();
       expect(body.object).toBe("chat.completion");
       expect(body.choices[0].message.content).toBe("start-plan reply");
+    } finally {
+      if (originalPreflight === undefined) delete process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
+      else process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = originalPreflight;
+    }
+  });
+
+  it("keeps start-plan query/session/trace stable across retry attempts", async () => {
+    const startPlanConfig: ProxyConfig = {
+      ...testConfig,
+      plan: "start-plan",
+      retry: {
+        ...testConfig.retry,
+        maxRetries: 1,
+        initialDelayMs: 1,
+        maxDelayMs: 1,
+        retryableStatuses: [529],
+      },
+    };
+    const originalPreflight = process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
+    process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = "0";
+    const successBody = JSON.stringify({
+      id: "msg_sp_retry",
+      type: "message",
+      role: "assistant",
+      content: [{ type: "text", text: "ok after retry" }],
+      model: "glm-4.6",
+      stop_reason: "end_turn",
+      stop_sequence: null,
+      usage: { input_tokens: 5, output_tokens: 3 },
+    });
+    const seen: Array<{
+      requestId: string | null;
+      traceId: string | null;
+      queryId: string | null;
+      sessionId: string | null;
+    }> = [];
+
+    try {
+      const fetchMock = mock(async (req: Request): Promise<Response> => {
+        seen.push({
+          requestId: req.headers.get("x-request-id"),
+          traceId: req.headers.get("x-zcode-trace-id"),
+          queryId: req.headers.get("x-query-id"),
+          sessionId: req.headers.get("x-session-id"),
+        });
+        await req.text();
+        if (seen.length === 1) {
+          return new Response(JSON.stringify({ error: { type: "overloaded" } }), {
+            status: 529,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        return new Response(successBody, { status: 200, headers: { "content-type": "application/json" } });
+      });
+
+      const auth = new AuthManager({ mode: "oauth", provider: "zai" });
+      auth.setOAuthCredential({ apiKey: "dummy", provider: "zai", plan: "start-plan", jwt: "jwt-mock" });
+      const clientReq = new Request("http://localhost:8080/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: '{"model":"glm-4.6","messages":[{"role":"user","content":"hi"}]}',
+      });
+
+      const resp = await proxyRequest(clientReq, "openai", {
+        config: startPlanConfig,
+        auth,
+        fetchImpl: fetchMock as any,
+      });
+
+      expect(resp.status).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(seen[0].requestId).toMatch(/^[0-9a-f-]{36}$/i);
+      expect(seen[1].requestId).toMatch(/^[0-9a-f-]{36}$/i);
+      expect(seen[0].requestId).not.toBe(seen[1].requestId);
+      expect(seen[0].traceId).toBe(seen[1].traceId);
+      expect(seen[0].queryId).toBe(seen[1].queryId);
+      expect(seen[0].sessionId).toBe(seen[1].sessionId);
     } finally {
       if (originalPreflight === undefined) delete process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
       else process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = originalPreflight;

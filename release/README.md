@@ -12,7 +12,8 @@
 > - **Anthropic beta 指纹修正**:上游固定发送 ZCode 客户端使用的 `mid-conversation-system-2026-04-07`，并阻止 Claude Code 的 `claude-code-*` beta 列表泄漏。
 > - **验证码配置请求头对齐**:验证码 `client/configs` 请求补齐 ZCode source headers、`x-request-id` 和可选 `X-Device-Mid`，更贴近桌面客户端取配置路径。
 > - **start-plan 预验证恢复默认对齐**:默认在 start-plan 模型请求前刷新 Aliyun runtime captcha headers，和 ZCode renderer 的 pre-send provider runtime headers 路径一致；诊断时可用 `ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT=0` 关闭。
-> - **测试覆盖**:新增 custom tool、thinking token、cache_control 混合消息和 header 白名单回归测试；全量测试与类型检查通过。
+> - **start-plan 重试归因对齐**:同一用户请求内重试只刷新 `x-request-id`，保持 `x-query-id`、`x-session-id` 和 `x-zcode-trace-id` 稳定，贴近 ZCode 客户端真实 retry 行为。
+> - **测试覆盖**:新增 custom tool、thinking token、cache_control 混合消息、header 白名单和 start-plan retry 归因回归测试；全量测试与类型检查通过。
 >
 > **升级建议**:建议使用 Codex Responses API、Claude Code、ZCode start-plan/coding-plan 代理或依赖 `apply_patch` 工具调用的用户升级到 v0.2.2.4。
 

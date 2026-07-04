@@ -34,9 +34,9 @@
  *   13. X-Os-Category            : macos | windows | linux
  *   14. X-Os-Version             : {os.version()}               (ONLY when non-empty)
  *   15. X-ZCode-Agent            : glm                           (start-plan only)
- *   16. x-request-id             : <fresh UUIDv4 per request>
+ *   16. x-request-id             : <fresh UUIDv4 per request attempt>
  *   17. x-zcode-trace-id         : <stable UUIDv4 per credential>  (start-plan only)
- *   18. x-query-id               : <fresh UUIDv4 per request>      (start-plan only)
+ *   18. x-query-id               : <fresh UUIDv4 per user query>   (start-plan only)
  *   19. x-session-id             : <stable UUIDv4 per credential>  (start-plan only)
  *
  * Auto-added by fetch/transport (do NOT set manually):
@@ -118,6 +118,14 @@ interface StartPlanAttributionContext {
   traceId: string;
 }
 
+export interface StartPlanRequestAttributionContext {
+  queryId: string;
+}
+
+export function createStartPlanRequestAttributionContext(): StartPlanRequestAttributionContext {
+  return { queryId: crypto.randomUUID() };
+}
+
 const MAX_STARTPLAN_ATTRIBUTION_CONTEXTS = 512;
 const startPlanAttributionByCredential = new Map<string, StartPlanAttributionContext>();
 
@@ -156,11 +164,14 @@ export function _startPlanAttributionContextCountForTesting(): number {
   return startPlanAttributionByCredential.size;
 }
 
-function buildStartPlanAttributionHeaders(cred: Credential): Record<string, string> {
+function buildStartPlanAttributionHeaders(
+  cred: Credential,
+  requestContext?: StartPlanRequestAttributionContext,
+): Record<string, string> {
   const ctx = getStartPlanAttributionContext(cred);
   return {
     "x-zcode-trace-id": ctx.traceId,
-    "x-query-id": crypto.randomUUID(),
+    "x-query-id": requestContext?.queryId ?? crypto.randomUUID(),
     "x-session-id": ctx.sessionId,
   };
 }
@@ -231,6 +242,7 @@ export function buildUpstreamHeaders(
   identity: ProxyIdentity,
   plan: "coding-plan" | "start-plan" = "coding-plan",
   extraHeaders?: Record<string, string>,
+  startPlanRequestContext?: StartPlanRequestAttributionContext,
 ): Record<string, string> {
   const credStr = credentialString(cred);
   const startPlanAuthorization = plan === "start-plan"
@@ -315,7 +327,7 @@ export function buildUpstreamHeaders(
     headers["x-zcode-agent"] = agent;
   }
 
-  // === 16. x-request-id (LAST — fresh UUIDv4 per request) ===
+  // === 16. x-request-id (LAST — fresh UUIDv4 per request attempt) ===
   headers["x-request-id"] = crypto.randomUUID();
 
   // === 17-19. Start-plan attribution headers ===
@@ -325,9 +337,10 @@ export function buildUpstreamHeaders(
   // Official ZCode creates session ids as `sess_${uuid}` and query ids as
   // `query_${uuid}`, then strips those prefixes before sending headers. We
   // mirror the observable wire shape: stable session/trace IDs per upstream
-  // credential, plus a fresh query id for each request attempt.
+  // credential, a query id that is stable for one user request, and a fresh
+  // request id for each retry attempt (matches the bundle's Fde() behavior).
   if (plan === "start-plan") {
-    Object.assign(headers, buildStartPlanAttributionHeaders(cred));
+    Object.assign(headers, buildStartPlanAttributionHeaders(cred, startPlanRequestContext));
   }
 
   // NOTE: accept-encoding and host and content-length are NOT set here —
@@ -405,13 +418,15 @@ export function buildUpstreamRequest(
    */
   resolveClientIp?: (req: Request) => string | undefined,
   trustProxy?: boolean,
+  startPlanRequestContext?: StartPlanRequestAttributionContext,
 ): Request {
-  // Resolve and discard — kept for API symmetry, no session header is built
-  // and no client header is read for the upstream request.
+  // Resolve and discard — kept for API symmetry. No client IP/header value is
+  // used to derive upstream attribution; start-plan session/query/trace are
+  // generated from ZCode-like runtime context instead.
   void clientIp(clientReq, resolveClientIp, trustProxy);
   const url = buildUpstreamURL(format, provider, plan);
   // Strict whitelist — does NOT read clientReq.headers.
-  const headers = buildUpstreamHeaders(format, cred, identity, plan, extraHeaders);
+  const headers = buildUpstreamHeaders(format, cred, identity, plan, extraHeaders, startPlanRequestContext);
 
   const init: RequestInit = {
     method: "POST",
