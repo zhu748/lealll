@@ -1061,6 +1061,20 @@ describe("transformRequestBody — alignZCodeFormat (field fill + drop, v0.2.0+)
     expect(parsed.tool_choice).toBeUndefined();
   });
 
+  it("drops standalone tool_choice when tools are absent or empty", () => {
+    const body = JSON.stringify({
+      model: "glm-5.2",
+      max_tokens: 1000,
+      thinking: { type: "enabled" },
+      messages: [{ role: "user", content: "hi" }],
+      tools: [],
+      tool_choice: { type: "auto" },
+    });
+    const out = transformRequestBody(body, { format: "anthropic" });
+    const parsed = JSON.parse(out as string);
+    expect(parsed.tool_choice).toBeUndefined();
+  });
+
   it("preserves client's existing tool_choice (doesn't overwrite)", () => {
     const body = JSON.stringify({
       model: "glm-5.2",

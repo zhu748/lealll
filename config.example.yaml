@@ -131,11 +131,10 @@ identity:
   zcodeAgent: "glm"
 
 # Start-plan captcha behavior:
-# - By default the proxy sends start-plan model requests without captcha
-#   headers, matching the normal ZCode message path. If upstream returns an
-#   explicit Aliyun 3007 JSON challenge, the proxy solves once and retries with
-#   a fresh one-shot runtime header. Set ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT=1
-#   only if you want the old behavior of solving before every model attempt.
+# - By default the proxy pre-solves and sends fresh Aliyun runtime captcha
+#   headers before each start-plan model attempt, matching ZCode's pre-send
+#   provider runtime headers path. Set ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT=0
+#   only if you want diagnostic 3007-only solving.
 # - ZCODE_CAPTCHA_SOLVER=auto (default) prefers a real Chrome/Edge CDP page,
 #   matching ZCode's Electron renderer, and falls back to the bundled JSDOM
 #   solver. Use ZCODE_CAPTCHA_SOLVER=jsdom only for no-browser diagnostics.

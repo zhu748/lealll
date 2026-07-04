@@ -62,6 +62,18 @@ describe("buildIdentityHeaders", () => {
     expect(h["X-ZCode-App-Version"]).toBe("unknown");
   });
 
+  it("falls back gracefully when appVersion is non-ASCII", () => {
+    const h = buildIdentityHeaders({ ...BASE, appVersion: "v3.2.5-中文" });
+    expect(h["User-Agent"]).toBe("ZCode/unknown");
+    expect(h["X-ZCode-App-Version"]).toBe("unknown");
+  });
+
+  it("falls back to default printable source headers when configured values are non-ASCII", () => {
+    const h = buildIdentityHeaders({ ...BASE, sourceTitle: "标题", refererOrigin: "https://例子.test" });
+    expect(h["X-Title"]).toBe("Z Code@electron");
+    expect(h["HTTP-Referer"]).toBe("https://zcode.z.ai");
+  });
+
   // v0.2.3 (2026-06-28 unpacking): identity header ORDER matches the real
   // ZCode desktop client's wire shape (Mf() offset 886853). The previous
   // revision emitted User-Agent → X-ZCode-App-Version → HTTP-Referer →

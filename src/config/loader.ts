@@ -350,6 +350,7 @@ function zcodeTelemetryStateCandidates(): string[] {
   const candidates: string[] = [];
   const base = process.env.ZCODE_DATA_BASE_DIR?.trim();
   if (base) {
+    candidates.push(join(base, ".zcode", "v2", "telemetry-state.json"));
     candidates.push(join(base, "v2", "telemetry-state.json"));
     candidates.push(join(base, "telemetry-state.json"));
   }

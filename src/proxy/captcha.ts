@@ -8,8 +8,8 @@
  * diagnostic path.
  *
  * Captcha verify params are treated as one-shot: whenever start-plan needs
- * a runtime captcha token (on upstream 3007, or when explicit preflight is
- * enabled), the solve result is used only for the immediate retry/attempt.
+ * a runtime captcha token (ZCode-aligned preflight, or an upstream 3007 retry),
+ * the solve result is used only for the immediate retry/attempt.
  * The mutex below serializes solves only to keep memory bounded; it never
  * shares a solved token between callers.
  *

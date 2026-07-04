@@ -120,7 +120,7 @@ codex --model glm-4.6
 | **Config file** | Auto-seeded from `config.example.yaml` (with placeholder API key stripped) into `$ZCODE_PROXY_CONFIG`. Real secrets come from env vars, which override YAML. |
 | **Health check** | `/healthz`, `/health`, and `/` are exempt from `proxyApiKey` so Render's probes succeed without auth headers. |
 | **OAuth login** | Browser login is not supported on Render. Generate/export OAuth credentials locally, then inject `ZCODE_OAUTH_CREDENTIAL`, or use `auth.mode: apikey` + `ZCODE_API_KEY`. |
-| **Start-plan captcha** | The Docker image includes Chromium + Xvfb. Render starts a virtual display so on-demand start-plan 3007 challenges can use the Chrome CDP path instead of the weaker JSDOM fallback. |
+| **Start-plan captcha** | The Docker image includes Chromium + Xvfb. Render starts a virtual display so ZCode-aligned start-plan preflight and 3007 retries can use the Chrome CDP path instead of the weaker JSDOM fallback. |
 | **Auto-deploy** | Enabled by default in `render.yaml`. Push to `main` → Render rebuilds. |
 | **Sleep behavior** | Free tier sleeps after 15 min of inactivity. First request after sleep takes ~30s. Use Starter plan for always-on. |
 
@@ -178,7 +178,7 @@ docker run --rm -p 8080:8080 \
 | `ZCODE_SOURCE_TITLE` | `Z Code@electron` | `X-Title` sent to upstream. |
 | `ZCODE_REFERER_ORIGIN` | `https://zcode.z.ai` | `HTTP-Referer` URL sent to upstream. |
 | `ZCODE_AGENT` | `glm` | `X-ZCode-Agent` sent on start-plan requests to mirror the official GLM agent provider. |
-| `ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT` | disabled | Start-plan sends the first model request without captcha headers and only solves after upstream returns an explicit `3007` challenge. Set to `1`, `true`, `on`, `yes`, or `always` to pre-solve before every model attempt. |
+| `ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT` | enabled | Start-plan pre-solves and sends fresh Aliyun captcha runtime headers before each model attempt, matching ZCode. Set to `0`, `false`, `off`, `no`, or `never` to solve only after an explicit `3007` challenge. |
 | `ZCODE_CAPTCHA_SOLVER` | `auto` | Captcha solver strategy: `auto` prefers a real Chrome/Edge CDP page (matching ZCode's Electron renderer) and falls back to JSDOM, `chrome` forces Chrome/Edge, `jsdom` forces the single-binary fallback. |
 | `ZCODE_CAPTCHA_LANGUAGE` | host locale | Optional Aliyun SDK language override: `cn` or `en`. When unset, Chinese host locales use `cn`; all others use `en`, matching the official client's locale behavior. |
 | `ZCODE_CAPTCHA_CHROME_INTERACTIVE` | `0` | Set to `1` to show the Chrome captcha fallback window on screen when Aliyun escalates from traceless verification to an interactive challenge. |

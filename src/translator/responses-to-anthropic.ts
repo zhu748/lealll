@@ -200,7 +200,9 @@ export function translateRequestResponsesToAnthropic(
     }
   }
 
-  if (req.tool_choice) {
+  // Only forward tool_choice when there are actual upstream tools left after
+  // filtering. Real ZCode does not send a standalone tool_choice without tools.
+  if (req.tool_choice && result.tools && result.tools.length > 0) {
     const tc = translateToolChoiceResponsesToAnthropic(req.tool_choice);
     if (tc) result.tool_choice = tc;
   }

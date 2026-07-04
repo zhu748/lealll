@@ -272,8 +272,8 @@ identity:
 
   it("identity: reads existing ZCode telemetry deviceMid when not configured", () => {
     const base = join(TMP, "zcode-data");
-    mkdirSync(join(base, "v2"), { recursive: true });
-    writeFileSync(join(base, "v2", "telemetry-state.json"), JSON.stringify({ deviceMid: "telemetry-device-mid" }), "utf-8");
+    mkdirSync(join(base, ".zcode", "v2"), { recursive: true });
+    writeFileSync(join(base, ".zcode", "v2", "telemetry-state.json"), JSON.stringify({ deviceMid: "telemetry-device-mid" }), "utf-8");
     process.env.ZCODE_DATA_BASE_DIR = base;
     const path = writeYaml(`
 auth:

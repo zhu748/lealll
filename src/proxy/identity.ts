@@ -176,7 +176,10 @@ export function _resetIdentityEnvCacheForTesting(): void {
  */
 export function buildIdentityHeaders(id: ProxyIdentity): IdentityHeaders {
   const env = getCachedEnv();
-  const appVersion = id.appVersion || "unknown";
+  const appVersion = normalizePrintable(id.appVersion) ?? "unknown";
+  const refererOrigin = normalizePrintable(id.refererOrigin) ?? "https://zcode.z.ai";
+  const sourceTitle = normalizePrintable(id.sourceTitle) ?? "Z Code@electron";
+  const releaseChannel = normalizePrintable(id.releaseChannel);
 
   // Build the headers in the EXACT wire order, assigning keys sequentially
   // so the resulting object's key iteration order matches the wire order
@@ -193,8 +196,8 @@ export function buildIdentityHeaders(id: ProxyIdentity): IdentityHeaders {
   // required fields are all populated by the time we return.
   const headers: Partial<IdentityHeaders> = {
     "User-Agent": `ZCode/${appVersion}`,
-    "HTTP-Referer": id.refererOrigin || "https://zcode.z.ai",
-    "X-Title": id.sourceTitle || "Z Code@electron",
+    "HTTP-Referer": refererOrigin,
+    "X-Title": sourceTitle,
     "X-ZCode-App-Version": appVersion,
     "X-Platform": `${env.platform}-${env.arch}`,
   };
@@ -202,8 +205,8 @@ export function buildIdentityHeaders(id: ProxyIdentity): IdentityHeaders {
   // X-Release-Channel: emit ONLY when the proxy operator set a non-empty
   // channel. Mirrors the real client's `r ? {...} : {}` conditional.
   // Wire position: between X-Platform and X-Client-Language.
-  if (id.releaseChannel && id.releaseChannel.trim().length > 0) {
-    headers["X-Release-Channel"] = id.releaseChannel;
+  if (releaseChannel) {
+    headers["X-Release-Channel"] = releaseChannel;
   }
 
   // Continue the wire order with X-Client-Language → X-Client-Timezone →
@@ -222,10 +225,15 @@ export function buildIdentityHeaders(id: ProxyIdentity): IdentityHeaders {
   // X-Device-Mid: optional telemetry marker from ZCode's local state.
   // The desktop bundle appends it after X-Os-Version when readExistingDeviceMid()
   // returns a printable value.
-  const deviceMid = id.deviceMid?.trim();
-  if (deviceMid && ASCII_PRINTABLE.test(deviceMid)) {
+  const deviceMid = normalizePrintable(id.deviceMid);
+  if (deviceMid) {
     headers["X-Device-Mid"] = deviceMid;
   }
 
   return headers as IdentityHeaders;
+}
+
+function normalizePrintable(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed && ASCII_PRINTABLE.test(trimmed) ? trimmed : undefined;
 }

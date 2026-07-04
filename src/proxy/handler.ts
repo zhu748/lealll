@@ -513,6 +513,15 @@ export async function proxyRequest(
     };
   };
 
+  const refreshStartPlanPreflightHeaders = async (): Promise<Record<string, string> | undefined> => {
+    if (currentPlan === "start-plan" && startPlanCaptchaPreflightEnabled()) {
+      captchaRetryHeaders = await refreshCaptchaHeaders();
+      return captchaRetryHeaders;
+    }
+    captchaRetryHeaders = undefined;
+    return undefined;
+  };
+
   type CaptchaChallengeResult = { response: Response; error?: Error; retried: boolean };
 
   const cancelResponseBody = async (resp: Response): Promise<void> => {
@@ -788,7 +797,7 @@ export async function proxyRequest(
     if (currentPlan === "start-plan" && startPlanCaptchaPreflightEnabled()) {
       proxyLog(`${reqId} start-plan captcha preflight enabled: refreshing runtime headers before model request...`);
       try {
-        captchaRetryHeaders = await refreshCaptchaHeaders();
+        await refreshStartPlanPreflightHeaders();
       } catch (err) {
         printRow(reqId, format, meta, 503, started, Date.now(), 0, 0, 0, false, 0, currentCredentialStatsKey(), totalCaptchaMs);
         return errorResponse(503, "captcha_failed", (err as Error).message);
@@ -905,11 +914,12 @@ export async function proxyRequest(
       // Cancel the old response body before refetching.
       await cancelResponseBody(upstreamResp);
 
-      // Refetch with the new proxy. Keep the same official header shape — no
-      // captcha headers are added on start-plan.
+      // Refetch with the new proxy. When ZCode-aligned preflight is enabled,
+      // refresh one-shot captcha runtime headers for this new model attempt.
       try {
         hadRetryAttempt = true;
-        upstreamResp = await fetchUpstreamDetected();
+        const rotationCaptchaHeaders = await refreshStartPlanPreflightHeaders();
+        upstreamResp = await fetchUpstreamDetected(rotationCaptchaHeaders);
         headersAt = Date.now();
       } catch (err) {
         proxyLog(`${reqId} WAF rotation ${rot + 1} fetch failed: ${(err as Error).message}`);
@@ -977,7 +987,8 @@ export async function proxyRequest(
   // captcha headers by default, matching the normal ZCode message path. If
   // upstream returns the explicit Aliyun 3007 JSON challenge, we solve once and
   // retry with a fresh one-shot runtime header. Operators can opt into the old
-  // pre-send refresh behavior with ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT=1.
+  // pre-send refresh behavior by default. Operators can set
+  // ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT=0 to diagnose without preflight.
 
   // SSE error detection for the initial response is already handled inside
   // fetchUpstreamDetected() above. The standalone detection block that used
@@ -1262,15 +1273,12 @@ export async function proxyRequest(
         // fetchUpstreamDetected also runs SSE error detection so 200 streams
         // with hidden errors get caught on every attempt.
         //
-        // start-plan captcha alignment: by default retries are sent without
-        // captcha headers and only solve on an explicit 3007 challenge. If the
-        // operator enables preflight, refresh before every retry because Aliyun
-        // verify params are one-shot and cannot be reused.
-        if (currentPlan === "start-plan" && startPlanCaptchaPreflightEnabled()) {
-          captchaRetryHeaders = await refreshCaptchaHeaders();
-        } else {
-          captchaRetryHeaders = undefined;
-        }
+        // start-plan captcha alignment: the ZCode renderer refreshes provider
+        // runtime captcha headers before zcode-plan sends. Refresh before every
+        // retry because Aliyun verify params are one-shot and cannot be reused.
+        // Operators can explicitly disable this with
+        // ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT=0 to fall back to 3007-only solving.
+        await refreshStartPlanPreflightHeaders();
         upstreamResp = await fetchUpstreamDetected(captchaRetryHeaders);
         const retryCaptchaResult = await retryStartPlanCaptchaChallenge(upstreamResp, ` on retry ${attempt}`);
         upstreamResp = retryCaptchaResult.response;
@@ -1328,7 +1336,8 @@ export async function proxyRequest(
                 await cancelResponseBody(upstreamResp);
                 try {
                   hadRetryAttempt = true;
-                  upstreamResp = await fetchUpstreamDetected();
+                  const rotationCaptchaHeaders = await refreshStartPlanPreflightHeaders();
+                  upstreamResp = await fetchUpstreamDetected(rotationCaptchaHeaders);
                   headersAt = Date.now();
                 } catch (err) {
                   proxyLog(`${reqId} retry WAF rotation ${rot + 1} fetch failed: ${(err as Error).message}`);

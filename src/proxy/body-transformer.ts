@@ -705,8 +705,12 @@ function alignZCodeRequestFormat(body: Record<string, unknown>): Record<string, 
   // client (e.g. Claude Code) doesn't send them. Fill in the defaults to match.
   // tool_choice: { type: "auto" } — only when tools are present (real ZCode
   // only sends tool_choice when tools array is non-empty).
-  if (Array.isArray(body.tools) && body.tools.length > 0 && body.tool_choice === undefined) {
+  const hasTools = Array.isArray(body.tools) && body.tools.length > 0;
+  if (hasTools && body.tool_choice === undefined) {
     body.tool_choice = { type: "auto" };
+    changed = true;
+  } else if (!hasTools && body.tool_choice !== undefined) {
+    delete body.tool_choice;
     changed = true;
   }
   // === Step 3b: Force stream: true ===

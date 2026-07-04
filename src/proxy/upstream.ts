@@ -74,7 +74,8 @@
 * to inject headers upstream. It is reserved for proxy-internal use — never
 * for passthrough of client headers. The start-plan captcha challenge path uses
 * this hook only after upstream returns an explicit Aliyun 3007 response, unless
-* the operator opts into preflight with ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT=1.
+* the operator has not explicitly disabled preflight with
+* ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT=0.
  *
  * CONFIRMED NOT SENT (real client wire capture, 2026-06-28):
  *   - anthropic-beta            ✅ fixed ZCode value only; downstream values are never passed through
@@ -83,7 +84,7 @@
  *   - x-zcode-trace-id          ✅ start-plan only, dynamic attribution
   *   - x-aliyun-captcha-*        ❌ from downstream clients; ✅ only after
   *                                  an explicit start-plan 3007 challenge, or
-  *                                  when preflight is explicitly enabled
+  *                                  during ZCode-aligned preflight
  *   - X-ZCode-Agent             ✅ start-plan only (official GLM agent provider)
  *   - accept                    ❌ (not on /v1/messages; was a v0.2.2 bug)
  *   - any x-stainless-*         ❌ (Anthropic SDK fingerprint)
@@ -342,7 +343,8 @@ export function buildUpstreamHeaders(
       const lower = k.toLowerCase();
       // Aliyun captcha headers are never passed through from the downstream
       // client. For start-plan only, handler.ts may inject freshly solved
-      // runtime headers after a 3007 challenge, or during explicit preflight.
+      // runtime headers during ZCode-aligned preflight, or after a 3007
+      // challenge when preflight is explicitly disabled.
       // The verify param is one-shot, so callers must pass a fresh value for
       // every attempt that includes these headers.
       if (ALIYUN_CAPTCHA_HEADERS.has(lower) && plan !== "start-plan") continue;

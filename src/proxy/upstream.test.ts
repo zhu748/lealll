@@ -24,11 +24,11 @@ const IDENTITY: ProxyIdentity = {
 };
 
 describe("start-plan captcha preflight switch", () => {
-  it("defaults to on-demand captcha solving and only preflights when explicitly enabled", () => {
+  it("defaults to ZCode-aligned captcha preflight and can be explicitly disabled", () => {
     const original = process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
     try {
       delete process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
-      expect(startPlanCaptchaPreflightEnabled()).toBe(false);
+      expect(startPlanCaptchaPreflightEnabled()).toBe(true);
 
       process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = "0";
       expect(startPlanCaptchaPreflightEnabled()).toBe(false);
@@ -37,6 +37,8 @@ describe("start-plan captcha preflight switch", () => {
       process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = "off";
       expect(startPlanCaptchaPreflightEnabled()).toBe(false);
       process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = "never";
+      expect(startPlanCaptchaPreflightEnabled()).toBe(false);
+      process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = "no";
       expect(startPlanCaptchaPreflightEnabled()).toBe(false);
 
       process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = "1";
@@ -1621,14 +1623,11 @@ describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
       ...testConfig,
       plan: "start-plan",
     };
-    const originalFetch = globalThis.fetch;
     const originalPreflight = process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
     delete process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
-    const globalFetchMock = mock(async (req: Request | string): Promise<Response> => {
-      const url = typeof req === "string" ? req : req.url;
-      throw new Error(`unexpected global fetch in test: ${url}`);
+    const captchaTokenProvider = mock(async () => {
+      return { verifyParam: "fresh-preflight-param", region: "cn-shanghai", solveMs: 11 };
     });
-    globalThis.fetch = globalFetchMock as unknown as typeof fetch;
 
     try {
       const fetchMock = mock(async (req: Request): Promise<Response> => {
@@ -1637,8 +1636,8 @@ describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
         expect(req.headers.get("x-zcode-trace-id")).toMatch(/^[0-9a-f-]{36}$/i);
         expect(req.headers.get("x-query-id")).toMatch(/^[0-9a-f-]{36}$/i);
         expect(req.headers.get("x-session-id")).toMatch(/^[0-9a-f-]{36}$/i);
-        expect(req.headers.get("x-aliyun-captcha-verify-param")).toBeNull();
-        expect(req.headers.get("x-aliyun-captcha-verify-region")).toBeNull();
+        expect(req.headers.get("x-aliyun-captcha-verify-param")).toBe("fresh-preflight-param");
+        expect(req.headers.get("x-aliyun-captcha-verify-region")).toBe("cn-shanghai");
         const reqBody = JSON.parse(await req.text());
         expect(reqBody.messages).toBeDefined();
         // vceshi0.1.7+: injectZCodeThinkingFormat forces max_tokens=64000
@@ -1666,19 +1665,98 @@ describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
         body: '{"model":"glm-4.6","messages":[{"role":"user","content":"hi"}]}',
       });
 
-      const resp = await proxyRequest(clientReq, "openai", { config: startPlanConfig, auth, fetchImpl: fetchMock as any });
+      const resp = await proxyRequest(clientReq, "openai", {
+        config: startPlanConfig,
+        auth,
+        fetchImpl: fetchMock as any,
+        captchaTokenProvider,
+      });
       expect(fetchMock).toHaveBeenCalledTimes(1);
-      // Default on-demand mode sends the first request without captcha headers.
-      expect(globalFetchMock).toHaveBeenCalledTimes(0);
+      expect(captchaTokenProvider).toHaveBeenCalledTimes(1);
       expect(resp.status).toBe(200);
       expect(resp.headers.get("content-type")).toBe("application/json");
       const body = await resp.json();
       expect(body.object).toBe("chat.completion");
       expect(body.choices[0].message.content).toBe("start-plan reply");
     } finally {
-      globalThis.fetch = originalFetch;
       if (originalPreflight === undefined) delete process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
       else process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = originalPreflight;
+    }
+  });
+
+  it("refreshes start-plan captcha preflight headers again after WAF proxy rotation", async () => {
+    const startPlanConfig: ProxyConfig = {
+      ...testConfig,
+      plan: "start-plan",
+    };
+    const originalPreflight = process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
+    const originalStoreDir = process.env.ZCODE_PROXY_STORE_DIR;
+    const tempStoreDir = mkdtempSync(join(tmpdir(), "zcode-proxy-upstream-pool-"));
+    const wafHtml = '<html><body><img src="https://errors.aliyun.com/error.png">blocked</body></html>';
+    const successBody = JSON.stringify({
+      id: "msg_rotated_preflight",
+      type: "message",
+      role: "assistant",
+      content: [{ type: "text", text: "ok after preflight rotation" }],
+      model: "glm-5.2",
+      stop_reason: "end_turn",
+      stop_sequence: null,
+      usage: { input_tokens: 5, output_tokens: 4 },
+    });
+    const seenProxies: Array<string | undefined> = [];
+    const seenCaptchaHeaders: Array<string | null> = [];
+    let captchaSeq = 0;
+
+    try {
+      process.env.ZCODE_PROXY_STORE_DIR = tempStoreDir;
+      delete process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
+      resetProxyPoolForTesting();
+      await importFromText("1.1.1.1:8080\n2.2.2.2:8080", true);
+      await updatePoolConfig({ enabled: true, maxRotations: 2, rotateOnGatewayBlock: true });
+
+      const fetchMock = mock(async (req: Request, init?: RequestInit & { proxy?: string }): Promise<Response> => {
+        seenProxies.push(init?.proxy);
+        seenCaptchaHeaders.push(req.headers.get("x-aliyun-captcha-verify-param"));
+        if (seenProxies.length === 1) {
+          return new Response(wafHtml, {
+            status: 405,
+            headers: { "content-type": "text/html", server: "Tengine" },
+          });
+        }
+        return new Response(successBody, { status: 200, headers: { "content-type": "application/json" } });
+      });
+      const captchaTokenProvider = mock(async () => {
+        captchaSeq++;
+        return { verifyParam: `fresh-preflight-${captchaSeq}`, region: "cn-shanghai", solveMs: 7 };
+      });
+
+      const auth = new AuthManager({ mode: "oauth", provider: "zai" });
+      auth.setOAuthCredential({ apiKey: "dummy", provider: "zai", plan: "start-plan", jwt: "jwt-mock" });
+      const clientReq = new Request("http://localhost:8080/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: '{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}',
+      });
+
+      const resp = await proxyRequest(clientReq, "openai", {
+        config: startPlanConfig,
+        auth,
+        fetchImpl: fetchMock as any,
+        captchaTokenProvider,
+      });
+
+      expect(resp.status).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(captchaTokenProvider).toHaveBeenCalledTimes(2);
+      expect(seenProxies).toEqual(["http://1.1.1.1:8080", "http://2.2.2.2:8080"]);
+      expect(seenCaptchaHeaders).toEqual(["fresh-preflight-1", "fresh-preflight-2"]);
+    } finally {
+      if (originalPreflight === undefined) delete process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
+      else process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = originalPreflight;
+      if (originalStoreDir === undefined) delete process.env.ZCODE_PROXY_STORE_DIR;
+      else process.env.ZCODE_PROXY_STORE_DIR = originalStoreDir;
+      resetProxyPoolForTesting();
+      rmSync(tempStoreDir, { recursive: true, force: true });
     }
   });
 

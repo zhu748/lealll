@@ -298,6 +298,18 @@ describe("translateRequestResponsesToAnthropic", () => {
     expect(result.tool_choice).toBeUndefined();
   });
 
+  it("drops standalone tool_choice when all tools are filtered out", () => {
+    const req: OpenAIResponseRequest = {
+      model: "glm-4.6",
+      input: "Hi",
+      tools: [{ type: "web_search", external_web_access: false } as any],
+      tool_choice: "auto",
+    };
+    const result = translateRequestResponsesToAnthropic(req);
+    expect(result.tools).toBeUndefined();
+    expect(result.tool_choice).toBeUndefined();
+  });
+
   it("forwards stream / temperature / top_p / stop fields", () => {
     const req: OpenAIResponseRequest = {
       model: "glm-4.6",
