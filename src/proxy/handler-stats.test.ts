@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { _testing } from "./handler.js";
 import { SSE as SSE_CONST } from "../utils/constants.js";
 
-const { createStatsTransform, observeStatsStream, readResponseTextLimited, readResponseTextPreview, printRow, wrapResponseBodyWithUpstreamTimeout } = _testing;
+const { createStatsTransform, observeStatsStream, readResponseTextLimited, readResponseTextPreview, printRow, wrapResponseBodyWithUpstreamTimeout, shouldEmitProxyLog } = _testing;
 
 async function collect(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
   const reader = stream.getReader();
@@ -18,6 +18,29 @@ async function collect(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> 
   for (const c of chunks) { out.set(c, off); off += c.length; }
   return out;
 }
+
+test("proxy runtime logs are quiet by default under bun test but can be re-enabled", () => {
+  const old = process.env.ZCODE_PROXY_TEST_LOGS;
+  const oldQuiet = process.env.ZCODE_PROXY_TEST_QUIET;
+  try {
+    delete process.env.ZCODE_PROXY_TEST_LOGS;
+    process.env.ZCODE_PROXY_TEST_QUIET = "1";
+    expect(shouldEmitProxyLog()).toBe(false);
+    process.env.ZCODE_PROXY_TEST_LOGS = "1";
+    expect(shouldEmitProxyLog()).toBe(true);
+  } finally {
+    if (old === undefined) {
+      delete process.env.ZCODE_PROXY_TEST_LOGS;
+    } else {
+      process.env.ZCODE_PROXY_TEST_LOGS = old;
+    }
+    if (oldQuiet === undefined) {
+      delete process.env.ZCODE_PROXY_TEST_QUIET;
+    } else {
+      process.env.ZCODE_PROXY_TEST_QUIET = oldQuiet;
+    }
+  }
+});
 
 test("stats transform disables parsing for an oversized unfinished SSE line but keeps passthrough", async () => {
   const input = "data: " + "x".repeat(SSE_CONST.MAX_STATS_BUFFERED_EVENT_BYTES + 1);

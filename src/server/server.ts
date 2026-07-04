@@ -8,7 +8,7 @@ import type { AuthManager } from "../auth/manager.js";
 import { handleChatCompletions, handleListModels } from "./routes-openai.js";
 import { handleMessages } from "./routes-anthropic.js";
 import { handleResponses } from "./routes-responses.js";
-import { errorResponse } from "../proxy/handler.js";
+import { errorResponse } from "../proxy/translated-response.js";
 import { handleAdminRoute, type AdminOptions } from "../admin/api.js";
 import { timingSafeEqual } from "../utils/crypto.js";
 

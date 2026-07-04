@@ -12,7 +12,7 @@ import { ZaiOAuthClient, BigmodelOAuthClient, normalizeCallbackWaitTimeoutMs } f
 import { KeyResolver } from "../auth/resolver.js";
 import { queryQuota } from "../auth/quota.js";
 import { readZCodeImport, detectZCodeProvider, listAvailableZCodeImports } from "../auth/zcode-config.js";
-import { errorResponse } from "../proxy/handler.js";
+import { errorResponse } from "../proxy/translated-response.js";
 import { getChromeCaptchaHelperStatus, warmupChromeCaptchaHelper, shutdownChromeCaptchaHelper } from "../proxy/captcha.js";
 import { wrapFetchWithSocksBridge, makeProxiedFetcher } from "../proxy/proxied-fetch.js";
 import { timingSafeEqual } from "../utils/crypto.js";
@@ -38,6 +38,21 @@ import {
 // would resolve to the exe's virtual root (e.g. B:\~BUN\root\) and fail
 // with ENOENT because dashboard.html is not shipped next to the exe.
 import dashboardHtml from "./dashboard.html.txt" with { type: "text" };
+import { VERSION } from "../version.js";
+import {
+  MAX_ACCOUNT_IMPORT_BODY_BYTES,
+  MAX_PROXY_IMPORT_TEXT_BODY_BYTES,
+  readJsonBody,
+  setAdminBodyIdleTimeoutForTesting,
+} from "./request-body.js";
+import {
+  clearVerifyFailure,
+  isVerifyLocked,
+  jsonResp,
+  recordVerifyFailure,
+  resolveIpForRateLimit,
+  withSecurityHeaders,
+} from "./security.js";
 
 export interface AdminOptions {
   config: ProxyConfig;
@@ -823,9 +838,6 @@ const persistConfig = (config: ProxyConfig, configPath: string): Promise<void> =
  *
  * Returns null when the caller should continue (success), or a Response
  * when the caller should return immediately.
- *
- * NOTE: jsonResp is defined later in this file but is hoisted (function
- * declaration), so we can reference it here.
  */
 function handleMutationResult(
   result: boolean | null,
@@ -1246,7 +1258,7 @@ export function appendLog(level: string, message: string) {
 
 /** Read the bundled dashboard HTML (inlined at build time). */
 export function getDashboardHTML(): string {
-  return dashboardHtml;
+  return dashboardHtml.replace("__ZCODE_PROXY_VERSION__", VERSION);
 }
 
 /** Handle admin API routes. Returns null if the path doesn't match. */
@@ -1376,7 +1388,7 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
     if (timingSafeEqual(token, opts.config.auth.proxyApiKey)) {
       // Successful verification clears the failure counter for this IP,
       // so a user who mistypes once doesn't carry a strike forever.
-      verifyFailures.delete(clientIp);
+      clearVerifyFailure(clientIp);
       return jsonResp({ valid: true });
     }
     recordVerifyFailure(clientIp);
@@ -3615,230 +3627,8 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
  *   - accounts JSON: 2 MiB file + JSON wrapper/escaping headroom
  *   - proxy text: 5 MiB text can grow after JSON string escaping newlines
  */
-const MAX_ADMIN_BODY_BYTES = 1 * 1024 * 1024;
-const MAX_ACCOUNT_IMPORT_BODY_BYTES = 3 * 1024 * 1024;
-const MAX_PROXY_IMPORT_TEXT_BODY_BYTES = 12 * 1024 * 1024;
-const DEFAULT_ADMIN_BODY_IDLE_TIMEOUT_MS = 30_000;
-
-let adminBodyIdleTimeoutMsForTesting: number | undefined;
-
 export function _setAdminBodyIdleTimeoutForTesting(timeoutMs?: number): void {
-  adminBodyIdleTimeoutMsForTesting = typeof timeoutMs === "number" && Number.isFinite(timeoutMs)
-    ? Math.max(1, Math.floor(timeoutMs))
-    : undefined;
-}
-
-function parseDeclaredContentLength(raw: string | null): number | undefined {
-  if (!raw) return undefined;
-  const trimmed = raw.trim();
-  if (!/^\d+$/.test(trimmed)) return undefined;
-  const n = Number(trimmed);
-  return Number.isSafeInteger(n) ? n : undefined;
-}
-
-/**
- * Read and parse a JSON request body with a size limit. Returns
- * `{ ok: false, error }` when the body is too large or not valid JSON,
- * so callers can early-return without exception handling boilerplate.
- */
-async function readJsonBody<T = unknown>(
-  req: Request,
-  options: { maxBytes?: number; idleTimeoutMs?: number } = {},
-): Promise<{ ok: true; body: T } | { ok: false; error: Response }> {
-  const maxBytes = Math.max(1, Math.floor(options.maxBytes ?? MAX_ADMIN_BODY_BYTES));
-  const idleTimeoutMs = Math.max(1, Math.floor(
-    options.idleTimeoutMs ?? adminBodyIdleTimeoutMsForTesting ?? DEFAULT_ADMIN_BODY_IDLE_TIMEOUT_MS,
-  ));
-  // Content-Length is set by virtually all well-behaved clients. If it's
-  // missing we still cap the actual read via the streaming check below.
-  const declaredLength = parseDeclaredContentLength(req.headers.get("content-length"));
-  if (declaredLength !== undefined && declaredLength > maxBytes) {
-    void req.body?.cancel().catch(() => {});
-    return { ok: false, error: errorResponse(413, "request_too_large", `Request body exceeds ${maxBytes} byte limit`) };
-  }
-  // Read the body as text with an explicit cap — defends against clients
-  // that omit Content-Length (chunked transfer encoding) or lie about it.
-  const reader = req.body?.getReader();
-  if (!reader) {
-    // No body — treat as empty object (some GETs reach here erroneously).
-    try { return { ok: true, body: {} as T }; } catch { return { ok: false, error: errorResponse(400, "invalid_request", "Empty body") }; }
-  }
-  let received = 0;
-  const chunks: Uint8Array[] = [];
-  try {
-    for (;;) {
-      const { done, value } = await readRequestBodyChunk(reader, idleTimeoutMs);
-      if (done) break;
-      received += value.byteLength;
-      if (received > maxBytes) {
-        try { await reader.cancel(); } catch { /* ignore */ }
-        return { ok: false, error: errorResponse(413, "request_too_large", `Request body exceeds ${maxBytes} byte limit`) };
-      }
-      chunks.push(value);
-    }
-  } catch (e) {
-    if (e instanceof AdminBodyTimeoutError) {
-      return { ok: false, error: errorResponse(408, "request_timeout", `Request body read timed out after ${idleTimeoutMs}ms`) };
-    }
-    return { ok: false, error: errorResponse(400, "invalid_request", `Failed to read body: ${(e as Error).message}`) };
-  } finally {
-    try { reader.releaseLock(); } catch { /* already released/cancelled */ }
-  }
-  const text = new TextDecoder().decode(Buffer.concat(chunks));
-  if (!text) return { ok: true, body: {} as T };
-  try {
-    return { ok: true, body: JSON.parse(text) as T };
-  } catch (e) {
-    return { ok: false, error: errorResponse(400, "invalid_request", `Invalid JSON: ${(e as Error).message}`) };
-  }
-}
-
-class AdminBodyTimeoutError extends Error {
-  constructor(timeoutMs: number) {
-    super(`request body read timed out after ${timeoutMs}ms`);
-    this.name = "AdminBodyTimeoutError";
-  }
-}
-
-async function readRequestBodyChunk(
-  reader: ReadableStreamDefaultReader<Uint8Array>,
-  timeoutMs: number,
-): Promise<Awaited<ReturnType<ReadableStreamDefaultReader<Uint8Array>["read"]>>> {
-  let timer: ReturnType<typeof setTimeout> | null = null;
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new AdminBodyTimeoutError(timeoutMs)), timeoutMs);
-    timer.unref?.();
-  });
-  try {
-    return await Promise.race([reader.read(), timeout]);
-  } catch (err) {
-    void reader.cancel(err).catch(() => {});
-    throw err;
-  } finally {
-    if (timer) {
-      clearTimeout(timer);
-      timer = null;
-    }
-  }
-}
-
-/** Security headers added to all admin responses (dashboard + API). */
-function withSecurityHeaders(resp: Response): Response {
-  const headers = new Headers(resp.headers);
-  // CSP: only allow same-origin scripts/styles. External connections are
-  // limited to the known upstream OAuth / quota endpoints. Inline scripts
-  // are NOT allowed (dashboard uses inline event handlers today, so we use
-  // 'unsafe-inline' for script-src as a temporary measure — TODO: replace
-  // inline handlers with addEventListener to drop 'unsafe-inline').
-  if (!headers.has("content-security-policy")) {
-    headers.set("content-security-policy",
-      "default-src 'self'; " +
-      "script-src 'self' 'unsafe-inline'; " +
-      "style-src 'self' 'unsafe-inline'; " +
-      "connect-src 'self' https://zcode.z.ai https://api.z.ai https://open.bigmodel.cn; " +
-      "img-src 'self' data:; " +
-      "font-src 'self' data:; " +
-      "frame-ancestors 'none'; " +
-      "base-uri 'self'; " +
-      "form-action 'self'");
-  }
-  if (!headers.has("x-frame-options")) headers.set("x-frame-options", "DENY");
-  if (!headers.has("x-content-type-options")) headers.set("x-content-type-options", "nosniff");
-  if (!headers.has("referrer-policy")) headers.set("referrer-policy", "same-origin");
-  // Dashboard returns secrets on some endpoints — never cache.
-  if (!headers.has("cache-control")) headers.set("cache-control", "no-store");
-  return new Response(resp.body, { status: resp.status, statusText: resp.statusText, headers });
-}
-
-/**
- * In-memory rate limiter for the /admin/api/verify endpoint. Tracks failed
- * attempts per client IP; after MAX_FAILURES within the WINDOW, all further
- * attempts from that IP are rejected with 429 until the lockout expires.
- *
- * This is a soft limit — it lives in process memory and resets on restart.
- * Its purpose is to make brute-forcing proxyApiKey impractical from a
- * single IP, not to defend against a distributed attacker (that requires
- * proxyApiKey to be strong, which is the operator's responsibility).
- */
-const VERIFY_RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000; // 15 min
-const VERIFY_RATE_LIMIT_MAX_FAILURES = 10;
-const VERIFY_RATE_LIMIT_MAX_ENTRIES = 4096;
-const VERIFY_RATE_LIMIT_GC_INTERVAL_MS = 60_000;
-const verifyFailures = new Map<string, { count: number; firstAt: number }>();
-let verifyFailuresLastGcAt = 0;
-
-function gcVerifyFailures(now: number, force = false): void {
-  if (!force && verifyFailures.size <= VERIFY_RATE_LIMIT_MAX_ENTRIES && now - verifyFailuresLastGcAt < VERIFY_RATE_LIMIT_GC_INTERVAL_MS) {
-    return;
-  }
-  verifyFailuresLastGcAt = now;
-  for (const [k, v] of verifyFailures) {
-    if (now - v.firstAt > VERIFY_RATE_LIMIT_WINDOW_MS) verifyFailures.delete(k);
-  }
-  if (verifyFailures.size <= VERIFY_RATE_LIMIT_MAX_ENTRIES) return;
-  const overflow = verifyFailures.size - VERIFY_RATE_LIMIT_MAX_ENTRIES;
-  let dropped = 0;
-  for (const k of verifyFailures.keys()) {
-    verifyFailures.delete(k);
-    dropped++;
-    if (dropped >= overflow) break;
-  }
-}
-
-/** Record a failed /verify attempt for `ip`. Evicts stale entries to bound memory. */
-function recordVerifyFailure(ip: string): void {
-  const now = Date.now();
-  gcVerifyFailures(now, verifyFailures.size >= VERIFY_RATE_LIMIT_MAX_ENTRIES);
-  const existing = verifyFailures.get(ip);
-  if (existing) {
-    existing.count++;
-    // If the first attempt is older than the window, reset the counter.
-    if (now - existing.firstAt > VERIFY_RATE_LIMIT_WINDOW_MS) {
-      existing.count = 1;
-      existing.firstAt = now;
-    }
-  } else {
-    verifyFailures.set(ip, { count: 1, firstAt: now });
-  }
-  if (verifyFailures.size > VERIFY_RATE_LIMIT_MAX_ENTRIES) {
-    gcVerifyFailures(now, true);
-  }
-}
-
-/** Returns true if `ip` is currently rate-locked-out. */
-function isVerifyLocked(ip: string): boolean {
-  const v = verifyFailures.get(ip);
-  if (!v) return false;
-  if (Date.now() - v.firstAt > VERIFY_RATE_LIMIT_WINDOW_MS) {
-    verifyFailures.delete(ip);
-    return false;
-  }
-  return v.count >= VERIFY_RATE_LIMIT_MAX_FAILURES;
-}
-
-/** Resolve a client IP for rate-limiting purposes. Prefers the socket-based resolver. */
-function resolveIpForRateLimit(req: Request, opts: AdminOptions): string {
-  if (opts.resolveClientIp) {
-    try {
-      const ip = opts.resolveClientIp(req);
-      if (ip) return ip;
-    } catch { /* ignore */ }
-  }
-  // Fall back to XFF ONLY if trustProxy (consistent with the loopback gate).
-  if (opts.config.server.trustProxy) {
-    const xRealIp = req.headers.get("x-real-ip") ?? "";
-    if (xRealIp) return xRealIp;
-    const xff = req.headers.get("x-forwarded-for") ?? "";
-    if (xff) return xff.split(",")[0].trim();
-  }
-  return "unknown";
-}
-
-function jsonResp(data: unknown, status = 200): Response {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { "content-type": "application/json" },
-  });
+  setAdminBodyIdleTimeoutForTesting(timeoutMs);
 }
 
 function isConfigObject(value: unknown): value is Record<string, unknown> {

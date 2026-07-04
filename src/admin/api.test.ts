@@ -13,6 +13,7 @@ import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import packageJson from "../../package.json" with { type: "json" };
 import {
   recordStat,
   recordDebugDump,
@@ -2155,6 +2156,14 @@ describe("/admin/api/verify — security warning", () => {
 });
 
 describe("/admin API — security headers", () => {
+  it("dashboard HTML renders the package.json version", async () => {
+    const opts = makeAdminOpts();
+    const resp = await callAdmin(new Request("http://localhost/admin"), opts);
+    const html = await resp!.text();
+    expect(html).toContain(`<span>v${packageJson.version}</span>`);
+    expect(html).not.toContain("__ZCODE_PROXY_VERSION__");
+  });
+
   it("dashboard HTML response includes CSP / X-Frame-Options / nosniff", async () => {
     const opts = makeAdminOpts();
     const resp = await callAdmin(new Request("http://localhost/admin"), opts);

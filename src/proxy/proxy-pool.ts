@@ -49,6 +49,7 @@ import { homedir } from "node:os";
 import { atomicWriteFile, createMutex } from "../utils/fs.js";
 import { validateProxyUrl } from "../auth/store.js";
 import { PROXY_POOL as PROXY_POOL_CONST } from "../utils/constants.js";
+import { runtimeLog, runtimeWarn } from "../utils/log.js";
 import { wrapFetchWithSocksBridge } from "./proxied-fetch.js";
 
 // --------------------------------------------------------------------
@@ -811,7 +812,7 @@ async function writePool(pool: PoolFile): Promise<void> {
     cachedSize = -1;
     lastMtimeCheckAt = 0;
     const message = (e as Error).message;
-    console.warn(`[proxy-pool] failed to persist pool file: ${message}`);
+    runtimeWarn(`[proxy-pool] failed to persist pool file: ${message}`);
     throw new Error(`Could not persist proxy pool to ${POOL_FILE}: ${message}`);
   }
 }
@@ -1582,7 +1583,7 @@ export function scheduleAutoRefresh(config?: ProxyPoolConfig): void {
     autoRefreshInFlight = true;
     refreshFromSources()
       .catch(e => {
-        console.warn(`[proxy-pool] auto-refresh failed: ${(e as Error).message}`);
+        runtimeWarn(`[proxy-pool] auto-refresh failed: ${(e as Error).message}`);
       })
       .finally(() => {
         autoRefreshInFlight = false;
@@ -1604,9 +1605,9 @@ export async function initPool(fetchImpl: typeof fetch = fetch): Promise<void> {
   if (pool.config.enabled
     && pool.proxies.length === 0
     && pool.config.sourceUrls.length > 0) {
-    console.log("[proxy-pool] pool empty + URLs configured — firing initial refresh");
+    runtimeLog("[proxy-pool] pool empty + URLs configured — firing initial refresh");
     refreshFromSources(fetchImpl).catch(e => {
-      console.warn(`[proxy-pool] initial refresh failed: ${(e as Error).message}`);
+      runtimeWarn(`[proxy-pool] initial refresh failed: ${(e as Error).message}`);
     });
   }
 }

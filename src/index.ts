@@ -14,11 +14,11 @@ import { readZCodeImport } from "./auth/zcode-config.js";
 import { atomicWriteFile } from "./utils/fs.js";
 import type { Credential, PlanId } from "./auth/types.js";
 import type { ProviderId } from "./provider/types.js";
+import { VERSION } from "./version.js";
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
-const VERSION = "0.2.2.1";
 const LOG_LEVEL_ORDER: Record<string, number> = { debug: 0, info: 1, warn: 2, error: 3 };
 
 // ---------------------------------------------------------------------------

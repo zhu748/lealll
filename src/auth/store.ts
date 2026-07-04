@@ -22,6 +22,7 @@ import { join, dirname, basename } from "node:path";
 import { homedir } from "node:os";
 import { randomBytes, createCipheriv, createDecipheriv, createHash } from "node:crypto";
 import { atomicWriteFile, createMutex } from "../utils/fs.js";
+import { runtimeLog, runtimeWarn } from "../utils/log.js";
 import type { Credential } from "./types.js";
 
 /**
@@ -431,13 +432,13 @@ async function decrypt(ciphertext: string): Promise<string> {
 
     plaintext = tryNodeFormat(key);
     if (plaintext !== null) {
-      console.log(`[store] Decryption succeeded with legacy fallback key: ${label}. File will be re-encrypted with the fixed key on next save.`);
+      runtimeLog(`[store] Decryption succeeded with legacy fallback key: ${label}. File will be re-encrypted with the fixed key on next save.`);
       return plaintext;
     }
 
     plaintext = await tryWebCryptoFormat(key);
     if (plaintext !== null) {
-      console.log(`[store] Decryption succeeded with legacy fallback key (WebCrypto format): ${label}. File will be re-encrypted with the fixed key on next save.`);
+      runtimeLog(`[store] Decryption succeeded with legacy fallback key (WebCrypto format): ${label}. File will be re-encrypted with the fixed key on next save.`);
       return plaintext;
     }
     void label; // label retained for future debug logging
@@ -617,7 +618,7 @@ async function readStore(): Promise<StoreV2 | null> {
         return cachedStore; // fresh
       }
       // mtime changed — external write. Drop cache + fall through.
-      console.log("[store] credentials.json fingerprint changed — external write detected, refreshing cache");
+      runtimeLog("[store] credentials.json fingerprint changed — external write detected, refreshing cache");
       cachedStore = undefined;
       cachedStoreMtimeMs = -1;
       cachedStoreCtimeMs = -1;
@@ -628,7 +629,7 @@ async function readStore(): Promise<StoreV2 | null> {
         // File was deleted externally — cache is now stale (if it claimed
         // to exist) or already correct (if it claimed null).
         if (cachedStore !== null) {
-          console.log("[store] credentials.json disappeared — external delete detected, refreshing cache");
+          runtimeLog("[store] credentials.json disappeared — external delete detected, refreshing cache");
           cachedStore = undefined;
           cachedStoreMtimeMs = -1;
           cachedStoreCtimeMs = -1;
@@ -746,7 +747,7 @@ async function readStoreUncached(): Promise<StoreV2 | null> {
   if (raw === null) {
     // All retries failed OR a non-retryable error. Log the actual error code
     // so the user can diagnose (AV lock vs permission vs disk failure).
-    console.warn(`[store] Could not read credentials.json after retries: ${(readErr as Error)?.message ?? readErr}`);
+    runtimeWarn(`[store] Could not read credentials.json after retries: ${(readErr as Error)?.message ?? readErr}`);
     // Do NOT backupCorruptedStore here — we don't have content to back up,
     // and the file may just be transiently locked. Do mark the null reason
     // so callers refuse to overwrite an existing-but-unreadable store.
@@ -762,7 +763,7 @@ async function readStoreUncached(): Promise<StoreV2 | null> {
   // concurrent save doesn't overwrite — but since the file is empty,
   // overwriting is actually fine, so we DON'T set the guard.
   if (raw.trim() === "") {
-    console.warn(`[store] credentials.json is empty (likely from a crashed write). Treating as no store — next save will create a fresh one.`);
+    runtimeWarn(`[store] credentials.json is empty (likely from a crashed write). Treating as no store — next save will create a fresh one.`);
     undecryptableFilePresent = false;
     return markStoreNull("empty");
   }
@@ -775,8 +776,8 @@ async function readStoreUncached(): Promise<StoreV2 | null> {
     // mid-write (old writeFileSync race, before atomicWriteFile) OR corrupted
     // by a disk error. Back up the partial content so the user can inspect
     // what survived, then start fresh.
-    console.warn(`[store] credentials.json is not valid JSON: ${(err as Error).message}`);
-    console.warn(`[store] File size: ${raw.length} bytes, first 100 chars: ${JSON.stringify(raw.slice(0, 100))}`);
+    runtimeWarn(`[store] credentials.json is not valid JSON: ${(err as Error).message}`);
+    runtimeWarn(`[store] File size: ${raw.length} bytes, first 100 chars: ${JSON.stringify(raw.slice(0, 100))}`);
     backupCorruptedStore(raw);
     undecryptableFilePresent = true;
     return markStoreNull("invalid_json");
@@ -806,9 +807,9 @@ async function readStoreUncached(): Promise<StoreV2 | null> {
       // later), set a guard flag, and return null. saveCredential() checks
       // the flag and REFUSES to overwrite — it throws so the caller surfaces
       // the error to the user instead of silently destroying data.
-      console.warn(`[store] Failed to decrypt credentials.json: ${(err as Error).message}`);
-      console.warn(`[store] This usually happens after changing username, reinstalling OS, or copying the file from another machine.`);
-      console.warn(`[store] The unreadable file has been backed up. The store will be treated as empty for reads, but saveCredential() will refuse to overwrite until you explicitly clear it (zcode-proxy auth logout) — this prevents accidental data loss.`);
+      runtimeWarn(`[store] Failed to decrypt credentials.json: ${(err as Error).message}`);
+      runtimeWarn(`[store] This usually happens after changing username, reinstalling OS, or copying the file from another machine.`);
+      runtimeWarn(`[store] The unreadable file has been backed up. The store will be treated as empty for reads, but saveCredential() will refuse to overwrite until you explicitly clear it (zcode-proxy auth logout) — this prevents accidental data loss.`);
       backupCorruptedStore(raw);
       undecryptableFilePresent = true;
       return markStoreNull("decrypt_failed");
@@ -824,14 +825,14 @@ async function readStoreUncached(): Promise<StoreV2 | null> {
       try {
         decryptedStore = JSON.parse(json);
       } catch (err) {
-        console.warn(`[store] Decrypted v2 credential store is not valid JSON: ${(err as Error).message}`);
+        runtimeWarn(`[store] Decrypted v2 credential store is not valid JSON: ${(err as Error).message}`);
         backupCorruptedStore(raw);
         undecryptableFilePresent = true;
         return markStoreNull("invalid_json");
       }
       const store = normalizeStore(decryptedStore);
       if (!store) {
-        console.warn("[store] Decrypted v2 credential store has an unsupported format.");
+        runtimeWarn("[store] Decrypted v2 credential store has an unsupported format.");
         return markStoreNull("unsupported_format");
       }
       undecryptableFilePresent = false;
@@ -848,14 +849,14 @@ async function readStoreUncached(): Promise<StoreV2 | null> {
     try {
       decryptedCredential = JSON.parse(json);
     } catch (err) {
-      console.warn(`[store] Decrypted v1 credential is not valid JSON: ${(err as Error).message}`);
+      runtimeWarn(`[store] Decrypted v1 credential is not valid JSON: ${(err as Error).message}`);
       backupCorruptedStore(raw);
       undecryptableFilePresent = true;
       return markStoreNull("invalid_json");
     }
     const cred = normalizeCredential(decryptedCredential);
     if (!cred) {
-      console.warn("[store] Decrypted v1 credential has an unsupported format.");
+      runtimeWarn("[store] Decrypted v1 credential has an unsupported format.");
       return markStoreNull("unsupported_format");
     }
     const account: StoredAccount = {
@@ -868,11 +869,11 @@ async function readStoreUncached(): Promise<StoreV2 | null> {
     normalizeStoreActiveId(migrated);
     try {
       await writeStore(migrated);
-      console.log(`[store] Migrated v1 credential store to v2 format on disk.`);
+      runtimeLog(`[store] Migrated v1 credential store to v2 format on disk.`);
     } catch (e) {
       // If write fails (e.g. read-only fs), at least return the in-memory copy
       // so the current request can proceed. Next read will re-migrate.
-      console.warn(`[store] Could not persist v1→v2 migration: ${(e as Error).message}`);
+      runtimeWarn(`[store] Could not persist v1→v2 migration: ${(e as Error).message}`);
     }
     clearStoreNullReason();
     return migrated;
@@ -889,7 +890,7 @@ async function readStoreUncached(): Promise<StoreV2 | null> {
       && parsed && (parsed as any).version === 2 && Array.isArray((parsed as any).accounts)) {
     const store = normalizeStore(parsed);
     if (!store) {
-      console.warn("[store] Plaintext credential store has an unsupported format.");
+      runtimeWarn("[store] Plaintext credential store has an unsupported format.");
       return markStoreNull("unsupported_format");
     }
     undecryptableFilePresent = false;
@@ -899,12 +900,12 @@ async function readStoreUncached(): Promise<StoreV2 | null> {
 
   // Plaintext file present but env not set — refuse to load and warn.
   if (parsed && (parsed as any).version === 2 && Array.isArray((parsed as any).accounts)) {
-    console.warn("[store] Refusing to load plaintext credentials.json without ZCODE_PROXY_ALLOW_PLAINTEXT_STORE=1.");
-    console.warn("[store] Either delete the file and re-login, or set the env var (test/debug only).");
+    runtimeWarn("[store] Refusing to load plaintext credentials.json without ZCODE_PROXY_ALLOW_PLAINTEXT_STORE=1.");
+    runtimeWarn("[store] Either delete the file and re-login, or set the env var (test/debug only).");
     return markStoreNull("plaintext_disallowed");
   }
 
-  console.warn("[store] credentials.json has an unsupported format. Refusing to treat it as an empty store.");
+  runtimeWarn("[store] credentials.json has an unsupported format. Refusing to treat it as an empty store.");
   return markStoreNull("unsupported_format");
 }
 
@@ -924,7 +925,7 @@ function backupCorruptedStore(originalContent: string): void {
   const backupPath = `${STORE_FILE}.broken-${Date.now()}`;
   try {
     writeFileSync(backupPath, originalContent, "utf-8");
-    console.warn(`[store] Unreadable store backed up to: ${backupPath}`);
+    runtimeWarn(`[store] Unreadable store backed up to: ${backupPath}`);
   } catch {
     // Can't even write a backup — nothing more we can do; the next writeStore()
     // call will still overwrite the broken file with a fresh one.
@@ -1109,7 +1110,7 @@ async function withExistingStoreLock<T>(
       // File EXISTS but readStore() returned null — this is the dangerous
       // case. Log loudly and return null to signal "transient failure,
       // don't write". This is the key defense against the 凭证丢失 bug.
-      console.warn(
+      runtimeWarn(
         `[store] withExistingStoreLock: readStore() returned null but file ` +
         `exists — likely transiently locked by antivirus or in a broken ` +
         `state. Skipping write to avoid clobbering credentials.json.`,
@@ -1185,7 +1186,7 @@ async function writeStore(store: StoreV2, opts: { allowEmpty?: boolean } = {}): 
   // store" in the logs without having explicitly removed their last account,
   // they know something is wrong and can investigate.
   if (store.accounts.length === 0 && !opts.allowEmpty) {
-    console.warn(
+    runtimeWarn(
       `[store] writeStore: writing EMPTY store to ${STORE_FILE}. ` +
       `If you didn't intend to delete all accounts, this is a bug — ` +
       `check the previous log lines for "withExistingStoreLock" warnings.`,
@@ -1226,8 +1227,8 @@ async function writeStore(store: StoreV2, opts: { allowEmpty?: boolean } = {}): 
     cachedStoreCtimeMs = -1;
     cachedStoreSize = -1;
     const message = (err as Error).message;
-    console.warn(`[store] Could not persist credentials to ${STORE_FILE}: ${message}`);
-    console.warn(`[store] Set ZCODE_PROXY_STORE_DIR to a writable path (e.g. /data/.zcode-proxy on Render with a disk, or /tmp/.zcode-proxy for ephemeral storage).`);
+    runtimeWarn(`[store] Could not persist credentials to ${STORE_FILE}: ${message}`);
+    runtimeWarn(`[store] Set ZCODE_PROXY_STORE_DIR to a writable path (e.g. /data/.zcode-proxy on Render with a disk, or /tmp/.zcode-proxy for ephemeral storage).`);
     throw new Error(
       `Could not persist credentials to ${STORE_FILE}: ${message}. ` +
       `Set ZCODE_PROXY_STORE_DIR to a writable path.`,

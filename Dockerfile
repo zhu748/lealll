@@ -4,27 +4,27 @@
 #
 # Why Bun (not Node)?
 #   - server.ts uses Bun.serve() directly, so we MUST run on Bun.
-#   - oven/bun:1.2-slim is a slim image that supports both Bun runtime
+#   - oven/bun:1.3.14-slim is a slim image that supports both Bun runtime
 #     and standard Linux glibc/musl tools Render's healthcheck needs.
 #     Note: bun.lock uses the new JSON lockfile format (lockfileVersion: 1)
 #     introduced in Bun 1.2, so we MUST use Bun >= 1.2 here.
 #
 # v0.2.0.8 hardening:
 #   - Multi-stage build (deps stage cached separately from source).
-#   - `oven/bun:1.2-slim` base (smaller than `-debian`).
+#   - `oven/bun:1.3.14-slim` base (smaller than `-debian`).
 #   - `tini` as PID 1 for proper signal forwarding / zombie reaping.
 #   - Non-root `zcode` user (uid 1001) — a container escape can no longer
 #     grant root inside the image.
 
 # --- Stage 1: dependencies (cached layer) -----------------------------------
-FROM oven/bun:1.2-slim AS deps
+FROM oven/bun:1.3.14-slim AS deps
 WORKDIR /app
 # Copy only lock manifests so this layer caches across source edits.
 COPY package.json bun.lock ./
 RUN bun install --frozen-lockfile --production
 
 # --- Stage 2: runtime --------------------------------------------------------
-FROM oven/bun:1.2-slim AS runtime
+FROM oven/bun:1.3.14-slim AS runtime
 
 # tini: minimal init for proper SIGTERM forwarding + zombie reaping.
 # Render sends SIGTERM on scale-down; without tini, Bun might exit uncleanly

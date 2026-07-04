@@ -29,6 +29,7 @@ import { join } from "node:path";
 import ALIYUN_SDK_LOCAL from "./AliyunCaptcha.js.txt" with { type: "text" };
 import { createMutex } from "../utils/fs.js";
 import type { AsyncMutex } from "../utils/fs.js";
+import { runtimeLog, runtimeWarn, runtimeError } from "../utils/log.js";
 
 const CAPTCHA_HEADER = "x-aliyun-captcha-verify-param";
 const REGION_HEADER = "x-aliyun-captcha-verify-region";
@@ -435,7 +436,7 @@ async function fetchCaptchaConfig(reqId?: string, opts?: CaptchaRuntimeOptions):
     // and let the upstream decide if it's needed).
     const wrapped = new Error(`captcha_config_fetch_failed: ${(err as Error).message}`);
     (wrapped as Error & { configFetchFailed?: boolean }).configFetchFailed = true;
-    console.warn(`${tag}[captcha] config fetch failed: ${(err as Error).message}`);
+    runtimeWarn(`${tag}[captcha] config fetch failed: ${(err as Error).message}`);
     throw wrapped;
   }
 }
@@ -481,7 +482,7 @@ export async function getCaptchaToken(
 
     const verifyParam = await solveInJsdomWithRetry(cfg, reqId, opts?.solver, resolveCaptchaLanguage(opts?.language));
     const solveMs = Date.now() - solveStart;
-    console.log(`${tag}captcha solved in ${solveMs}ms`);
+    runtimeLog(`${tag}captcha solved in ${solveMs}ms`);
     return { verifyParam, region: cfg.region, solveMs };
   });
 }
@@ -517,7 +518,7 @@ async function solveInJsdomWithRetry(
   let chromeErr: Error | null = null;
   const tryChrome = async (reason: string): Promise<string> => {
     chromeTried = true;
-    console.log(`${tag}[captcha] using Chrome CDP solver (${reason})...`);
+    runtimeLog(`${tag}[captcha] using Chrome CDP solver (${reason})...`);
     return await solveInChromeCdp(cfg, language);
   };
   if (solver === "chrome") {
@@ -533,7 +534,7 @@ async function solveInJsdomWithRetry(
     } catch (err) {
       chromeErr = err as Error;
       if (process.env.ZCODE_CAPTCHA_JSDOM_FALLBACK === "0") throw err;
-      console.warn(`${tag}[captcha] Chrome CDP solve failed; trying JSDOM fallback: ${chromeErr.message}`);
+      runtimeWarn(`${tag}[captcha] Chrome CDP solve failed; trying JSDOM fallback: ${chromeErr.message}`);
     }
   }
   for (let attempt = 1; attempt <= SOLVE_RETRIES; attempt++) {
@@ -570,7 +571,7 @@ async function solveInJsdomWithRetry(
       if (/config unavailable|disabled|empty config/i.test(msg)) {
         throw err;
       }
-      console.error(`${tag}[captcha] solve attempt ${attempt}/${SOLVE_RETRIES} failed: ${msg}`);
+      runtimeError(`${tag}[captcha] solve attempt ${attempt}/${SOLVE_RETRIES} failed: ${msg}`);
       // Brief backoff between retries — gives the SDK a chance to release
       // any lingering timers / event-loop work from the failed attempt.
       if (attempt < SOLVE_RETRIES) {
@@ -580,7 +581,7 @@ async function solveInJsdomWithRetry(
   }
   if (solver !== "jsdom" && !chromeTried && process.env.ZCODE_CAPTCHA_CHROME_FALLBACK !== "0") {
     try {
-      console.log(`${tag}[captcha] jsdom solve failed; trying Chrome CDP fallback...`);
+      runtimeLog(`${tag}[captcha] jsdom solve failed; trying Chrome CDP fallback...`);
       return await solveInChromeCdp(cfg, language);
     } catch (err) {
       throw new Error(
@@ -830,7 +831,7 @@ async function openChromeCdpSession(userData: { dir: string; ephemeral: boolean 
       lastErr = err as Error;
       chromeLastError = lastErr.message;
       if (i < ports.length - 1) {
-        console.warn(`[captcha] Chrome CDP startup failed on port ${ports[i]}, retrying on ${ports[i + 1]}: ${lastErr.message}`);
+        runtimeWarn(`[captcha] Chrome CDP startup failed on port ${ports[i]}, retrying on ${ports[i + 1]}: ${lastErr.message}`);
       }
     }
   }
@@ -1392,7 +1393,7 @@ async function showChromeWindow(session: ChromeCdpSession, reason: string): Prom
       bounds: { left: 120, top: 80, width: 1280, height: 720, windowState: "normal" },
     });
     session.visible = true;
-    console.warn(`[captcha] interactive challenge requested; showing Chrome window (${reason})`);
+    runtimeWarn(`[captcha] interactive challenge requested; showing Chrome window (${reason})`);
   } catch (err) {
     session.lastError = `show_window_failed: ${(err as Error).message}`;
   }
@@ -1461,7 +1462,7 @@ async function closeChromeSession(
       try { rmSync(session.userDataDir, { recursive: true, force: true }); } catch {}
     }
     if (reason !== "idle timeout" && reason !== "per-solve complete") {
-      console.log(`[captcha] Chrome helper stopped: ${reason}`);
+      runtimeLog(`[captcha] Chrome helper stopped: ${reason}`);
     }
   })().finally(() => {
     session.closePromise = null;
@@ -1517,7 +1518,7 @@ async function solveInJsdom(cfg: FetchedCaptchaConfig, language: CaptchaLanguage
     if (/vm\.runInContext|Not implemented:/i.test(msg)) {
       return; // suppress
     }
-    console.error(`[captcha] jsdomError: ${msg}`);
+    runtimeError(`[captcha] jsdomError: ${msg}`);
   });
 
   const sdkSafe = ALIYUN_SDK_LOCAL.replace(/<\/script>/gi, "<\\/script>");

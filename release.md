@@ -59,8 +59,8 @@ sed -i "s|<span>v[^<]*</span>|<span>v$VERSION</span>|" src/admin/dashboard.html.
 提交前本地先跑一遍，避免 push 上去才发现 CI 红：
 
 ```bash
-bun test             # 必须全部通过
-bun x tsc --noEmit   # 必须零错误
+bun run test         # 必须全部通过
+bun run typecheck    # 必须零错误
 ```
 
 > GitHub Actions 也会跑这两步作为发版门禁。本地过了，CI 基本也过。
@@ -386,8 +386,8 @@ workflow 执行步骤（全程无需人工干预）：
 2. **Setup Bun**（固定 1.3.14，与本地一致）
 3. **bun install** 装依赖
 4. **tsc --noEmit** 类型检查（门禁，不过则失败）
-5. **bun test** 测试（门禁，不过则失败）
-6. **校验三处版本号** 等于 tag 版本号（门禁）
+5. **bun run test** 测试（门禁，不过则失败）
+6. **校验 package.json 版本号** 等于 tag 版本号（门禁）
 7. **bun build --compile --target=bun-windows-x64** 交叉编译 Windows exe
 8. **校验 exe 是 PE32+**（防止漏加 --target 编出 ELF）
 9. **复制 config.yaml**、**校验 start.bat ASCII+CRLF**、**chmod start.sh**

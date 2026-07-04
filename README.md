@@ -667,13 +667,19 @@ Response Handling
 
 ```bash
 # Run tests
-bun test
+bun run test
+
+# Run tests with full proxy request logs
+ZCODE_PROXY_TEST_LOGS=1 bun run test
 
 # Type check
-bun x tsc --noEmit
+bun run typecheck
 
 # Run in dev mode
 bun run src/index.ts config.yaml
+
+# Build Windows executable
+bun run build
 ```
 
 ## Available Models

@@ -9,30 +9,83 @@
  *
  * @see .omo/plans/zcode-proxy.md Task 6
  */
-import type { Format } from "../translator/types.js";
+import type { Format, OpenAIResponseRequest } from "../translator/types.js";
 import type { ProxyConfig } from "../config/types.js";
 import type { AuthManager } from "../auth/manager.js";
 import type { Credential } from "../auth/types.js";
 import { getProvider } from "../provider/providers.js";
-import { listModelIds } from "../provider/models.js";
 import { buildUpstreamRequest } from "./upstream.js";
 import { getCaptchaToken, RETRY_HEADERS } from "./captcha.js";
 import { transformRequestBodyObj } from "./body-transformer.js";
 import { detectSseErrorAndConvert } from "./sse-error-detector.js";
 import { anthropicSseToBatchMessage } from "./sse-to-batch.js";
-import { translateRequestOpenAIToAnthropic, translateResponseAnthropicToOpenAI } from "../translator/openai-to-anthropic.js";
-import { translateRequestResponsesToAnthropic } from "../translator/responses-to-anthropic.js";
-import { translateResponseAnthropicToResponses, anthropicSseToResponsesSse } from "../translator/anthropic-to-responses.js";
-import { saveTurn } from "../translator/responses-store.js";
+import { anthropicSseToResponsesSse } from "../translator/anthropic-to-responses.js";
 import { anthropicSseToOpenaiSse } from "../translator/sse-translator.js";
-import type { OpenAIChatRequest, OpenAIResponseRequest, AnthropicMessagesResponse } from "../translator/types.js";
 import { pickProxy, markProxyFailed, getMaxRotations, getCurrentWorkingProxy, setCurrentWorkingProxy } from "./proxy-pool.js";
 import { wrapFetchWithSocksBridge } from "./proxied-fetch.js";
-import { recordStat, recordDebugDump, appendLog } from "../admin/api.js";
+import { recordDebugDump, appendLog } from "../admin/api.js";
 import { sleep } from "../utils/sleep.js";
 import { exportAccounts, switchAccount, maskApiKey, credentialStatsKey } from "../auth/store.js";
 import { recordHeaders } from "../utils/header-debug.js";
-import { RETRY as RETRY_CONST, PROXY_POOL as PROXY_POOL_CONST, WAF as WAF_CONST, SSE as SSE_CONST, SSE_HEARTBEAT as SSE_HEARTBEAT_CONST } from "../utils/constants.js";
+import { runtimeError } from "../utils/log.js";
+import { RETRY as RETRY_CONST, PROXY_POOL as PROXY_POOL_CONST } from "../utils/constants.js";
+import { computeRetryDelayMs, normalizeTimerMs } from "./retry.js";
+import {
+  DEFAULT_MAX_REQUEST_BODY_BYTES,
+  RequestBodyTimeoutError,
+  RequestBodyTooLargeError,
+  readBody,
+  setRequestBodyIdleTimeoutForTesting,
+} from "./request-body.js";
+import {
+  countThinkingBlocks,
+  countToolResultCacheControl,
+  stripUndefinedStringFields,
+  summarizeBody,
+} from "./request-diagnostics.js";
+import {
+  globMatch,
+  isKnownGlmModel,
+  lookupModelMapping,
+  peekParsedBody,
+} from "./model-routing.js";
+import { withSseHeartbeat } from "./sse-heartbeat.js";
+import {
+  createStatsTransform,
+  observeStatsStream,
+  printRow,
+  proxyLog,
+  shouldEmitProxyLog,
+  type RequestMeta,
+} from "./stats.js";
+import { checkWafBlock } from "./waf.js";
+import { logUpstreamResponseDebug } from "./upstream-debug.js";
+import { translateClientBodyObj } from "./request-translation.js";
+import { nextReqId, startPlanCaptchaPreflightEnabled } from "./runtime-options.js";
+import {
+  errorResponse,
+  passthroughResponse,
+  sseToBatchBodyLimitBytes,
+  translatedBatchResponse,
+  translatedResponsesBatchResponse,
+  translatedSseResponse,
+} from "./translated-response.js";
+import {
+  isCompressedContentEncoding,
+  readResponseTextLimited,
+  readResponseTextPreview,
+  splitResponseForPreview,
+  utf8ByteLength,
+  wrapResponseBodyWithUpstreamTimeout,
+  type ResponseTextPreview,
+  type ResponseTextPreviewOptions,
+} from "./response-body.js";
+
+export { computeRetryDelayMs, parseRetryAfterMs } from "./retry.js";
+export { checkWafBlock } from "./waf.js";
+export { globMatch } from "./model-routing.js";
+export { errorResponse } from "./translated-response.js";
+export { startPlanCaptchaPreflightEnabled } from "./runtime-options.js";
 
 /** Options for the proxy handler. */
 export interface ProxyHandlerOptions {
@@ -56,12 +109,6 @@ export interface ProxyHandlerOptions {
    * opted in.
    */
   resolveClientIp?: (req: Request) => string | undefined;
-}
-
-export function startPlanCaptchaPreflightEnabled(): boolean {
-  const raw = process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT?.trim().toLowerCase();
-  if (!raw) return false;
-  return raw === "1" || raw === "true" || raw === "on" || raw === "yes" || raw === "always";
 }
 
 /**
@@ -100,102 +147,11 @@ export function startPlanCaptchaPreflightEnabled(): boolean {
  */
 const DEFAULT_UPSTREAM_TIMEOUT_STREAM_MS = 10 * 60_000;
 const DEFAULT_UPSTREAM_TIMEOUT_BATCH_MS = 5 * 60_000;
-const DEFAULT_MAX_REQUEST_BODY_BYTES = 64 * 1024 * 1024;
-const DEFAULT_REQUEST_BODY_IDLE_TIMEOUT_MS = 30_000;
 const ERROR_RESPONSE_PREVIEW_BYTES = 64 * 1024;
 const PASSTHROUGH_USAGE_PREVIEW_BYTES = 2 * 1024 * 1024;
-const DEFAULT_TRANSLATED_UPSTREAM_BODY_BYTES = 32 * 1024 * 1024;
-const MAX_TIMER_MS = 2_147_483_647;
-const SAFE_RETRY_INITIAL_DELAY_MS = 1_000;
-const SAFE_RETRY_MAX_DELAY_MS = 8_000;
-const HTTP_DAY = "(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)";
-const HTTP_DAY_LONG = "(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)";
-const HTTP_MONTH = "(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)";
-const HTTP_TIME = "\\d{2}:\\d{2}:\\d{2}";
-const RETRY_AFTER_HTTP_DATE_RE = new RegExp(
-  `^(?:${HTTP_DAY}, \\d{2} ${HTTP_MONTH} \\d{4} ${HTTP_TIME} GMT|` +
-  `${HTTP_DAY_LONG}, \\d{2}-${HTTP_MONTH}-\\d{2} ${HTTP_TIME} GMT|` +
-  `${HTTP_DAY} ${HTTP_MONTH} [ \\d]\\d ${HTTP_TIME} \\d{4})$`,
-  "i",
-);
-
-let requestBodyIdleTimeoutMsForTesting: number | undefined;
 
 export function _setRequestBodyIdleTimeoutForTesting(timeoutMs?: number): void {
-  requestBodyIdleTimeoutMsForTesting = typeof timeoutMs === "number" && Number.isFinite(timeoutMs)
-    ? Math.max(1, Math.floor(timeoutMs))
-    : undefined;
-}
-
-export function parseRetryAfterMs(raw: string | null | undefined, now = Date.now()): number | undefined {
-  const value = raw?.trim();
-  if (!value) return undefined;
-
-  if (/^\d+$/.test(value)) {
-    const seconds = Number(value);
-    if (!Number.isSafeInteger(seconds) || seconds <= 0 || seconds > Number.MAX_SAFE_INTEGER / 1000) {
-      return undefined;
-    }
-    return seconds * 1000;
-  }
-
-  if (!RETRY_AFTER_HTTP_DATE_RE.test(value)) return undefined;
-  const dateMs = Date.parse(value);
-  if (!Number.isFinite(dateMs)) return undefined;
-  const delayMs = dateMs - now;
-  return delayMs > 0 ? delayMs : undefined;
-}
-
-function normalizeRetryDelayMs(raw: number, fallback: number): number {
-  const n = Number.isFinite(raw) && raw > 0 ? raw : fallback;
-  const safe = Number.isFinite(n) && n > 0 ? n : SAFE_RETRY_INITIAL_DELAY_MS;
-  return Math.max(1, Math.min(Math.floor(safe), MAX_TIMER_MS));
-}
-
-function normalizeTimerMs(raw: number, fallback: number): number {
-  const n = Number.isFinite(raw) && raw > 0 ? raw : fallback;
-  const safe = Number.isFinite(n) && n > 0 ? n : fallback;
-  return Math.max(1, Math.min(Math.floor(safe), MAX_TIMER_MS));
-}
-
-function normalizeRetryBackoffFactor(raw: number): number {
-  return Number.isFinite(raw) && raw > 0 ? raw : 1;
-}
-
-function normalizeJitterRandom(raw: number): number {
-  if (!Number.isFinite(raw)) return 0;
-  if (raw <= 0) return 0;
-  if (raw >= 1) return 1;
-  return raw;
-}
-
-export function computeRetryDelayMs(
-  retry: Pick<ProxyConfig["retry"], "initialDelayMs" | "maxDelayMs" | "backoffFactor">,
-  attempt: number,
-  retryAfter: string | null | undefined,
-  now = Date.now(),
-  random: () => number = Math.random,
-): number {
-  const maxDelayMs = normalizeRetryDelayMs(retry.maxDelayMs, SAFE_RETRY_MAX_DELAY_MS);
-  const initialDelayMs = Math.min(
-    normalizeRetryDelayMs(retry.initialDelayMs, SAFE_RETRY_INITIAL_DELAY_MS),
-    maxDelayMs,
-  );
-  const backoffFactor = normalizeRetryBackoffFactor(retry.backoffFactor);
-  const exponent = Number.isFinite(attempt) ? Math.max(0, Math.floor(attempt) - 1) : 0;
-  const rawDelay = initialDelayMs * Math.pow(backoffFactor, exponent);
-  let delayMs = Number.isFinite(rawDelay) && rawDelay > 0
-    ? Math.min(rawDelay, maxDelayMs)
-    : maxDelayMs;
-
-  const retryAfterMs = parseRetryAfterMs(retryAfter, now);
-  if (retryAfterMs !== undefined) {
-    delayMs = Math.max(delayMs, Math.min(retryAfterMs, maxDelayMs));
-  }
-
-  const jitter = delayMs * 0.25 * normalizeJitterRandom(random());
-  const rounded = Math.round(delayMs + jitter);
-  return Math.max(1, Math.min(rounded, maxDelayMs));
+  setRequestBodyIdleTimeoutForTesting(timeoutMs);
 }
 
 export async function proxyRequest(
@@ -224,7 +180,7 @@ export async function proxyRequest(
   // reqId corresponds to this client request?".
   const clientPath = new URL(clientReq.url).pathname;
   const clientMethod = clientReq.method;
-  console.log(`${reqId} >>> ${clientMethod} ${clientPath} (${format})`);
+  proxyLog(`${reqId} >>> ${clientMethod} ${clientPath} (${format})`);
 
   // Debug logging flag — when true, logs the full upstream response details
   // (status + key headers + body preview) for every request. Enabled via
@@ -256,7 +212,7 @@ export async function proxyRequest(
   if (body && body.length > 0) {
     const bodyBytes = utf8ByteLength(body);
     const sizeKB = (bodyBytes / 1024).toFixed(1);
-    console.log(`${reqId} body size: ${sizeKB}KB (${bodyBytes} bytes)`);
+    proxyLog(`${reqId} body size: ${sizeKB}KB (${bodyBytes} bytes)`);
   }
 
   // Parse the body once and reuse the parsed object throughout the pipeline.
@@ -290,7 +246,7 @@ export async function proxyRequest(
   if (parsedBody && typeof parsedBody === "object") {
     const removed = stripUndefinedStringFields(parsedBody as Record<string, unknown>);
     if (removed > 0) {
-      console.log(`${reqId} stripped ${removed} "[undefined]" field(s) from request body`);
+      proxyLog(`${reqId} stripped ${removed} "[undefined]" field(s) from request body`);
     }
   }
 
@@ -312,7 +268,7 @@ export async function proxyRequest(
     openaiBaseURL: config.providers[effectiveProviderId].openaiBase,
   };
   if (matchedRule) {
-    console.log(`${reqId} routing rule matched: ${matchedRule.pattern} → provider=${matchedRule.provider}${matchedRule.endpoint ? `, endpoint=${matchedRule.endpoint}` : ""}`);
+    proxyLog(`${reqId} routing rule matched: ${matchedRule.pattern} → provider=${matchedRule.provider}${matchedRule.endpoint ? `, endpoint=${matchedRule.endpoint}` : ""}`);
     // Note: matchedRule.endpoint is currently used for documentation/UI only.
     // Applying a custom endpoint here would require restructuring buildUpstreamURL
     // to accept a URL override; tracked separately. For now, the rule's provider
@@ -353,12 +309,12 @@ export async function proxyRequest(
     if (clientModel) {
       const mapped = lookupModelMapping(clientModel, config.modelMappings);
       if (mapped) {
-        console.log(`${reqId} model mapping: ${clientModel} → ${mapped} (configured)`);
+        proxyLog(`${reqId} model mapping: ${clientModel} → ${mapped} (configured)`);
         bodyObj.model = mapped;
         meta.model = mapped;
       } else if (!isKnownGlmModel(clientModel)) {
         const fallback = config.defaultModel || "glm-4.6";
-        console.log(`${reqId} model fallback: ${clientModel} → ${fallback} (non-GLM model not accepted upstream)`);
+        proxyLog(`${reqId} model fallback: ${clientModel} → ${fallback} (non-GLM model not accepted upstream)`);
         bodyObj.model = fallback;
         meta.model = fallback;
       }
@@ -422,7 +378,7 @@ export async function proxyRequest(
   let currentPlan: "coding-plan" | "start-plan" = effectivePlanForCred(cred);
   const currentCredentialStatsKey = (): string => credentialStatsKey(cred);
   if (currentPlan !== config.plan) {
-    console.log(`${reqId} plan resolved from active credential: ${config.plan} → ${currentPlan}`);
+    proxyLog(`${reqId} plan resolved from active credential: ${config.plan} → ${currentPlan}`);
   }
 
   let transformedObj = transformRequestBodyObj(upstreamBodyObj, { format: upstreamFormat, userId: cred.userId, startPlan: currentPlan === "start-plan", thinkingLevel: config.thinkingLevel === "high" ? "high" : "max" });
@@ -495,7 +451,7 @@ export async function proxyRequest(
     const before = countThinkingBlocks(parsedBody);
     const after = countThinkingBlocks(transformedObj);
     if (before > 0 || after > 0) {
-      console.log(`${reqId} thinking blocks: ${before} → ${after} (stripped ${before - after})`);
+      proxyLog(`${reqId} thinking blocks: ${before} → ${after} (stripped ${before - after})`);
     }
     // Also log cache_control-on-tool_result count changes. Current ZCode
     // alignment may keep, add, or strip these depending on whether the last
@@ -504,7 +460,7 @@ export async function proxyRequest(
     const ccAfter = countToolResultCacheControl(transformedObj);
     if (ccBefore > 0 || ccAfter > 0) {
       const delta = ccAfter - ccBefore;
-      console.log(`${reqId} tool_result+cache_control: ${ccBefore} → ${ccAfter} (delta ${delta >= 0 ? "+" : ""}${delta})`);
+      proxyLog(`${reqId} tool_result+cache_control: ${ccBefore} → ${ccAfter} (delta ${delta >= 0 ? "+" : ""}${delta})`);
     }
   }
 
@@ -708,11 +664,11 @@ export async function proxyRequest(
             // Log which proxy is being used for this request. Sticky proxies
             // (reused from a previous success) are marked accordingly.
             const sticky = getCurrentWorkingProxy() === picked;
-            console.log(`${reqId} proxy: ${picked}${sticky ? " (sticky)" : ""}`);
+            proxyLog(`${reqId} proxy: ${picked}${sticky ? " (sticky)" : ""}`);
           }
         } catch (e) {
           // Pool must NEVER break the request — log and fall through.
-          console.log(`${reqId} proxy pool pick failed: ${(e as Error).message}`);
+          proxyLog(`${reqId} proxy pool pick failed: ${(e as Error).message}`);
         }
       }
       if (currentRequestProxy) {
@@ -749,12 +705,12 @@ export async function proxyRequest(
             headerSummary[k] = v;
           }
         }
-        console.log(`${reqId} [verbose] upstream headers: ${JSON.stringify(headerSummary)}`);
+        proxyLog(`${reqId} [verbose] upstream headers: ${JSON.stringify(headerSummary)}`);
         if (transformedBody) {
           const bodyPreview = transformedBody.length > 2000
             ? transformedBody.slice(0, 2000) + `...(truncated, total ${transformedBody.length} chars)`
             : transformedBody;
-          console.log(`${reqId} [verbose] transformed body: ${bodyPreview}`);
+          proxyLog(`${reqId} [verbose] transformed body: ${bodyPreview}`);
         }
       } catch { /* verbose logging must never break the request */ }
     }
@@ -762,7 +718,7 @@ export async function proxyRequest(
       const originalStatus = resp.status;
       resp = await detectSseErrorAndConvert(resp);
       if (resp.status !== originalStatus) {
-        console.log(`${reqId} SSE error detected in 200 stream → HTTP ${resp.status}`);
+        proxyLog(`${reqId} SSE error detected in 200 stream → HTTP ${resp.status}`);
       }
     }
     // DEBUG: log the upstream response details for debugging quota / empty /
@@ -776,9 +732,9 @@ export async function proxyRequest(
       const split = splitResponseForPreview(resp);
       if (split) {
         resp = split.passthrough;
-        logUpstreamResponseDebug(reqId, split.preview, meta.stream, true);
+        logUpstreamResponseDebug(reqId, split.preview, true);
       } else {
-        logUpstreamResponseDebug(reqId, resp, meta.stream, false);
+        logUpstreamResponseDebug(reqId, resp, false);
       }
     }
     return resp;
@@ -793,7 +749,7 @@ export async function proxyRequest(
     if (!captchaCheck.failed) return { response: checkedResp, retried: false };
 
     await cancelResponseBody(checkedResp);
-    console.log(`${reqId} start-plan captcha verify failed${context}; solving Aliyun captcha with Chrome and retrying once...`);
+    proxyLog(`${reqId} start-plan captcha verify failed${context}; solving Aliyun captcha with Chrome and retrying once...`);
     hadRetryAttempt = true;
     try {
       captchaRetryHeaders = await refreshCaptchaHeaders("chrome");
@@ -819,7 +775,7 @@ export async function proxyRequest(
   let upstreamResp: Response;
   try {
     if (currentPlan === "start-plan" && startPlanCaptchaPreflightEnabled()) {
-      console.log(`${reqId} start-plan captcha preflight enabled: refreshing runtime headers before model request...`);
+      proxyLog(`${reqId} start-plan captcha preflight enabled: refreshing runtime headers before model request...`);
       try {
         captchaRetryHeaders = await refreshCaptchaHeaders();
       } catch (err) {
@@ -844,7 +800,7 @@ export async function proxyRequest(
       printRow(reqId, format, meta, 502, started, Date.now(), 0, 0, 0);
       return errorResponse(502, "upstream_unreachable", errMsg);
     }
-    console.log(`${reqId} initial upstream fetch failed: ${errMsg}; entering retry loop...`);
+    proxyLog(`${reqId} initial upstream fetch failed: ${errMsg}; entering retry loop...`);
     upstreamResp = new Response(
       JSON.stringify({ error: { type: "upstream_unreachable", message: errMsg } }),
       {
@@ -895,7 +851,7 @@ export async function proxyRequest(
     // If rotation is not possible (no pool, no untried proxies, or per-account
     // proxy was in use), we fall back to the original "stop & return 503" path.
     const ct = upstreamResp.headers.get("content-type") ?? "";
-    console.error(
+    runtimeError(
       `${reqId} ⚠️  ALIYUN WAF BLOCK DETECTED — status=${upstreamResp.status}, ` +
       `content-type=${ct}. Will attempt proxy rotation if pool has alternatives.`,
     );
@@ -923,17 +879,17 @@ export async function proxyRequest(
       try {
         nextProxy = await pickProxy(triedProxySetView());
       } catch (e) {
-        console.log(`${reqId} proxy pool rotation failed: ${(e as Error).message}`);
+        proxyLog(`${reqId} proxy pool rotation failed: ${(e as Error).message}`);
         break;
       }
       if (!nextProxy) {
         // No more untried proxies in the pool — give up.
-        console.log(`${reqId} proxy pool exhausted after ${rot} rotation(s) — surfacing WAF error`);
+        proxyLog(`${reqId} proxy pool exhausted after ${rot} rotation(s) — surfacing WAF error`);
         break;
       }
       currentRequestProxy = nextProxy;
       markProxyTried(nextProxy);
-      console.log(`${reqId} WAF rotation ${rot + 1}/${maxRotations}: switching to proxy ${nextProxy}`);
+      proxyLog(`${reqId} WAF rotation ${rot + 1}/${maxRotations}: switching to proxy ${nextProxy}`);
 
       // Cancel the old response body before refetching.
       await cancelResponseBody(upstreamResp);
@@ -945,7 +901,7 @@ export async function proxyRequest(
         upstreamResp = await fetchUpstreamDetected();
         headersAt = Date.now();
       } catch (err) {
-        console.log(`${reqId} WAF rotation ${rot + 1} fetch failed: ${(err as Error).message}`);
+        proxyLog(`${reqId} WAF rotation ${rot + 1} fetch failed: ${(err as Error).message}`);
         // Network error with this proxy — try the next one.
         try { await markProxyFailed(nextProxy); } catch { /* non-fatal */ }
         continue;
@@ -968,18 +924,18 @@ export async function proxyRequest(
           const postCaptchaWafCheck = await checkWafBlock(upstreamResp);
           if (postCaptchaWafCheck.wafBlocked) {
             try { await markProxyFailed(nextProxy); } catch { /* non-fatal */ }
-            console.log(`${reqId} WAF rotation ${rot + 1} captcha retry was blocked on proxy ${nextProxy}`);
+            proxyLog(`${reqId} WAF rotation ${rot + 1} captcha retry was blocked on proxy ${nextProxy}`);
             continue;
           }
           upstreamResp = postCaptchaWafCheck.response;
         }
-        console.log(`${reqId} WAF rotation ${rot + 1} succeeded — request now proceeds with proxy ${nextProxy}`);
+        proxyLog(`${reqId} WAF rotation ${rot + 1} succeeded — request now proceeds with proxy ${nextProxy}`);
         rotated = true;
         break;
       }
       // Still blocked — mark this proxy failed and try the next one.
       try { await markProxyFailed(nextProxy); } catch { /* non-fatal */ }
-      console.log(`${reqId} WAF rotation ${rot + 1} still blocked on proxy ${nextProxy}`);
+      proxyLog(`${reqId} WAF rotation ${rot + 1} still blocked on proxy ${nextProxy}`);
       }
     }
 
@@ -1126,7 +1082,7 @@ export async function proxyRequest(
       if (totalAvailableCredentials > 1) {
         allCredentialsExhausted = true;
         if (!loggedExhaustedCredentialsNoAlternative) {
-          console.log(
+          proxyLog(
             `${reqId} ${context} but no alternative credential available ` +
             `(tried ${triedApiKeys.size} of ${totalAvailableCredentials} credential(s)). ` +
             `Will return 503 (not 529) after retries exhaust to stop client retry loops.`,
@@ -1134,7 +1090,7 @@ export async function proxyRequest(
           loggedExhaustedCredentialsNoAlternative = true;
         }
       } else if (!loggedSingleCredentialNoAlternative) {
-        console.log(
+        proxyLog(
           `${reqId} ${context} but no alternative credential available ` +
           `(only ${totalAvailableCredentials} credential configured). Continuing with current — ` +
           `forwarding 529 (retryable) to client since this may be transient overload.`,
@@ -1162,7 +1118,7 @@ export async function proxyRequest(
       // grew faster than the cap check (the for-condition only re-evaluates
       // at the top of each iteration).
       if (attempt > MAX_TOTAL_ATTEMPTS) {
-        console.log(`${reqId} hit MAX_TOTAL_ATTEMPTS cap (${MAX_TOTAL_ATTEMPTS}) — stopping retry loop`);
+        proxyLog(`${reqId} hit MAX_TOTAL_ATTEMPTS cap (${MAX_TOTAL_ATTEMPTS}) — stopping retry loop`);
         allCredentialsExhausted = totalAvailableCredentials > 1;
         break;
       }
@@ -1177,7 +1133,7 @@ export async function proxyRequest(
       const retryAfter = upstreamResp.headers.get("retry-after");
       const delayMs = computeRetryDelayMs(config.retry, attempt, retryAfter);
 
-      console.log(
+      proxyLog(
         `${reqId} upstream returned ${upstreamResp.status}, retry ${attempt}/${effectiveRetryLimit()} in ${delayMs}ms...`,
       );
       hadRetryAttempt = true;
@@ -1209,7 +1165,7 @@ export async function proxyRequest(
           const reason = shouldSwitchForEmptyStream
             ? `${consecutiveEmptyStreams} consecutive empty-stream responses`
             : `${failedCount} consecutive failures`;
-          console.log(
+          proxyLog(
             `${reqId} credential switched after ${reason} ` +
             `(retry ${attempt}/${effectiveRetryLimit()}): ${maskApiKey(cred.apiKey)} → ${maskApiKey(newCred.apiKey)}`,
           );
@@ -1221,7 +1177,7 @@ export async function proxyRequest(
           // guaranteeing the retried request fails the same way.
           const newPlan = effectivePlanForCred(newCred);
           if (newPlan !== currentPlan) {
-            console.log(`${reqId} plan synced to ${newPlan} (from new credential ${maskApiKey(newCred.apiKey)})`);
+            proxyLog(`${reqId} plan synced to ${newPlan} (from new credential ${maskApiKey(newCred.apiKey)})`);
             currentPlan = newPlan;
           }
           // v0.2.2+ PERF: rebuild the transformed body only if the
@@ -1260,7 +1216,7 @@ export async function proxyRequest(
               // return false anyway). This is expected when the user has
               // cleared credentials; the in-memory switch above still
               // works for the remainder of this request.
-              console.log(`${reqId} credential store is empty, skipping switchAccount persist`);
+              proxyLog(`${reqId} credential store is empty, skipping switchAccount persist`);
             } else {
               const match = accounts.find(a => a.credential.apiKey === newCred.apiKey);
               if (match) {
@@ -1271,16 +1227,16 @@ export async function proxyRequest(
                   // Transient store read failure — the in-memory switch still
                   // works for this request. Don't log an error (it's not
                   // actionable), just a debug note.
-                  console.log(`${reqId} could not persist credential switch: store temporarily unreadable, will retry on next switch`);
+                  proxyLog(`${reqId} could not persist credential switch: store temporarily unreadable, will retry on next switch`);
                 } else {
                   // false: account not in store (race condition — another
                   // process removed it between exportAccounts and switchAccount)
-                  console.log(`${reqId} could not persist credential switch: account ${match.id} not found in store (race condition)`);
+                  proxyLog(`${reqId} could not persist credential switch: account ${match.id} not found in store (race condition)`);
                 }
               }
             }
           } catch (e) {
-            console.log(`${reqId} could not persist credential switch: ${(e as Error).message}`);
+            proxyLog(`${reqId} could not persist credential switch: ${(e as Error).message}`);
           }
         } else {
           // No alternative credential available (or all alternatives already
@@ -1326,7 +1282,7 @@ export async function proxyRequest(
         const retryWafCheck = await checkWafBlock(upstreamResp);
         if (retryWafCheck.wafBlocked) {
           const ct = upstreamResp.headers.get("content-type") ?? "";
-          console.error(
+          runtimeError(
             `${reqId} ⚠️  ALIYUN WAF BLOCK DETECTED on retry ${attempt} — status=${upstreamResp.status}, ` +
             `content-type=${ct}. Attempting proxy rotation...`,
           );
@@ -1347,16 +1303,16 @@ export async function proxyRequest(
                 try {
                   nextProxy = await pickProxy(triedProxySetView());
                 } catch (e) {
-                  console.log(`${reqId} retry proxy pool rotation failed: ${(e as Error).message}`);
+                  proxyLog(`${reqId} retry proxy pool rotation failed: ${(e as Error).message}`);
                   break;
                 }
                 if (!nextProxy) {
-                  console.log(`${reqId} retry proxy pool exhausted after ${rot} rotation(s)`);
+                  proxyLog(`${reqId} retry proxy pool exhausted after ${rot} rotation(s)`);
                   break;
                 }
                 currentRequestProxy = nextProxy;
                 markProxyTried(nextProxy);
-                console.log(`${reqId} retry WAF rotation ${rot + 1}/${retryMaxRotations}: switching to proxy ${nextProxy}`);
+                proxyLog(`${reqId} retry WAF rotation ${rot + 1}/${retryMaxRotations}: switching to proxy ${nextProxy}`);
 
                 await cancelResponseBody(upstreamResp);
                 try {
@@ -1364,7 +1320,7 @@ export async function proxyRequest(
                   upstreamResp = await fetchUpstreamDetected();
                   headersAt = Date.now();
                 } catch (err) {
-                  console.log(`${reqId} retry WAF rotation ${rot + 1} fetch failed: ${(err as Error).message}`);
+                  proxyLog(`${reqId} retry WAF rotation ${rot + 1} fetch failed: ${(err as Error).message}`);
                   try { await markProxyFailed(nextProxy); } catch { /* non-fatal */ }
                   continue;
                 }
@@ -1383,17 +1339,17 @@ export async function proxyRequest(
                     const postCaptchaWafCheck = await checkWafBlock(upstreamResp);
                     if (postCaptchaWafCheck.wafBlocked) {
                       try { await markProxyFailed(nextProxy); } catch { /* non-fatal */ }
-                      console.log(`${reqId} retry WAF rotation ${rot + 1} captcha retry was blocked on ${nextProxy}`);
+                      proxyLog(`${reqId} retry WAF rotation ${rot + 1} captcha retry was blocked on ${nextProxy}`);
                       continue;
                     }
                     upstreamResp = postCaptchaWafCheck.response;
                   }
-                  console.log(`${reqId} retry WAF rotation ${rot + 1} succeeded — proxy ${nextProxy}`);
+                  proxyLog(`${reqId} retry WAF rotation ${rot + 1} succeeded — proxy ${nextProxy}`);
                   retryRotated = true;
                   break;
                 }
                 try { await markProxyFailed(nextProxy); } catch { /* non-fatal */ }
-                console.log(`${reqId} retry WAF rotation ${rot + 1} still blocked on ${nextProxy}`);
+                proxyLog(`${reqId} retry WAF rotation ${rot + 1} still blocked on ${nextProxy}`);
               }
             }
           }
@@ -1421,7 +1377,7 @@ export async function proxyRequest(
         // Network errors count toward the credential-switch failure counter.
         consecutiveCredFailures++;
         if (attempt < effectiveRetryLimit()) {
-          console.log(`${reqId} fetch failed on retry ${attempt}: ${errMsg}, will retry again...`);
+          proxyLog(`${reqId} fetch failed on retry ${attempt}: ${errMsg}, will retry again...`);
           // Network errors are ALWAYS retryable — they are the most common
           // retry scenario (upstream blip, transient DNS, ECONNREFUSED during
           // deploy). The previous code synthesized a 502 and then checked
@@ -1431,14 +1387,14 @@ export async function proxyRequest(
           // continuing the loop directly here.
           continue;
         }
-        console.log(`${reqId} fetch failed on final retry ${attempt}: ${errMsg}`);
+        proxyLog(`${reqId} fetch failed on final retry ${attempt}: ${errMsg}`);
         printRow(reqId, format, meta, 502, started, Date.now(), 0, 0, 0, hadRetryAttempt, 0, currentCredentialStatsKey(), totalCaptchaMs);
         return errorResponse(502, "upstream_unreachable", errMsg);
       }
 
       // If the new response is no longer a retryable status, break out
       if (!config.retry.retryableStatuses.includes(upstreamResp.status)) {
-        console.log(`${reqId} retry ${attempt} succeeded (status ${upstreamResp.status})`);
+        proxyLog(`${reqId} retry ${attempt} succeeded (status ${upstreamResp.status})`);
         break;
       }
 
@@ -1451,7 +1407,7 @@ export async function proxyRequest(
         upstreamResp.headers.get("x-zcode-empty-stream") === "1";
       if (retryWasEmptyStream) {
         consecutiveEmptyStreams++;
-        console.log(`${reqId} retry ${attempt} got empty-stream 529 (${consecutiveEmptyStreams}/${EMPTY_STREAM_SWITCH_THRESHOLD} before forced switch)`);
+        proxyLog(`${reqId} retry ${attempt} got empty-stream 529 (${consecutiveEmptyStreams}/${EMPTY_STREAM_SWITCH_THRESHOLD} before forced switch)`);
       } else {
         // Any non-empty retryable status resets the empty-stream counter —
         // a 529 from a real overloaded_error is a different signal than
@@ -1484,14 +1440,14 @@ export async function proxyRequest(
           const reason = (EMPTY_STREAM_SWITCH_THRESHOLD > 0 && consecutiveEmptyStreams >= EMPTY_STREAM_SWITCH_THRESHOLD)
             ? `${consecutiveEmptyStreams} consecutive empty-stream responses`
             : `${failedCount} consecutive failures`;
-          console.log(
+          proxyLog(
             `${reqId} credential switched (end-of-loop) after ${reason} ` +
             `(retry ${attempt}/${effectiveRetryLimit()}): ${maskApiKey(cred.apiKey)} → ${maskApiKey(newCred.apiKey)}`,
           );
           cred = newCred;
           const newPlan = effectivePlanForCred(newCred);
           if (newPlan !== currentPlan) {
-            console.log(`${reqId} plan synced to ${newPlan} (from new credential ${maskApiKey(newCred.apiKey)})`);
+            proxyLog(`${reqId} plan synced to ${newPlan} (from new credential ${maskApiKey(newCred.apiKey)})`);
             currentPlan = newPlan;
           }
           // v0.2.2+ PERF: see rebuildTransformedBody docstring above.
@@ -1515,7 +1471,7 @@ export async function proxyRequest(
           try {
             const accounts = await exportAccounts();
             if (accounts.length === 0) {
-              console.log(`${reqId} credential store is empty, skipping switchAccount persist (end-of-loop)`);
+              proxyLog(`${reqId} credential store is empty, skipping switchAccount persist (end-of-loop)`);
             } else {
               const match = accounts.find(a => a.credential.apiKey === newCred.apiKey);
               if (match) {
@@ -1523,14 +1479,14 @@ export async function proxyRequest(
                 if (persistResult === true) {
                   appendLog("info", `Auto-switched credential to "${match.label}" (${maskApiKey(newCred.apiKey)}) after ${reason}`);
                 } else if (persistResult === null) {
-                  console.log(`${reqId} could not persist credential switch (end-of-loop): store temporarily unreadable`);
+                  proxyLog(`${reqId} could not persist credential switch (end-of-loop): store temporarily unreadable`);
                 } else {
-                  console.log(`${reqId} could not persist credential switch (end-of-loop): account ${match.id} not found (race)`);
+                  proxyLog(`${reqId} could not persist credential switch (end-of-loop): account ${match.id} not found (race)`);
                 }
               }
             }
           } catch (e) {
-            console.log(`${reqId} could not persist credential switch: ${(e as Error).message}`);
+            proxyLog(`${reqId} could not persist credential switch: ${(e as Error).message}`);
           }
           await cancelResponseBody(upstreamResp);
           continue; // skip the break, give the new cred a chance
@@ -1546,7 +1502,7 @@ export async function proxyRequest(
       // refetched — but that refetch reused the consumed Request object
       // and always failed. Keeping the body is simpler and correct.
       if (attempt === effectiveRetryLimit()) {
-        console.log(`${reqId} all ${effectiveRetryLimit()} retries exhausted, returning ${upstreamResp.status}`);
+        proxyLog(`${reqId} all ${effectiveRetryLimit()} retries exhausted, returning ${upstreamResp.status}`);
         break;
       }
 
@@ -1575,7 +1531,7 @@ export async function proxyRequest(
   // — for non-retryable statuses (4xx), forwarding the original response is
   // correct.
   if (allCredentialsExhausted && upstreamResp.status >= 500 && upstreamResp.status < 600) {
-    console.log(
+    proxyLog(
       `${reqId} all credentials exhausted + upstream ${upstreamResp.status}, ` +
       `returning 503 (Retry-After: 300) to stop client retry loops`,
     );
@@ -1616,7 +1572,7 @@ export async function proxyRequest(
   if (currentRequestProxy && !cred.proxy && upstreamResp.status >= 200 && upstreamResp.status < 300) {
     if (getCurrentWorkingProxy() !== currentRequestProxy) {
       setCurrentWorkingProxy(currentRequestProxy);
-      console.log(`${reqId} proxy sticky: ${currentRequestProxy} (will reuse for future requests)`);
+      proxyLog(`${reqId} proxy sticky: ${currentRequestProxy} (will reuse for future requests)`);
     }
   }
 
@@ -1644,7 +1600,7 @@ export async function proxyRequest(
       maxBytes: sseToBatchBodyLimitBytes(),
     });
     if ("error" in result) {
-      console.log(`${reqId} SSE->batch reassembly error: ${result.error}`);
+      proxyLog(`${reqId} SSE->batch reassembly error: ${result.error}`);
       printRow(reqId, format, meta, 502, started, headersAt, 0, 0, 0, hadRetryAttempt, 0, currentCredentialStatsKey(), totalCaptchaMs);
       return errorResponse(502, "upstream_stream_error", result.error);
     }
@@ -1684,15 +1640,15 @@ export async function proxyRequest(
     }).catch(() => ({ text: "", truncated: false, timedOut: false, complete: false }));
     upstreamErrorPreview = errPeek.text;
     const suffix = errPeek.truncated ? `...(truncated at ${ERROR_RESPONSE_PREVIEW_BYTES} bytes)` : errPeek.timedOut ? "...(preview timed out)" : "";
-    console.log(`${reqId} upstream ${upstreamResp.status} ${upstreamErrorPreview.slice(0, 200)}${suffix}`);
-    console.log(`${reqId} transformed request summary: ${summarizeBody(transformedObj ?? parsedBody)}`);
+    proxyLog(`${reqId} upstream ${upstreamResp.status} ${upstreamErrorPreview.slice(0, 200)}${suffix}`);
+    proxyLog(`${reqId} transformed request summary: ${summarizeBody(transformedObj ?? parsedBody)}`);
     // Also log the anthropic-beta header that was actually sent upstream —
     // mismatched beta flags vs body is a common 3001 cause on ZCode gateway.
     // Reuses lastSentBeta captured during the real fetch (instead of building
     // a fresh Request just to read one header — the old code generated new
     // random UUIDs for x-request-id etc., making the logged header belong to
     // a different request than the one actually sent).
-    console.log(`${reqId} anthropic-beta sent: ${lastSentBeta ?? "(none)"}`);
+    proxyLog(`${reqId} anthropic-beta sent: ${lastSentBeta ?? "(none)"}`);
     if (transformedBody) {
       try {
         recordDebugDump({
@@ -1704,7 +1660,7 @@ export async function proxyRequest(
           body: transformedBody,
         });
       } catch (e) {
-        console.log(`${reqId} failed to record debug dump: ${(e as Error).message}`);
+        proxyLog(`${reqId} failed to record debug dump: ${(e as Error).message}`);
       }
     }
   }
@@ -1833,1517 +1789,11 @@ export async function proxyRequest(
   return passthroughResponse(upstreamResp);
 }
 
-class RequestBodyTooLargeError extends Error {
-  constructor(maxBytes: number, actualBytes: number) {
-    super(`Request body is too large (${actualBytes} bytes, limit ${maxBytes} bytes)`);
-    this.name = "RequestBodyTooLargeError";
-  }
-}
-
-class RequestBodyTimeoutError extends Error {
-  constructor(timeoutMs: number) {
-    super(`Request body read timed out after ${timeoutMs}ms`);
-    this.name = "RequestBodyTimeoutError";
-  }
-}
-
-class ResponseBodyTooLargeError extends Error {
-  constructor(label: string, maxBytes: number, actualBytes: number) {
-    super(`${label} is too large (${actualBytes} bytes, limit ${maxBytes} bytes)`);
-    this.name = "ResponseBodyTooLargeError";
-  }
-}
-
-function parseContentLength(headers: Headers): number | undefined {
-  const raw = headers.get("content-length");
-  if (!raw) return undefined;
-  const trimmed = raw.trim();
-  if (!/^\d+$/.test(trimmed)) return undefined;
-  const n = Number(trimmed);
-  return Number.isSafeInteger(n) ? n : undefined;
-}
-
-function isCompressedContentEncoding(value: string | null): boolean {
-  return !!value && value.trim().toLowerCase() !== "identity";
-}
-
-const utf8ByteLengthEncoder = new TextEncoder();
-const utf8LogPreviewDecoder = new TextDecoder();
-
-function utf8ByteLength(value: string): number {
-  return utf8ByteLengthEncoder.encode(value).byteLength;
-}
-
-function truncateUtf8ForLog(value: string, maxBytes: number): { text: string; bytes: number; truncated: boolean } {
-  const limit = Math.max(0, Math.floor(maxBytes));
-  const bytes = utf8ByteLengthEncoder.encode(value);
-  if (bytes.byteLength <= limit) return { text: value, bytes: bytes.byteLength, truncated: false };
-  let end = limit;
-  while (end > 0 && bytes[end] !== undefined && (bytes[end] & 0xc0) === 0x80) {
-    end--;
-  }
-  return {
-    text: utf8LogPreviewDecoder.decode(bytes.subarray(0, end)),
-    bytes: bytes.byteLength,
-    truncated: true,
-  };
-}
-
-function parsePositiveIntegerLimit(raw: string | undefined, fallback: number): number {
-  if (!raw) return fallback;
-  const trimmed = raw.trim();
-  if (!/^\d+$/.test(trimmed)) return fallback;
-  const parsed = Number(trimmed);
-  if (!Number.isSafeInteger(parsed) || parsed <= 0) return fallback;
-  return parsed;
-}
-
-function translatedUpstreamBodyLimitBytes(): number {
-  return parsePositiveIntegerLimit(
-    process.env.ZCODE_TRANSLATED_RESPONSE_MAX_BYTES,
-    DEFAULT_TRANSLATED_UPSTREAM_BODY_BYTES,
-  );
-}
-
-function sseToBatchBodyLimitBytes(): number {
-  return parsePositiveIntegerLimit(
-    process.env.ZCODE_SSE_TO_BATCH_MAX_BYTES,
-    SSE_CONST.MAX_TO_BATCH_BYTES,
-  );
-}
-
-async function readResponseTextLimited(
-  resp: Response,
-  maxBytes: number,
-  label: string,
-): Promise<string> {
-  const limit = Math.max(1, Math.floor(maxBytes));
-  const declaredLength = parseContentLength(resp.headers);
-  if (declaredLength !== undefined && declaredLength > limit) {
-    void resp.body?.cancel().catch(() => {});
-    throw new ResponseBodyTooLargeError(label, limit, declaredLength);
-  }
-  if (!resp.body) return "";
-
-  const reader = resp.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (!value) continue;
-      total += value.byteLength;
-      if (total > limit) {
-        try { await reader.cancel(); } catch {}
-        throw new ResponseBodyTooLargeError(label, limit, total);
-      }
-      chunks.push(value);
-    }
-  } finally {
-    try { reader.releaseLock(); } catch {}
-  }
-
-  const bytes = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return new TextDecoder().decode(bytes);
-}
-
-interface ResponseTextPreviewOptions {
-  maxBytes: number;
-  timeoutMs: number;
-  clone?: boolean;
-}
-
-interface ResponseTextPreview {
-  text: string;
-  truncated: boolean;
-  timedOut: boolean;
-  complete: boolean;
-}
-
-async function readResponseTextPreview(
-  resp: Response,
-  opts: ResponseTextPreviewOptions,
-): Promise<ResponseTextPreview> {
-  const maxBytes = Math.max(0, Math.floor(opts.maxBytes));
-  const timeoutMs = normalizeTimerMs(opts.timeoutMs, 1_000);
-  const shouldClone = opts.clone !== false;
-  const declaredLength = parseContentLength(resp.headers);
-  if (maxBytes > 0 && declaredLength !== undefined && declaredLength > maxBytes) {
-    if (!shouldClone && resp.body) {
-      void resp.body.cancel().catch(() => {});
-    }
-    return { text: "", truncated: true, timedOut: false, complete: false };
-  }
-
-  let source = resp;
-  if (shouldClone) {
-    try {
-      source = resp.clone();
-    } catch {
-      return { text: "", truncated: false, timedOut: false, complete: false };
-    }
-  }
-  if (!source.body || maxBytes === 0) {
-    if (!shouldClone && source.body) {
-      void source.body.cancel().catch(() => {});
-    }
-    return { text: "", truncated: false, timedOut: false, complete: !source.body };
-  }
-
-  const reader = source.body.getReader();
-  const decoder = new TextDecoder();
-  const deadline = Date.now() + timeoutMs;
-  let text = "";
-  let readBytes = 0;
-  let truncated = false;
-  let timedOut = false;
-  let complete = false;
-
-  try {
-    while (readBytes < maxBytes) {
-      const remainingMs = deadline - Date.now();
-      if (remainingMs <= 0) {
-        timedOut = true;
-        break;
-      }
-      let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
-      const result = await Promise.race([
-        reader.read(),
-        new Promise<"timeout">(resolve => {
-          timeoutTimer = setTimeout(() => resolve("timeout"), remainingMs);
-        }),
-      ]).finally(() => {
-        if (timeoutTimer) {
-          clearTimeout(timeoutTimer);
-          timeoutTimer = null;
-        }
-      });
-      if (result === "timeout") {
-        timedOut = true;
-        break;
-      }
-      const { done, value } = result;
-      if (done) {
-        complete = true;
-        break;
-      }
-      if (!value) continue;
-      const remainingBytes = maxBytes - readBytes;
-      const chunk = value.byteLength > remainingBytes ? value.slice(0, remainingBytes) : value;
-      text += decoder.decode(chunk, { stream: true });
-      readBytes += chunk.byteLength;
-      if (chunk.byteLength < value.byteLength) {
-        truncated = true;
-        break;
-      }
-    }
-    if (readBytes >= maxBytes && !complete) truncated = true;
-    const tail = decoder.decode();
-    if (complete) text += tail;
-  } finally {
-    if (!shouldClone || !complete) {
-      // Do not await cancel here. This preview often reads a branch produced by
-      // ReadableStream.tee(); in Bun, canceling one branch can wait until the
-      // passthrough branch is also canceled/consumed. Awaiting that would stall
-      // the real request while the client is still reading the other branch.
-      void reader.cancel().catch(() => {});
-    }
-    try { reader.releaseLock(); } catch {}
-  }
-
-  return { text, truncated, timedOut, complete };
-}
-
-function wrapResponseBodyWithUpstreamTimeout(
-  resp: Response,
-  ctrl: AbortController,
-  timer: ReturnType<typeof setTimeout>,
-  timeoutMs: number,
-): Response {
-  if (!resp.body) {
-    clearTimeout(timer);
-    return resp;
-  }
-
-  const reader = resp.body.getReader();
-  let finished = false;
-  let streamClosed = false;
-  let timedOut = false;
-  let activeController: ReadableStreamDefaultController<Uint8Array> | null = null;
-  const timeoutError = () => new Error(`upstream timeout after ${timeoutMs}ms`);
-  const cleanup = (releaseReader = true): void => {
-    if (finished) return;
-    finished = true;
-    clearTimeout(timer);
-    ctrl.signal.removeEventListener("abort", onAbort);
-    if (releaseReader) {
-      try { reader.releaseLock(); } catch {}
-    }
-  };
-  const safeClose = (controller: ReadableStreamDefaultController<Uint8Array>): void => {
-    if (streamClosed) return;
-    streamClosed = true;
-    try { controller.close(); } catch {}
-  };
-  const safeError = (controller: ReadableStreamDefaultController<Uint8Array>, err: unknown): void => {
-    if (streamClosed) return;
-    streamClosed = true;
-    try { controller.error(err); } catch {}
-  };
-  const safeEnqueue = (controller: ReadableStreamDefaultController<Uint8Array>, value: Uint8Array): boolean => {
-    if (streamClosed) return false;
-    try {
-      controller.enqueue(value);
-      return true;
-    } catch (err) {
-      safeError(controller, err);
-      return false;
-    }
-  };
-  const onAbort = (): void => {
-    if (finished) return;
-    timedOut = true;
-    const controller = activeController;
-    cleanup(false);
-    if (controller) {
-      safeError(controller, timeoutError());
-    }
-    void reader.cancel(timeoutError()).catch(() => {}).finally(() => {
-      try { reader.releaseLock(); } catch {}
-    });
-  };
-  ctrl.signal.addEventListener("abort", onAbort, { once: true });
-
-  const body = new ReadableStream<Uint8Array>({
-    async pull(controller) {
-      if (finished) {
-        if (timedOut) safeError(controller, timeoutError());
-        return;
-      }
-      if (ctrl.signal.aborted) {
-        onAbort();
-        return;
-      }
-      activeController = controller;
-      try {
-        const { done, value } = await reader.read();
-        if (finished) return;
-        if (done) {
-          cleanup();
-          safeClose(controller);
-          return;
-        }
-        if (value && !safeEnqueue(controller, value)) {
-          cleanup(false);
-          void reader.cancel("downstream closed").catch(() => {}).finally(() => {
-            try { reader.releaseLock(); } catch {}
-          });
-        }
-      } catch (err) {
-        if (finished) return;
-        cleanup();
-        safeError(controller, ctrl.signal.aborted ? timeoutError() : err);
-      } finally {
-        if (activeController === controller) activeController = null;
-      }
-    },
-    async cancel(reason) {
-      streamClosed = true;
-      cleanup(false);
-      ctrl.abort();
-      try { await reader.cancel(reason); } catch {}
-      try { reader.releaseLock(); } catch {}
-    },
-  });
-
-  return new Response(body, {
-    status: resp.status,
-    statusText: resp.statusText,
-    headers: resp.headers,
-  });
-}
-
-function splitResponseForPreview(resp: Response): { preview: Response; passthrough: Response } | null {
-  if (!resp.body) return null;
-  try {
-    const [previewBody, passthroughBody] = resp.body.tee();
-    const init: ResponseInit = {
-      status: resp.status,
-      statusText: resp.statusText,
-      headers: resp.headers,
-    };
-    return {
-      preview: new Response(previewBody, init),
-      passthrough: new Response(passthroughBody, init),
-    };
-  } catch {
-    return null;
-  }
-}
-
 export async function _readResponseTextPreviewForTesting(
   resp: Response,
   opts: ResponseTextPreviewOptions,
 ): Promise<ResponseTextPreview> {
   return readResponseTextPreview(resp, opts);
-}
-
-async function readRequestBodyChunk(
-  reader: ReadableStreamDefaultReader<Uint8Array>,
-  timeoutMs: number,
-): Promise<Awaited<ReturnType<ReadableStreamDefaultReader<Uint8Array>["read"]>>> {
-  const timeout = normalizeTimerMs(timeoutMs, DEFAULT_REQUEST_BODY_IDLE_TIMEOUT_MS);
-  let timer: ReturnType<typeof setTimeout> | null = null;
-  const result = await Promise.race([
-    reader.read(),
-    new Promise<"timeout">(resolve => {
-      timer = setTimeout(() => resolve("timeout"), timeout);
-      timer.unref?.();
-    }),
-  ]).finally(() => {
-    if (timer) {
-      clearTimeout(timer);
-      timer = null;
-    }
-  });
-  if (result === "timeout") {
-    const err = new RequestBodyTimeoutError(timeout);
-    void reader.cancel(err).catch(() => {});
-    throw err;
-  }
-  return result;
-}
-
-/** Read the request body as a string, returning undefined for empty bodies. */
-async function readBody(req: Request, maxBytes: number): Promise<string | undefined> {
-  if (req.method === "GET" || req.method === "HEAD") return undefined;
-  const limit = Number.isFinite(maxBytes) && maxBytes > 0 ? Math.floor(maxBytes) : 0;
-  const idleTimeoutMs = requestBodyIdleTimeoutMsForTesting ?? DEFAULT_REQUEST_BODY_IDLE_TIMEOUT_MS;
-  const declaredLength = parseContentLength(req.headers);
-  if (limit > 0 && declaredLength !== undefined && declaredLength > limit) {
-    void req.body?.cancel().catch(() => {});
-    throw new RequestBodyTooLargeError(limit, declaredLength);
-  }
-  if (!req.body) return undefined;
-
-  const reader = req.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  try {
-    while (true) {
-      const { done, value } = await readRequestBodyChunk(reader, idleTimeoutMs);
-      if (done) break;
-      if (!value) continue;
-      total += value.byteLength;
-      if (limit > 0 && total > limit) {
-        try { await reader.cancel(); } catch {}
-        throw new RequestBodyTooLargeError(limit, total);
-      }
-      chunks.push(value);
-    }
-  } finally {
-    try { reader.releaseLock(); } catch {}
-  }
-  if (total === 0) return undefined;
-  const bytes = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return new TextDecoder().decode(bytes);
-}
-
-/**
- * Recursively strip fields whose value is exactly the string "[undefined]".
- *
- * Some clients (notably Cherry Studio) serialize JavaScript `undefined` as
- * the literal STRING "[undefined]" instead of omitting the field. These
- * pass through JSON.parse as string values, get forwarded to z.ai as
- * bogus request parameters (`temperature: "[undefined]"` etc.), and are
- * a strong WAF fingerprint — no legitimate client would ever send them.
- *
- * Returns the count of removed fields for diagnostic logging.
- */
-function stripUndefinedStringFields(node: unknown): number {
-  if (Array.isArray(node)) {
-    let removed = 0;
-    for (const item of node) {
-      if (item && typeof item === "object") {
-        removed += stripUndefinedStringFields(item);
-      }
-    }
-    return removed;
-  }
-  if (node && typeof node === "object") {
-    const obj = node as Record<string, unknown>;
-    let removed = 0;
-    for (const key of Object.keys(obj)) {
-      const v = obj[key];
-      if (v === "[undefined]") {
-        delete obj[key];
-        removed++;
-      } else if (v && typeof v === "object") {
-        removed += stripUndefinedStringFields(v);
-      }
-    }
-    return removed;
-  }
-  return 0;
-}
-
-/**
- * Detect Aliyun WAF block responses.
- *
- * z.ai / zcode.z.ai use Aliyun WAF. When an IP is blacklisted, the WAF
- * returns a non-standard response:
- *   - HTTP 405 / 403 / 200 (NOT a typical API error status)
- *   - content-type: text/html (NOT application/json or text/event-stream)
- *   - body is an Aliyun HTML error page containing `errors.aliyun.com`
- *   - server: Tengine (Alibaba's nginx fork)
- *
- * We peek at the body to confirm it's actually a WAF page (not some other
- * html response) — the `errors.aliyun.com` string is the reliable signal.
- *
- * Returns `{ wafBlocked: true }` if this is a WAF block. In that case the
- * response body has already been consumed (for inspection) and MUST NOT be
- * used further — the caller returns a synthetic error response.
- *
- * Returns `{ wafBlocked: false, response: <Response> }` if this is NOT a
- * WAF block. The returned Response has a FRESH readable body reconstructed
- * from the consumed text, so downstream code can read it normally (`.text()`,
- * `.json()`, `.body.tee()`, etc.) as if the inspection never happened.
- *
- * vceshi0.0.8+ bugfix: previously this function returned `false` after
- * consuming the body and stashed the text on the response object via
- * `(resp as any)._wafCheckBody = text`. But NO downstream code path ever
- * read `_wafCheckBody`, so for any 200 + HTML response that wasn't a WAF
- * block, `upstreamResp.body` was already locked/consumed and
- * `upstreamResp.body.tee()` would throw. Reconstructing a new Response
- * here is the clean fix — the Body mixin's constructor accepts a string
- * and produces a fresh, readable stream.
- */
-export async function checkWafBlock(resp: Response): Promise<{ wafBlocked: true } | { wafBlocked: false; response: Response }> {
-  // Fast path: status codes that the WAF typically uses.
-  // 405 = Method Not Allowed (the classic WAF block)
-  // 403 = Forbidden (sometimes used by WAF or upstream auth failures)
-  // 200 = sometimes the WAF returns 200 + HTML instead of an error status
-  const isSuspectStatus = resp.status === 405 || resp.status === 403 || resp.status === 200;
-  if (!isSuspectStatus) return { wafBlocked: false, response: resp };
-
-  const ct = resp.headers.get("content-type") ?? "";
-  // WAF responses are HTML; legitimate API responses are JSON or SSE.
-  // If content-type is JSON or SSE, this is NOT a WAF block — and we don't
-  // need to consume the body to confirm, so we can return the original
-  // response untouched.
-  if (ct.includes("application/json") || ct.includes("text/event-stream")) {
-    return { wafBlocked: false, response: resp };
-  }
-  // Strong signal: Tengine server header (Alibaba's nginx fork).
-  // But not all WAF responses have it, so we don't require it.
-  const server = resp.headers.get("server") ?? "";
-
-  // v0.2.2+ PERF: stream the body peek with a hard size cap. Previously
-  // `await resp.text()` read the ENTIRE body into memory — for a 1MB HTML
-  // error page (some upstreams return verbose HTML) this would block the
-  // event loop and spike memory. Now we read up to MAX_PEEK_BYTES (32KB,
-  // more than enough to contain any Aliyun WAF page) and stop early as
-  // soon as the WAF signature is found. The cap is enforced in bytes, not
-  // decoded string length, so a single large upstream chunk cannot sneak
-  // past the limit. If the body doesn't contain the signature within the
-  // cap, we treat it as "not a WAF block" and reconstruct the response with
-  // the peeked prefix.
-  try {
-    const MAX_PEEK = WAF_CONST.MAX_PEEK_BYTES;
-    let text = "";
-    let peekedBytes = 0;
-    let bodyDone = false;
-    if (resp.body) {
-      const reader = resp.body.getReader();
-      const decoder = new TextDecoder();
-      try {
-        while (peekedBytes < MAX_PEEK) {
-          const { done, value } = await reader.read();
-          if (done) { bodyDone = true; break; }
-          if (!value) continue;
-          const remainingBytes = MAX_PEEK - peekedBytes;
-          const chunk = value.byteLength > remainingBytes
-            ? value.subarray(0, remainingBytes)
-            : value;
-          peekedBytes += chunk.byteLength;
-          text += decoder.decode(chunk, { stream: true });
-          // Early-exit: signature found, no need to keep reading.
-          if (text.includes(WAF_CONST.SIGNATURE)) {
-            bodyDone = false;  // there may be more body, but we don't need it
-            break;
-          }
-          if (chunk.byteLength < value.byteLength) break;
-        }
-        if (bodyDone) {
-          // Flush the decoder's internal buffer (final partial multi-byte
-          // sequence) so the text is complete.
-          text += decoder.decode();
-        } else {
-          // Drop a possible partial character at the byte cap instead of
-          // expanding the preview beyond MAX_PEEK_BYTES.
-          decoder.decode();
-        }
-      } finally {
-        try { await reader.cancel(); } catch { /* best-effort */ }
-      }
-    } else {
-      // No body — nothing to peek. Treat as non-WAF.
-      return { wafBlocked: false, response: resp };
-    }
-    // === Aliyun WAF standard block page ===
-    // 已有指纹 1: errors.aliyun.com 字符串(图片 URL / 错误页链接)
-    if (text.includes("errors.aliyun.com") || (text.includes("aliyun") && text.includes("WAF"))) {
-      return { wafBlocked: true };
-    }
-    // 已有指纹 2: Tengine server + 405 + text/html
-    if (resp.status === 405 && ct.includes("text/html") && server.toLowerCase().includes("tengine")) {
-      return { wafBlocked: true };
-    }
-    // 新增指纹 3: 阿里云 WAF 拦截页更稳的特征(不依赖图片 URL 是否变化)
-    //   - data-spm 是阿里云埋点属性,几乎所有阿里云系拦截页都带
-    //   - block_message / block_traceid_tips 是阿里云 WAF 标准 JS 文案 key
-    //   - 这些字段即使 errors.aliyun.com 域名换了也仍然存在
-    if (ct.includes("text/html") &&
-        text.includes("data-spm") &&
-        (text.includes("block_message") || text.includes("block_traceid_tips"))) {
-      return { wafBlocked: true };
-    }
-
-    // === Nginx 伪装 405 拦截页 (Render 日志观察到的形态) ===
-    // 形态:`<html><head><title>405 Not Allowed</title></head>
-    //        <body><center><h1>405 Not Allowed</h1></center>
-    //        <hr><center>nginx/1.31.2</center></body></html>`
-    //
-    // 关键特征:
-    //   - body 极短(<2KB),纯标准 nginx 默认错误页
-    //   - server 头声称 nginx/1.31.x,但 nginx 实际不存在 1.31 mainline
-    //     (2025 年 nginx mainline 是 1.27.x,stable 是 1.26.x)
-    //     这种"未来版本号"几乎肯定是 WAF/网关伪装
-    //   - z.ai / bigmodel 的 API 端点正常情况下绝不返回 HTML 405
-    //
-    // 新增指纹 4: nginx 不存在的版本号(1.31+ 都不存在)
-    if (resp.status === 405 && ct.includes("text/html") &&
-        /nginx\/1\.(3[1-9]|[4-9]\d|1\d{2}|[2-9]\d{2})/i.test(server)) {
-      return { wafBlocked: true };
-    }
-    // 新增指纹 5: nginx 默认 405 错误页 + nginx 标志性 footer (`<hr><center>nginx`)
-    // 即使 server 头丢失或被改成其他值,只要 body 是这个标准模板
-    // 且来自一个 JSON API 上游(返回 text/html 本身就异常),就认定为 WAF
-    if (resp.status === 405 && ct.includes("text/html") &&
-        text.length < 2048 &&
-        text.includes("<title>405 Not Allowed</title>") &&
-        /<hr[^>]*>\s*<center>\s*nginx/i.test(text)) {
-      return { wafBlocked: true };
-    }
-
-    // 新增兜底指纹 6: JSON API 上游(anthropic/openai)返回 405 + text/html
-    // 正常的 API 405 应该是 JSON 格式错误;HTML 405 来自 nginx/Caddy 这类
-    // 反向代理或 WAF 拦截。这个项目所有上游都是 JSON API,任何 HTML 405
-    // 都是异常。为了保守,只匹配明显是网关默认错误页的(短 body + 标准
-    // 标题),避免误伤偶发的 HTML 帮助页。
-    if (resp.status === 405 && ct.includes("text/html") && text.length < 2048 &&
-        (text.includes("<title>405") || text.includes("<h1>405"))) {
-      return { wafBlocked: true };
-    }
-    // Not a WAF block — reconstruct a fresh Response with the peeked
-    // body text. The new Response has the same status, headers, and a
-    // brand-new readable body stream that downstream code can read freely.
-    //
-    // v0.2.2+ note: if we hit MAX_PEEK without finding the signature,
-    // `text` is only the first 32KB of the body — the original stream
-    // was cancelled, so the rest is lost. This is acceptable because:
-    //   1. The only legitimate non-WAF response that's > 32KB + HTML
-    //      + status 200/403/405 is an unusual upstream error page.
-    //   2. We forward the (truncated) body to the client anyway — the
-    //      client's HTML parser will render what it can.
-    //   3. The alternative (reading the full body) has worse failure
-    //      modes: OOM on huge responses, multi-second event-loop stalls.
-    return {
-      wafBlocked: false,
-      response: new Response(text, {
-        status: resp.status,
-        statusText: resp.statusText,
-        headers: resp.headers,
-      }),
-    };
-  } catch {
-    // Body read failed — return original resp (body may still be readable
-    // if the read threw before consuming; if not, downstream will error
-    // anyway and there's nothing we can do here).
-    return { wafBlocked: false, response: resp };
-  }
-}
-
-/**
- * Count `thinking` / `redacted_thinking` content blocks across all messages.
- * Used for diagnostic logging so users can verify the strip-thinking-blocks
- * transform actually fired.
- */
-function countThinkingBlocks(body: unknown): number {
-  if (!body || typeof body !== "object") return 0;
-  const messages = (body as Record<string, unknown>).messages;
-  if (!Array.isArray(messages)) return 0;
-  let count = 0;
-  for (const msg of messages) {
-    if (!msg || typeof msg !== "object") continue;
-    const content = (msg as Record<string, unknown>).content;
-    if (!Array.isArray(content)) continue;
-    for (const block of content) {
-      if (block && typeof block === "object") {
-        const t = (block as Record<string, unknown>).type;
-        if (t === "thinking" || t === "redacted_thinking") count++;
-      }
-    }
-  }
-  return count;
-}
-
-/**
- * Count `tool_result` blocks that carry a `cache_control` field. Current
- * ZCode alignment keeps/adds this for a single tool_result in the last user
- * message, and strips it for multiple tool_results in that same message.
- * Used for diagnostic logging around cache-control placement changes.
- */
-function countToolResultCacheControl(body: unknown): number {
-  if (!body || typeof body !== "object") return 0;
-  const messages = (body as Record<string, unknown>).messages;
-  if (!Array.isArray(messages)) return 0;
-  let count = 0;
-  for (const msg of messages) {
-    if (!msg || typeof msg !== "object") continue;
-    const content = (msg as Record<string, unknown>).content;
-    if (!Array.isArray(content)) continue;
-    for (const block of content) {
-      if (block && typeof block === "object") {
-        const b = block as Record<string, unknown>;
-        if (b.type === "tool_result" && b.cache_control !== undefined) count++;
-      }
-    }
-  }
-  return count;
-}
-
-/**
- * Build a one-line summary of the transformed request body for diagnostic
- * logging on upstream 4xx. Shows top-level fields that GLM commonly rejects
- * (thinking, context_management, output_config), the message role/content-type
- * sequence (so role-alternation issues are visible), and the system block count.
- *
- * The full body can be 90KB+; this summary is <500 chars and surfaces exactly
- * the fields that cause GLM 3001 "parameter error".
- */
-function summarizeBody(body: unknown): string {
-  if (!body || typeof body !== "object") return "(empty)";
-  const b = body as Record<string, unknown>;
-  const parts: string[] = [];
-
-  // Top-level fields GLM cares about
-  if (b.model) parts.push(`model=${b.model}`);
-  parts.push(`thinking=${JSON.stringify(b.thinking)}`);
-  if (b.context_management) parts.push("context_management=present");
-  if (b.output_config) parts.push("output_config=present");
-  if (b.metadata) parts.push(`metadata=${JSON.stringify(b.metadata).slice(0, 80)}`);
-
-  // Messages — role + content block types per message, with cache_control flags
-  // so we can see whether tool_result cache-control placement matches the
-  // current ZCode pattern (single tool_result keeps cc; multiple strip it).
-  const messages = b.messages;
-  if (Array.isArray(messages)) {
-    const msgSummary = messages.map((m: unknown, i: number) => {
-      if (!m || typeof m !== "object") return `[${i}]?`;
-      const msg = m as Record<string, unknown>;
-      const role = msg.role ?? "?";
-      const content = msg.content;
-      if (typeof content === "string") return `[${i}]${role}/str`;
-      if (!Array.isArray(content)) return `[${i}]${role}/?`;
-      const types = content.map((c: unknown) => {
-        if (!c || typeof c !== "object") return "?";
-        const blk = c as Record<string, unknown>;
-        const t = blk.type ?? "?";
-        // Annotate cache_control presence so tool_result+cache_control is visible
-        const cc = blk.cache_control ? "+cc" : "";
-        // For tool_result blocks, show content format (str vs arr) and is_error
-        // presence. String content and is_error:true are valid ZCode shapes;
-        // is_error:false should have been stripped before upstream.
-        let suffix = "";
-        if (t === "tool_result") {
-          if (typeof blk.content === "string") suffix = "/str";
-          else if (Array.isArray(blk.content)) suffix = "/arr";
-          if ("is_error" in blk) suffix += "/+err";
-        }
-        return `${t}${cc}${suffix}`;
-      });
-      return `[${i}]${role}/{${types.join(",")}}`;
-    });
-    parts.push(`msgs[${msgSummary.join(",")}]`);
-  }
-
-  // System block count (relocation may have changed it)
-  if (Array.isArray(b.system)) {
-    parts.push(`system=${b.system.length} blocks`);
-  } else if (typeof b.system === "string") {
-    parts.push("system=string");
-  }
-
-  // Tool count
-  if (Array.isArray(b.tools)) {
-    parts.push(`tools=${b.tools.length}`);
-  }
-
-  return parts.join(" | ");
-}
-
-/**
- * Create a passthrough response that streams the upstream body to the client.
- * Preserves status, headers, and body stream.
- */
-function passthroughResponse(upstream: Response, body?: ReadableStream<Uint8Array>): Response {
-  const headers = new Headers();
-  const forwardHeaders = [
-    "content-type",
-    "content-encoding",
-    "cache-control",
-    "x-request-id",
-    "anthropic-ratelimit-requests-limit",
-    "anthropic-ratelimit-requests-remaining",
-    "anthropic-ratelimit-requests-reset",
-    "anthropic-ratelimit-tokens-limit",
-    "anthropic-ratelimit-tokens-remaining",
-    "anthropic-ratelimit-tokens-reset",
-  ];
-
-  for (const h of forwardHeaders) {
-    const v = upstream.headers.get(h);
-    if (v) headers.set(h, v);
-  }
-
-  return new Response(body ?? upstream.body, {
-    status: upstream.status,
-    statusText: upstream.statusText,
-    headers,
-  });
-}
-
-/** Build a JSON error response. */
-export function errorResponse(status: number, type: string, message: string): Response {
-  const body = JSON.stringify({
-    error: { type, message },
-  });
-  return new Response(body, {
-    status,
-    headers: { "content-type": "application/json" },
-  });
-}
-
-/** True when the client request explicitly accepts gzip (and has not disabled it via q=0). */
-function clientAcceptsGzip(req: Request): boolean {
-  const ae = req.headers.get("accept-encoding");
-  if (!ae) return false;
-  return /\bgzip\b(?!\s*;\s*q=0(?:\.0+)?\s*(?:,|$))/i.test(ae);
-}
-
-/**
- * Gzip a fully-materialized payload as a non-blocking ReadableStream.
- *
- * v0.2.0.8: replaces `Bun.gzipSync(payload)`, which blocked the event loop
- * for ~5-20ms per 200KB response. Under batch concurrency this serialized
- * all responses. We now pipe the bytes through a `CompressionStream`
- * (web-standard, Bun/Node/Deno all implement it natively) so the compression
- * happens off the main thread. The output is a stream the Response can
- * consume directly.
- *
- * Falls back to `Bun.gzipSync` if `CompressionStream` is unavailable for any
- * reason (defensive — every modern runtime ships it). The fallback path keeps
- * the old sync behaviour so we never regress to "no compression".
- */
-function gzipPayloadStream(payload: Uint8Array): ReadableStream<Uint8Array> {
-  try {
-    // Wrap the buffer in a single-chunk ReadableStream and pipe it through
-    // gzip. The stream completes after one chunk + a flush.
-    //
-    // v0.2.0.8 type note: TS 5.9's stricter Uint8Array<ArrayBuffer> vs
-    // Uint8Array<ArrayBufferLike> generics clash with CompressionStream's
-    // ReadableWritablePair signature. The runtime behaviour is correct on
-    // every supported platform; we cast through `as unknown as` to satisfy
-    // tsc without changing semantics.
-    const readable = new ReadableStream<Uint8Array>({
-      start(controller) {
-        controller.enqueue(payload);
-        controller.close();
-      },
-    });
-    return readable.pipeThrough(new CompressionStream("gzip") as unknown as TransformStream<Uint8Array, Uint8Array>);
-  } catch {
-    // Fallback: synchronous gzip, wrapped as a stream so the caller still
-    // gets a ReadableStream<Uint8Array>. This path is only hit on very old
-    // runtimes missing CompressionStream.
-    const gz = Bun.gzipSync(payload as Uint8Array<ArrayBuffer>);
-    return new ReadableStream<Uint8Array>({
-      start(controller) {
-        controller.enqueue(gz as Uint8Array);
-        controller.close();
-      },
-    });
-  }
-}
-
-/** Build a translated batch (non-streaming) OpenAI response. Gzip if client accepts. */
-async function translatedBatchResponse(
-  clientReq: Request,
-  upstream: Response,
-  model: string,
-  reqId: string,
-  format: Format,
-  meta: RequestMeta,
-  started: number,
-  headersAt: number,
-  credKey?: string,
-  captchaMs: number = 0,
-  retried: boolean = false,
-): Promise<Response> {
-  let raw: string;
-  try {
-    raw = await readResponseTextLimited(
-      upstream,
-      translatedUpstreamBodyLimitBytes(),
-      "Translated upstream response",
-    );
-  } catch (err) {
-    printRow(reqId, format, meta, 502, started, headersAt, 0, 0, 0, retried, 0, credKey, captchaMs);
-    return errorResponse(502, "translation_failed", `failed to read upstream response body: ${(err as Error).message}`);
-  }
-  let parsedAnthropic: AnthropicMessagesResponse;
-  try {
-    parsedAnthropic = JSON.parse(raw) as AnthropicMessagesResponse;
-  } catch (err) {
-    printRow(reqId, format, meta, 502, started, headersAt, 0, 0, 0, retried, 0, credKey, captchaMs);
-    return errorResponse(502, "translation_failed", `upstream returned non-JSON body: ${(err as Error).message}`);
-  }
-  const openaiResp = translateResponseAnthropicToOpenAI(parsedAnthropic, model);
-  const json = JSON.stringify(openaiResp);
-  const payload = new TextEncoder().encode(json);
-  // vceshi0.0.6+: capture input tokens from translated OpenAI response usage
-  const inTok = openaiResp.usage?.prompt_tokens ?? 0;
-  const outTok = openaiResp.usage?.completion_tokens ?? 0;
-  // v0.2.0.6: capture cache-read tokens from upstream Anthropic usage
-  const cacheReadTok = parsedAnthropic.usage?.cache_read_input_tokens ?? 0;
-
-  const respHeaders = new Headers();
-  respHeaders.set("content-type", "application/json");
-  for (const h of forwardedUpstreamHeaders()) {
-    const v = upstream.headers.get(h);
-    if (v) respHeaders.set(h, v);
-  }
-
-  if (clientAcceptsGzip(clientReq)) {
-    respHeaders.set("content-encoding", "gzip");
-    printRow(reqId, format, meta, upstream.status, started, headersAt, outTok, 0, 0, retried, inTok, credKey, captchaMs, cacheReadTok);
-    // v0.2.0.8: stream the payload through CompressionStream instead of
-    // Bun.gzipSync — avoids blocking the event loop for large responses.
-    return new Response(gzipPayloadStream(payload), {
-      status: upstream.status,
-      headers: respHeaders,
-    });
-  }
-  printRow(reqId, format, meta, upstream.status, started, headersAt, outTok, 0, 0, retried, inTok, credKey, captchaMs, cacheReadTok);
-  return new Response(payload, {
-    status: upstream.status,
-    headers: respHeaders,
-  });
-}
-
-function forwardedUpstreamHeaders(): string[] {
-  return [
-    "x-request-id",
-    "anthropic-ratelimit-requests-limit",
-    "anthropic-ratelimit-requests-remaining",
-    "anthropic-ratelimit-requests-reset",
-    "anthropic-ratelimit-tokens-limit",
-    "anthropic-ratelimit-tokens-remaining",
-    "anthropic-ratelimit-tokens-reset",
-  ];
-}
-
-/**
- * Build a translated batch (non-streaming) Responses API response.
- * Saves the input+output to the in-memory store keyed by the new response id,
- * so subsequent requests with `previous_response_id` can replay the history.
- * Gzip if client accepts.
- */
-async function translatedResponsesBatchResponse(
-  clientReq: Request,
-  upstream: Response,
-  model: string,
-  reqId: string,
-  format: Format,
-  meta: RequestMeta,
-  started: number,
-  headersAt: number,
-  previousResponseId: string | undefined,
-  clientInput: unknown,
-  credKey?: string,
-  captchaMs: number = 0,
-  retried: boolean = false,
-): Promise<Response> {
-  let raw: string;
-  try {
-    raw = await readResponseTextLimited(
-      upstream,
-      translatedUpstreamBodyLimitBytes(),
-      "Translated upstream response",
-    );
-  } catch (err) {
-    printRow(reqId, format, meta, 502, started, headersAt, 0, 0, 0, retried, 0, credKey, captchaMs);
-    return errorResponse(502, "translation_failed", `failed to read upstream response body: ${(err as Error).message}`);
-  }
-  let parsedAnthropic: AnthropicMessagesResponse;
-  try {
-    parsedAnthropic = JSON.parse(raw) as AnthropicMessagesResponse;
-  } catch (err) {
-    printRow(reqId, format, meta, 502, started, headersAt, 0, 0, 0, retried, 0, credKey, captchaMs);
-    return errorResponse(502, "translation_failed", `upstream returned non-JSON body: ${(err as Error).message}`);
-  }
-  const responsesResp = translateResponseAnthropicToResponses(parsedAnthropic, model, previousResponseId ?? null);
-
-  // Persist turn for previous_response_id chaining.
-  const normalizedInput = typeof clientInput === "string"
-    ? [{ type: "message", role: "user", content: clientInput }]
-    : Array.isArray(clientInput) ? clientInput : [];
-  saveTurn(responsesResp.id, normalizedInput as unknown[], responsesResp.output as unknown[]);
-
-  const json = JSON.stringify(responsesResp);
-  const payload = new TextEncoder().encode(json);
-  // vceshi0.0.6+: capture input/output tokens from translated Responses API usage
-  const inTok = responsesResp.usage?.input_tokens ?? 0;
-  const outTok = responsesResp.usage?.output_tokens ?? 0;
-  // v0.2.0.6: capture cache-read tokens from upstream Anthropic usage
-  const cacheReadTok = parsedAnthropic.usage?.cache_read_input_tokens ?? 0;
-
-  const respHeaders = new Headers();
-  respHeaders.set("content-type", "application/json");
-  for (const h of forwardedUpstreamHeaders()) {
-    const v = upstream.headers.get(h);
-    if (v) respHeaders.set(h, v);
-  }
-
-  if (clientAcceptsGzip(clientReq)) {
-    respHeaders.set("content-encoding", "gzip");
-    printRow(reqId, format, meta, upstream.status, started, headersAt, outTok, 0, 0, retried, inTok, credKey, captchaMs, cacheReadTok);
-    // v0.2.0.8: stream through CompressionStream (see gzipPayloadStream).
-    return new Response(gzipPayloadStream(payload), {
-      status: upstream.status,
-      headers: respHeaders,
-    });
-  }
-  printRow(reqId, format, meta, upstream.status, started, headersAt, outTok, 0, 0, retried, inTok, credKey, captchaMs, cacheReadTok);
-  return new Response(payload, {
-    status: upstream.status,
-    headers: respHeaders,
-  });
-}
-
-function translatedSseResponse(body: ReadableStream<Uint8Array>): Response {
-  return new Response(body, {
-    status: 200,
-    headers: {
-      "content-type": "text/event-stream",
-      "cache-control": "no-cache",
-    },
-  });
-}
-
-interface RequestMeta {
-  model: string;
-  stream: boolean;
-}
-
-function peekParsedBody(parsed: unknown): RequestMeta {
-  if (!parsed || typeof parsed !== "object") return { model: "-", stream: false };
-  const p = parsed as Record<string, unknown>;
-  return {
-    model: typeof p.model === "string" ? p.model : "-",
-    stream: p.stream === true,
-  };
-}
-
-/**
- * Shell-glob style matcher supporting `*` (any chars) and `?` (single char).
- * Case-insensitive — model ids often differ only in case ("GLM-5" vs "glm-5").
- * Implemented as a non-backtracking DP so a pathological pattern like
- * "a*****b" against "aaaaaa...a" won't blow up.
- *
- * Examples:
- *   globMatch("glm-5*", "glm-5.1")      // true
- *   globMatch("glm-5?", "glm-5.1")      // true
- *   globMatch("glm-5", "glm-5")         // true (exact match)
- *   globMatch("glm-5", "glm-5.1")       // false (no wildcard)
- */
-export function globMatch(pattern: string, value: string): boolean {
-  if (!pattern) return false;
-  const p = pattern.toLowerCase();
-  const v = value.toLowerCase();
-  // Fast paths
-  if (p === "*") return true;
-  if (!p.includes("*") && !p.includes("?")) return p === v;
-
-  // DP: dp[i] = true if v[0..i) matches the part of pattern processed so far.
-  // Use Uint8Array (1 byte per cell) instead of Array<boolean> — slightly
-  // less memory, faster to allocate (no .fill call needed since 0 is falsy).
-  const dp = new Uint8Array(v.length + 1);
-  dp[0] = 1;
-  for (let pi = 0; pi < p.length; pi++) {
-    const ch = p[pi];
-    if (ch === "*") {
-      // `*` matches zero or more chars: dp[j] = dp[j] || dp[j-1]
-      for (let j = 1; j <= v.length; j++) dp[j] = dp[j]! || dp[j - 1]! ? 1 : 0;
-    } else {
-      // Single char (or `?`): must match exactly one char, shift right-to-left.
-      for (let j = v.length; j >= 1; j--) {
-        dp[j] = dp[j - 1]! && (ch === "?" || ch === v[j - 1]) ? 1 : 0;
-      }
-      dp[0] = 0; // any non-* char requires at least one input char
-    }
-  }
-  return dp[v.length] === 1;
-}
-
-/**
- * Check if a model id is a known GLM model OR a plausible GLM variant (starts with "glm-").
- */
-function isKnownGlmModel(model: string): boolean {
-  if (!model) return false;
-  const normalized = model.toLowerCase();
-  if (normalized.startsWith("glm-")) return true;
-  return knownGlmModelSet.has(normalized);
-}
-
-const knownGlmModelSet = new Set(listModelIds());
-
-/**
- * Look up a model rewrite in the configured modelMappings.
- * Case-insensitive exact match on `from` (mappings are stored lowercased).
- * Returns the target model id, or undefined if no mapping matches.
- */
-function lookupModelMapping(clientModel: string, mappings: { from: string; to: string }[] | undefined): string | undefined {
-  if (!mappings || mappings.length === 0) return undefined;
-  const lower = clientModel.toLowerCase();
-  return mappings.find((m) => m.from === lower)?.to;
-}
-
-/** Translate a client request body object to Anthropic JSON. Returns error Response on failure. */
-function translateClientBodyObj(parsed: unknown, format: Format, opts?: { forceThinkingModels?: string[] }): Response | unknown {
-  if (parsed === undefined || parsed === null) {
-    return errorResponse(400, "translation_failed", `${format} request body is empty; cannot translate.`);
-  }
-  try {
-    if (format === "openai-responses") {
-      return translateRequestResponsesToAnthropic(parsed as OpenAIResponseRequest, opts?.forceThinkingModels ? { forceThinkingModels: opts.forceThinkingModels } : undefined);
-    }
-    return translateRequestOpenAIToAnthropic(parsed as OpenAIChatRequest);
-  } catch (err) {
-    return errorResponse(400, "translation_failed", `${format}→Anthropic translation failed: ${(err as Error).message}`);
-  }
-}
-
-let reqCounter = 0;
-let headerPrinted = false;
-
-function nextReqId(): string {
-  return `#${String(++reqCounter).padStart(3, "0")}`;
-}
-
-function printHeader(): void {
-  if (headerPrinted) return;
-  headerPrinted = true;
-  console.log(
-    "| #    | Time       | Fmt | Model       | Mode   | Stat |    TTFB | Captcha |   Tok |  tok/s |   Total |",
-  );
-  console.log(
-    "|------|------------|-----|-------------|--------|------|---------|---------|-------|--------|---------|",
-  );
-}
-
-function printRow(
-  reqId: string,
-  format: Format,
-  meta: RequestMeta,
-  status: number,
-  started: number,
-  headersAt: number,
-  tokens: number,
-  avgTps: number,
-  streamEndAt: number,
-  retried: boolean = false,
-  inputTokens: number = 0,
-  credKey?: string,
-  captchaMs: number = 0,
-  cacheReadTokens: number = 0,
-  thinkingTokens: number = 0,
-): void {
-  printHeader();
-  const ts = new Date(started).toISOString().slice(11, 19);
-  const tag = format === "anthropic" ? "ANT" : format === "openai-responses" ? "RSP" : "OAI";
-  const mode = meta.stream ? "stream" : "batch";
-  const ttfbMs = Math.max(0, headersAt - started);
-  const ttfb = `${ttfbMs}ms`;
-  const captcha = captchaMs > 0 ? `${captchaMs}ms` : "-";
-  const total = streamEndAt > started ? `${streamEndAt - started}ms` : "-";
-  const tok = tokens > 0 ? String(tokens) : "-";
-  // v0.2.0.6: input token display reflects the TOTAL input the model saw
-  // (new input + cache_read + cache_creation). When cache is in play, also
-  // show the cache-hit portion inline so users can see prompt caching is
-  // working: "in: 41152 (c:40000) out: 4413".
-  const totalInput = inputTokens + cacheReadTokens;
-  const inTok = totalInput > 0 ? String(totalInput) : "-";
-  const cacheMarker = cacheReadTokens > 0 ? `(c:${cacheReadTokens})` : "";
-  const inField = `${inTok.padStart(5)}${cacheMarker}`.trim();
-  // v0.2.0.7: when thinking is enabled, GLM streams thinking_delta events
-  // before the final text output. Show thinking token count inline so users
-  // can distinguish "model is thinking" from "model produced final answer".
-  // Format: "out: 529 (th:1234)" means 529 output tokens + 1234 thinking tokens.
-  const thinkMarker = thinkingTokens > 0 ? `(th:${thinkingTokens})` : "";
-  const outField = `${tok.padStart(5)}${thinkMarker}`.trim();
-  const tps = avgTps > 0 ? avgTps.toFixed(1) : "-";
-  // When captcha took a significant portion of TTFB, show the breakdown
-  if (captchaMs > 0 && ttfbMs > 0) {
-    const netTtfb = Math.max(0, ttfbMs - captchaMs);
-    console.log(
-      `| ${reqId.padEnd(4)} | ${ts.padEnd(10)} | ${tag} | ${meta.model.padEnd(11)} | ${mode.padEnd(6)} | ${String(status).padStart(4)} | ${ttfb.padStart(7)} | ${captcha.padStart(7)} | in:${inField} out:${outField} | ${tps.padStart(6)} | ${total.padStart(7)} |  TTFB=${ttfbMs}ms (net ${netTtfb}ms + captcha ${captchaMs}ms)`,
-    );
-  } else {
-    console.log(
-      `| ${reqId.padEnd(4)} | ${ts.padEnd(10)} | ${tag} | ${meta.model.padEnd(11)} | ${mode.padEnd(6)} | ${String(status).padStart(4)} | ${ttfb.padStart(7)} | ${captcha.padStart(7)} | in:${inField} out:${outField} | ${tps.padStart(6)} | ${total.padStart(7)} |`,
-    );
-  }
-  // Record stats for the admin dashboard
-  recordStat({
-    id: reqId,
-    time: ts,
-    model: meta.model,
-    status,
-    ttfb: String(ttfbMs),
-    tokens: String(tokens),
-    inputTokens: String(totalInput),
-    cacheReadTokens: cacheReadTokens > 0 ? String(cacheReadTokens) : undefined,
-    credentialKey: credKey,
-    retried,
-    captchaMs: String(captchaMs),
-  });
-}
-
-/**
- * Build a TransformStream that observes an SSE/byte stream for stats while
- * passing every chunk through to the client unchanged.
- *
- * v0.2.0.8: replaces the `body.tee()` + parallel `observeStream()` reader
- * pattern. The tee() approach forced both branches to share one internal
- * buffer in Bun's whatwg implementation: the slow stats reader (fire-and-
- * forget async) held back the fast client branch, so on long LLM streams
- * (100K+ tokens) the entire response buffered in memory until the stats
- * reader caught up — doubling peak memory.
- *
- * This TransformStream parses each chunk inline during the `transform()`
- * callback, which runs on the same pump as the client response. No second
- * reader, no shared buffer, no back-pressure stall. Bytes flow through and
- * are parsed in-place.
- *
- * The stats state (tokens, inputTokens, sseBuffer, etc.) is captured in the
- * closure passed to `onComplete`. `parseSse` is the same parser used by the
- * standalone observeStream — kept in sync via the `parseSseChunk` export.
- */
-function createStatsTransform(
-  reqId: string,
-  format: Format,
-  meta: RequestMeta,
-  status: number,
-  requestSentAt: number,
-  contentEncoding: string | null,
-  credKey: string | undefined,
-  captchaMs: number,
-  retried: boolean = false,
-): { transform: TransformStream<Uint8Array, Uint8Array>; done: Promise<void>; finalize: () => void } {
-  const compressed = isCompressedContentEncoding(contentEncoding);
-  const state = {
-    tokens: 0,
-    inputTokens: 0,
-    thinkingTokens: 0,
-    cacheReadTokens: 0,
-    sseBuffer: "",
-    statsParsingDisabled: false,
-    firstChunkAt: 0,
-  };
-  const decoder = compressed ? null : new TextDecoder();
-
-  let finished = false;
-  let resolveDone: () => void;
-  const done = new Promise<void>((r) => { resolveDone = r; });
-  const finalize = (): void => {
-    if (finished) return;
-    finished = true;
-    try {
-      if (!compressed && !state.statsParsingDisabled) {
-        const tail = decoder!.decode();
-        if (tail) state.sseBuffer += tail;
-      }
-      if (!compressed && !state.statsParsingDisabled && utf8ByteLength(state.sseBuffer) > SSE_CONST.MAX_STATS_BUFFERED_EVENT_BYTES) {
-        state.sseBuffer = "";
-        state.statsParsingDisabled = true;
-      }
-      if (!compressed && !state.statsParsingDisabled && state.sseBuffer) {
-        observeStreamParseSse(state.sseBuffer, state);
-      }
-      const endAt = Date.now();
-      const ttfbMs = (state.firstChunkAt > 0 ? state.firstChunkAt : endAt) - requestSentAt;
-      const totalMs = endAt - requestSentAt;
-      const avgTps = state.tokens > 0 && totalMs > 0 ? state.tokens / (totalMs / 1000) : 0;
-      printRow(reqId, format, meta, status, requestSentAt, requestSentAt + ttfbMs, state.tokens, avgTps, endAt, retried, state.inputTokens, credKey, captchaMs, state.cacheReadTokens, state.thinkingTokens);
-    } finally {
-      resolveDone();
-    }
-  };
-
-  const transform = new TransformStream<Uint8Array, Uint8Array>({
-    transform(chunk, controller) {
-      if (state.firstChunkAt === 0) state.firstChunkAt = Date.now();
-      if (!compressed && !state.statsParsingDisabled) {
-        state.sseBuffer += decoder!.decode(chunk, { stream: true });
-        const idx = state.sseBuffer.lastIndexOf("\n");
-        if (idx >= 0) {
-          observeStreamParseSse(state.sseBuffer.slice(0, idx), state);
-          state.sseBuffer = state.sseBuffer.slice(idx + 1);
-        }
-        if (utf8ByteLength(state.sseBuffer) > SSE_CONST.MAX_STATS_BUFFERED_EVENT_BYTES) {
-          state.sseBuffer = "";
-          state.statsParsingDisabled = true;
-        }
-      }
-      // Pass the chunk straight through to the client — no buffering.
-      controller.enqueue(chunk);
-    },
-    flush() {
-      finalize();
-    },
-  });
-
-  return { transform, done, finalize };
-}
-
-function observeStatsStream(
-  source: ReadableStream<Uint8Array>,
-  stats: ReturnType<typeof createStatsTransform>,
-): ReadableStream<Uint8Array> {
-  const reader = source.pipeThrough(stats.transform).getReader();
-  let closed = false;
-  const releaseReader = (): void => {
-    try { reader.releaseLock(); } catch {}
-  };
-  const closeStream = (controller: ReadableStreamDefaultController<Uint8Array>): void => {
-    if (closed) return;
-    closed = true;
-    try { controller.close(); } catch {}
-  };
-  const errorStream = (controller: ReadableStreamDefaultController<Uint8Array>, err: unknown): void => {
-    if (closed) return;
-    closed = true;
-    try { controller.error(err); } catch {}
-  };
-  const enqueueStream = (controller: ReadableStreamDefaultController<Uint8Array>, value: Uint8Array): boolean => {
-    if (closed) return false;
-    try {
-      controller.enqueue(value);
-      return true;
-    } catch (err) {
-      errorStream(controller, err);
-      return false;
-    }
-  };
-
-  return new ReadableStream<Uint8Array>({
-    async pull(controller) {
-      if (closed) return;
-      try {
-        const { done, value } = await reader.read();
-        if (closed) return;
-        if (done) {
-          stats.finalize();
-          releaseReader();
-          closeStream(controller);
-          return;
-        }
-        if (value && !enqueueStream(controller, value)) {
-          stats.finalize();
-          releaseReader();
-        }
-      } catch (err) {
-        stats.finalize();
-        releaseReader();
-        errorStream(controller, err);
-      }
-    },
-    async cancel(reason) {
-      if (closed) return;
-      closed = true;
-      stats.finalize();
-      try {
-        await reader.cancel(reason);
-      } catch {
-        // Best-effort cancellation; downstream is already gone.
-      } finally {
-        releaseReader();
-      }
-    },
-  });
-}
-
-/**
- * SSE heartbeat transform — keeps the client connection alive while the
- * upstream is slow to emit its first byte.
- *
- * Why this exists: Cloudflare (and other reverse proxies) impose a Proxy
- * Read Timeout (CF Free/Pro = 100s). GLM-5.2 thinking mode can sit silent
- * for 60-180s before the first SSE event. Without heartbeat, CF returns
- * 524 to the client and tears down the connection.
- *
- * Mechanism: while no real chunk has arrived from upstream yet, flush a
- * no-op SSE comment line (`: keepalive\n\n`) to the client every
- * `intervalMs`. SSE comment lines are spec-compliant and silently ignored
- * by every conformant client. The bytes keep TCP active, resetting CF's
- * idle timer.
- *
- * Once the first real chunk arrives, the heartbeat stops immediately and
- * never re-fires — zero overhead after TTFB.
- *
- * Pipeline order: heartbeat wraps the stream AFTER createStatsTransform
- * (closer to the client). Stats still sees only real upstream bytes; heartbeat
- * comments flow directly to the client and are not counted as model output.
- *
- * Cancellation: implemented as a ReadableStream wrapper rather than a
- * TransformStream so downstream cancellation has a real `cancel()` hook. That
- * hook clears the heartbeat timer immediately and cancels the upstream reader,
- * avoiding timer leaks when the client disconnects before upstream TTFB.
- *
- * @param intervalMs Heartbeat interval in ms. 0 or negative = disabled
- *                  (the source stream is returned unchanged).
- */
-function withSseHeartbeat(source: ReadableStream<Uint8Array>, intervalMs: number): ReadableStream<Uint8Array> {
-  // Disabled / invalid interval — pure passthrough, no timer.
-  if (!intervalMs || intervalMs <= 0) {
-    return source;
-  }
-
-  const commentBytes = new TextEncoder().encode(SSE_HEARTBEAT_CONST.COMMENT_LINE);
-  const reader = source.getReader();
-  let firstChunkSeen = false;
-  let closed = false;
-  let timer: ReturnType<typeof setInterval> | null = null;
-  let readInFlight = false;
-
-  const stopHeartbeat = (): void => {
-    if (timer) {
-      clearInterval(timer);
-      timer = null;
-    }
-  };
-  const closeAll = (): void => {
-    closed = true;
-    stopHeartbeat();
-  };
-
-  const flushHeartbeat = (controller: ReadableStreamDefaultController<Uint8Array>): void => {
-    if (closed || firstChunkSeen) return;
-    if (controller.desiredSize !== null && controller.desiredSize <= 0) return;
-    try {
-      controller.enqueue(commentBytes);
-    } catch {
-      // Stream errored or closed — stop the timer to prevent leak.
-      closeAll();
-      void reader.cancel("heartbeat enqueue failed").catch(() => {}).finally(() => {
-        try { reader.releaseLock(); } catch {}
-      });
-    }
-  };
-
-  return new ReadableStream<Uint8Array>({
-    start(controller) {
-      // Kick off the heartbeat immediately. We use setInterval (not
-      // setTimeout chain) because it's cheaper and Bun's timer impl
-      // doesn't drift under load the way recursive setTimeout can.
-      timer = setInterval(() => flushHeartbeat(controller), intervalMs);
-      // Don't keep the event loop alive solely for heartbeat — if the
-      // only thing pending is our timer, the process should be able to
-      // exit. The real request pipeline (fetch response body) holds the
-      // loop alive anyway.
-      if (timer && typeof timer.unref === "function") timer.unref();
-    },
-    async pull(controller) {
-      if (closed || readInFlight) return;
-      readInFlight = true;
-      const safeClose = (): void => {
-        if (closed) return;
-        closeAll();
-        try { controller.close(); } catch {}
-      };
-      const safeError = (err: unknown): void => {
-        if (closed) return;
-        closeAll();
-        try { controller.error(err); } catch {}
-      };
-      const safeEnqueue = (value: Uint8Array): boolean => {
-        if (closed) return false;
-        try {
-          controller.enqueue(value);
-          return true;
-        } catch (err) {
-          safeError(err);
-          return false;
-        }
-      };
-      try {
-        const { done, value } = await reader.read();
-        if (closed) return;
-        if (done) {
-          try { reader.releaseLock(); } catch {}
-          safeClose();
-          return;
-        }
-        // First real chunk from upstream — stop the heartbeat forever.
-        if (!firstChunkSeen) {
-          firstChunkSeen = true;
-          stopHeartbeat();
-        }
-        if (value && !safeEnqueue(value)) {
-          try { await reader.cancel("downstream closed"); } catch {}
-          try { reader.releaseLock(); } catch {}
-        }
-      } catch (err) {
-        try { reader.releaseLock(); } catch {}
-        safeError(err);
-      } finally {
-        readInFlight = false;
-      }
-    },
-    async cancel(reason) {
-      closeAll();
-      try {
-        await reader.cancel(reason);
-      } catch {
-        // Best-effort cancellation; the downstream is already gone.
-      } finally {
-        try { reader.releaseLock(); } catch {}
-      }
-    },
-  });
 }
 
 /** Exported for focused transform tests. */
@@ -3355,187 +1805,5 @@ export const _testing = {
   readResponseTextPreview,
   printRow,
   wrapResponseBodyWithUpstreamTimeout,
+  shouldEmitProxyLog,
 };
-
-/**
- * Inlined SSE parser for createStatsTransform — mirrors the logic in
- * observeStream.parseSse exactly. Kept as a standalone function (rather than
- * a closure) so it doesn't get re-created per chunk. Any change to the
- * parsing rules MUST be applied here AND in observeStream above.
- *
- * v0.2.2+ PERF: substring-based early-exit before JSON.parse. Each SSE
- * line is checked for at least one of the "interesting" markers; lines
- * without any marker (keepalive pings, unknown event types) are skipped
- * without paying the JSON.parse cost. On a long streaming response with
- * 1000+ events, this saves 100ms+ of CPU.
- */
-function observeStreamParseSse(text: string, state: {
-  tokens: number; inputTokens: number; thinkingTokens: number; cacheReadTokens: number;
-}): void {
-  let lineStart = 0;
-  for (;;) {
-    const lineEnd = text.indexOf("\n", lineStart);
-    const end = lineEnd < 0 ? text.length : lineEnd;
-    if (text.startsWith("data:", lineStart)) {
-      observeStreamParseDataLine(text.slice(lineStart + 5, end).trimStart(), state);
-    }
-    if (lineEnd < 0) break;
-    lineStart = lineEnd + 1;
-  }
-}
-
-function observeStreamParseDataLine(dataStr: string, state: {
-  tokens: number; inputTokens: number; thinkingTokens: number; cacheReadTokens: number;
-}): void {
-  if (!dataStr || dataStr === "[DONE]") return;
-  // v0.2.2+ PERF: cheap substring check before JSON.parse. The markers
-  // below cover every branch that actually updates state — anything
-  // without one of these markers is guaranteed to be a no-op (the
-  // try/catch below would parse and discard it).
-  let hasMarker = false;
-  for (const marker of SSE_CONST.STATS_INTERESTING_MARKERS) {
-    if (dataStr.includes(marker)) { hasMarker = true; break; }
-  }
-  if (!hasMarker) return;
-  try {
-    const j = JSON.parse(dataStr);
-    if (j.type === "message_start" && j.message?.usage) {
-      const u = j.message.usage;
-      if (typeof u.input_tokens === "number" && u.input_tokens > 0) state.inputTokens = u.input_tokens;
-      if (typeof u.cache_read_input_tokens === "number" && u.cache_read_input_tokens > 0) state.cacheReadTokens = u.cache_read_input_tokens;
-    }
-    if (j.usage?.completion_tokens) { state.tokens = j.usage.completion_tokens; }
-    if (j.usage?.output_tokens) { state.tokens = j.usage.output_tokens; }
-    if (j.usage?.prompt_tokens) { state.inputTokens = j.usage.prompt_tokens; }
-    if (j.usage?.input_tokens) { state.inputTokens = j.usage.input_tokens; }
-    if (j.usage?.cache_read_input_tokens) { state.cacheReadTokens = j.usage.cache_read_input_tokens; }
-    const oai = j.choices?.[0]?.delta?.content;
-    if (typeof oai === "string" && oai.length > 0) { state.tokens++; return; }
-    if (j.type === "content_block_delta" && j.delta?.type === "thinking_delta") {
-      const t = j.delta?.thinking;
-      if (typeof t === "string" && t.length > 0) state.thinkingTokens++;
-      return;
-    }
-    if (j.type === "content_block_delta" && j.delta?.type === "text_delta") {
-      const t = j.delta?.text;
-      if (typeof t === "string" && t.length > 0) state.tokens++;
-      return;
-    }
-    if (j.type === "response.output_text.delta") {
-      const t = j.delta;
-      if (typeof t === "string" && t.length > 0) state.tokens++;
-      return;
-    }
-    if (j.type === "response.completed" && j.response?.usage) {
-      const u = j.response.usage;
-      if (u.output_tokens) state.tokens = u.output_tokens;
-      if (u.input_tokens) state.inputTokens = u.input_tokens;
-      if (u.cache_read_input_tokens) state.cacheReadTokens = u.cache_read_input_tokens;
-      // v0.2.0.10: Responses API carries thinking token count in
-      // usage.output_tokens_details.reasoning_tokens. Prefer this
-      // authoritative value over chunk counting when present.
-      const rt = u.output_tokens_details?.reasoning_tokens;
-      if (typeof rt === "number" && rt > 0) state.thinkingTokens = rt;
-      return;
-    }
-    if (j.type === "message_delta" && j.usage) {
-      if (j.usage.output_tokens) state.tokens = j.usage.output_tokens;
-      if (j.usage.input_tokens) state.inputTokens = j.usage.input_tokens;
-      if (j.usage.cache_read_input_tokens) state.cacheReadTokens = j.usage.cache_read_input_tokens;
-      // v0.2.0.10: GLM extension — message_delta.usage may carry an
-      // authoritative reasoning_tokens count. Prefer it over chunk counting.
-      if (typeof j.usage.reasoning_tokens === "number" && j.usage.reasoning_tokens > 0) state.thinkingTokens = j.usage.reasoning_tokens;
-      return;
-    }
-    // v0.2.0.10: Chat Completions streaming — the final chunk carries usage
-    // with cache_read_input_tokens / reasoning_tokens as non-standard
-    // extension fields (added by sse-translator.ts). OpenAI chunks don't
-    // have a `type` field, so we match by the presence of `choices` +
-    // `usage`. This must run AFTER the message_delta / response.completed
-    // branches above so those take precedence on type collisions.
-    if (j.choices && j.usage) {
-      if (j.usage.cache_read_input_tokens) state.cacheReadTokens = j.usage.cache_read_input_tokens;
-      if (typeof j.usage.reasoning_tokens === "number" && j.usage.reasoning_tokens > 0) state.thinkingTokens = j.usage.reasoning_tokens;
-    }
-  } catch {}
-}
-
-/**
- * Debug log the upstream response — shows EXACTLY what the upstream returned.
- *
- * The caller can pass a tee'd preview branch when the original response body
- * must remain available for passthrough. This avoids relying on Response.clone()
- * cancellation behavior, which is not fully isolated in Bun for streaming
- * bodies.
- *
- * Logs:
- *   - HTTP status + key headers (content-type, retry-after, empty-stream flag,
- *     ratelimit headers)
-  *   - Body preview: first 1000 bytes (for JSON) or first 8KB (for SSE streams)
- *
- * This is the "调试日志" the user requested: see what 529 / empty 200 / captcha
- * 403 actually returned, including the error JSON body. Enabled via
- * config.logging.debug or ZCODE_PROXY_DEBUG_LOGGING=1.
- *
- * MUST never throw — all operations wrapped in try/catch.
- */
-async function logUpstreamResponseDebug(reqId: string, resp: Response, _isStream: boolean, alreadyPreviewResponse = false): Promise<void> {
-  try {
-    const status = resp.status;
-    const ct = resp.headers.get("content-type") ?? "";
-    const ce = resp.headers.get("content-encoding") ?? "";
-    const retryAfter = resp.headers.get("retry-after") ?? "";
-    const emptyStream = resp.headers.get("x-zcode-empty-stream") ?? "";
-    const ratelimitRemaining = resp.headers.get("anthropic-ratelimit-requests-remaining")
-      ?? resp.headers.get("x-ratelimit-remaining") ?? "";
-
-    // Header summary — always logged
-    const headerParts: string[] = [`status=${status}`, `ct=${ct || "(none)"}`];
-    if (isCompressedContentEncoding(ce)) headerParts.push(`encoding=${ce}`);
-    if (retryAfter) headerParts.push(`retry-after=${retryAfter}`);
-    if (emptyStream) headerParts.push(`empty-stream=${emptyStream}`);
-    if (ratelimitRemaining) headerParts.push(`ratelimit-remaining=${ratelimitRemaining}`);
-    console.log(`${reqId} [debug] upstream response: ${headerParts.join(" | ")}`);
-
-    // Read a bounded body preview with a timeout so a hung stream doesn't
-    // block the request forever.
-    //
-    // v0.2.0.6: For SSE streams, the AUTHORITATIVE usage (including cache
-    // token counts) is in the `message_delta` event near the END of the
-    // stream — the previous 2KB cap + "stop at first \n\n" logic always
-    // captured only message_start (with 0/0 placeholder usage). We now
-    // keep reading until we see `message_delta` (which carries the real
-    // usage) or hit the 8KB / timeout limit. This lets users see real token
-    // counts in the debug log without enabling full request logging.
-    //
-    // v0.2.0.7: timeout raised from 3s to 10s for SSE streams. When thinking
-    // is enabled, GLM streams a long series of thinking_delta events BEFORE
-    // producing any text output — the message_delta (carrying usage) only
-    // arrives at the very end. A 3s timeout always cut off mid-thinking,
-    // showing "(read timeout after 3s)" instead of the real usage. 10s is
-    // enough for most thinking-enabled responses; very long thinking traces
-    // (30s+) will still time out, but at least we capture the thinking_delta
-    // prefix for diagnosis. JSON error responses stay at 3s (small bodies).
-    const isSSE = ct.includes("text/event-stream");
-    const PREVIEW_TIMEOUT_MS = isSSE ? 10_000 : 3_000;
-    const PREVIEW_CAP = isSSE ? 8192 : 2048;
-    const previewResult = await readResponseTextPreview(resp, {
-      maxBytes: PREVIEW_CAP,
-      timeoutMs: PREVIEW_TIMEOUT_MS,
-      clone: !alreadyPreviewResponse,
-    }).catch(() => null);
-    const preview = previewResult
-      ? `${previewResult.text}${previewResult.truncated ? `...(truncated at ${PREVIEW_CAP} bytes)` : previewResult.timedOut ? `...(read timeout after ${PREVIEW_TIMEOUT_MS / 1000}s)` : ""}`
-      : "(body read failed)";
-
-    // v0.2.0.6: For SSE streams, allow up to 8KB of preview so the
-    // message_delta event (carrying usage / cache tokens) is visible.
-    // JSON responses stay at 1KB (small error bodies don't need more).
-    const trimCapBytes = ct.includes("text/event-stream") ? 8000 : 1000;
-    const trimmed = truncateUtf8ForLog(preview, trimCapBytes);
-    const suffix = trimmed.truncated ? `...(truncated, total ${trimmed.bytes} bytes)` : "";
-    console.log(`${reqId} [debug] body preview (${trimmed.bytes} bytes): ${trimmed.text}${suffix || (trimmed.text ? "" : "(empty body)")}`);
-  } catch (err) {
-    console.log(`${reqId} [debug] failed to log response: ${(err as Error).message}`);
-  }
-}
