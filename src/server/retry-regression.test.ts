@@ -20,6 +20,7 @@ import { describe, it, expect } from "bun:test";
 import { createFetchHandler } from "./server.js";
 import type { ProxyConfig } from "../config/types.js";
 import { AuthManager } from "../auth/manager.js";
+import { _resetStatsForTesting } from "../admin/api.js";
 
 function makeRetryConfig(): ProxyConfig {
   return {
@@ -41,6 +42,57 @@ function makeRetryConfig(): ProxyConfig {
 }
 
 describe("retry body-reuse regression", () => {
+  it("retries an initial network error even when 502 is not listed as retryable", async () => {
+    const config = makeRetryConfig();
+    config.retry = {
+      ...config.retry,
+      maxRetries: 2,
+      initialDelayMs: 1,
+      maxDelayMs: 1,
+      backoffFactor: 1,
+      retryableStatuses: [529],
+    };
+    const auth = new AuthManager({ mode: "apikey", provider: "zai", apiKey: "testkey.testsecret" });
+
+    let callCount = 0;
+    const receivedBodies: string[] = [];
+    const mockFetch = (async (req: Request): Promise<Response> => {
+      callCount++;
+      receivedBodies.push(await req.text());
+      if (callCount === 1) {
+        throw new Error("ECONNRESET during first fetch");
+      }
+      return new Response(
+        JSON.stringify({
+          id: "msg_test",
+          type: "message",
+          role: "assistant",
+          content: [{ type: "text", text: "Success after initial network retry" }],
+          model: "glm-4.6",
+          stop_reason: "end_turn",
+          stop_sequence: null,
+          usage: { input_tokens: 10, output_tokens: 5 },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as typeof fetch;
+
+    const handler = createFetchHandler({ config, auth, fetchImpl: mockFetch });
+    const resp = await handler(
+      new Request("http://localhost/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "glm-4.6", max_tokens: 100, messages: [{ role: "user", content: "Hi" }] }),
+      }),
+    );
+
+    expect(callCount).toBe(2);
+    expect(receivedBodies).toHaveLength(2);
+    expect(resp.status).toBe(200);
+    const respBody = await resp.json();
+    expect(respBody.content[0].text).toBe("Success after initial network retry");
+  });
+
   it("retries successfully after 529 by building fresh Request each time", async () => {
     const config = makeRetryConfig();
     const auth = new AuthManager({ mode: "apikey", provider: "zai", apiKey: "testkey.testsecret" });
@@ -113,6 +165,230 @@ describe("retry body-reuse regression", () => {
     expect(resp.status).toBe(200);
     const respBody = await resp.json();
     expect(respBody.content[0].text).toBe("Success after retry");
+  });
+
+  it("marks admin stats as retried when a retry succeeds", async () => {
+    _resetStatsForTesting();
+    try {
+      const config = makeRetryConfig();
+      config.auth.proxyApiKey = "proxy-secret";
+      config.retry = {
+        ...config.retry,
+        maxRetries: 1,
+        initialDelayMs: 1,
+        maxDelayMs: 1,
+        backoffFactor: 1,
+        retryableStatuses: [529],
+      };
+      const auth = new AuthManager({ mode: "apikey", provider: "zai", apiKey: "testkey.testsecret" });
+
+      let callCount = 0;
+      const mockFetch = (async (req: Request): Promise<Response> => {
+        callCount++;
+        await req.text();
+        if (callCount === 1) {
+          return new Response(
+            JSON.stringify({ type: "error", error: { type: "overloaded_error", message: "busy" } }),
+            { status: 529, headers: { "content-type": "application/json" } },
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            id: "msg_retry_stats",
+            type: "message",
+            role: "assistant",
+            content: [{ type: "text", text: "Stats retry success" }],
+            model: "glm-4.6",
+            stop_reason: "end_turn",
+            stop_sequence: null,
+            usage: { input_tokens: 10, output_tokens: 5 },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }) as typeof fetch;
+
+      const handler = createFetchHandler({ config, auth, fetchImpl: mockFetch });
+      const resp = await handler(
+        new Request("http://localhost/v1/messages", {
+          method: "POST",
+          headers: {
+            "authorization": "Bearer proxy-secret",
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({ model: "glm-4.6", max_tokens: 100, messages: [{ role: "user", content: "Hi" }] }),
+        }),
+      );
+
+      expect(resp.status).toBe(200);
+      expect(callCount).toBe(2);
+
+      const statsResp = await handler(
+        new Request("http://localhost/admin/api/stats", {
+          headers: { "authorization": "Bearer proxy-secret" },
+        }),
+      );
+      expect(statsResp.status).toBe(200);
+      const stats = await statsResp.json();
+      expect(stats.total).toBe(1);
+      expect(stats.retried).toBe(1);
+      expect(stats.requests[0].retried).toBe(true);
+    } finally {
+      _resetStatsForTesting();
+    }
+  });
+
+  it("caps Retry-After retry sleeps to maxDelayMs", async () => {
+    const config = makeRetryConfig();
+    config.server = { ...config.server, upstreamTimeoutMs: 9_999 };
+    config.retry = {
+      ...config.retry,
+      maxRetries: 1,
+      initialDelayMs: 1,
+      maxDelayMs: 5,
+      backoffFactor: 1,
+      retryableStatuses: [529],
+    };
+    const auth = new AuthManager({ mode: "apikey", provider: "zai", apiKey: "testkey.testsecret" });
+
+    let callCount = 0;
+    const mockFetch = (async (req: Request): Promise<Response> => {
+      callCount++;
+      await req.text();
+      if (callCount === 1) {
+        return new Response(
+          JSON.stringify({ type: "error", error: { type: "overloaded_error", message: "busy" } }),
+          { status: 529, headers: { "content-type": "application/json", "retry-after": "3600" } },
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          id: "msg_test",
+          type: "message",
+          role: "assistant",
+          content: [{ type: "text", text: "Success after capped retry" }],
+          model: "glm-4.6",
+          stop_reason: "end_turn",
+          stop_sequence: null,
+          usage: { input_tokens: 10, output_tokens: 5 },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as typeof fetch;
+
+    const scheduledRetryDelays: number[] = [];
+    const originalSetTimeout = globalThis.setTimeout;
+    (globalThis as any).setTimeout = (handler: any, timeout?: number, ...args: unknown[]) => {
+      const delay = Number(timeout ?? 0);
+      if (delay !== config.server.upstreamTimeoutMs) {
+        scheduledRetryDelays.push(delay);
+      }
+      const actualDelay = delay > 1000 ? 0 : delay;
+      return originalSetTimeout(handler as any, actualDelay as any, ...args as any);
+    };
+
+    try {
+      const handler = createFetchHandler({ config, auth, fetchImpl: mockFetch });
+      const resp = await handler(
+        new Request("http://localhost/v1/messages", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ model: "glm-4.6", max_tokens: 100, messages: [{ role: "user", content: "Hi" }] }),
+        }),
+      );
+
+      expect(resp.status).toBe(200);
+      expect(callCount).toBe(2);
+      expect(scheduledRetryDelays.some(delay => delay > 0 && delay <= config.retry.maxDelayMs)).toBe(true);
+      expect(scheduledRetryDelays.some(delay => delay >= 60_000)).toBe(false);
+    } finally {
+      globalThis.setTimeout = originalSetTimeout;
+    }
+  });
+
+  it("cancels retryable response bodies and keeps the final success body readable", async () => {
+    const config = makeRetryConfig();
+    config.retry = {
+      ...config.retry,
+      maxRetries: 2,
+      initialDelayMs: 1,
+      maxDelayMs: 1,
+      backoffFactor: 1,
+      retryableStatuses: [529],
+    };
+    const auth = new AuthManager({ mode: "apikey", provider: "zai", apiKey: "testkey.testsecret" });
+    const encoder = new TextEncoder();
+    const canceledBodies: string[] = [];
+    let finalBodyCanceled = false;
+    let callCount = 0;
+
+    const retryableBody = (label: string) => new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(JSON.stringify({
+          type: "error",
+          error: { type: "overloaded_error", message: label },
+        })));
+        // Intentionally leave the stream open. The retry loop must cancel it
+        // before the next upstream attempt.
+      },
+      cancel() {
+        canceledBodies.push(label);
+      },
+    });
+
+    const finalBody = () => new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(JSON.stringify({
+          id: "msg_test",
+          type: "message",
+          role: "assistant",
+          content: [{ type: "text", text: "Final body survived retries" }],
+          model: "glm-4.6",
+          stop_reason: "end_turn",
+          stop_sequence: null,
+          usage: { input_tokens: 10, output_tokens: 5 },
+        })));
+        controller.close();
+      },
+      cancel() {
+        finalBodyCanceled = true;
+      },
+    });
+
+    const mockFetch = (async (req: Request): Promise<Response> => {
+      callCount++;
+      await req.text();
+      if (callCount <= 2) {
+        return new Response(retryableBody(`retry-body-${callCount}`), {
+          status: 529,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(finalBody(), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+
+    const handler = createFetchHandler({ config, auth, fetchImpl: mockFetch });
+
+    const resp = await handler(
+      new Request("http://localhost/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "glm-4.6", max_tokens: 100, messages: [{ role: "user", content: "Hi" }] }),
+      }),
+    );
+
+    for (let i = 0; i < 10 && canceledBodies.length < 2; i++) {
+      await new Promise(resolve => setTimeout(resolve, 0));
+    }
+
+    expect(callCount).toBe(3);
+    expect(canceledBodies).toEqual(["retry-body-1", "retry-body-2"]);
+    expect(resp.status).toBe(200);
+    const respBody = await resp.json();
+    expect(respBody.content[0].text).toBe("Final body survived retries");
+    expect(finalBodyCanceled).toBe(false);
   });
 
   it("returns 502 after all retries exhausted when upstream keeps returning 529", async () => {

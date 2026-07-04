@@ -165,34 +165,39 @@ export function translateRequestResponsesToAnthropic(
   // (e.g. Codex's apply_patch) are converted to function-type so the upstream
   // GLM endpoint accepts them. Built-in client-side tools (tool_search,
   // web_search, etc.) are dropped — they only exist on the client side.
-  const translatedTools: AnthropicToolDefinition[] = [];
-  for (const tool of (req.tools ?? [])) {
-    if (!tool) continue;
-    if (tool.type === "function" && tool.name) {
-      translatedTools.push(translateToolResponsesToAnthropic(tool));
-    } else if (tool.type === "custom" && tool.name) {
-      // Convert custom tools to function-type. The "format" field (e.g. grammar
-      // definition) is not representable in Anthropic's input_schema, so we
-      // embed a description of the format in the tool description instead.
-      // The patch content itself arrives as plain text in function_call arguments,
-      // which the upstream model processes as a string parameter.
-      translatedTools.push(translateCustomToolToAnthropic(tool));
-    } else if (tool.type === "tool_search" && tool.parameters) {
-      // Codex uses tool_search for deferred tool discovery. Convert to a
-      // function tool so the model knows it can search for tools. The
-      // execution is client-side, but the model needs the schema to decide
-      // when to call it.
-      translatedTools.push({
-        name: "tool_search",
-        description: tool.description || "Search for available tools by query.",
-        input_schema: tool.parameters as Record<string, unknown>,
-      });
+  // tool_choice "none" means "do not call any tools". Anthropic has no
+  // matching enum, so we must drop the tools array entirely; otherwise the
+  // upstream treats the tools as available and may auto-call them.
+  if (req.tool_choice !== "none") {
+    const translatedTools: AnthropicToolDefinition[] = [];
+    for (const tool of (req.tools ?? [])) {
+      if (!tool) continue;
+      if (tool.type === "function" && tool.name) {
+        translatedTools.push(translateToolResponsesToAnthropic(tool));
+      } else if (tool.type === "custom" && tool.name) {
+        // Convert custom tools to function-type. The "format" field (e.g. grammar
+        // definition) is not representable in Anthropic's input_schema, so we
+        // embed a description of the format in the tool description instead.
+        // The patch content itself arrives as plain text in function_call arguments,
+        // which the upstream model processes as a string parameter.
+        translatedTools.push(translateCustomToolToAnthropic(tool));
+      } else if (tool.type === "tool_search" && tool.parameters) {
+        // Codex uses tool_search for deferred tool discovery. Convert to a
+        // function tool so the model knows it can search for tools. The
+        // execution is client-side, but the model needs the schema to decide
+        // when to call it.
+        translatedTools.push({
+          name: "tool_search",
+          description: tool.description || "Search for available tools by query.",
+          input_schema: tool.parameters as Record<string, unknown>,
+        });
+      }
+      // tool_search, web_search, file_search, computer_use, code_interpreter,
+      // local_shell — all client-side built-ins, no upstream equivalent. Skip.
     }
-    // tool_search, web_search, file_search, computer_use, code_interpreter,
-    // local_shell — all client-side built-ins, no upstream equivalent. Skip.
-  }
-  if (translatedTools.length > 0) {
-    result.tools = translatedTools;
+    if (translatedTools.length > 0) {
+      result.tools = translatedTools;
+    }
   }
 
   if (req.tool_choice) {

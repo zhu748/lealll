@@ -21,6 +21,7 @@
  *
  * @see handler.ts — called before the retryable-status check
  */
+import { waitForBackpressure } from "../utils/sse.js";
 
 /** Maps Anthropic error types to HTTP status codes. */
 const SSE_ERROR_STATUS_MAP: Record<string, number> = {
@@ -44,9 +45,39 @@ export interface SseErrorInfo {
   rawBody: string;
 }
 
+interface SseBufferInspection {
+  errorInfo: SseErrorInfo | null;
+  hasLegitimateProgress: boolean;
+}
+
 /** Maximum bytes to buffer while peeking for an error event. 16KB is enough
  *  for any error event — they're always sent before generation starts. */
 const MAX_PEEK_BYTES = 16 * 1024;
+const MAX_JSON_EMPTY_INSPECT_BYTES = 2 * 1024 * 1024;
+
+function parseContentLength(headers: Headers): number | undefined {
+  const raw = headers.get("content-length");
+  if (!raw) return undefined;
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) return undefined;
+  const n = Number(trimmed);
+  return Number.isSafeInteger(n) ? n : undefined;
+}
+
+function isCompressedContentEncoding(value: string | null): boolean {
+  return !!value && value.trim().toLowerCase() !== "identity";
+}
+
+function decodeChunks(chunks: Uint8Array[]): string {
+  const total = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(bytes);
+}
 
 /**
  * If the response is an SSE stream with an embedded error event, convert it
@@ -71,7 +102,7 @@ export async function detectSseErrorAndConvert(resp: Response): Promise<Response
   if (!resp.body) return resp;
   if (resp.status !== 200) return resp;
 
-  const ct = resp.headers.get("content-type") ?? "";
+  const ct = (resp.headers.get("content-type") ?? "").toLowerCase();
 
   // ----- Non-SSE 200 responses: detect empty / content-less JSON bodies -----
   //
@@ -92,6 +123,8 @@ export async function detectSseErrorAndConvert(resp: Response): Promise<Response
   // logic kicks in. The body is then reconstructed so any downstream
   // passthrough still has something to read.
   if (ct.includes("application/json")) {
+    const ce = resp.headers.get("content-encoding");
+    if (isCompressedContentEncoding(ce)) return resp;
     return detectEmptyJsonAndConvert(resp);
   }
 
@@ -100,11 +133,12 @@ export async function detectSseErrorAndConvert(resp: Response): Promise<Response
   // Skip compressed streams — we can't decode gzip/br as UTF-8.
   // SSE streams are almost never compressed, so this is a rare edge case.
   const ce = resp.headers.get("content-encoding");
-  if (ce && ce !== "identity") return resp;
+  if (isCompressedContentEncoding(ce)) return resp;
 
   const reader = resp.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let peekedBytes = 0;
   const bufferedChunks: Uint8Array[] = [];
   // Track whether we saw ANY complete SSE event (terminated by \n\n) inside
   // the buffer. If the stream ends with zero complete events, the upstream
@@ -113,31 +147,43 @@ export async function detectSseErrorAndConvert(resp: Response): Promise<Response
   let sawAnyCompleteEvent = false;
 
   try {
-    while (buffer.length < MAX_PEEK_BYTES) {
+    while (peekedBytes < MAX_PEEK_BYTES) {
       const { done, value } = await reader.read();
       if (done) break;
+      if (!value) continue;
       bufferedChunks.push(value);
-      buffer += decoder.decode(value, { stream: true });
+      const remainingBytes = MAX_PEEK_BYTES - peekedBytes;
+      const peekChunk = value.byteLength > remainingBytes
+        ? value.subarray(0, remainingBytes)
+        : value;
+      peekedBytes += peekChunk.byteLength;
+      buffer += decoder.decode(peekChunk, { stream: true });
 
-      // Check for SSE error event
-      const errorInfo = parseSseError(buffer);
-      if (errorInfo) {
+      // Inspect complete SSE blocks once per peek. Error events win over
+      // keepalive/progress detection; ping-only streams keep peeking.
+      const inspection = inspectSseBuffer(buffer);
+      if (inspection.errorInfo) {
         // Found an error — cancel the stream and return synthetic response
         try { await reader.cancel(); } catch {}
-        return makeSyntheticErrorResponse(errorInfo, resp.headers);
+        try { reader.releaseLock(); } catch {}
+        return makeSyntheticErrorResponse(inspection.errorInfo, resp.headers);
       }
 
       // Check for a legitimate (non-error) event — stop peeking, pass through
-      if (hasNonErrorEvent(buffer)) {
+      if (inspection.hasLegitimateProgress) {
         sawAnyCompleteEvent = true;
         break;
       }
+
+      if (peekChunk.byteLength < value.byteLength) break;
     }
-    // If we exited the loop because buffer grew past MAX_PEEK_BYTES, we must
-    // have seen at least one complete event (otherwise the loop would have
-    // kept reading). Mark accordingly so the empty-stream check below doesn't
-    // fire.
-    if (buffer.length >= MAX_PEEK_BYTES) {
+    // If we hit the peek cap without finding an error or a complete event,
+    // pass through unchanged. A very large first SSE event can legitimately
+    // exceed the detector window; converting it to an empty-stream 529 would
+    // be a false positive. The cap is enforced in bytes for the decoded
+    // inspection buffer, while `bufferedChunks` retains the original bytes so
+    // the downstream response stays byte-for-byte intact.
+    if (peekedBytes >= MAX_PEEK_BYTES) {
       sawAnyCompleteEvent = true;
     }
   } catch {
@@ -162,7 +208,7 @@ export async function detectSseErrorAndConvert(resp: Response): Promise<Response
   //
   // The fix: trigger whenever we saw no real content event, regardless of
   // how many bytes were buffered. The `hasNonErrorEvent` check above already
-  // correctly distinguishes "legitimate stream with ping/message_start" from
+  // correctly distinguishes "legitimate stream with message_start/content" from
   // "only comments / whitespace / partial fragments".
   //
   // The user-visible symptom of this bug: "200 OK but no output" when a
@@ -177,6 +223,7 @@ export async function detectSseErrorAndConvert(resp: Response): Promise<Response
   //      counter, triggering credential switch after 3 consecutive empties
   if (!sawAnyCompleteEvent) {
     try { await reader.cancel(); } catch {}
+    try { reader.releaseLock(); } catch {}
     const emptyInfo: SseErrorInfo = {
       type: "overloaded_error",
       status: 529,
@@ -220,15 +267,35 @@ export async function detectSseErrorAndConvert(resp: Response): Promise<Response
  * existing error passthrough in handler.ts surfaces it to the client).
  */
 async function detectEmptyJsonAndConvert(resp: Response): Promise<Response> {
-  // Read the body once. We'll reconstruct the response either way so
-  // downstream passthrough still has access to the bytes.
-  let raw = "";
-  try {
-    raw = await resp.text();
-  } catch {
-    // Body read failed — can't inspect, pass through unchanged
+  // Read at most a small preview. Empty/content-less JSON responses are tiny;
+  // large legitimate batch completions should not be fully buffered merely
+  // for this retry heuristic.
+  const declaredLength = parseContentLength(resp.headers);
+  if (declaredLength !== undefined && declaredLength > MAX_JSON_EMPTY_INSPECT_BYTES) {
     return resp;
   }
+  const reader = resp.body?.getReader();
+  if (!reader) return resp;
+
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      chunks.push(value);
+      total += value.byteLength;
+      if (total > MAX_JSON_EMPTY_INSPECT_BYTES) {
+        return reconstructStream(resp, chunks, reader);
+      }
+    }
+  } catch {
+    return reconstructStream(resp, chunks, reader);
+  }
+  try { reader.releaseLock(); } catch {}
+
+  const raw = decodeChunks(chunks);
 
   // Trim whitespace — empty body is the most common case
   const trimmed = raw.trim();
@@ -312,59 +379,126 @@ function reconstructJsonResponse(resp: Response, body: string): Response {
   });
 }
 
+function normalizeSseNewlines(buffer: string): string {
+  return buffer.indexOf("\r") >= 0
+    ? buffer.replace(/\r\n/g, "\n").replace(/\r/g, "\n")
+    : buffer;
+}
+
 /**
- * Parse the buffer for an SSE error event.
- * Handles multiple formats seen in the wild:
+ * Inspect complete SSE blocks in the peek buffer.
+ *
+ * The previous implementation called parseSseError(buffer) and then
+ * hasNonErrorEvent(buffer). Both normalized and split the whole buffer on every
+ * peek chunk. Streams delivered as many tiny chunks could repeatedly allocate
+ * arrays and rescan the same bytes. This single pass preserves behavior:
  *   1. Standard Anthropic:  event: error\ndata: {"type":"error","error":{"type":"overloaded_error",...}}
  *   2. Bare data:           data: {"type":"error","error":{"type":"overloaded_error",...}}
  *   3. Direct error type:   data: {"type":"overloaded_error","message":"..."}
  *   4. Raw JSON (no SSE):   {"type":"overloaded_error","message":"..."}
  */
-function parseSseError(buffer: string): SseErrorInfo | null {
-  // Try parsing as SSE blocks first
-  const blocks = buffer.split("\n\n");
-  for (const block of blocks) {
-    if (!block.trim()) continue;
+function inspectSseBuffer(buffer: string): SseBufferInspection {
+  const normalized = normalizeSseNewlines(buffer);
+  let hasLegitimateProgress = false;
+  let start = 0;
 
-    const lines = block.split("\n").filter(Boolean);
-    let eventType = "";
-    let dataStr = "";
+  for (;;) {
+    const end = normalized.indexOf("\n\n", start);
+    if (end < 0) break;
 
-    for (const line of lines) {
-      if (line.startsWith("event:")) {
-        eventType = line.slice(6).trim();
-      } else if (line.startsWith("data:")) {
-        // Handles both "data:" and "data: "
-        dataStr = line.slice(5).trimStart();
-      }
+    const block = normalized.slice(start, end);
+    start = end + 2;
+
+    const blockResult = inspectCompleteSseBlock(block);
+    if (blockResult.errorInfo) {
+      return { errorInfo: blockResult.errorInfo, hasLegitimateProgress };
     }
-
-    if (dataStr) {
-      const info = extractErrorFromJson(dataStr, eventType);
-      if (info) return info;
+    if (blockResult.hasLegitimateProgress) {
+      hasLegitimateProgress = true;
     }
   }
 
   // If no SSE framing found, try parsing the whole buffer as raw JSON.
   // Some gateways send the error body without SSE framing at all.
-  const trimmed = buffer.trim();
+  const trimmed = normalized.trim();
   if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
     const info = extractErrorFromJson(trimmed, "");
-    if (info) return info;
+    if (info) return { errorInfo: info, hasLegitimateProgress };
   }
 
-  return null;
+  return { errorInfo: null, hasLegitimateProgress };
+}
+
+function inspectCompleteSseBlock(block: string): SseBufferInspection {
+  if (!block.trim()) return { errorInfo: null, hasLegitimateProgress: false };
+
+  let eventType = "";
+  const dataLines: string[] = [];
+  let lineStart = 0;
+
+  for (;;) {
+    const lineEnd = block.indexOf("\n", lineStart);
+    const line = lineEnd < 0 ? block.slice(lineStart) : block.slice(lineStart, lineEnd);
+    lineStart = lineEnd < 0 ? block.length + 1 : lineEnd + 1;
+
+    if (line) {
+      if (line.startsWith("event:")) {
+        eventType = line.slice(6).trim();
+      } else if (line.startsWith("data:")) {
+        // Handles both "data:" and "data: "
+        dataLines.push(line.slice(5).trimStart());
+      }
+    }
+
+    if (lineEnd < 0) break;
+  }
+
+  const dataStr = dataLines.join("\n");
+  if (dataStr) {
+    const info = extractErrorFromJson(dataStr, eventType);
+    if (info) return { errorInfo: info, hasLegitimateProgress: false };
+  }
+
+  // `ping` is only a keepalive. Keep peeking until we see a real content or
+  // lifecycle event; otherwise a ping-before-error stream can bypass retry.
+  if (isLegitimateProgressEvent(eventType)) {
+    return { errorInfo: null, hasLegitimateProgress: true };
+  }
+
+  if (dataStr === "[DONE]") {
+    return { errorInfo: null, hasLegitimateProgress: true };
+  }
+
+  // No event type but valid JSON with a real progress type is also legitimate
+  // (e.g., {"type":"message_start", ...}). OpenAI Chat Completions streams
+  // also omit the `event:` field and rely on `data: {"choices":[...]}` chunks.
+  if (!eventType && dataStr) {
+    try {
+      const data = JSON.parse(dataStr);
+      if (isLegitimateProgressPayload(data)) {
+        return { errorInfo: null, hasLegitimateProgress: true };
+      }
+    } catch {
+      // Not JSON — can't determine, don't short-circuit.
+    }
+  }
+
+  return { errorInfo: null, hasLegitimateProgress: false };
 }
 
 /** Try to extract error info from a JSON string. Returns null if not an error. */
 function extractErrorFromJson(jsonStr: string, eventType: string): SseErrorInfo | null {
+  const trimmed = jsonStr.trim();
+  if (!trimmed || trimmed === "[DONE]") return null;
+  if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return null;
+
   let data: any;
   try {
-    data = JSON.parse(jsonStr);
+    data = JSON.parse(trimmed);
   } catch (err) {
     // Log malformed JSON in SSE error events so silent passthrough of
     // garbage streams can be diagnosed. Previously these were swallowed.
-    console.warn(`[sse-error] malformed JSON in SSE error event: ${(err as Error).message}; payload=${jsonStr.slice(0, 200)}`);
+    console.warn(`[sse-error] malformed JSON in SSE error event: ${(err as Error).message}; payload=${trimmed.slice(0, 200)}`);
     return null;
   }
 
@@ -399,56 +533,42 @@ function extractErrorFromJson(jsonStr: string, eventType: string): SseErrorInfo 
   return null;
 }
 
-/**
- * Check if the buffer contains a complete, non-error SSE event.
- * Used to short-circuit peeking once we know the stream is legitimate
- * (e.g., we've seen `message_start` or `content_block_start`).
- *
- * IMPORTANT: Only checks COMPLETE blocks (those terminated by \n\n).
- * The last block after split("\n\n") might be a partial event (e.g.,
- * `event: er` when the full `event: error` hasn't arrived yet). Checking
- * partial blocks would cause false positives — "er" !== "error" would
- * make us think it's a non-error event and stop peeking prematurely.
- */
-function hasNonErrorEvent(buffer: string): boolean {
-  const blocks = buffer.split("\n\n");
-  // Skip the last block — it may be incomplete (no trailing \n\n).
-  // If buffer ends with \n\n, the last element is "" (empty), which is safe to skip.
-  // If buffer doesn't end with \n\n, the last element is a partial block we must skip.
-  for (let i = 0; i < blocks.length - 1; i++) {
-    const block = blocks[i];
-    if (!block.trim()) continue;
+function isLegitimateProgressEvent(type: unknown): boolean {
+  if (typeof type !== "string") return false;
+  return type === "message_start"
+    || type === "message_delta"
+    || type === "message_stop"
+    || type === "content_block_start"
+    || type === "content_block_delta"
+    || type === "content_block_stop"
+    || type === "response.created"
+    || type === "response.in_progress"
+    || type === "response.output_item.added"
+    || type === "response.output_item.done"
+    || type === "response.content_part.added"
+    || type === "response.content_part.done"
+    || type === "response.output_text.delta"
+    || type === "response.output_text.done"
+    || type === "response.function_call_arguments.delta"
+    || type === "response.function_call_arguments.done"
+    || type === "response.completed"
+    || type === "response.incomplete"
+    || type === "response.failed";
+}
 
-    const lines = block.split("\n").filter(Boolean);
-    let eventType = "";
-    let dataStr = "";
+function isLegitimateProgressPayload(data: any): boolean {
+  if (isLegitimateProgressEvent(data?.type)) return true;
 
-    for (const line of lines) {
-      if (line.startsWith("event:")) {
-        eventType = line.slice(6).trim();
-      } else if (line.startsWith("data:")) {
-        dataStr = line.slice(5).trimStart();
-      }
-    }
+  // OpenAI Chat Completions streaming:
+  //   data: {"object":"chat.completion.chunk","choices":[...]}
+  // The final include_usage chunk may carry `choices: []` with a usage object.
+  if (data?.object === "chat.completion.chunk" && Array.isArray(data.choices)) return true;
+  if (Array.isArray(data?.choices) && data.choices.length > 0) return true;
+  if (Array.isArray(data?.choices) && data?.usage && typeof data.usage === "object") return true;
 
-    // A non-error event type means the stream is legitimate
-    if (eventType && eventType !== "error") {
-      return true;
-    }
-
-    // No event type but valid JSON with a non-error type is also legitimate
-    // (e.g., {"type":"message_start", ...})
-    if (!eventType && dataStr) {
-      try {
-        const data = JSON.parse(dataStr);
-        if (data?.type && data.type !== "error" && !SSE_ERROR_STATUS_MAP[data.type]) {
-          return true;
-        }
-      } catch {
-        // Not JSON — can't determine, don't short-circuit
-      }
-    }
-  }
+  // OpenAI Responses streaming usually has an event name, but the payload's
+  // `type` is authoritative. Keep this tolerant for event-stripped proxies.
+  if (typeof data?.type === "string" && data.type.startsWith("response.")) return true;
 
   return false;
 }
@@ -535,6 +655,7 @@ function reconstructStream(
           while (true) {
             const { done, value } = await reader.read();
             if (done) break;
+            await waitForBackpressure(controller);
             safeEnqueue(controller, value);
           }
           safeClose(controller);
@@ -549,7 +670,7 @@ function reconstructStream(
       // Mark closed so the async read loop's subsequent safeEnqueue/safeClose
       // calls become no-ops instead of throwing.
       streamClosed = true;
-      try { reader.cancel(reason); } catch {}
+      void reader.cancel(reason).catch(() => {});
     },
   });
 

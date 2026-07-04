@@ -7,15 +7,17 @@
 import type { ProxyConfig, RoutingRule, ModelMapping, ResponsesThinkingConfig } from "../config/types.js";
 import type { AuthManager } from "../auth/manager.js";
 import type { Credential as AppCredential } from "../auth/types.js";
-import { loadCredential, saveCredential, clearCredentialAsync, listAccounts, switchAccount, removeAccount, setAccountLabel, setAccountPlan, setAccountProxy, setAccountName, setAccountEmail, setAccountDisabled, exportSingleAccount, exportAccounts, exportStore, importAccounts, maskApiKey, invalidateStoreCache } from "../auth/store.js";
-import { ZaiOAuthClient, BigmodelOAuthClient } from "../auth/oauth.js";
+import { loadCredential, saveCredential, clearCredentialAsync, listAccounts, switchAccount, removeAccount, setAccountLabel, setAccountPlan, setAccountProxy, setAccountName, setAccountEmail, setAccountDisabled, exportSingleAccount, exportAccounts, exportStore, importAccounts, maskApiKey, invalidateStoreCache, validateProxyUrl } from "../auth/store.js";
+import { ZaiOAuthClient, BigmodelOAuthClient, normalizeCallbackWaitTimeoutMs } from "../auth/oauth.js";
 import { KeyResolver } from "../auth/resolver.js";
 import { queryQuota } from "../auth/quota.js";
 import { readZCodeImport, detectZCodeProvider, listAvailableZCodeImports } from "../auth/zcode-config.js";
 import { errorResponse } from "../proxy/handler.js";
+import { getChromeCaptchaHelperStatus, warmupChromeCaptchaHelper, shutdownChromeCaptchaHelper } from "../proxy/captcha.js";
 import { wrapFetchWithSocksBridge, makeProxiedFetcher } from "../proxy/proxied-fetch.js";
 import { timingSafeEqual } from "../utils/crypto.js";
 import { atomicWriteFile, createMutex } from "../utils/fs.js";
+import { LOG as LOG_CONST } from "../utils/constants.js";
 import { MODELS as GLM_CATALOG } from "../provider/models.js";
 import { stringify as stringifyYaml } from "yaml";
 import {
@@ -29,6 +31,7 @@ import {
   startTestJob,
   getTestJobState,
   cancelTestJob,
+  validateProxySourceUrl,
 } from "../proxy/proxy-pool.js";
 // Inline the dashboard HTML at build time so it works inside a
 // `bun build --compile` single-file executable. Runtime `readFileSync`
@@ -69,28 +72,58 @@ export interface AdminOptions {
 // path) are O(1) instead of O(n). At 200 entries × 100 req/s the old findIndex
 // approach ran 20k string compares/sec; the Map version runs 100.
 //
-// vceshi0.0.7+: `seenIds` is a lifetime Set of ids we've already counted.
+// vceshi0.0.7+: `seenIds` is a bounded lifetime Map of ids we've already counted.
 // Once a request id is evicted from `requestIndex` (via the 200-entry trim),
 // retries that arrive later would otherwise be misclassified as new requests
-// and inflate the totals. `seenIds` lets us detect this case and update the
-// existing totals without creating a duplicate `requests[]` entry.
+// and inflate the totals. The value keeps the last counted status/retry state
+// so post-trim retries can still re-classify success/failed without making
+// counters inconsistent.
 //
-// The Set is bounded by `SEEN_IDS_LIMIT` (default 5000) — beyond that, we
+// The Map is bounded by `SEEN_IDS_LIMIT` (default 50000) — beyond that, we
 // accept the small risk of double-counting ancient retries in exchange for
-// bounded memory. 5000 ids at ~50 bytes each is ~250KB.
-const SEEN_IDS_LIMIT = 50_000;
-const SEEN_IDS_EVICT_BATCH = 1_000;
+// bounded memory.
+const SEEN_IDS_LIMIT = LOG_CONST.SEEN_IDS_LIMIT;
+const SEEN_IDS_EVICT_BATCH = LOG_CONST.SEEN_IDS_EVICT_BATCH;
+const MAX_MODEL_STATS = 100;
+const MAX_CREDENTIAL_STATS = 1000;
+const MAX_PROXY_POOL_REFRESH_INTERVAL_MIN = Math.floor(2_147_483_647 / 60_000);
+const MAX_PROXY_POOL_ROTATIONS = 20;
+const CONFIG_SECRET_MASK = "***configured***";
+type StatsRequestEntry = {
+  id: string;
+  time: string;
+  model: string;
+  status: number;
+  ttfb: string;
+  tokens: string;
+  inputTokens: string;
+  cacheReadTokens?: string;
+  credentialKey?: string;
+  captchaMs?: string;
+  retried?: boolean;
+};
+type SeenStat = {
+  status: number;
+  retried: boolean;
+  model: string;
+  modelBucket: string;
+  ttfb: string;
+  tokens: string;
+  inputTokens: string;
+  credentialKey?: string;
+};
 const stats = {
   total: 0,
   success: 0,
   failed: 0,
   retried: 0,
-  requests: [] as Array<{ id: string; time: string; model: string; status: number; ttfb: string; tokens: string; inputTokens: string; cacheReadTokens?: string; captchaMs?: string; retried?: boolean }>,
+  requests: [] as StatsRequestEntry[],
   models: {} as Record<string, { count: number; avgTtfb: number; tokens: number; inputTokens: number }>,
   // vceshi0.0.6+: per-credential usage stats (in-memory, reset on restart).
-  // Keyed by maskApiKey(apiKey) to avoid leaking plaintext keys in stats.
-  // The dashboard joins this with listAccounts (which has apiKeyMask) to
-  // display "使用次数" per account.
+  // Keyed by credentialStatsKey(provider + apiKey hash) to avoid leaking
+  // plaintext keys and avoid collisions from display-only apiKeyMask.
+  // The dashboard joins this with listAccounts.credentialKey to display
+  // "使用次数" per account.
   byCredential: {} as Record<string, { count: number; inputTokens: number; outputTokens: number; lastUsed: string; success: number; failed: number }>,
   // G5: Error stats by status code — enables the dashboard to show "529: 12, 429: 3"
   // instead of just "failed: 15". Critical for diagnosing whether failures are
@@ -98,7 +131,152 @@ const stats = {
   byStatus: {} as Record<number, number>,
 };
 const requestIndex = new Map<string, number>();
-const seenIds = new Set<string>();
+const requestModelBuckets = new Map<string, string>();
+const modelTtfbTotals = new Map<string, number>();
+const seenIds = new Map<string, SeenStat>();
+const credentialStatLastSeen = new Map<string, number>();
+let credentialStatSeq = 0;
+
+function isSuccessStatus(status: number): boolean {
+  return status >= 200 && status < 300;
+}
+
+function moveStatusCounter(fromStatus: number, toStatus: number): void {
+  if (fromStatus === toStatus) return;
+  const oldCount = (stats.byStatus[fromStatus] ?? 0) - 1;
+  if (oldCount > 0) stats.byStatus[fromStatus] = oldCount;
+  else delete stats.byStatus[fromStatus];
+  stats.byStatus[toStatus] = (stats.byStatus[toStatus] ?? 0) + 1;
+}
+
+function statNumber(value: string | undefined): number {
+  const raw = value?.trim();
+  if (!raw || !/^\d+$/.test(raw)) return 0;
+  const n = Number(raw);
+  return Number.isSafeInteger(n) ? n : 0;
+}
+
+function resolveModelBucket(model: string): string {
+  if (stats.models[model]) return model;
+  if (Object.keys(stats.models).length >= MAX_MODEL_STATS) return "_other";
+  return model;
+}
+
+function addModelStats(entry: StatsRequestEntry, forcedBucket?: string): string {
+  const bucket = forcedBucket ?? resolveModelBucket(entry.model);
+  const m = stats.models[bucket] ?? { count: 0, avgTtfb: 0, tokens: 0, inputTokens: 0 };
+  const ttfbMs = statNumber(entry.ttfb);
+  const nextTtfbTotal = (modelTtfbTotals.get(bucket) ?? (m.avgTtfb * m.count)) + ttfbMs;
+  m.count++;
+  m.avgTtfb = Math.round(nextTtfbTotal / m.count);
+  m.tokens += statNumber(entry.tokens);
+  m.inputTokens += statNumber(entry.inputTokens);
+  stats.models[bucket] = m;
+  modelTtfbTotals.set(bucket, nextTtfbTotal);
+  return bucket;
+}
+
+function removeModelStats(bucket: string, entry: Pick<StatsRequestEntry, "ttfb" | "tokens" | "inputTokens">): void {
+  const m = stats.models[bucket];
+  if (!m) return;
+  const nextCount = m.count - 1;
+  const nextTtfbTotal = Math.max(0, (modelTtfbTotals.get(bucket) ?? (m.avgTtfb * m.count)) - statNumber(entry.ttfb));
+  if (nextCount <= 0) {
+    delete stats.models[bucket];
+    modelTtfbTotals.delete(bucket);
+    return;
+  }
+  m.count = nextCount;
+  m.tokens = Math.max(0, m.tokens - statNumber(entry.tokens));
+  m.inputTokens = Math.max(0, m.inputTokens - statNumber(entry.inputTokens));
+  m.avgTtfb = Math.round(nextTtfbTotal / nextCount);
+  stats.models[bucket] = m;
+  modelTtfbTotals.set(bucket, nextTtfbTotal);
+}
+
+function updateModelStatsForRetry(oldBucket: string, oldEntry: StatsRequestEntry | SeenStat, newEntry: StatsRequestEntry): string {
+  removeModelStats(oldBucket, oldEntry);
+  const targetBucket = oldBucket === "_other" && !stats.models[newEntry.model] ? "_other" : undefined;
+  return addModelStats(newEntry, targetBucket);
+}
+
+type CredentialStatEntry = Pick<StatsRequestEntry, "credentialKey" | "status" | "inputTokens" | "tokens"> & { time?: string };
+
+function touchCredentialStat(key: string): void {
+  credentialStatLastSeen.set(key, ++credentialStatSeq);
+}
+
+function pruneCredentialStats(): void {
+  const keys = Object.keys(stats.byCredential);
+  if (keys.length <= MAX_CREDENTIAL_STATS) return;
+  keys.sort((a, b) => (credentialStatLastSeen.get(a) ?? 0) - (credentialStatLastSeen.get(b) ?? 0));
+  const overflow = keys.length - MAX_CREDENTIAL_STATS;
+  for (let i = 0; i < overflow; i++) {
+    delete stats.byCredential[keys[i]];
+    credentialStatLastSeen.delete(keys[i]);
+  }
+}
+
+function addCredentialStats(entry: CredentialStatEntry): void {
+  if (!entry.credentialKey) return;
+  const c = stats.byCredential[entry.credentialKey] ?? { count: 0, inputTokens: 0, outputTokens: 0, lastUsed: "", success: 0, failed: 0 };
+  if (isSuccessStatus(entry.status)) {
+    c.count++;
+    c.success++;
+    c.inputTokens += statNumber(entry.inputTokens);
+    c.outputTokens += statNumber(entry.tokens);
+  } else {
+    c.failed++;
+  }
+  c.lastUsed = entry.time ?? c.lastUsed;
+  stats.byCredential[entry.credentialKey] = c;
+  touchCredentialStat(entry.credentialKey);
+  pruneCredentialStats();
+}
+
+function removeCredentialStats(entry: CredentialStatEntry): void {
+  if (!entry.credentialKey) return;
+  const c = stats.byCredential[entry.credentialKey];
+  if (!c) return;
+  if (isSuccessStatus(entry.status)) {
+    c.count = Math.max(0, c.count - 1);
+    c.success = Math.max(0, c.success - 1);
+    c.inputTokens = Math.max(0, c.inputTokens - statNumber(entry.inputTokens));
+    c.outputTokens = Math.max(0, c.outputTokens - statNumber(entry.tokens));
+  } else {
+    c.failed = Math.max(0, c.failed - 1);
+  }
+  if (c.count === 0 && c.success === 0 && c.failed === 0 && c.inputTokens === 0 && c.outputTokens === 0) {
+    delete stats.byCredential[entry.credentialKey];
+    credentialStatLastSeen.delete(entry.credentialKey);
+  } else {
+    stats.byCredential[entry.credentialKey] = c;
+    touchCredentialStat(entry.credentialKey);
+  }
+}
+
+function updateCredentialStatsForRetry(oldEntry: CredentialStatEntry, newEntry: CredentialStatEntry): void {
+  removeCredentialStats(oldEntry);
+  addCredentialStats(newEntry);
+}
+
+function rememberSeenStat(entry: StatsRequestEntry, modelBucket: string): void {
+  // Map preserves insertion order, but `set()` on an existing key does not
+  // move it. Delete first so retries refresh the id's LRU position; otherwise
+  // an old request that was just updated could still be evicted immediately,
+  // and a later retry would be double-counted as a brand-new request.
+  seenIds.delete(entry.id);
+  seenIds.set(entry.id, {
+    status: entry.status,
+    retried: !!entry.retried,
+    model: entry.model,
+    modelBucket,
+    ttfb: entry.ttfb,
+    tokens: entry.tokens,
+    inputTokens: entry.inputTokens,
+    credentialKey: entry.credentialKey,
+  });
+}
 
 /**
  * Record a request for stats. Called from handler.ts printRow.
@@ -111,62 +289,40 @@ const seenIds = new Set<string>();
  *
  * vceshi0.0.6+: `inputTokens` and `credentialKey` fields added.
  * - inputTokens: from upstream usage.input_tokens / prompt_tokens
- * - credentialKey: maskApiKey(cred.apiKey) for per-credential usage tracking
+ * - credentialKey: credentialStatsKey(cred) for per-credential usage tracking
  */
 export function recordStat(entry: { id: string; time: string; model: string; status: number; ttfb: string; tokens: string; inputTokens?: string; cacheReadTokens?: string; credentialKey?: string; retried?: boolean; captchaMs?: string }) {
   const existingIdx = requestIndex.get(entry.id);
   if (existingIdx !== undefined) {
     // Update the existing entry — do NOT increment counters again.
     const old = stats.requests[existingIdx];
-    // Re-classify if the status changed (e.g. 529 → 200 after retry).
-    const wasSuccess = old.status >= 200 && old.status < 300;
-    const isSuccess = entry.status >= 200 && entry.status < 300;
-    if (wasSuccess !== isSuccess) {
-      if (isSuccess) { stats.failed--; stats.success++; }
-      else { stats.success--; stats.failed++; }
-    }
-    // G5: Update byStatus on re-classification
-    if (wasSuccess !== isSuccess) {
-      // Decrement the old status count (it's being re-classified)
-      stats.byStatus[old.status] = (stats.byStatus[old.status] ?? 1) - 1;
-      if (stats.byStatus[old.status] <= 0) delete stats.byStatus[old.status];
-      // Increment the new status count
-      stats.byStatus[entry.status] = (stats.byStatus[entry.status] ?? 0) + 1;
-    }
-    // Always count retry flag — the final entry wins.
-    if (entry.retried && !old.retried) stats.retried++;
-    // vceshi0.0.7+: if the success classification flipped to success, the
-    // byCredential counter (which only counts successes) was previously
-    // skipped on the original failed recordStat call. Now that it succeeded,
-    // we must increment byCredential to reflect the actual upstream usage.
-    // Conversely, if it flipped from success to failure, the credential
-    // didn't actually serve the request successfully — but we don't decrement
-    // because the original increment already happened (decrementing would
-    // risk going negative on edge cases).
-    if (!wasSuccess && isSuccess && entry.credentialKey) {
-      const c = stats.byCredential[entry.credentialKey] ?? { count: 0, inputTokens: 0, outputTokens: 0, lastUsed: "", success: 0, failed: 0 };
-      c.count++;
-      c.success++;
-      // Decrement the failed counter that was incremented on the original failed recordStat
-      c.failed = Math.max(0, (c.failed || 0) - 1);
-      c.inputTokens += parseInt(entry.inputTokens ?? "0") || 0;
-      c.outputTokens += parseInt(entry.tokens) || 0;
-      c.lastUsed = entry.time;
-      stats.byCredential[entry.credentialKey] = c;
-    }
-    // G6: If re-classified from success to failure, track credential failure
-    if (wasSuccess && !isSuccess && entry.credentialKey) {
-      const c = stats.byCredential[entry.credentialKey];
-      if (c) { c.success--; c.failed++; }
-    }
-    stats.requests[existingIdx] = {
+    const nextEntry: StatsRequestEntry = {
       ...old,
       ...entry,
       inputTokens: entry.inputTokens ?? old.inputTokens ?? "0",
       cacheReadTokens: entry.cacheReadTokens ?? old.cacheReadTokens,
+      credentialKey: entry.credentialKey ?? old.credentialKey,
       captchaMs: entry.captchaMs ?? old.captchaMs ?? "0",
       retried: entry.retried || old.retried,
     };
+    // Re-classify if the status changed (e.g. 529 → 200 after retry).
+    const wasSuccess = isSuccessStatus(old.status);
+    const isSuccess = isSuccessStatus(entry.status);
+    if (wasSuccess !== isSuccess) {
+      if (isSuccess) { stats.failed--; stats.success++; }
+      else { stats.success--; stats.failed++; }
+    }
+    // G5: Keep the status breakdown aligned with the latest status even when
+    // both old/new statuses are failures, e.g. 529 -> 503.
+    moveStatusCounter(old.status, entry.status);
+    // Always count retry flag — the final entry wins.
+    if (entry.retried && !old.retried) stats.retried++;
+    updateCredentialStatsForRetry(old, nextEntry);
+    const oldBucket = requestModelBuckets.get(entry.id) ?? seenIds.get(entry.id)?.modelBucket ?? old.model;
+    const nextBucket = updateModelStatsForRetry(oldBucket, old, nextEntry);
+    requestModelBuckets.set(entry.id, nextBucket);
+    stats.requests[existingIdx] = nextEntry;
+    rememberSeenStat(nextEntry, nextBucket);
     return;
   }
 
@@ -175,35 +331,54 @@ export function recordStat(entry: { id: string; time: string; model: string; sta
   // counting. The retry's status update still flows through to the totals
   // (re-classifying success↔failed), but we don't create a new requests[]
   // row for it.
-  if (seenIds.has(entry.id)) {
-    // We've seen this id before but it was evicted from requestIndex.
-    // Update totals based on the diff (assuming the previous state was
-    // either success or failed — we can't know which, so we conservatively
-    // treat this as a new failure→success re-classification IF the current
-    // status is success and we have a credentialKey (the common case is a
-    // retried request that now succeeded). For the rarer success→failure
-    // case (server gave 200 then retried and got 529 — unusual), we
-    // under-count failures, which is acceptable.
-    if (entry.status >= 200 && entry.status < 300) stats.success++;
-    else stats.failed++;
-    if (entry.retried) stats.retried++;
+  const seen = seenIds.get(entry.id);
+  if (seen) {
+    // We've seen this id before but it was evicted from requestIndex. Reconcile
+    // aggregate counters against the remembered state, but don't add a new row
+    // or increment total.
+    const wasSuccess = isSuccessStatus(seen.status);
+    const isSuccess = isSuccessStatus(entry.status);
+    if (wasSuccess !== isSuccess) {
+      if (isSuccess) { stats.failed--; stats.success++; }
+      else { stats.success--; stats.failed++; }
+    }
+    moveStatusCounter(seen.status, entry.status);
+    if (entry.retried && !seen.retried) stats.retried++;
+    const nextEntry: StatsRequestEntry = {
+      id: entry.id,
+      time: entry.time,
+      model: entry.model,
+      status: entry.status,
+      ttfb: entry.ttfb,
+      tokens: entry.tokens,
+      inputTokens: entry.inputTokens ?? seen.inputTokens ?? "0",
+      cacheReadTokens: entry.cacheReadTokens,
+      credentialKey: entry.credentialKey ?? seen.credentialKey,
+      captchaMs: entry.captchaMs ?? "0",
+      retried: entry.retried || seen.retried,
+    };
+    updateCredentialStatsForRetry(seen, nextEntry);
+    const nextBucket = updateModelStatsForRetry(seen.modelBucket, seen, nextEntry);
+    rememberSeenStat(nextEntry, nextBucket);
     // Don't double-count total — it was already counted on first sighting.
     return;
   }
 
   const idx = stats.requests.length;
   stats.total++;
-  if (entry.status >= 200 && entry.status < 300) stats.success++;
+  if (isSuccessStatus(entry.status)) stats.success++;
   else stats.failed++;
   if (entry.retried) stats.retried++;
   // G5: Track by status code
   stats.byStatus[entry.status] = (stats.byStatus[entry.status] ?? 0) + 1;
-  const fullEntry = { ...entry, inputTokens: entry.inputTokens ?? "0", captchaMs: entry.captchaMs ?? "0", cacheReadTokens: entry.cacheReadTokens };
+  const fullEntry: StatsRequestEntry = { ...entry, inputTokens: entry.inputTokens ?? "0", captchaMs: entry.captchaMs ?? "0", cacheReadTokens: entry.cacheReadTokens };
   stats.requests.push(fullEntry);
   requestIndex.set(entry.id, idx);
   // vceshi0.0.7+: track lifetime-seen ids to handle post-trim retries.
-  seenIds.add(entry.id);
-  // Bound the seenIds set to prevent unbounded memory growth on long-lived
+  const modelBucket = addModelStats(fullEntry);
+  requestModelBuckets.set(entry.id, modelBucket);
+  rememberSeenStat(fullEntry, modelBucket);
+  // Bound the seenIds map to prevent unbounded memory growth on long-lived
   // servers.
   //
   // v0.2.2+ FIX: LRU-style incremental eviction. The previous code did
@@ -214,14 +389,11 @@ export function recordStat(entry: { id: string; time: string; model: string; sta
   //
   // Now we evict the oldest SEEN_IDS_EVICT_BATCH entries when the limit
   // is hit. This is O(N) per eviction but only fires once per 1000 new
-  // requests — negligible overhead. The Map (instead of Set) preserves
-  // insertion order so `keys().next()` reliably returns the oldest entry.
+  // requests — negligible overhead. Map preserves insertion order so
+  // `keys().next()` reliably returns the oldest entry.
   if (seenIds.size > SEEN_IDS_LIMIT) {
-    // Convert to Map iteration to drop oldest entries in insertion order.
-    // (Set also iterates in insertion order, but Map's delete + iterator
-    // pattern is clearer and slightly faster.)
     let evicted = 0;
-    const it = seenIds.values();
+    const it = seenIds.keys();
     while (evicted < SEEN_IDS_EVICT_BATCH) {
       const r = it.next();
       if (r.done) break;
@@ -233,53 +405,22 @@ export function recordStat(entry: { id: string; time: string; model: string; sta
     // Drop the oldest 100 entries; rebuild the index from the survivors.
     stats.requests = stats.requests.slice(-100);
     requestIndex.clear();
+    requestModelBuckets.clear();
     for (let i = 0; i < stats.requests.length; i++) {
       requestIndex.set(stats.requests[i].id, i);
+      const seen = seenIds.get(stats.requests[i].id);
+      if (seen) requestModelBuckets.set(stats.requests[i].id, seen.modelBucket);
     }
-  }
-  // vceshi0.0.7+: cap the models map to prevent unbounded growth when
-  // clients send many distinct model names (e.g. arbitrary strings via
-  // custom mappings). 100 distinct models is more than enough for any
-  // realistic deployment; beyond that, aggregate into "_other".
-  const MAX_MODELS = 100;
-  if (Object.keys(stats.models).length >= MAX_MODELS && !stats.models[entry.model]) {
-    // Aggregate the new model under "_other" rather than creating a new entry.
-    const other = stats.models["_other"] ?? { count: 0, avgTtfb: 0, tokens: 0, inputTokens: 0 };
-    other.count++;
-    const ttfbMs = parseInt(entry.ttfb) || 0;
-    other.avgTtfb = Math.round((other.avgTtfb * (other.count - 1) + ttfbMs) / other.count);
-    other.tokens += parseInt(entry.tokens) || 0;
-    other.inputTokens += parseInt(fullEntry.inputTokens) || 0;
-    stats.models["_other"] = other;
-  } else {
-    const m = stats.models[entry.model] ?? { count: 0, avgTtfb: 0, tokens: 0, inputTokens: 0 };
-    m.count++;
-    const ttfbMs = parseInt(entry.ttfb) || 0;
-    m.avgTtfb = Math.round((m.avgTtfb * (m.count - 1) + ttfbMs) / m.count);
-    m.tokens += parseInt(entry.tokens) || 0;
-    m.inputTokens += parseInt(fullEntry.inputTokens) || 0;
-    stats.models[entry.model] = m;
   }
 
   // vceshi0.0.6+: per-credential usage tracking (in-memory).
   // G6: Now tracks both success AND failure counts per credential, enabling
   // the dashboard to display success rates. Previously only successes were
   // counted, making it impossible to identify credentials that are failing.
-  // vceshi0.0.7+: no cap needed here — byCredential is keyed by maskApiKey
-  // which is bounded by the number of stored accounts (typically < 20).
-  if (entry.credentialKey) {
-    const c = stats.byCredential[entry.credentialKey] ?? { count: 0, inputTokens: 0, outputTokens: 0, lastUsed: "", success: 0, failed: 0 };
-    if (entry.status >= 200 && entry.status < 300) {
-      c.count++;
-      c.success++;
-      c.inputTokens += parseInt(fullEntry.inputTokens) || 0;
-      c.outputTokens += parseInt(entry.tokens) || 0;
-    } else {
-      c.failed++;
-    }
-    c.lastUsed = entry.time;
-    stats.byCredential[entry.credentialKey] = c;
-  }
+  // v0.2.2+: byCredential is also capped. It is normally keyed by the stored
+  // credential set, but large imports or transient/rotated credential keys
+  // should not grow dashboard stats forever on long-lived processes.
+  addCredentialStats(fullEntry);
 }
 
 /**
@@ -288,7 +429,7 @@ export function recordStat(entry: { id: string; time: string; model: string; sta
  * public API — production callers should use `DELETE /admin/api/stats`.
  * @internal
  */
-export function _resetStatsForTesting(): void {
+function resetStats(): void {
   stats.total = 0;
   stats.success = 0;
   stats.failed = 0;
@@ -298,17 +439,207 @@ export function _resetStatsForTesting(): void {
   stats.byCredential = {};
   stats.byStatus = {};
   requestIndex.clear();
+  requestModelBuckets.clear();
+  modelTtfbTotals.clear();
   seenIds.clear();
+  credentialStatLastSeen.clear();
+  credentialStatSeq = 0;
+}
+
+export function _resetStatsForTesting(): void {
+  resetStats();
 }
 
 // Active OAuth flows (in-memory)
-const activeFlows = new Map<string, { provider: string; flowId: string; pollToken: string; expiresAt: number; plan?: string; status?: string; error?: string; callbackUrl?: string; state?: string }>();
+type ActiveOAuthFlow = { provider: string; flowId: string; pollToken: string; expiresAt: number; plan?: string; status?: string; error?: string; callbackUrl?: string; state?: string; close?: () => Promise<void> };
+const MAX_ACTIVE_OAUTH_FLOWS = 100;
+const OAUTH_FLOW_CLEANUP_GRACE_MS = 5 * 60_000;
+const activeFlows = new Map<string, ActiveOAuthFlow>();
+
+function closeActiveOAuthFlow(flow: ActiveOAuthFlow): void {
+  const close = flow.close;
+  if (!close) return;
+  void close().catch((err) => {
+    appendLog("debug", `OAuth flow ${flow.flowId} close failed: ${(err as Error).message}`);
+  });
+}
+
+function deleteActiveOAuthFlow(flowId: string): boolean {
+  const flow = activeFlows.get(flowId);
+  if (!flow) return false;
+  activeFlows.delete(flowId);
+  closeActiveOAuthFlow(flow);
+  return true;
+}
+
+function pruneActiveOAuthFlows(now = Date.now()): number {
+  let cleaned = 0;
+  for (const [id, flow] of activeFlows) {
+    if (now > flow.expiresAt + OAUTH_FLOW_CLEANUP_GRACE_MS) {
+      activeFlows.delete(id);
+      closeActiveOAuthFlow(flow);
+      cleaned++;
+    }
+  }
+  while (activeFlows.size > MAX_ACTIVE_OAUTH_FLOWS) {
+    const oldest = activeFlows.keys().next().value;
+    if (oldest === undefined) break;
+    deleteActiveOAuthFlow(oldest);
+    cleaned++;
+  }
+  return cleaned;
+}
+
+function rememberActiveOAuthFlow(flowId: string, flow: ActiveOAuthFlow): void {
+  pruneActiveOAuthFlows();
+  deleteActiveOAuthFlow(flowId);
+  activeFlows.set(flowId, flow);
+  pruneActiveOAuthFlows();
+}
+
+export function _resetActiveOAuthFlowsForTesting(): void {
+  for (const flow of activeFlows.values()) closeActiveOAuthFlow(flow);
+  activeFlows.clear();
+}
+
+export function _activeOAuthFlowCountForTesting(): number {
+  return activeFlows.size;
+}
+
+export function _hasActiveOAuthFlowForTesting(flowId: string): boolean {
+  return activeFlows.has(flowId);
+}
+
+export function _rememberActiveOAuthFlowForTesting(
+  flowId: string,
+  expiresAt = Date.now() + 300_000,
+  close?: () => Promise<void>,
+): void {
+  rememberActiveOAuthFlow(flowId, {
+    provider: "zai",
+    flowId,
+    pollToken: flowId,
+    expiresAt,
+    close,
+  });
+}
 
 // vceshi0.0.7+: Per-account quota result cache. Keyed by account id.
 // Used by /admin/api/accounts/quota to rate-limit upstream billing queries.
 // Bounded to 50 entries (FIFO eviction). Entries never expire on their own —
 // they're refreshed on the next query after QUOTA_CACHE_MS.
+const QUOTA_CACHE_LIMIT = 50;
+const ACTIVATION_PROBE_LIMIT = 50;
+const ACTIVATION_PROBE_HARD_TIMEOUT_MS = 45_000;
+// Account-specific invalidation generations are tombstones for in-flight
+// requests. Keep them bounded too; when this fills up we bump the global epoch
+// and clear the tombstones, which safely invalidates all older in-flight quota
+// requests without retaining one entry per historical account id forever.
+const QUOTA_GENERATION_LIMIT = 200;
 const quotaCache = new Map<string, { ts: number; result: unknown }>();
+const quotaInFlight = new Map<string, Promise<unknown>>();
+const quotaCacheGenerations = new Map<string, number>();
+let quotaCacheEpoch = 0;
+type ActivationProbeInFlight = {
+  promise: Promise<unknown>;
+  abort: () => void;
+};
+const activationProbeInFlight = new Map<string, ActivationProbeInFlight>();
+
+function quotaGenerationForAccount(id: string): string {
+  return `${quotaCacheEpoch}:${quotaCacheGenerations.get(id) ?? 0}`;
+}
+
+function pruneQuotaGenerations(): void {
+  if (quotaCacheGenerations.size <= QUOTA_GENERATION_LIMIT) return;
+  quotaCacheEpoch++;
+  quotaCacheGenerations.clear();
+}
+
+function pruneActivationProbes(): void {
+  while (activationProbeInFlight.size > ACTIVATION_PROBE_LIMIT) {
+    const oldest = activationProbeInFlight.keys().next().value;
+    if (oldest === undefined) break;
+    const entry = activationProbeInFlight.get(oldest);
+    activationProbeInFlight.delete(oldest);
+    entry?.abort();
+  }
+}
+
+function clearActivationProbes(): void {
+  const entries = Array.from(activationProbeInFlight.values());
+  activationProbeInFlight.clear();
+  for (const entry of entries) entry.abort();
+}
+
+function clearQuotaCacheForAccount(id: string): void {
+  quotaCache.delete(id);
+  quotaInFlight.delete(id);
+  quotaCacheGenerations.set(id, (quotaCacheGenerations.get(id) ?? 0) + 1);
+  pruneQuotaGenerations();
+}
+
+function clearQuotaCache(): void {
+  quotaCache.clear();
+  quotaInFlight.clear();
+  quotaCacheGenerations.clear();
+  quotaCacheEpoch++;
+  clearActivationProbes();
+}
+
+export function _resetQuotaCacheForTesting(): void {
+  clearQuotaCache();
+}
+
+export function _quotaCacheStateForTesting(): { cached: number; inFlight: number; generations: number; epoch: number; activationProbes: number } {
+  return {
+    cached: quotaCache.size,
+    inFlight: quotaInFlight.size,
+    generations: quotaCacheGenerations.size,
+    epoch: quotaCacheEpoch,
+    activationProbes: activationProbeInFlight.size,
+  };
+}
+
+function withActivationProbeHardTimeout<T>(task: Promise<T>, onTimeout?: () => void): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      try { onTimeout?.(); } catch {}
+      reject(new Error(`activation probe timeout after ${ACTIVATION_PROBE_HARD_TIMEOUT_MS}ms`));
+    }, ACTIVATION_PROBE_HARD_TIMEOUT_MS);
+    timer.unref?.();
+  });
+  return Promise.race([task, timeout]).finally(() => {
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  });
+}
+
+function withLinkedAbortSignal(baseFetch: typeof fetch, signal: AbortSignal): typeof fetch {
+  return (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const upstreamSignal = init?.signal;
+    if (!upstreamSignal) {
+      return baseFetch(input, { ...(init as RequestInit), signal });
+    }
+    const ctrl = new AbortController();
+    const onAbort = () => ctrl.abort();
+    if (signal.aborted || upstreamSignal.aborted) {
+      ctrl.abort();
+    } else {
+      signal.addEventListener("abort", onAbort, { once: true });
+      upstreamSignal.addEventListener("abort", onAbort, { once: true });
+    }
+    try {
+      return await baseFetch(input, { ...(init as RequestInit), signal: ctrl.signal });
+    } finally {
+      signal.removeEventListener("abort", onAbort);
+      upstreamSignal.removeEventListener("abort", onAbort);
+    }
+  }) as typeof fetch;
+}
 
 /**
  * Fire-and-forget a start-plan quota probe right after a credential is saved.
@@ -337,20 +668,47 @@ function probeStartPlanActivation(
   appVersion: string | undefined,
 ): void {
   if (cred.plan !== "start-plan" || !cred.jwt) return;
+  const key = `${cred.provider}:${cred.apiKey}:${cred.jwt.slice(0, 16)}:${cred.proxy ?? ""}:${appVersion ?? ""}`;
+  if (activationProbeInFlight.has(key)) return;
+  pruneActivationProbes();
   // Honour a per-account outbound proxy if configured, matching the quota
   // handler's accountFetch construction. SOCKS proxies are routed through
   // the local HTTP-CONNECT→SOCKS bridge transparently via makeProxiedFetcher
   // (Bun's native fetch only supports HTTP proxies — see proxied-fetch.ts).
-  const accountFetch = makeProxiedFetcher(cred.proxy, fetchImpl);
+  const probeAbort = new AbortController();
+  const abortProbe = () => {
+    try { probeAbort.abort(); } catch {}
+  };
+  const accountFetch = withLinkedAbortSignal(makeProxiedFetcher(cred.proxy, fetchImpl), probeAbort.signal);
   const tag = cred.apiKey.slice(0, 8);
-  queryQuota(cred, accountFetch, appVersion)
+  let entry!: ActivationProbeInFlight;
+  const probe = withActivationProbeHardTimeout(queryQuota(cred, accountFetch, appVersion), abortProbe)
     .then((r) => {
+      if (activationProbeInFlight.get(key) !== entry) return r;
       const outcome = r.planName ?? r.unavailableReason ?? "ok";
       appendLog("info", `start-plan activation probe (${tag}…): ${outcome}`);
+      return r;
     })
     .catch((e) => {
-      appendLog("debug", `start-plan activation probe (${tag}…) failed: ${(e as Error).message}`);
+      if (activationProbeInFlight.get(key) === entry) {
+        appendLog("debug", `start-plan activation probe (${tag}…) failed: ${(e as Error).message}`);
+      }
+      return undefined;
+    })
+    .finally(() => {
+      if (activationProbeInFlight.get(key) === entry) activationProbeInFlight.delete(key);
     });
+  entry = { promise: probe, abort: abortProbe };
+  activationProbeInFlight.set(key, entry);
+  pruneActivationProbes();
+}
+
+export function _probeStartPlanActivationForTesting(
+  cred: AppCredential,
+  fetchImpl: typeof fetch,
+  appVersion?: string,
+): void {
+  probeStartPlanActivation(cred, fetchImpl, appVersion);
 }
 
 /**
@@ -361,14 +719,7 @@ function probeStartPlanActivation(
  * expiresAt timestamp to give in-flight poll requests a chance to drain.
  */
 setInterval(() => {
-  const now = Date.now();
-  let cleaned = 0;
-  for (const [id, flow] of activeFlows) {
-    if (now > flow.expiresAt + 5 * 60_000) {
-      activeFlows.delete(id);
-      cleaned++;
-    }
-  }
+  const cleaned = pruneActiveOAuthFlows();
   if (cleaned > 0) {
     appendLog("debug", `OAuth flow cleanup: removed ${cleaned} expired flow(s)`);
   }
@@ -381,6 +732,11 @@ setInterval(() => {
 // last 20 dumps in memory and expose them via /admin/api/debug-dumps.
 // ---------------------------------------------------------------------------
 const DEBUG_DUMP_LIMIT = 20;
+const DEBUG_DUMP_BODY_MAX_CHARS = 64 * 1024;
+const DEBUG_DUMP_SUMMARY_MAX_CHARS = 8 * 1024;
+const DEBUG_DUMP_ERROR_MAX_CHARS = 2 * 1024;
+const DEBUG_DUMP_BETA_MAX_CHARS = 1024;
+const ADMIN_ERROR_MESSAGE_MAX_CHARS = 1000;
 const debugDumps: Array<{
   id: string;
   time: string;
@@ -390,6 +746,18 @@ const debugDumps: Array<{
   bodySummary: string;
   body: string;
 }> = [];
+
+function truncateDebugDumpField(value: string, maxChars: number): string {
+  if (value.length <= maxChars) return value;
+  const omitted = value.length - maxChars;
+  return `${value.slice(0, maxChars)}\n...[truncated ${omitted} chars]`;
+}
+
+function truncateAdminErrorMessage(value: string): string {
+  if (value.length <= ADMIN_ERROR_MESSAGE_MAX_CHARS) return value;
+  const omitted = value.length - ADMIN_ERROR_MESSAGE_MAX_CHARS;
+  return `${value.slice(0, ADMIN_ERROR_MESSAGE_MAX_CHARS)}...(truncated ${omitted} chars)`;
+}
 
 /**
  * Record a 4xx upstream response's transformed body for diagnostics.
@@ -404,7 +772,12 @@ export function recordDebugDump(entry: {
   body: string;
 }): void {
   debugDumps.push({
-    ...entry,
+    id: entry.id,
+    status: entry.status,
+    upstreamError: truncateDebugDumpField(entry.upstreamError, DEBUG_DUMP_ERROR_MAX_CHARS),
+    anthropicBeta: truncateDebugDumpField(entry.anthropicBeta, DEBUG_DUMP_BETA_MAX_CHARS),
+    bodySummary: truncateDebugDumpField(entry.bodySummary, DEBUG_DUMP_SUMMARY_MAX_CHARS),
+    body: truncateDebugDumpField(entry.body, DEBUG_DUMP_BODY_MAX_CHARS),
     time: new Date().toISOString().slice(11, 19),
   });
   if (debugDumps.length > DEBUG_DUMP_LIMIT) {
@@ -481,21 +854,34 @@ function handleMutationResult(
 // array is trimmed. The old approach used array indices, which became
 // stale whenever splice() ran — causing clients to miss logs or replay
 // old ones after a trim event.
-const LOG_BUFFER_SIZE = 2000;
+const LOG_BUFFER_SIZE = LOG_CONST.BUFFER_SIZE;
 // G8: Ring buffer implementation — replaces the old splice-based approach.
 // splice(0, N) on a 2000-element array copies 1000 elements and is O(N).
 // A ring buffer avoids the copy entirely — push at the write cursor,
 // overwrite the oldest entry when full, and iterate via modulo arithmetic.
 // The logBuffer array is pre-allocated to LOG_BUFFER_SIZE to avoid resizing.
-const logBufferRing = new Array<{ seq: number; time: string; level: string; message: string } | null>(LOG_BUFFER_SIZE).fill(null);
+type LogEntry = { seq: number; time: string; level: string; message: string };
+type SerializedLogEntry = { entry: LogEntry; json: string; sse: string };
+type LogWaiter = {
+  resolve: (value: SerializedLogEntry) => void;
+  resolveBatch: (values: readonly SerializedLogEntry[]) => void;
+  flush: () => void;
+};
+
+const logBufferRing = new Array<LogEntry | null>(LOG_BUFFER_SIZE).fill(null);
 let logRingWrite = 0;  // next write position (wraps around)
 let logRingCount = 0;  // number of valid entries (0..LOG_BUFFER_SIZE)
 let logSeq = 0; // monotonic, never reset — used as client cursor
-const logWaiters: Array<{ resolve: (value: unknown) => void }> = [];
+const MAX_LOG_STREAM_SUBSCRIBERS = 50;
+const logWaiters: LogWaiter[] = [];
 // v0.2.2+ PERF: pending batch of log entries to fan out in one microtask.
 // See appendLog() for the rationale.
-let pendingLogEntries: Array<{ seq: number; time: string; level: string; message: string }> = [];
+let pendingLogEntries: SerializedLogEntry[] = [];
 let logFlushScheduled = false;
+let pendingLogOverflow = false;
+const MAX_PENDING_LOG_FANOUT = 512;
+const DEFAULT_LOG_STREAM_BACKPRESSURE_CHUNKS = 256;
+let logStreamBackpressureChunksForTesting: number | undefined;
 
 // G3: File logging — when set, each log entry is also appended to this file.
 // Set via config.logging.file or env var ZCODE_PROXY_LOG_FILE.
@@ -504,30 +890,102 @@ let logFilePath: string | undefined;
 // Buffered async file logging — replaces the old `appendFileSync` per-log
 // write which blocked the event loop on Windows. See appendLog() for the
 // full rationale.
-const logFileBuffer: string[] = [];
+type PendingLogFileLine = { path: string; line: string };
+const logFileBuffer: PendingLogFileLine[] = [];
 let logFileFlushInterval: ReturnType<typeof setInterval> | null = null;
+let logFileFlushInFlight: Promise<void> | null = null;
+const LOG_FILE_FLUSH_WARN_INTERVAL_MS = 60_000;
+const LOG_FILE_DROP_WARN_INTERVAL_MS = 60_000;
+let logFileFlushWarnKey: string | undefined;
+let logFileFlushLastWarnAt = 0;
+let logFileDroppedSinceWarn = 0;
+let logFileDropLastWarnAt = 0;
+let logFileDropWarnInProgress = false;
 import { appendFile as appendFileAsync } from "node:fs/promises";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
+let appendLogFile = appendFileAsync;
+
+function warnLogFileFlushFailure(path: string, message: string): void {
+  const now = Date.now();
+  const key = `${path}\0${message}`;
+  if (key === logFileFlushWarnKey && now - logFileFlushLastWarnAt < LOG_FILE_FLUSH_WARN_INTERVAL_MS) {
+    return;
+  }
+  logFileFlushWarnKey = key;
+  logFileFlushLastWarnAt = now;
+  console.warn(`[admin] Could not flush log file ${path}: ${message}`);
+}
+
+function warnLogFileBufferDrop(path: string): void {
+  if (logFileDropWarnInProgress) return;
+  logFileDroppedSinceWarn++;
+  const now = Date.now();
+  if (now - logFileDropLastWarnAt < LOG_FILE_DROP_WARN_INTERVAL_MS) return;
+  const dropped = logFileDroppedSinceWarn;
+  logFileDroppedSinceWarn = 0;
+  logFileDropLastWarnAt = now;
+  logFileDropWarnInProgress = true;
+  try {
+    console.warn(
+      `[admin] Log file buffer is full (${LOG_CONST.FILE_BUFFER_MAX} pending entries); ` +
+      `dropped ${dropped} log line(s) for ${path}. Disk may be slow or unavailable.`,
+    );
+  } finally {
+    logFileDropWarnInProgress = false;
+  }
+}
+
 /**
  * Flush the log file buffer to disk asynchronously. Called by the interval
  * timer (every 500ms) and on process exit (best-effort). Errors are logged
- * to console.warn but don't break the buffer — we just keep accumulating.
+ * to console.warn with throttling and don't break the server.
  */
-async function flushLogFile(): Promise<void> {
-  if (logFileBuffer.length === 0 || !logFilePath) return;
-  // Snapshot and clear the buffer atomically — if the write fails, we've
-  // already lost the entries (can't re-append because new entries may have
-  // been pushed during the await). This is acceptable: file logging is
-  // best-effort, the in-memory ring buffer + SSE clients still get all logs.
-  const snapshot = logFileBuffer.splice(0, logFileBuffer.length);
+async function appendLogFileBatch(path: string, lines: string[]): Promise<void> {
   try {
-    await appendFileAsync(logFilePath, snapshot.join(""));
+    await appendLogFile(path, lines.join(""));
+    logFileFlushWarnKey = undefined;
+    logFileFlushLastWarnAt = 0;
   } catch (err) {
-    // Don't spam console — just warn once per failed flush.
-    console.warn(`[admin] Could not flush log file ${logFilePath}: ${(err as Error).message}`);
+    warnLogFileFlushFailure(path, (err as Error).message);
   }
+}
+
+async function drainLogFileBuffer(): Promise<void> {
+  while (logFileBuffer.length > 0) {
+    // Snapshot and clear the buffer atomically. Each line captures the target
+    // path at append time, so switching log files while a slow flush is active
+    // cannot send old-path lines into the new file.
+    const snapshot = logFileBuffer.splice(0, logFileBuffer.length);
+    let currentPath = "";
+    let lines: string[] = [];
+    for (const item of snapshot) {
+      if (currentPath && item.path !== currentPath) {
+        await appendLogFileBatch(currentPath, lines);
+        lines = [];
+      }
+      currentPath = item.path;
+      lines.push(item.line);
+    }
+    if (currentPath && lines.length > 0) {
+      await appendLogFileBatch(currentPath, lines);
+    }
+  }
+}
+
+async function flushLogFile(): Promise<void> {
+  if (logFileFlushInFlight) return logFileFlushInFlight;
+  if (logFileBuffer.length === 0) return;
+  // Serialize async file appends. A slow disk / antivirus scan can easily make
+  // the 500ms interval fire again before the previous append completes; without
+  // this guard, concurrent appendFile calls can reorder log lines and add I/O
+  // pressure exactly when the machine is already struggling.
+  logFileFlushInFlight = drainLogFileBuffer().finally(() => {
+    logFileFlushInFlight = null;
+    if (logFileBuffer.length > 0) void flushLogFile();
+  });
+  return logFileFlushInFlight;
 }
 
 /**
@@ -548,15 +1006,17 @@ export function setLogFilePath(path: string | undefined): void {
     logFileFlushInterval = null;
   }
   logFilePath = path;
+  logFileFlushWarnKey = undefined;
+  logFileFlushLastWarnAt = 0;
   if (path) {
     // Ensure the parent directory exists
     try {
       mkdirSync(dirname(path), { recursive: true });
     } catch { /* may already exist */ }
-    // Start the async flush interval — every 500ms, drain the buffer.
+    // Start the async flush interval — every LOG.FILE_FLUSH_INTERVAL_MS, drain the buffer.
     // This replaces the per-log appendFileSync which was blocking the event
     // loop on Windows (each sync write = 5-50ms with AV interference).
-    logFileFlushInterval = setInterval(flushLogFile, 500);
+    logFileFlushInterval = setInterval(flushLogFile, LOG_CONST.FILE_FLUSH_INTERVAL_MS);
     // Don't keep the process alive just for this interval — it should only
     // fire while the server is running for other reasons.
     if (typeof logFileFlushInterval.unref === "function") {
@@ -566,11 +1026,54 @@ export function setLogFilePath(path: string | undefined): void {
   }
 }
 
+export function flushLogFileForShutdown(): Promise<void> {
+  return flushLogFile();
+}
+
+export function _flushLogFileForTesting(): Promise<void> {
+  return flushLogFileForShutdown();
+}
+
+export function _logFileFlushStateForTesting(): { pending: number; inFlight: boolean } {
+  return { pending: logFileBuffer.length, inFlight: logFileFlushInFlight !== null };
+}
+
+export function _setLogFileAppendForTesting(fn?: typeof appendFileAsync): void {
+  appendLogFile = fn ?? appendFileAsync;
+}
+
+export function _logWaiterCountForTesting(): number {
+  return logWaiters.length;
+}
+
+export function _setLogStreamBackpressureLimitForTesting(chunks?: number): void {
+  logStreamBackpressureChunksForTesting = typeof chunks === "number" && Number.isFinite(chunks)
+    ? Math.max(1, Math.floor(chunks))
+    : undefined;
+}
+
+export function _resetLogFileForTesting(): void {
+  if (logFileFlushInterval) {
+    clearInterval(logFileFlushInterval);
+    logFileFlushInterval = null;
+  }
+  logFilePath = undefined;
+  logFileBuffer.length = 0;
+  logFileFlushInFlight = null;
+  appendLogFile = appendFileAsync;
+  logFileFlushWarnKey = undefined;
+  logFileFlushLastWarnAt = 0;
+  logFileDroppedSinceWarn = 0;
+  logFileDropLastWarnAt = 0;
+  logFileDropWarnInProgress = false;
+  logStreamBackpressureChunksForTesting = undefined;
+}
+
 /**
  * Iterate over the ring buffer in order (oldest → newest).
  * Yields only non-null entries. Used by SSE flush and batch endpoint.
  */
-function* iterRingBuffer(): Generator<{ seq: number; time: string; level: string; message: string }> {
+function* iterRingBuffer(): Generator<LogEntry> {
   if (logRingCount === 0) return;
   // If the buffer isn't full yet, start from index 0.
   // If full, logRingWrite points to the OLDEST entry (next to be overwritten).
@@ -582,23 +1085,79 @@ function* iterRingBuffer(): Generator<{ seq: number; time: string; level: string
   }
 }
 
+/**
+ * Return the most recent log entries in chronological order without first
+ * materializing the whole ring. Used by dashboard refresh paths where the
+ * caller only needs a tail window.
+ */
+function recentRingEntries(limit: number): LogEntry[] {
+  if (logRingCount === 0 || limit <= 0) return [];
+  const count = Math.min(Math.floor(limit), logRingCount);
+  const result: LogEntry[] = [];
+  const oldest = logRingCount < LOG_BUFFER_SIZE ? 0 : logRingWrite;
+  const first = logRingCount - count;
+  for (let i = 0; i < count; i++) {
+    const idx = (oldest + first + i) % LOG_BUFFER_SIZE;
+    const entry = logBufferRing[idx];
+    if (entry) result.push(entry);
+  }
+  return result;
+}
+
+/**
+ * Return the most recent matching log entries in chronological order without
+ * materializing/filtering the whole ring. This keeps the dashboard's filtered
+ * log polling cheap after the process has been running for a long time.
+ */
+function recentMatchingRingEntries(limit: number, level?: string | null, search?: string | null): LogEntry[] {
+  if (logRingCount === 0 || limit <= 0) return [];
+  const count = Math.min(Math.floor(limit), logRingCount);
+  const result: LogEntry[] = [];
+  const oldest = logRingCount < LOG_BUFFER_SIZE ? 0 : logRingWrite;
+  for (let i = logRingCount - 1; i >= 0; i--) {
+    const idx = (oldest + i) % LOG_BUFFER_SIZE;
+    const entry = logBufferRing[idx];
+    if (!entry) continue;
+    if (level && entry.level !== level) continue;
+    if (search && !entry.message.toLowerCase().includes(search)) continue;
+    result.push(entry);
+    if (result.length >= count) break;
+  }
+  return result.reverse();
+}
+
+function parseQueryLimit(raw: string | null, fallback: number, max: number): number {
+  const trimmed = raw?.trim();
+  if (!trimmed) return fallback;
+  if (!/^\d+$/.test(trimmed)) return fallback;
+  const n = Number(trimmed);
+  if (!Number.isSafeInteger(n)) return fallback;
+  return Math.min(n, max);
+}
+
 /** Add a log entry to the buffer (called by intercepting console.log). */
 export function appendLog(level: string, message: string) {
-  // vceshi0.0.6+: verbose log lines (containing [verbose]) get a higher char
-  // limit so the full transformed body / headers aren't truncated to 500 chars.
-  // Regular log lines stay at 500 to keep the buffer compact.
-  //
-  // vceshi0.0.7+: also grant the higher limit to `debug` level — those are
-  // the diagnostic logs (request bodies, headers, transformed payloads) that
-  // need the extra space. The old `[verbose]` substring check is preserved
-  // for backward compat with any code paths that still embed the tag.
-  const isVerbose = level === "debug" || message.includes("[verbose]");
-  const maxLen = isVerbose ? 3000 : 500;
+  // v0.2.2+: keep log storage compact by default, but reserve more room for
+  // explicit diagnostics. `console.log("[debug] ...")` arrives here as level
+  // "info", so content tags matter in addition to the structured level.
+  const isDebugDiagnostic = level === "debug" || message.includes("[debug]");
+  const isVerbose = message.includes("[verbose]");
+  const maxLen = isDebugDiagnostic
+    ? LOG_CONST.DEBUG_MAX_CHARS
+    : isVerbose
+      ? LOG_CONST.VERBOSE_MAX_CHARS
+      : LOG_CONST.REGULAR_MAX_CHARS;
   const entry = {
     seq: ++logSeq,
     time: new Date().toISOString().slice(11, 19),
     level,
     message: message.slice(0, maxLen),
+  };
+  const entryJson = JSON.stringify(entry);
+  const serializedEntry: SerializedLogEntry = {
+    entry,
+    json: entryJson,
+    sse: `data: ${entryJson}\n\n`,
   };
   // Ring buffer write — overwrite oldest when full
   logBufferRing[logRingWrite] = entry;
@@ -623,8 +1182,10 @@ export function appendLog(level: string, message: string) {
   // This reduces disk writes from N (per-log) to ~1 per 500ms, and each
   // write is async so it doesn't block the event loop.
   if (logFilePath) {
-    if (logFileBuffer.length < 1000) {
-      logFileBuffer.push(JSON.stringify(entry) + "\n");
+    if (logFileBuffer.length < LOG_CONST.FILE_BUFFER_MAX) {
+      logFileBuffer.push({ path: logFilePath, line: entryJson + "\n" });
+    } else {
+      warnLogFileBufferDrop(logFilePath);
     }
     // The flush is triggered by logFileFlushInterval (set up in setLogFilePath).
     // If the interval isn't running yet (e.g. setLogFilePath hasn't been called
@@ -642,21 +1203,42 @@ export function appendLog(level: string, message: string) {
   //
   // Now we batch entries into a pending array and flush them in a single
   // microtask. Multiple appendLog calls within the same microtask tick
-  // share one fan-out pass per waiter, reducing enqueue calls by ~10×.
-  pendingLogEntries.push(entry);
+  // share one fan-out pass per waiter and one SSE chunk per waiter,
+  // reducing enqueue/JSON/encode work by ~10× during log storms.
+  if (!pendingLogOverflow) {
+    if (pendingLogEntries.length < MAX_PENDING_LOG_FANOUT) {
+      pendingLogEntries.push(serializedEntry);
+    } else {
+      // A synchronous log storm can enqueue thousands of entries before the
+      // microtask below gets a chance to run. Don't let that pending array
+      // grow without bound; ask each SSE client to flush from the ring buffer
+      // cursor once instead. The ring is capped, so memory stays bounded and
+      // clients still receive the latest retained entries in order.
+      pendingLogOverflow = true;
+      pendingLogEntries = [];
+    }
+  }
   if (!logFlushScheduled) {
     logFlushScheduled = true;
     queueMicrotask(() => {
       logFlushScheduled = false;
       const batch = pendingLogEntries;
+      const overflow = pendingLogOverflow;
       pendingLogEntries = [];
+      pendingLogOverflow = false;
       // Iterate a snapshot in case logWaiters is mutated during the loop
       // (a waiter's resolve() may register a new waiter via re-poll).
       const waiters = logWaiters.slice();
       for (const w of waiters) {
-        for (const e of batch) {
-          try { w.resolve(e); } catch { /* controller closed */ }
-        }
+        try {
+          if (overflow) {
+            w.flush();
+          } else if (batch.length === 1) {
+            w.resolve(batch[0]);
+          } else if (batch.length > 1) {
+            w.resolveBatch(batch);
+          }
+        } catch { /* controller closed */ }
       }
     });
   }
@@ -815,25 +1397,30 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
       // Prevent masked placeholder values from overwriting real secrets.
       // The sanitizeConfig() GET endpoint returns "***configured***" for
       // secret fields; if the dashboard sends those back unchanged we skip them.
-      const MASK = "***configured***";
-      const authBody = body.auth as Record<string, unknown> | undefined;
+      const authBody = optionalConfigObject(body, "auth");
+      const hasCorsAllowList = Object.prototype.hasOwnProperty.call(body, "corsAllowList");
+      const hasResponsesThinking = Object.prototype.hasOwnProperty.call(body, "responsesThinking");
+      const hasRoutingRules = Object.prototype.hasOwnProperty.call(body, "routingRules");
+      const hasModelMappings = Object.prototype.hasOwnProperty.call(body, "modelMappings");
+      const hasModels = Object.prototype.hasOwnProperty.call(body, "models");
+      const newServer = optionalConfigObject(body, "server");
+      const retryBody = optionalConfigObject(body, "retry");
+      const identityBody = optionalConfigObject(body, "identity");
+      const loggingBody = optionalConfigObject(body, "logging");
+      const providersBody = optionalConfigObject(body, "providers");
+      if (hasModels && !Array.isArray(body.models)) {
+        throw new Error("models must be an array");
+      }
       if (authBody) {
-        if (authBody.apiKey === MASK || authBody.apiKey === "") delete authBody.apiKey;
-        if (authBody.proxyApiKey === MASK || authBody.proxyApiKey === "") delete authBody.proxyApiKey;
+        if (authBody.apiKey === CONFIG_SECRET_MASK || authBody.apiKey === "") delete authBody.apiKey;
+        if (authBody.proxyApiKey === CONFIG_SECRET_MASK || authBody.proxyApiKey === "") delete authBody.proxyApiKey;
       }
 
       // Compute which fields changed in a way that requires a server restart
       // to take effect (vs. fields that can be hot-swapped at runtime).
       // The dashboard uses this to show "restart required" highlights.
-      const restartFields: string[] = [];
       const oldPort = opts.config.server.port;
       const oldHost = opts.config.server.host;
-      const newServer = body.server as Record<string, unknown> | undefined;
-      if (newServer) {
-        const newPort = typeof newServer.port === "number" ? newServer.port : parseInt(String(newServer.port), 10);
-        if (Number.isFinite(newPort) && newPort !== oldPort) restartFields.push("server.port");
-        if (typeof newServer.host === "string" && newServer.host !== oldHost) restartFields.push("server.host");
-      }
 
       const newConfig = { ...opts.config, ...body };
       // Deep-merge nested objects so partial updates don't drop fields.
@@ -845,41 +1432,41 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
       if (authBody) {
         newConfig.auth = { ...opts.config.auth, ...authBody };
       }
-      // v0.2.1.7: deep-merge server so partial updates (e.g. only sending
-      // sseHeartbeatMs) don't drop port / host / upstreamTimeoutMs / trustProxy.
+      // v0.2.1.7+: deep-merge server so partial updates (e.g. only sending
+      // sseHeartbeatMs) don't drop port / host / upstreamTimeoutMs / trustProxy /
+      // maxRequestBodyBytes.
       // port + host changes require restart; other server fields are hot-swappable.
       if (newServer) {
         newConfig.server = {
           ...opts.config.server,
           ...newServer,
-          // Ensure port is always a valid number (fallback to existing)
-          port: typeof newServer.port === "number" ? newServer.port
-            : (typeof newServer.port === "string" ? parseInt(String(newServer.port), 10) : opts.config.server.port),
-          // Ensure host is always a string (fallback to existing)
-          host: typeof newServer.host === "string" ? newServer.host : opts.config.server.host,
         };
       }
-      if (body.retry) {
+      if (retryBody) {
+        const rawRetryStatuses = retryBody.retryableStatuses;
         newConfig.retry = {
           ...opts.config.retry,
-          ...(body.retry as object),
+          ...retryBody,
           // retryableStatuses is an array — if client sends it, use it; else keep existing
-          retryableStatuses: Array.isArray((body.retry as any).retryableStatuses)
-            ? (body.retry as any).retryableStatuses
-            : opts.config.retry.retryableStatuses,
+          retryableStatuses: Array.isArray(rawRetryStatuses)
+            ? normalizeRetryableStatuses(rawRetryStatuses)
+            : [...opts.config.retry.retryableStatuses],
         };
       }
-      if (body.identity) {
-        newConfig.identity = { ...opts.config.identity, ...(body.identity as object) };
+      if (identityBody) {
+        newConfig.identity = { ...opts.config.identity, ...identityBody };
       }
-      if (body.logging) {
-        newConfig.logging = { ...opts.config.logging, ...(body.logging as object) };
+      if (loggingBody) {
+        newConfig.logging = { ...opts.config.logging, ...loggingBody };
       }
-      if (body.providers) {
-        const bp = body.providers as any;
+      if (providersBody) {
+        const zaiBody = optionalNestedConfigObject(providersBody, "zai", "providers.zai") ?? {};
+        const bigmodelBody = optionalNestedConfigObject(providersBody, "bigmodel", "providers.bigmodel") ?? {};
+        if (zaiBody.credential === CONFIG_SECRET_MASK || zaiBody.credential === "") delete zaiBody.credential;
+        if (bigmodelBody.credential === CONFIG_SECRET_MASK || bigmodelBody.credential === "") delete bigmodelBody.credential;
         newConfig.providers = {
-          zai: { ...opts.config.providers.zai, ...(bp.zai || {}) },
-          bigmodel: { ...opts.config.providers.bigmodel, ...(bp.bigmodel || {}) },
+          zai: { ...opts.config.providers.zai, ...zaiBody },
+          bigmodel: { ...opts.config.providers.bigmodel, ...bigmodelBody },
         };
       }
       // v0.2.2+ FIX: defensive deep-clone for nested objects that the
@@ -889,42 +1476,80 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
       // mutation (e.g. `newConfig.responsesThinking.models.push(...)`)
       // would corrupt the live in-memory config even if the persist fails.
       // Same for `corsAllowList` and `routingRules` / `modelMappings`.
-      if (opts.config.responsesThinking) {
+      if (opts.config.responsesThinking || hasResponsesThinking) {
+        const currentResponsesThinking = opts.config.responsesThinking;
         newConfig.responsesThinking = {
-          models: Array.isArray(opts.config.responsesThinking.models)
-            ? [...opts.config.responsesThinking.models]
+          models: Array.isArray(currentResponsesThinking?.models)
+            ? [...currentResponsesThinking.models]
             : [],
         };
-        if (body.responsesThinking && Array.isArray((body.responsesThinking as any).models)) {
-          newConfig.responsesThinking.models = [...(body.responsesThinking as any).models];
+        if (hasResponsesThinking) {
+          const raw = body.responsesThinking as any;
+          if (raw !== null && !Array.isArray(raw) && !isConfigObject(raw)) {
+            throw new Error("responsesThinking must be an object or an array of strings");
+          }
+          const models = Array.isArray(raw) ? raw : raw ? raw.models : undefined;
+          if (models === undefined || models === null) {
+            newConfig.responsesThinking.models = [];
+          } else if (Array.isArray(models) && models.every((model) => typeof model === "string")) {
+            newConfig.responsesThinking.models = [...models];
+          } else {
+            throw new Error("responsesThinking.models must be an array of strings");
+          }
         }
       }
-      if (Array.isArray(opts.config.routingRules)) {
-        newConfig.routingRules = opts.config.routingRules.map(r => ({ ...r }));
-        if (Array.isArray(body.routingRules)) {
-          newConfig.routingRules = (body.routingRules as any[]).map(r => ({ ...r }));
+      if (Array.isArray(opts.config.routingRules) || hasRoutingRules) {
+        const rawRules = hasRoutingRules ? body.routingRules : opts.config.routingRules;
+        if (!Array.isArray(rawRules)) {
+          throw new Error("routingRules must be an array");
         }
+        newConfig.routingRules = normalizeRoutingRulesForSave(rawRules);
       }
-      if (Array.isArray(opts.config.modelMappings)) {
-        newConfig.modelMappings = opts.config.modelMappings.map(m => ({ ...m }));
-        if (Array.isArray(body.modelMappings)) {
-          newConfig.modelMappings = (body.modelMappings as any[]).map(m => ({ ...m }));
+      if (Array.isArray(opts.config.modelMappings) || hasModelMappings) {
+        const rawMappings = hasModelMappings ? body.modelMappings : opts.config.modelMappings;
+        if (!Array.isArray(rawMappings)) {
+          throw new Error("modelMappings must be an array");
         }
+        newConfig.modelMappings = normalizeModelMappingsForSave(rawMappings);
       }
       if (Array.isArray((opts.config as any).corsAllowList)) {
         (newConfig as any).corsAllowList = [...(opts.config as any).corsAllowList];
+      }
+      if (hasCorsAllowList) {
         if (Array.isArray(body.corsAllowList)) {
-          (newConfig as any).corsAllowList = [...(body.corsAllowList as any[])];
+          const entries = body.corsAllowList as unknown[];
+          if (!entries.every((entry) => typeof entry === "string")) {
+            throw new Error("corsAllowList must be an array of strings");
+          }
+          (newConfig as any).corsAllowList = entries.map((entry) => entry.trim()).filter(Boolean);
+        } else if (body.corsAllowList == null) {
+          delete (newConfig as any).corsAllowList;
+        } else {
+          throw new Error("corsAllowList must be an array of strings");
         }
       }
       if (Array.isArray(opts.config.models)) {
         newConfig.models = [...opts.config.models];
         if (Array.isArray(body.models)) {
-          newConfig.models = [...(body.models as any[])];
+          newConfig.models = normalizeModelList(body.models, newConfig.defaultModel);
         }
       }
-      // Validate the merged config before persisting
+      // Normalize + validate the merged config before persisting. This keeps
+      // dashboard/API saves aligned with loadConfig(): numeric strings like
+      // "8080" become numbers, but trailing junk like "8080abc" is rejected
+      // instead of being prefix-parsed by parseInt.
+      normalizeConfigForSave(newConfig);
       validateConfigForSave(newConfig);
+
+      const restartFields: string[] = [];
+      if (newServer) {
+        if (Object.prototype.hasOwnProperty.call(newServer, "port") && newConfig.server.port !== oldPort) {
+          restartFields.push("server.port");
+        }
+        if (Object.prototype.hasOwnProperty.call(newServer, "host") && newConfig.server.host !== oldHost) {
+          restartFields.push("server.host");
+        }
+      }
       await persistConfig(newConfig as ProxyConfig, opts.configPath);
 
       // Apply hot-swappable fields to the in-memory config so they take
@@ -943,18 +1568,43 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
       // v0.2.0.4: forceStreamAnthropic removed — stream:true is now unconditional.
       if (newConfig.thinkingLevel !== undefined) opts.config.thinkingLevel = newConfig.thinkingLevel === "high" ? "high" : "max";
       if (authBody) opts.config.auth = newConfig.auth;
+      if (hasCorsAllowList) {
+        if (Array.isArray((newConfig as any).corsAllowList)) {
+          (opts.config as any).corsAllowList = [...(newConfig as any).corsAllowList];
+        } else {
+          delete (opts.config as any).corsAllowList;
+        }
+      }
       // providers.*.anthropicBase / openaiBase: also hot-swappable
-      if (body.providers) {
+      if (providersBody) {
         opts.config.providers = newConfig.providers;
       }
-      // v0.2.1.7: server hot-swappable fields (NOT port/host — those need
+      // v0.2.1.7+: server hot-swappable fields (NOT port/host — those need
       // restart, tracked in restartFields above). upstreamTimeoutMs,
-      // trustProxy, and sseHeartbeatMs all affect per-request behavior and
-      // are safe to hot-swap.
+      // trustProxy, sseHeartbeatMs, and maxRequestBodyBytes all affect
+      // per-request behavior and are safe to hot-swap.
       if (newServer) {
         if (newConfig.server.upstreamTimeoutMs !== undefined) opts.config.server.upstreamTimeoutMs = newConfig.server.upstreamTimeoutMs;
         if (newConfig.server.trustProxy !== undefined) opts.config.server.trustProxy = newConfig.server.trustProxy;
         if (newConfig.server.sseHeartbeatMs !== undefined) opts.config.server.sseHeartbeatMs = newConfig.server.sseHeartbeatMs;
+        if (newConfig.server.maxRequestBodyBytes !== undefined) opts.config.server.maxRequestBodyBytes = newConfig.server.maxRequestBodyBytes;
+      }
+
+      // Keep AuthManager in sync with the hot-applied config. The config
+      // object above is mutable, but AuthManager also caches mode/provider and
+      // the parsed apikey credential internally. Without this, changing
+      // auth.apiKey/provider/plan in the dashboard only takes effect after a
+      // restart despite the API reporting "hotApplied: auth".
+      opts.auth.updateConfig({
+        mode: newConfig.auth.mode,
+        provider: newConfig.provider,
+        apiKey: newConfig.auth.apiKey ?? newConfig.providers[newConfig.provider]?.credential,
+        plan: newConfig.plan,
+      });
+      if (newConfig.auth.mode === "oauth") {
+        const activeCredential = await loadCredential();
+        if (activeCredential) opts.auth.setOAuthCredential(activeCredential);
+        else opts.auth.clearOAuthCredential();
       }
 
       appendLog("info", "Configuration updated via admin dashboard");
@@ -963,7 +1613,7 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
         requiresRestart: restartFields.length > 0,
         restartFields,
         // hotApplied: fields that were applied to the live config without restart
-        hotApplied: ["provider", "plan", "defaultModel", "models", "identity", "logging", "retry", "routingRules", "modelMappings", "responsesThinking", "thinkingLevel", ...(authBody ? ["auth"] : []), ...(body.providers ? ["providers"] : []), ...(newServer ? ["server"] : [])],
+        hotApplied: ["provider", "plan", "defaultModel", "models", "identity", "logging", "retry", "routingRules", "modelMappings", "responsesThinking", "thinkingLevel", ...(authBody ? ["auth"] : []), ...(hasCorsAllowList ? ["corsAllowList"] : []), ...(providersBody ? ["providers"] : []), ...(newServer ? ["server"] : [])],
       });
     } catch (err) {
       return errorResponse(500, "save_failed", (err as Error).message);
@@ -979,10 +1629,14 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
     // EVERY dashboard refresh, AND it makes concurrent reads miss the cache
     // too — turning every refresh into a global cache-bust event. This was
     // a major contributor to the "管理面板刷新卡一会" symptom.
-    const cred = await loadCredential();
+    const store = await exportStore();
+    const activeAccount = store?.accounts.find((a) => a.id === store.activeId);
+    const cred = activeAccount?.credential;
     if (!cred) return jsonResp({ credential: null });
     return jsonResp({
       credential: {
+        id: activeAccount.id,
+        label: activeAccount.label,
         provider: cred.provider,
         apiKeyMask: maskApiKey(cred.apiKey),
         hasSecret: !!cred.secret,
@@ -990,6 +1644,10 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
         expiresAt: cred.expiresAt,
         mode: opts.config.auth.mode,
         plan: cred.plan || "coding-plan",
+        name: cred.name,
+        email: cred.email,
+        proxy: cred.proxy,
+        disabled: !!cred.disabled,
       },
     });
   }
@@ -1008,7 +1666,10 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
       if (body.provider !== "zai" && body.provider !== "bigmodel") {
         return errorResponse(400, "invalid_param", "provider must be 'zai' or 'bigmodel'");
       }
-      const plan = (body.plan === "start-plan" ? "start-plan" : "coding-plan") as "coding-plan" | "start-plan";
+      if (body.plan !== undefined && body.plan !== "coding-plan" && body.plan !== "start-plan") {
+        return errorResponse(400, "invalid_param", "plan must be coding-plan or start-plan");
+      }
+      const plan = (body.plan ?? "coding-plan") as "coding-plan" | "start-plan";
       const cred = {
         apiKey: body.apiKey.trim(),
         provider: body.provider,
@@ -1046,6 +1707,7 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
     // (handler.ts auto-switch + dashboard add/edit running in parallel),
     // causing the deleted file to be "resurrected" by the in-flight write.
     await clearCredentialAsync();
+    clearQuotaCache();
     opts.auth.clearOAuthCredential();
     appendLog("info", "All credentials cleared via admin dashboard");
     return jsonResp({ ok: true });
@@ -1139,6 +1801,7 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
       const ok = await setAccountPlan(body.id, body.plan);
       const errResp = handleMutationResult(ok);
       if (errResp) return errResp;
+      clearQuotaCacheForAccount(body.id);
 
       // If the updated account is the currently active one, hot-swap the
       // in-memory credential so running requests immediately use the new
@@ -1223,6 +1886,7 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
       const success = await setAccountProxy(body.id, body.proxy);
       const errResp = handleMutationResult(success);
       if (errResp) return errResp;
+      clearQuotaCacheForAccount(body.id);
 
       // If the updated account is the currently active one, hot-swap the
       // in-memory credential so running requests immediately use (or stop
@@ -1274,31 +1938,13 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
       if (!trimmed) {
         return errorResponse(400, "invalid_param", "proxy URL cannot be empty (use 'No proxy' on the dashboard instead)");
       }
-      // M3 fix: validate via new URL() (consistent with /accounts/proxy).
-      let proxyUrl: URL;
-      try {
-        proxyUrl = new URL(trimmed);
-      } catch {
-        return errorResponse(
-          400,
-          "invalid_param",
-          "proxy must be a valid URL with scheme http://, https://, socks4://, socks4a://, socks5://, or socks5h://",
-        );
-      }
-      const allowedProtocols = ["http:", "https:", "socks4:", "socks4a:", "socks5:", "socks5h:"];
-      if (!allowedProtocols.includes(proxyUrl.protocol)) {
-        return errorResponse(
-          400,
-          "invalid_param",
-          "proxy must be a valid URL with scheme http://, https://, socks4://, socks4a://, socks5://, or socks5h://",
-        );
-      }
-      if (/[<>'"\s]/.test(proxyUrl.host)) {
-        return errorResponse(
-          400,
-          "invalid_param",
-          "proxy host contains invalid characters",
-        );
+      // Keep the "test proxy" path aligned with the actual account proxy
+      // save path. Without this, the dashboard could initiate a connectivity
+      // probe to a URL that /accounts/proxy would later reject (e.g. cloud
+      // metadata / link-local addresses).
+      const validation = validateProxyUrl(trimmed);
+      if (!validation.ok) {
+        return errorResponse(400, "invalid_param", validation.message);
       }
 
       // Test target: the relevant provider's base host. Hitting the bare host
@@ -1323,6 +1969,7 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
       const started = Date.now();
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), 10_000);
+      timer.unref?.();
       // Use injected fetchImpl if provided (for tests); fall back to global.
       // wrapFetchWithSocksBridge transparently routes SOCKS proxies through
       // a local HTTP-CONNECT→SOCKS bridge (Bun's native fetch would throw
@@ -1339,8 +1986,8 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
           // cast through any because { proxy } is Bun-specific
           ...(trimmed ? { proxy: trimmed } : {}),
         } as any);
-        clearTimeout(timer);
         const latencyMs = Date.now() - started;
+        try { await resp.body?.cancel(); } catch {}
         // Any HTTP response means the proxy is working — the upstream may
         // return 200, 404, 403, etc. depending on its root path handling.
         return jsonResp({
@@ -1350,17 +1997,18 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
           target,
         });
       } catch (err) {
-        clearTimeout(timer);
         const latencyMs = Date.now() - started;
         const errMsg = (err as Error).message || String(err);
         // Distinguish timeout from other errors for clearer UX
         const isTimeout = ctrl.signal.aborted || /abort/i.test(errMsg);
         return jsonResp({
           ok: false,
-          error: isTimeout ? `Connection timed out after 10s` : errMsg,
+          error: isTimeout ? `Connection timed out after 10s` : truncateAdminErrorMessage(errMsg),
           latencyMs,
           target,
         });
+      } finally {
+        clearTimeout(timer);
       }
     } catch (err) {
       return errorResponse(500, "test_failed", (err as Error).message);
@@ -1384,23 +2032,25 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
       if (!body.id || typeof body.id !== "string") {
         return errorResponse(400, "missing_param", "id is required and must be a string");
       }
+      const accountId = body.id;
       // Per-account rate limit: 1 query / 15s. Stale cached results are
       // returned with a `cached: true` flag so the dashboard can show "this
       // is a cached result, query again in Ns" instead of silently returning
       // old data.
       const now = Date.now();
       const QUOTA_CACHE_MS = 15_000;
-      const cached = quotaCache.get(body.id);
+      const store = await exportStore();
+      const acct = store?.accounts.find((a) => a.id === accountId);
+      if (!acct || !acct.credential) {
+        clearQuotaCacheForAccount(accountId);
+        return errorResponse(404, "not_found", "Account not found");
+      }
+      const cached = quotaCache.get(accountId);
       if (cached && now - cached.ts < QUOTA_CACHE_MS) {
         // Spread the cached result object and add cache metadata.
         // Cast through Record<string, unknown> because the cached result
         // is typed as `unknown` (we accept any QuotaResult shape).
         return jsonResp({ ...(cached.result as Record<string, unknown>), cached: true, cachedAt: cached.ts });
-      }
-      const store = await exportStore();
-      const acct = store?.accounts.find((a) => a.id === body.id);
-      if (!acct || !acct.credential) {
-        return errorResponse(404, "not_found", "Account not found");
       }
       const cred = acct.credential;
       // Honour a per-account outbound proxy if configured, matching how real
@@ -1409,16 +2059,30 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
       // local HTTP-CONNECT→SOCKS bridge.
       const baseFetch = opts.fetchImpl ?? fetch;
       const accountFetch = makeProxiedFetcher(cred.proxy, baseFetch);
-      const result = await queryQuota(cred, accountFetch, opts.config.identity?.appVersion);
-      // Cache the fresh result (even on failure — saves the upstream from
-      // immediate re-hammering when the failure is durable like a 403).
-      quotaCache.set(body.id, { ts: now, result });
-      // Bound the cache size — 50 accounts is plenty, drop oldest by insertion.
-      if (quotaCache.size > 50) {
-        const firstKey = quotaCache.keys().next().value;
-        if (firstKey !== undefined) quotaCache.delete(firstKey);
+      const generation = quotaGenerationForAccount(accountId);
+      let inFlight = quotaInFlight.get(accountId);
+      if (!inFlight) {
+        inFlight = queryQuota(cred, accountFetch, opts.config.identity?.appVersion)
+          .finally(() => {
+            if (quotaInFlight.get(accountId) === inFlight) quotaInFlight.delete(accountId);
+          });
+        quotaInFlight.set(accountId, inFlight);
       }
-      return jsonResp({ ...result, cached: false });
+      const result = await inFlight;
+      const freshTs = Date.now();
+      // Cache the fresh result (even on failure — saves the upstream from
+      // immediate re-hammering when the failure is durable like a 403). If the
+      // account changed while this request was in flight, skip the write so an
+      // old proxy/key/plan result cannot overwrite the invalidated cache.
+      if (quotaGenerationForAccount(accountId) === generation) {
+        quotaCache.set(accountId, { ts: freshTs, result });
+        // Bound the cache size — 50 accounts is plenty, drop oldest by insertion.
+        if (quotaCache.size > QUOTA_CACHE_LIMIT) {
+          const firstKey = quotaCache.keys().next().value;
+          if (firstKey !== undefined) quotaCache.delete(firstKey);
+        }
+      }
+      return jsonResp({ ...(result as Record<string, unknown>), cached: false });
     } catch (err) {
       return errorResponse(500, "quota_failed", (err as Error).message);
     }
@@ -1435,10 +2099,11 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
     // account reusing the same id (unlikely but possible) doesn't see stale
     // data. Previously the cache entry leaked — bounded to 50 entries so it
     // self-corrected eventually, but explicit cleanup is cleaner.
-    quotaCache.delete(id);
+    clearQuotaCacheForAccount(id);
     // Hot-swap the in-memory credential if active changed
     const cred = await loadCredential();
     if (cred) opts.auth.setOAuthCredential(cred);
+    else opts.auth.clearOAuthCredential();
     appendLog("info", `Removed account ${id}`);
     return jsonResp({ ok: true });
   }
@@ -1458,9 +2123,12 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
         return errorResponse(400, "invalid_param", "provider must be 'zai' or 'bigmodel'");
       }
       const provider = body.provider as "zai" | "bigmodel";
+      if (body.plan !== undefined && body.plan !== "coding-plan" && body.plan !== "start-plan") {
+        return errorResponse(400, "invalid_param", "plan must be coding-plan or start-plan");
+      }
       // The dashboard's plan dropdown is the user's explicit choice — pass it
       // as forcedPlan so readZCodeImport imports exactly what they picked.
-      const forcedPlan = (body.plan === "start-plan" ? "start-plan" : body.plan === "coding-plan" ? "coding-plan" : undefined) as "coding-plan" | "start-plan" | undefined;
+      const forcedPlan = body.plan as "coding-plan" | "start-plan" | undefined;
       const source = readZCodeImport(provider, forcedPlan);
 
       // Build the Credential. A raw access_token JWT needs the biz-API exchange
@@ -1661,6 +2329,9 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
       const errResp = handleMutationResult(ok);
       if (errResp) return errResp;
       invalidateStoreCache();
+      const cred = await loadCredential();
+      if (cred) opts.auth.setOAuthCredential(cred);
+      else opts.auth.clearOAuthCredential();
       appendLog("info", `Account ${body.id} ${body.disabled ? "disabled" : "enabled"}`);
       return jsonResp({ ok: true, disabled: body.disabled });
     } catch (err) {
@@ -1740,7 +2411,7 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
   // Import accounts from backup
   if (path === "/admin/api/accounts/import" && method === "POST") {
     try {
-      const parsed = await readJsonBody<{ accounts?: unknown[] }>(req);
+      const parsed = await readJsonBody<{ accounts?: unknown[] }>(req, { maxBytes: MAX_ACCOUNT_IMPORT_BODY_BYTES });
       if (!parsed.ok) return parsed.error;
       const body = parsed.body;
       if (!Array.isArray(body.accounts)) {
@@ -1755,6 +2426,7 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
         return errorResponse(400, "invalid_param", "No valid accounts found in import data");
       }
       const result = await importAccounts(validated as any);
+      clearQuotaCache();
       appendLog("info", `Imported accounts: ${result.added} added, ${result.updated} updated`);
       // Hot-swap active credential (only if it changed). After import we
       // must invalidate cache so loadCredential() reads the freshly-imported
@@ -1763,6 +2435,7 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
       invalidateStoreCache();
       const cred = await loadCredential();
       if (cred) opts.auth.setOAuthCredential(cred);
+      else opts.auth.clearOAuthCredential();
       return jsonResp({ ok: true, added: result.added, updated: result.updated });
     } catch (err) {
       return errorResponse(500, "import_failed", (err as Error).message);
@@ -1784,14 +2457,17 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
         return errorResponse(400, "invalid_param", "provider must be 'zai' or 'bigmodel'");
       }
       const provider = body.provider;
-      const oauthPlan = (body.plan === "start-plan" ? "start-plan" : "coding-plan") as "coding-plan" | "start-plan";
+      if (body.plan !== undefined && body.plan !== "coding-plan" && body.plan !== "start-plan") {
+        return errorResponse(400, "invalid_param", "plan must be coding-plan or start-plan");
+      }
+      const oauthPlan = (body.plan ?? "coding-plan") as "coding-plan" | "start-plan";
 
       if (provider === "bigmodel") {
         const oauth = new BigmodelOAuthClient();
         const { authorizeUrl, callbackUrl, state } = await oauth.start();
         // Store flow info for polling
         const flowId = `bm_${state.slice(0, 16)}`;
-        activeFlows.set(flowId, {
+        rememberActiveOAuthFlow(flowId, {
           provider,
           flowId,
           pollToken: state,
@@ -1800,7 +2476,8 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
           callbackUrl,
           state,
           plan: oauthPlan,
-        } as any);
+          close: () => oauth.close(),
+        });
         // Start background process to wait for callback.
         //
         // Wrapped in try/finally so oauth.close() ALWAYS runs — even if
@@ -1860,7 +2537,7 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
       // authorize URL (flowId == state doubles as the CSRF token + flow key).
       const oauth = new ZaiOAuthClient();
       const init = await oauth.start();
-      activeFlows.set(init.flowId, {
+      rememberActiveOAuthFlow(init.flowId, {
         provider,
         flowId: init.flowId,
         pollToken: init.pollToken,
@@ -1868,12 +2545,13 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
         callbackUrl: init.callbackUrl,
         state: init.state,
         plan: oauthPlan,
-      } as any);
+        close: () => oauth.close(),
+      });
       // Background process: wait for the localhost callback, then exchange.
       // Wrapped in try/finally so oauth.close() ALWAYS runs — see bigmodel path.
       (async () => {
         try {
-          const authCode = await oauth.waitForCallback(init.expiresAt - Date.now() || 300_000);
+          const authCode = await oauth.waitForCallback(normalizeCallbackWaitTimeoutMs(init.expiresAt - Date.now()));
           const { accessToken, userId, jwt, email } = await oauth.exchangeCode(authCode, init.callbackUrl, init.state);
           const resolver = new KeyResolver();
           const cred = await resolver.resolveCredential(accessToken, provider, userId, oauthPlan, jwt, email);
@@ -1914,7 +2592,7 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
     // Check expiry (vceshi0.0.5+): expired flows return "expired" status so the
     // dashboard can show a clear "授权已过期" message instead of spinning forever.
     if (Date.now() > flow.expiresAt) {
-      activeFlows.delete(flowId);
+      deleteActiveOAuthFlow(flowId);
       return jsonResp({ status: "expired" });
     }
     const status = (flow as any).status || "pending";
@@ -1924,7 +2602,7 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
     if (status === "failed" && (flow as any).error) {
       resp.error = (flow as any).error;
     }
-    if (status === "ready" || status === "failed") activeFlows.delete(flowId);
+    if (status === "ready" || status === "failed") deleteActiveOAuthFlow(flowId);
     return jsonResp(resp);
   }
 
@@ -1947,7 +2625,7 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
         return errorResponse(404, "flow_not_found", "Unknown or expired OAuth flow. Please restart the login.");
       }
       if (Date.now() > flow.expiresAt) {
-        activeFlows.delete(flowId);
+        deleteActiveOAuthFlow(flowId);
         return errorResponse(410, "flow_expired", "OAuth flow has expired. Please restart the login.");
       }
 
@@ -1996,7 +2674,7 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
         // Probe start-plan activation in the background (fire-and-forget).
         probeStartPlanActivation(cred, opts.fetchImpl ?? fetch, opts.config.identity?.appVersion);
 
-        activeFlows.delete(flowId);
+        deleteActiveOAuthFlow(flowId);
         return jsonResp({
           ok: true,
           provider: "zai",
@@ -2039,7 +2717,7 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
         // Probe start-plan activation in the background (fire-and-forget).
         probeStartPlanActivation(cred, opts.fetchImpl ?? fetch, opts.config.identity?.appVersion);
 
-        activeFlows.delete(flowId);
+        deleteActiveOAuthFlow(flowId);
         return jsonResp({
           ok: true,
           provider: "bigmodel",
@@ -2242,6 +2920,31 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
     }
   }
 
+  // Chrome captcha helper state/control. Warmup starts the hidden persistent
+  // CDP renderer without solving a token; stop releases the browser/profile.
+  if (path === "/admin/api/captcha-helper" && method === "GET") {
+    return jsonResp(getChromeCaptchaHelperStatus());
+  }
+
+  if (path === "/admin/api/captcha-helper/warmup" && method === "POST") {
+    try {
+      const status = await warmupChromeCaptchaHelper();
+      appendLog("info", status.running
+        ? "Captcha helper warmed up (Chrome CDP persistent session active)"
+        : "Captcha helper warmup skipped (persistent Chrome disabled or ephemeral profile)");
+      return jsonResp(status);
+    } catch (err) {
+      appendLog("warn", `Captcha helper warmup failed: ${(err as Error).message}`);
+      return errorResponse(500, "captcha_helper_failed", (err as Error).message);
+    }
+  }
+
+  if (path === "/admin/api/captcha-helper/stop" && method === "POST") {
+    const status = await shutdownChromeCaptchaHelper("admin stop");
+    appendLog("info", "Captcha helper stopped by admin");
+    return jsonResp(status);
+  }
+
   // Get stats
   if (path === "/admin/api/stats" && method === "GET") {
     return jsonResp({
@@ -2252,16 +2955,7 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
 
   // Reset stats
   if (path === "/admin/api/stats" && method === "DELETE") {
-    stats.total = 0;
-    stats.success = 0;
-    stats.failed = 0;
-    stats.retried = 0;
-    stats.requests = [];
-    stats.models = {};
-    stats.byCredential = {};
-    stats.byStatus = {};
-    requestIndex.clear();
-    seenIds.clear(); // vceshi0.0.7+: clear lifetime dedup set on manual reset
+    resetStats();
     appendLog("info", "Stats reset by admin");
     return jsonResp({ ok: true });
   }
@@ -2286,27 +2980,90 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
   // appendLog fires between the initial buffer-scan and the logWaiters.push()
   // (which would otherwise be missed because the waiter isn't registered yet).
   if (path === "/admin/api/logs/stream" && method === "GET") {
+    if (logWaiters.length >= MAX_LOG_STREAM_SUBSCRIBERS) {
+      return errorResponse(
+        503,
+        "too_many_log_streams",
+        `Too many concurrent log stream connections (max ${MAX_LOG_STREAM_SUBSCRIBERS}). Close other dashboard tabs and retry.`,
+      );
+    }
     let lastSentSeq = logSeq;
     let cleanup: (() => void) | null = null;
     let closed = false;
     const stream = new ReadableStream({
       async start(controller) {
         const encoder = new TextEncoder();
-        const send = (entry: { seq: number; time: string; level: string; message: string }) => {
-          if (closed) return;
-          try {
-            controller.enqueue(encoder.encode(`data: ${JSON.stringify(entry)}\n\n`));
-          } catch { /* SSE controller may be closed; safe to ignore */ }
+        const backpressureLimit = logStreamBackpressureChunksForTesting ?? DEFAULT_LOG_STREAM_BACKPRESSURE_CHUNKS;
+        let streamWaiter: LogWaiter | null = null;
+        const closeLogStream = (): void => {
+          closed = true;
+          cleanup?.();
+          if (streamWaiter) {
+            const idx = logWaiters.indexOf(streamWaiter);
+            if (idx >= 0) logWaiters.splice(idx, 1);
+          }
+          try { controller.close(); } catch { /* already closed */ }
         };
+        const sendPayload = (payload: string): boolean => {
+          if (closed) return false;
+          try {
+            controller.enqueue(encoder.encode(payload));
+            const desiredSize = controller.desiredSize;
+            if (typeof desiredSize === "number" && desiredSize <= -backpressureLimit) {
+              closeLogStream();
+              return false;
+            }
+            return true;
+          } catch {
+            // The client is already gone. Clean up immediately instead of
+            // keeping a dead waiter until the next heartbeat/maxTimeout.
+            closeLogStream();
+            return false;
+          }
+        };
+        const sendBatch = (entries: readonly LogEntry[], respectCursor = true): boolean => {
+          if (closed || entries.length === 0) return !closed;
+          let payload = "";
+          let nextSeq = lastSentSeq;
+          for (const entry of entries) {
+            if (respectCursor && entry.seq <= nextSeq) continue;
+            payload += `data: ${JSON.stringify(entry)}\n\n`;
+            if (entry.seq > nextSeq) nextSeq = entry.seq;
+          }
+          if (!payload) return true;
+          if (!sendPayload(payload)) return false;
+          lastSentSeq = nextSeq;
+          return true;
+        };
+        const sendSerializedBatch = (entries: readonly SerializedLogEntry[]): boolean => {
+          if (closed || entries.length === 0) return !closed;
+          let payload = "";
+          let nextSeq = lastSentSeq;
+          for (const item of entries) {
+            const entry = item.entry;
+            if (entry.seq <= nextSeq) continue;
+            payload += item.sse;
+            if (entry.seq > nextSeq) nextSeq = entry.seq;
+          }
+          if (!payload) return true;
+          if (!sendPayload(payload)) return false;
+          lastSentSeq = nextSeq;
+          return true;
+        };
+        const sendSerialized = (entry: SerializedLogEntry): boolean => sendSerializedBatch([entry]);
 
         // Flush any new entries with seq > lastSentSeq, then advance cursor.
         // Used by the safety-net polling interval only — push delivery goes
         // through waiter.resolve(entry) directly, no full buffer scan needed.
         const flushNew = () => {
+          const pending: LogEntry[] = [];
           for (const e of iterRingBuffer()) {
-            if (e.seq > lastSentSeq) send(e);
+            if (e.seq > lastSentSeq) {
+              pending.push(e);
+            }
           }
-          lastSentSeq = logSeq;
+          if (pending.length > 0 && !sendBatch(pending)) return;
+          if (!closed) lastSentSeq = logSeq;
         };
 
         // Send existing buffered logs first — but ONLY the most recent
@@ -2334,46 +3091,55 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
         // The cap is intentionally a separate constant from
         // LOG_BUFFER_SIZE so we can tune replay size independently of
         // retention.
-        const INITIAL_REPLAY_LIMIT = 200;
-        const allBuffered = Array.from(iterRingBuffer());
-        const replay = allBuffered.length > INITIAL_REPLAY_LIMIT
-          ? allBuffered.slice(allBuffered.length - INITIAL_REPLAY_LIMIT)
-          : allBuffered;
-        for (const entry of replay) {
-          send(entry);
-        }
-        lastSentSeq = logSeq;
+        const replay = recentRingEntries(LOG_CONST.INITIAL_REPLAY_LIMIT);
+        const replayEndSeq = replay.length > 0 ? replay[replay.length - 1].seq : logSeq;
+        if (!sendBatch(replay, false)) return;
+        // Advance only to the last entry we actually replayed. If a log is
+        // appended between the replay snapshot and waiter registration, it is
+        // not in `replay`; flushNew below must still be able to deliver it.
+        lastSentSeq = replayEndSeq;
 
         // Long-lived waiter: appendLog() calls resolve(entry) for every
         // connected SSE client. resolve() just sends the entry directly —
         // NO re-push, NO flushNew (the entry is right here, no need to
         // re-scan the buffer). The waiter stays in logWaiters until the
         // connection closes (cancel() handler removes it).
-        const waiter: { resolve: (value: unknown) => void } = {
-          resolve: (value: unknown) => {
+        const waiter: LogWaiter = {
+          resolve: (entry: SerializedLogEntry) => {
             if (closed) return;
             // The value IS the new log entry — send it directly.
             // No need to flushNew() because we have the entry right here.
-            const entry = value as { seq: number; time: string; level: string; message: string };
-            if (entry.seq > lastSentSeq) {
-              send(entry);
-              lastSentSeq = entry.seq;
+            if (entry.entry.seq > lastSentSeq) {
+              sendSerialized(entry);
             }
           },
+          resolveBatch: (entries: readonly SerializedLogEntry[]) => {
+            if (closed) return;
+            sendSerializedBatch(entries);
+          },
+          flush: flushNew,
         };
+        streamWaiter = waiter;
         logWaiters.push(waiter);
         // v0.2.0.8: cap concurrent SSE log subscribers. Each connected
         // dashboard tab holds one entry here; without a cap a script (or a
         // browser tab flood) could grow logWaiters unbounded, and every
         // appendLog call would fan out to all of them. 50 is plenty for any
         // realistic ops use; a 51st connection gets a 503 + explanatory
-        // message so the client can retry with backoff.
-        if (logWaiters.length > 50) {
+        // message so the client can retry with backoff. The route-level
+        // preflight above rejects before initial replay; this guard is kept
+        // as a defensive backstop if stream starts interleave unexpectedly.
+        if (logWaiters.length > MAX_LOG_STREAM_SUBSCRIBERS) {
           logWaiters.pop(); // undo the push
           closed = true;
-          controller.error(new Error("Too many concurrent log stream connections (max 50). Close other dashboard tabs and retry."));
+          controller.error(new Error(`Too many concurrent log stream connections (max ${MAX_LOG_STREAM_SUBSCRIBERS}). Close other dashboard tabs and retry.`));
           return;
         }
+
+        // Close the narrow race window between initial replay and waiter
+        // registration. This is cheap (ring buffer is bounded) and prevents
+        // rare dashboard log gaps on refresh.
+        flushNew();
 
         // v0.1.5+ HEARTBEAT + SHORTER maxTimeout.
         //
@@ -2403,6 +3169,7 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
           if (closed) return;
           flushNew();
         }, 2000);
+        interval.unref?.();
 
         // v0.1.5+ HEARTBEAT: send a no-op SSE comment (": heartbeat\n\n")
         // every 30s. This serves two purposes:
@@ -2418,14 +3185,13 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
         // browser's EventSource API — it doesn't trigger any message event.
         heartbeat = setInterval(() => {
           if (closed) return;
-          try {
-            controller.enqueue(encoder.encode(`: heartbeat\n\n`));
-          } catch {
+          if (!sendPayload(`: heartbeat\n\n`)) {
             // enqueue failed — client is gone. Trigger cleanup.
             doCleanup();
             try { controller.close(); } catch { /* already closed */ }
           }
-        }, 30_000);
+        }, LOG_CONST.HEARTBEAT_MS);
+        heartbeat.unref?.();
 
         // v0.1.5+ SHORTER maxTimeout: was 1 hour (way too long — leaked
         // waiters up to 1h per disconnected client). 10 minutes was still
@@ -2441,7 +3207,8 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
         maxTimeout = setTimeout(() => {
           doCleanup();
           try { controller.close(); } catch { /* already closed */ }
-        }, 120_000);
+        }, LOG_CONST.MAX_CONNECTION_MS);
+        maxTimeout.unref?.();
       },
       cancel() {
         // Cleanup if the client disconnects early
@@ -2463,18 +3230,18 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
   if (path === "/admin/api/logs" && method === "GET") {
     const level = url.searchParams.get("level");
     const search = url.searchParams.get("search")?.toLowerCase();
-    const limit = Math.min(parseInt(url.searchParams.get("limit") ?? "200", 10) || 200, 2000);
-    let logs = Array.from(iterRingBuffer());
-    if (level) logs = logs.filter(l => l.level === level);
-    if (search) logs = logs.filter(l => l.message.toLowerCase().includes(search));
-    return jsonResp({ logs: logs.slice(-limit), total: logRingCount });
+    const limit = parseQueryLimit(url.searchParams.get("limit"), 200, 2000);
+    const logs = level || search
+      ? recentMatchingRingEntries(limit, level, search)
+      : recentRingEntries(limit);
+    return jsonResp({ logs, total: logRingCount });
   }
 
   // Get debug dumps (memory ring buffer of upstream 4xx transformed bodies).
   // Replaces the old writeFileSync-to-disk approach that leaked user
   // conversation content to <cwd>/zcode-proxy-debug-*.json forever.
   if (path === "/admin/api/debug-dumps" && method === "GET") {
-    const limit = Math.min(parseInt(url.searchParams.get("limit") ?? "20", 10) || 20, 100);
+    const limit = parseQueryLimit(url.searchParams.get("limit"), 20, 100);
     // Strip the full body by default — only return it when ?full=1.
     // Bodies can be 90KB+ and may contain user conversation content, so we
     // hide them behind an explicit opt-in to avoid surprising the user.
@@ -2483,10 +3250,10 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
     if (dumpId) {
       const dump = debugDumps.find(d => d.id === dumpId);
       if (!dump) return errorResponse(404, "not_found", "Debug dump not found");
-      return jsonResp(dump);
+      return jsonResp(includeBody ? dump : { ...dump, body: undefined });
     }
     return jsonResp({
-      dumps: debugDumps.slice(-limit).reverse().map(d =>
+      dumps: (limit <= 0 ? [] : debugDumps.slice(-limit).reverse()).map(d =>
         includeBody ? d : { ...d, body: undefined }
       ),
       total: debugDumps.length,
@@ -2518,40 +3285,60 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
 
   if (path === "/admin/api/proxy-pool/config" && method === "PUT") {
     try {
-      const parsed = await readJsonBody<{
-        enabled?: boolean;
-        refreshIntervalMin?: number;
-        sourceUrls?: string[];
-        rotateOnGatewayBlock?: boolean;
-        maxRotations?: number;
-      }>(req);
+      const parsed = await readJsonBody<Record<string, unknown>>(req);
       if (!parsed.ok) return parsed.error;
       const body = parsed.body;
-      const patch: Record<string, unknown> = {};
-      if (typeof body.enabled === "boolean") patch.enabled = body.enabled;
-      if (typeof body.refreshIntervalMin === "number" && body.refreshIntervalMin >= 0) {
-        patch.refreshIntervalMin = Math.floor(body.refreshIntervalMin);
+      if (typeof body !== "object" || body === null || Array.isArray(body)) {
+        return errorResponse(400, "invalid_param", "Body must be a JSON object");
       }
-      if (Array.isArray(body.sourceUrls)) {
+      const patch: Record<string, unknown> = {};
+      if (Object.prototype.hasOwnProperty.call(body, "enabled")) {
+        if (typeof body.enabled !== "boolean") {
+          return errorResponse(400, "invalid_param", "enabled must be a boolean");
+        }
+        patch.enabled = body.enabled;
+      }
+      if (Object.prototype.hasOwnProperty.call(body, "refreshIntervalMin")) {
+        if (typeof body.refreshIntervalMin !== "number"
+          || !Number.isInteger(body.refreshIntervalMin)
+          || body.refreshIntervalMin < 0
+          || body.refreshIntervalMin > MAX_PROXY_POOL_REFRESH_INTERVAL_MIN) {
+          return errorResponse(400, "invalid_param", `refreshIntervalMin must be an integer between 0 and ${MAX_PROXY_POOL_REFRESH_INTERVAL_MIN}`);
+        }
+        patch.refreshIntervalMin = body.refreshIntervalMin;
+      }
+      if (Object.prototype.hasOwnProperty.call(body, "sourceUrls")) {
+        if (!Array.isArray(body.sourceUrls)) {
+          return errorResponse(400, "invalid_param", "sourceUrls must be an array of URLs");
+        }
         // Validate each URL.
         const urls: string[] = [];
         for (const u of body.sourceUrls) {
-          if (typeof u !== "string") continue;
+          if (typeof u !== "string") {
+            return errorResponse(400, "invalid_param", "sourceUrls must contain only strings");
+          }
           const trimmed = u.trim();
           if (!trimmed) continue;
-          try {
-            // Reject obviously-invalid URLs.
-            new URL(trimmed);
-            urls.push(trimmed);
-          } catch {
-            return errorResponse(400, "invalid_param", `Invalid source URL: ${trimmed}`);
-          }
+          const validation = validateProxySourceUrl(trimmed);
+          if (!validation.ok) return errorResponse(400, "invalid_param", validation.message);
+          urls.push(validation.url);
         }
         patch.sourceUrls = urls;
       }
-      if (typeof body.rotateOnGatewayBlock === "boolean") patch.rotateOnGatewayBlock = body.rotateOnGatewayBlock;
-      if (typeof body.maxRotations === "number" && body.maxRotations >= 0) {
-        patch.maxRotations = Math.floor(body.maxRotations);
+      if (Object.prototype.hasOwnProperty.call(body, "rotateOnGatewayBlock")) {
+        if (typeof body.rotateOnGatewayBlock !== "boolean") {
+          return errorResponse(400, "invalid_param", "rotateOnGatewayBlock must be a boolean");
+        }
+        patch.rotateOnGatewayBlock = body.rotateOnGatewayBlock;
+      }
+      if (Object.prototype.hasOwnProperty.call(body, "maxRotations")) {
+        if (typeof body.maxRotations !== "number"
+          || !Number.isInteger(body.maxRotations)
+          || body.maxRotations < 0
+          || body.maxRotations > MAX_PROXY_POOL_ROTATIONS) {
+          return errorResponse(400, "invalid_param", `maxRotations must be an integer between 0 and ${MAX_PROXY_POOL_ROTATIONS}`);
+        }
+        patch.maxRotations = body.maxRotations;
       }
       const newConfig = await updatePoolConfig(patch);
       appendLog("info", `Proxy pool config updated (enabled=${newConfig.enabled}, interval=${newConfig.refreshIntervalMin}min, sources=${newConfig.sourceUrls.length})`);
@@ -2566,7 +3353,7 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
   // Returns: { ok: true, added, removed, total }
   if (path === "/admin/api/proxy-pool/import-text" && method === "POST") {
     try {
-      const parsed = await readJsonBody<{ text?: string; replace?: boolean }>(req);
+      const parsed = await readJsonBody<{ text?: string; replace?: boolean }>(req, { maxBytes: MAX_PROXY_IMPORT_TEXT_BODY_BYTES });
       if (!parsed.ok) return parsed.error;
       const body = parsed.body;
       if (typeof body.text !== "string") {
@@ -2592,11 +3379,10 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
         return errorResponse(400, "missing_param", "url is required");
       }
       const trimmed = body.url.trim();
-      try { new URL(trimmed); } catch {
-        return errorResponse(400, "invalid_param", "url is not a valid URL");
-      }
+      const validation = validateProxySourceUrl(trimmed);
+      if (!validation.ok) return errorResponse(400, "invalid_param", validation.message);
       const fetchImpl = opts.fetchImpl ?? fetch;
-      const result = await importFromUrl(trimmed, fetchImpl);
+      const result = await importFromUrl(validation.url, fetchImpl);
       if (result.error) {
         appendLog("warn", `Proxy pool import (URL ${trimmed}) failed: ${result.error}`);
         return jsonResp({ ok: false, ...result }, 200);
@@ -2691,6 +3477,7 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
       const started = Date.now();
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), 10_000);
+      timer.unref?.();
       // wrapFetchWithSocksBridge transparently routes SOCKS proxies through
       // the local HTTP-CONNECT→SOCKS bridge.
       const fetchImpl = wrapFetchWithSocksBridge(opts.fetchImpl ?? fetch);
@@ -2701,8 +3488,8 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
           redirect: "follow",
           ...(proxyUrl ? { proxy: proxyUrl } : {}),
         } as any);
-        clearTimeout(timer);
         const latencyMs = Date.now() - started;
+        try { await resp.body?.cancel(); } catch {}
         return jsonResp({
           ok: true,
           id: body.id,
@@ -2712,7 +3499,6 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
           target,
         });
       } catch (err) {
-        clearTimeout(timer);
         const latencyMs = Date.now() - started;
         const errMsg = (err as Error).message || String(err);
         const isTimeout = ctrl.signal.aborted || /abort/i.test(errMsg);
@@ -2720,10 +3506,12 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
           ok: false,
           id: body.id,
           url: proxyUrl,
-          error: isTimeout ? "Connection timed out after 10s" : errMsg,
+          error: isTimeout ? "Connection timed out after 10s" : truncateAdminErrorMessage(errMsg),
           latencyMs,
           target,
         });
+      } finally {
+        clearTimeout(timer);
       }
     } catch (err) {
       return errorResponse(500, "test_failed", (err as Error).message);
@@ -2741,6 +3529,16 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
       const parsed = await readJsonBody<{ batchSize?: number; autoRemove?: boolean; provider?: string }>(req);
       if (!parsed.ok) return parsed.error;
       const body = parsed.body;
+      if (body.batchSize !== undefined
+          && (!Number.isSafeInteger(body.batchSize) || body.batchSize < 1 || body.batchSize > 50)) {
+        return errorResponse(400, "invalid_param", "batchSize must be an integer between 1 and 50");
+      }
+      if (body.autoRemove !== undefined && typeof body.autoRemove !== "boolean") {
+        return errorResponse(400, "invalid_param", "autoRemove must be a boolean");
+      }
+      if (body.provider !== undefined && body.provider !== "zai" && body.provider !== "bigmodel") {
+        return errorResponse(400, "invalid_param", "provider must be 'zai' or 'bigmodel'");
+      }
 
       // Determine test target (provider's base host origin).
       const providerId = body.provider === "bigmodel" ? "bigmodel" : "zai";
@@ -2772,7 +3570,9 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
   // Returns the current job state, or { running: false, total: 0, ... } if
   // no job has ever run.
   if (path === "/admin/api/proxy-pool/test-status" && method === "GET") {
-    const state = getTestJobState();
+    const sinceRaw = url.searchParams.get("sinceSeq");
+    const sinceSeq = sinceRaw != null && /^\d+$/.test(sinceRaw) ? Number(sinceRaw) : undefined;
+    const state = getTestJobState({ sinceSeq });
     if (!state) {
       return jsonResp({
         running: false,
@@ -2784,6 +3584,7 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
         batchSize: 0,
         autoRemove: false,
         startedAt: 0,
+        resultSeq: 0,
         results: {},
       });
     }
@@ -2803,28 +3604,57 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
 // --- Helpers ---
 
 /**
- * Maximum allowed JSON request body size for admin API routes (1 MiB).
+ * Maximum allowed JSON request body size for ordinary admin API routes (1 MiB).
  * All admin mutation endpoints accept small structured payloads (credentials,
  * config patches, OAuth flow ids) — anything larger is almost certainly
  * malicious or a misconfigured client. Limiting prevents OOM from a
  * malicious 1GB JSON body reaching `await req.json()`.
+ *
+ * File-import endpoints intentionally opt into larger per-route limits so the
+ * backend matches the dashboard's documented client-side caps:
+ *   - accounts JSON: 2 MiB file + JSON wrapper/escaping headroom
+ *   - proxy text: 5 MiB text can grow after JSON string escaping newlines
  */
 const MAX_ADMIN_BODY_BYTES = 1 * 1024 * 1024;
+const MAX_ACCOUNT_IMPORT_BODY_BYTES = 3 * 1024 * 1024;
+const MAX_PROXY_IMPORT_TEXT_BODY_BYTES = 12 * 1024 * 1024;
+const DEFAULT_ADMIN_BODY_IDLE_TIMEOUT_MS = 30_000;
+
+let adminBodyIdleTimeoutMsForTesting: number | undefined;
+
+export function _setAdminBodyIdleTimeoutForTesting(timeoutMs?: number): void {
+  adminBodyIdleTimeoutMsForTesting = typeof timeoutMs === "number" && Number.isFinite(timeoutMs)
+    ? Math.max(1, Math.floor(timeoutMs))
+    : undefined;
+}
+
+function parseDeclaredContentLength(raw: string | null): number | undefined {
+  if (!raw) return undefined;
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) return undefined;
+  const n = Number(trimmed);
+  return Number.isSafeInteger(n) ? n : undefined;
+}
 
 /**
  * Read and parse a JSON request body with a size limit. Returns
  * `{ ok: false, error }` when the body is too large or not valid JSON,
  * so callers can early-return without exception handling boilerplate.
  */
-async function readJsonBody<T = unknown>(req: Request): Promise<{ ok: true; body: T } | { ok: false; error: Response }> {
+async function readJsonBody<T = unknown>(
+  req: Request,
+  options: { maxBytes?: number; idleTimeoutMs?: number } = {},
+): Promise<{ ok: true; body: T } | { ok: false; error: Response }> {
+  const maxBytes = Math.max(1, Math.floor(options.maxBytes ?? MAX_ADMIN_BODY_BYTES));
+  const idleTimeoutMs = Math.max(1, Math.floor(
+    options.idleTimeoutMs ?? adminBodyIdleTimeoutMsForTesting ?? DEFAULT_ADMIN_BODY_IDLE_TIMEOUT_MS,
+  ));
   // Content-Length is set by virtually all well-behaved clients. If it's
   // missing we still cap the actual read via the streaming check below.
-  const declared = req.headers.get("content-length");
-  if (declared) {
-    const n = parseInt(declared, 10);
-    if (Number.isFinite(n) && n > MAX_ADMIN_BODY_BYTES) {
-      return { ok: false, error: errorResponse(413, "request_too_large", `Request body exceeds ${MAX_ADMIN_BODY_BYTES} byte limit`) };
-    }
+  const declaredLength = parseDeclaredContentLength(req.headers.get("content-length"));
+  if (declaredLength !== undefined && declaredLength > maxBytes) {
+    void req.body?.cancel().catch(() => {});
+    return { ok: false, error: errorResponse(413, "request_too_large", `Request body exceeds ${maxBytes} byte limit`) };
   }
   // Read the body as text with an explicit cap — defends against clients
   // that omit Content-Length (chunked transfer encoding) or lie about it.
@@ -2837,17 +3667,22 @@ async function readJsonBody<T = unknown>(req: Request): Promise<{ ok: true; body
   const chunks: Uint8Array[] = [];
   try {
     for (;;) {
-      const { done, value } = await reader.read();
+      const { done, value } = await readRequestBodyChunk(reader, idleTimeoutMs);
       if (done) break;
       received += value.byteLength;
-      if (received > MAX_ADMIN_BODY_BYTES) {
+      if (received > maxBytes) {
         try { await reader.cancel(); } catch { /* ignore */ }
-        return { ok: false, error: errorResponse(413, "request_too_large", `Request body exceeds ${MAX_ADMIN_BODY_BYTES} byte limit`) };
+        return { ok: false, error: errorResponse(413, "request_too_large", `Request body exceeds ${maxBytes} byte limit`) };
       }
       chunks.push(value);
     }
   } catch (e) {
+    if (e instanceof AdminBodyTimeoutError) {
+      return { ok: false, error: errorResponse(408, "request_timeout", `Request body read timed out after ${idleTimeoutMs}ms`) };
+    }
     return { ok: false, error: errorResponse(400, "invalid_request", `Failed to read body: ${(e as Error).message}`) };
+  } finally {
+    try { reader.releaseLock(); } catch { /* already released/cancelled */ }
   }
   const text = new TextDecoder().decode(Buffer.concat(chunks));
   if (!text) return { ok: true, body: {} as T };
@@ -2855,6 +3690,35 @@ async function readJsonBody<T = unknown>(req: Request): Promise<{ ok: true; body
     return { ok: true, body: JSON.parse(text) as T };
   } catch (e) {
     return { ok: false, error: errorResponse(400, "invalid_request", `Invalid JSON: ${(e as Error).message}`) };
+  }
+}
+
+class AdminBodyTimeoutError extends Error {
+  constructor(timeoutMs: number) {
+    super(`request body read timed out after ${timeoutMs}ms`);
+    this.name = "AdminBodyTimeoutError";
+  }
+}
+
+async function readRequestBodyChunk(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  timeoutMs: number,
+): Promise<Awaited<ReturnType<ReadableStreamDefaultReader<Uint8Array>["read"]>>> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new AdminBodyTimeoutError(timeoutMs)), timeoutMs);
+    timer.unref?.();
+  });
+  try {
+    return await Promise.race([reader.read(), timeout]);
+  } catch (err) {
+    void reader.cancel(err).catch(() => {});
+    throw err;
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
   }
 }
 
@@ -2898,15 +3762,33 @@ function withSecurityHeaders(resp: Response): Response {
  */
 const VERIFY_RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000; // 15 min
 const VERIFY_RATE_LIMIT_MAX_FAILURES = 10;
+const VERIFY_RATE_LIMIT_MAX_ENTRIES = 4096;
+const VERIFY_RATE_LIMIT_GC_INTERVAL_MS = 60_000;
 const verifyFailures = new Map<string, { count: number; firstAt: number }>();
+let verifyFailuresLastGcAt = 0;
+
+function gcVerifyFailures(now: number, force = false): void {
+  if (!force && verifyFailures.size <= VERIFY_RATE_LIMIT_MAX_ENTRIES && now - verifyFailuresLastGcAt < VERIFY_RATE_LIMIT_GC_INTERVAL_MS) {
+    return;
+  }
+  verifyFailuresLastGcAt = now;
+  for (const [k, v] of verifyFailures) {
+    if (now - v.firstAt > VERIFY_RATE_LIMIT_WINDOW_MS) verifyFailures.delete(k);
+  }
+  if (verifyFailures.size <= VERIFY_RATE_LIMIT_MAX_ENTRIES) return;
+  const overflow = verifyFailures.size - VERIFY_RATE_LIMIT_MAX_ENTRIES;
+  let dropped = 0;
+  for (const k of verifyFailures.keys()) {
+    verifyFailures.delete(k);
+    dropped++;
+    if (dropped >= overflow) break;
+  }
+}
 
 /** Record a failed /verify attempt for `ip`. Evicts stale entries to bound memory. */
 function recordVerifyFailure(ip: string): void {
   const now = Date.now();
-  // Lazy GC: drop entries older than the window.
-  for (const [k, v] of verifyFailures) {
-    if (now - v.firstAt > VERIFY_RATE_LIMIT_WINDOW_MS) verifyFailures.delete(k);
-  }
+  gcVerifyFailures(now, verifyFailures.size >= VERIFY_RATE_LIMIT_MAX_ENTRIES);
   const existing = verifyFailures.get(ip);
   if (existing) {
     existing.count++;
@@ -2917,6 +3799,9 @@ function recordVerifyFailure(ip: string): void {
     }
   } else {
     verifyFailures.set(ip, { count: 1, firstAt: now });
+  }
+  if (verifyFailures.size > VERIFY_RATE_LIMIT_MAX_ENTRIES) {
+    gcVerifyFailures(now, true);
   }
 }
 
@@ -2956,6 +3841,36 @@ function jsonResp(data: unknown, status = 200): Response {
   });
 }
 
+function isConfigObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function optionalConfigObject(body: Record<string, unknown>, key: string): Record<string, unknown> | undefined {
+  if (!Object.prototype.hasOwnProperty.call(body, key)) return undefined;
+  const value = body[key];
+  if (!isConfigObject(value)) {
+    throw new Error(`${key} must be an object`);
+  }
+  return value;
+}
+
+function optionalNestedConfigObject(body: Record<string, unknown>, key: string, path: string): Record<string, unknown> | undefined {
+  if (!Object.prototype.hasOwnProperty.call(body, key)) return undefined;
+  const value = body[key];
+  if (!isConfigObject(value)) {
+    throw new Error(`${path} must be an object`);
+  }
+  return value;
+}
+
+function sanitizeProviderEndpoints(provider: ProxyConfig["providers"]["zai"]): Record<string, unknown> {
+  const { credential, ...rest } = provider;
+  return {
+    ...rest,
+    ...(credential ? { credential: CONFIG_SECRET_MASK } : {}),
+  };
+}
+
 function sanitizeConfig(config: ProxyConfig): Record<string, unknown> {
   return {
     server: config.server,
@@ -2964,15 +3879,20 @@ function sanitizeConfig(config: ProxyConfig): Record<string, unknown> {
     auth: {
       mode: config.auth.mode,
       // Don't expose full API key, just indicate presence
-      apiKey: config.auth.apiKey ? "***configured***" : "",
-      proxyApiKey: config.auth.proxyApiKey ? "***configured***" : "",
+      apiKey: config.auth.apiKey ? CONFIG_SECRET_MASK : "",
+      proxyApiKey: config.auth.proxyApiKey ? CONFIG_SECRET_MASK : "",
+      ...(config.auth.oauthCredentialsPath ? { oauthCredentialsPath: config.auth.oauthCredentialsPath } : {}),
     },
-    providers: config.providers,
+    providers: {
+      zai: sanitizeProviderEndpoints(config.providers.zai),
+      bigmodel: sanitizeProviderEndpoints(config.providers.bigmodel),
+    },
     defaultModel: config.defaultModel,
     models: config.models,
     identity: config.identity,
     logging: config.logging,
     retry: config.retry,
+    corsAllowList: config.corsAllowList ?? [],
     routingRules: config.routingRules ?? [],
     modelMappings: config.modelMappings ?? [],
     responsesThinking: config.responsesThinking ?? { models: [] },
@@ -2991,19 +3911,21 @@ function configToYaml(config: ProxyConfig): string {
     server: {
       port: config.server.port,
       host: config.server.host,
-      // v0.2.1.7: persist all server fields so dashboard saves don't
-      // drop upstreamTimeoutMs / trustProxy / sseHeartbeatMs. Previously
+      // v0.2.1.7+: persist all server fields so dashboard saves don't
+      // drop upstreamTimeoutMs / trustProxy / sseHeartbeatMs / maxRequestBodyBytes. Previously
       // only port+host were serialized, causing these fields to vanish
       // from config.yaml on the next save (and revert to defaults on
       // restart).
       ...(config.server.upstreamTimeoutMs !== undefined ? { upstreamTimeoutMs: config.server.upstreamTimeoutMs } : {}),
       ...(config.server.trustProxy !== undefined ? { trustProxy: config.server.trustProxy } : {}),
       ...(config.server.sseHeartbeatMs !== undefined ? { sseHeartbeatMs: config.server.sseHeartbeatMs } : {}),
+      ...(config.server.maxRequestBodyBytes !== undefined ? { maxRequestBodyBytes: config.server.maxRequestBodyBytes } : {}),
     },
     auth: {
       mode: config.auth.mode,
       ...(config.auth.apiKey ? { apiKey: config.auth.apiKey } : {}),
       ...(config.auth.proxyApiKey ? { proxyApiKey: config.auth.proxyApiKey } : {}),
+      ...(config.auth.oauthCredentialsPath ? { oauthCredentialsPath: config.auth.oauthCredentialsPath } : {}),
     },
     provider: config.provider,
     plan: config.plan,
@@ -3024,6 +3946,9 @@ function configToYaml(config: ProxyConfig): string {
     identity: { ...config.identity },
     logging: { ...config.logging },
     retry: { ...config.retry, retryableStatuses: [...config.retry.retryableStatuses] },
+    ...(config.corsAllowList && config.corsAllowList.length > 0
+      ? { corsAllowList: [...config.corsAllowList] }
+      : {}),
     ...(config.routingRules && config.routingRules.length > 0
       ? { routingRules: config.routingRules.map(r => ({
           pattern: r.pattern,
@@ -3062,13 +3987,183 @@ function configToYaml(config: ProxyConfig): string {
   });
 }
 
+function normalizeRetryableStatuses(values: unknown[]): number[] {
+  const out: number[] = [];
+  const seen = new Set<number>();
+  for (const s of values) {
+    const n = typeof s === "number"
+      ? s
+      : (typeof s === "string" && /^\d+$/.test(s.trim()) ? Number(s.trim()) : NaN);
+    if (!Number.isInteger(n) || n < 100 || n > 599) {
+      throw new Error(`retry.retryableStatuses contains invalid status: ${s}`);
+    }
+    if (seen.has(n)) continue;
+    seen.add(n);
+    out.push(n);
+  }
+  return out;
+}
+
+function normalizeModelList(values: unknown[], defaultModel: unknown): string[] {
+  const models = values
+    .filter((m): m is string => typeof m === "string")
+    .map(m => m.trim())
+    .filter(Boolean);
+  if (typeof defaultModel === "string" && defaultModel.trim() && !models.includes(defaultModel.trim())) {
+    models.push(defaultModel.trim());
+  }
+  return models;
+}
+
+function normalizeRoutingRulesForSave(values: unknown[]): RoutingRule[] {
+  const rules: RoutingRule[] = [];
+  for (const item of values) {
+    if (!isConfigObject(item)) {
+      throw new Error("routingRules entries must be objects");
+    }
+    if (typeof item.pattern !== "string" || item.pattern.trim() === "") {
+      throw new Error("routingRules entries need a non-empty pattern");
+    }
+    if (item.provider !== "zai" && item.provider !== "bigmodel") {
+      throw new Error(`routingRules entry "${item.pattern}" has invalid provider`);
+    }
+    if (item.endpoint !== undefined && item.endpoint !== null && typeof item.endpoint !== "string") {
+      throw new Error("routingRules.endpoint must be a string");
+    }
+    if (item.note !== undefined && item.note !== null && typeof item.note !== "string") {
+      throw new Error("routingRules.note must be a string");
+    }
+    rules.push({
+      pattern: item.pattern.trim(),
+      provider: item.provider,
+      endpoint: typeof item.endpoint === "string" && item.endpoint.trim() ? item.endpoint.trim() : undefined,
+      note: typeof item.note === "string" && item.note.trim() ? item.note.trim() : undefined,
+    });
+  }
+  return rules;
+}
+
+function normalizeModelMappingsForSave(values: unknown[]): ModelMapping[] {
+  const mappings: ModelMapping[] = [];
+  const seenFrom = new Set<string>();
+  for (const item of values) {
+    if (!isConfigObject(item)) {
+      throw new Error("modelMappings entries must be objects");
+    }
+    if (typeof item.from !== "string" || item.from.trim() === "") {
+      throw new Error("modelMappings entries need a non-empty from");
+    }
+    if (typeof item.to !== "string" || item.to.trim() === "") {
+      throw new Error("modelMappings entries need a non-empty to");
+    }
+    const from = item.from.trim().toLowerCase();
+    if (seenFrom.has(from)) {
+      throw new Error(`Duplicate modelMappings.from value: "${item.from}"`);
+    }
+    seenFrom.add(from);
+    if (item.note !== undefined && item.note !== null && typeof item.note !== "string") {
+      throw new Error("modelMappings.note must be a string");
+    }
+    mappings.push({
+      from,
+      to: item.to.trim(),
+      note: typeof item.note === "string" && item.note.trim() ? item.note.trim() : undefined,
+    });
+  }
+  return mappings;
+}
+
+function parseStrictNumber(raw: unknown): number | null {
+  if (typeof raw === "number") return Number.isFinite(raw) ? raw : null;
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  if (!/^[+-]?\d+(?:\.\d+)?$/.test(trimmed)) return null;
+  const n = Number(trimmed);
+  return Number.isFinite(n) ? n : null;
+}
+
+function requireStrictNumber(raw: unknown, field: string): number {
+  const n = parseStrictNumber(raw);
+  if (n === null) throw new Error(`${field} must be a valid number`);
+  return n;
+}
+
+function normalizeIntegerField(
+  obj: Record<string, unknown>,
+  key: string,
+  field: string,
+  opts: { min?: number; max?: number } = {},
+): void {
+  if (!Object.prototype.hasOwnProperty.call(obj, key)) return;
+  const n = requireStrictNumber(obj[key], field);
+  if (!Number.isSafeInteger(n)) throw new Error(`${field} must be an integer`);
+  if (opts.min !== undefined && n < opts.min) throw new Error(`${field} ${n} must be >= ${opts.min}`);
+  if (opts.max !== undefined && n > opts.max) throw new Error(`${field} ${n} is out of range (${opts.min ?? "-Infinity"}-${opts.max})`);
+  obj[key] = n;
+}
+
+function normalizePositiveNumberField(obj: Record<string, unknown>, key: string, field: string): void {
+  if (!Object.prototype.hasOwnProperty.call(obj, key)) return;
+  const n = requireStrictNumber(obj[key], field);
+  if (n <= 0) throw new Error(`${field} ${n} must be > 0`);
+  obj[key] = n;
+}
+
+function normalizeBooleanField(obj: Record<string, unknown>, key: string, field: string): void {
+  if (!Object.prototype.hasOwnProperty.call(obj, key)) return;
+  const value = obj[key];
+  if (typeof value === "boolean") return;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "true" || normalized === "1") {
+      obj[key] = true;
+      return;
+    }
+    if (normalized === "false" || normalized === "0") {
+      obj[key] = false;
+      return;
+    }
+  }
+  throw new Error(`${field} must be a boolean`);
+}
+
+function normalizeConfigForSave(cfg: Record<string, unknown>): void {
+  const server = cfg.server as Record<string, unknown> | undefined;
+  if (server) {
+    normalizeIntegerField(server, "port", "server.port", { min: 1, max: 65535 });
+    normalizeIntegerField(server, "maxRequestBodyBytes", "server.maxRequestBodyBytes", { min: 0 });
+    normalizeIntegerField(server, "upstreamTimeoutMs", "server.upstreamTimeoutMs", { min: 0 });
+    normalizeIntegerField(server, "sseHeartbeatMs", "server.sseHeartbeatMs", { min: 0 });
+    normalizeBooleanField(server, "trustProxy", "server.trustProxy");
+  }
+
+  const retry = cfg.retry as Record<string, unknown> | undefined;
+  if (retry) {
+    normalizeIntegerField(retry, "maxRetries", "retry.maxRetries", { min: 0 });
+    normalizeIntegerField(retry, "initialDelayMs", "retry.initialDelayMs", { min: 1, max: 60_000 });
+    normalizeIntegerField(retry, "maxDelayMs", "retry.maxDelayMs", { min: 1, max: 300_000 });
+    normalizeIntegerField(retry, "credentialSwitchThreshold", "retry.credentialSwitchThreshold", { min: 0 });
+    normalizeIntegerField(retry, "emptyStreamSwitchThreshold", "retry.emptyStreamSwitchThreshold", { min: 0 });
+    normalizePositiveNumberField(retry, "backoffFactor", "retry.backoffFactor");
+    if (Object.prototype.hasOwnProperty.call(retry, "retryableStatuses")) {
+      if (!Array.isArray(retry.retryableStatuses)) {
+        throw new Error("retry.retryableStatuses must be an array");
+      }
+      retry.retryableStatuses = normalizeRetryableStatuses(retry.retryableStatuses);
+    }
+  }
+}
+
 /** Basic validation for config saves from the dashboard. Throws on invalid input. */
 function validateConfigForSave(cfg: Record<string, unknown>): void {
   const server = cfg.server as Record<string, unknown> | undefined;
   if (server) {
-    const port = typeof server.port === "number" ? server.port : parseInt(String(server.port), 10);
+    const port = typeof server.port === "number" ? server.port : NaN;
     if (!Number.isFinite(port) || port < 1 || port > 65535) {
       throw new Error(`server.port ${port} is out of range (1-65535)`);
+    }
+    if (server.host !== undefined && typeof server.host !== "string") {
+      throw new Error("server.host must be a string");
     }
     if (typeof server.host === "string" && server.host.length > 0) {
       // Basic host validation: IPv4, IPv6, or hostname. Rejects spaces and
@@ -3077,6 +4172,21 @@ function validateConfigForSave(cfg: Record<string, unknown>): void {
       if (!hostRe.test(server.host)) {
         throw new Error(`server.host "${server.host}" is not a valid IP or hostname`);
       }
+    }
+    if (server.maxRequestBodyBytes !== undefined) {
+      const maxRequestBodyBytes = typeof server.maxRequestBodyBytes === "number" ? server.maxRequestBodyBytes : NaN;
+      if (!Number.isFinite(maxRequestBodyBytes) || maxRequestBodyBytes < 0) {
+        throw new Error(`server.maxRequestBodyBytes ${server.maxRequestBodyBytes} must be >= 0`);
+      }
+    }
+    if (server.upstreamTimeoutMs !== undefined && (typeof server.upstreamTimeoutMs !== "number" || server.upstreamTimeoutMs < 0)) {
+      throw new Error(`server.upstreamTimeoutMs ${server.upstreamTimeoutMs} must be >= 0`);
+    }
+    if (server.sseHeartbeatMs !== undefined && (typeof server.sseHeartbeatMs !== "number" || server.sseHeartbeatMs < 0)) {
+      throw new Error(`server.sseHeartbeatMs ${server.sseHeartbeatMs} must be >= 0`);
+    }
+    if (server.trustProxy !== undefined && typeof server.trustProxy !== "boolean") {
+      throw new Error("server.trustProxy must be a boolean");
     }
   }
   const provider = cfg.provider as string | undefined;
@@ -3107,6 +4217,10 @@ function validateConfigForSave(cfg: Record<string, unknown>): void {
           }
         }
       }
+      const credential = p?.credential;
+      if (credential !== undefined && credential !== null && typeof credential !== "string") {
+        throw new Error(`providers.${name}.credential must be a string`);
+      }
     }
   }
 
@@ -3115,21 +4229,21 @@ function validateConfigForSave(cfg: Record<string, unknown>): void {
   // to retry indefinitely (e.g. a flaky upstream during peak hours).
   const retry = cfg.retry as Record<string, unknown> | undefined;
   if (retry) {
-    const maxRetries = typeof retry.maxRetries === "number" ? retry.maxRetries : parseInt(String(retry.maxRetries), 10);
+    const maxRetries = typeof retry.maxRetries === "number" ? retry.maxRetries : NaN;
     if (Number.isFinite(maxRetries) && maxRetries < 0) {
       throw new Error(`retry.maxRetries ${maxRetries} must be >= 0`);
     }
-    const initialDelayMs = typeof retry.initialDelayMs === "number" ? retry.initialDelayMs : parseInt(String(retry.initialDelayMs), 10);
-    if (Number.isFinite(initialDelayMs) && (initialDelayMs < 0 || initialDelayMs > 60_000)) {
-      throw new Error(`retry.initialDelayMs ${initialDelayMs} is out of range (0-60000)`);
+    const initialDelayMs = typeof retry.initialDelayMs === "number" ? retry.initialDelayMs : NaN;
+    if (Number.isFinite(initialDelayMs) && (initialDelayMs < 1 || initialDelayMs > 60_000)) {
+      throw new Error(`retry.initialDelayMs ${initialDelayMs} is out of range (1-60000)`);
     }
-    const maxDelayMs = typeof retry.maxDelayMs === "number" ? retry.maxDelayMs : parseInt(String(retry.maxDelayMs), 10);
-    if (Number.isFinite(maxDelayMs) && (maxDelayMs < 0 || maxDelayMs > 300_000)) {
-      throw new Error(`retry.maxDelayMs ${maxDelayMs} is out of range (0-300000)`);
+    const maxDelayMs = typeof retry.maxDelayMs === "number" ? retry.maxDelayMs : NaN;
+    if (Number.isFinite(maxDelayMs) && (maxDelayMs < 1 || maxDelayMs > 300_000)) {
+      throw new Error(`retry.maxDelayMs ${maxDelayMs} is out of range (1-300000)`);
     }
     if (Array.isArray(retry.retryableStatuses)) {
       for (const s of retry.retryableStatuses) {
-        const n = typeof s === "number" ? s : parseInt(String(s), 10);
+        const n = typeof s === "number" ? s : NaN;
         if (!Number.isFinite(n) || n < 100 || n > 599) {
           throw new Error(`retry.retryableStatuses contains invalid status: ${s}`);
         }
@@ -3141,7 +4255,7 @@ function validateConfigForSave(cfg: Record<string, unknown>): void {
     // trigger (the retry loop exhausts first). We allow any non-negative int.
     const credentialSwitchThreshold = typeof retry.credentialSwitchThreshold === "number"
       ? retry.credentialSwitchThreshold
-      : parseInt(String(retry.credentialSwitchThreshold), 10);
+      : NaN;
     if (Number.isFinite(credentialSwitchThreshold) && credentialSwitchThreshold < 0) {
       throw new Error(`retry.credentialSwitchThreshold ${credentialSwitchThreshold} must be >= 0`);
     }
@@ -3149,14 +4263,14 @@ function validateConfigForSave(cfg: Record<string, unknown>): void {
     // number of consecutive empty-stream 529s before forcing a credential switch.
     const emptyStreamSwitchThreshold = typeof retry.emptyStreamSwitchThreshold === "number"
       ? retry.emptyStreamSwitchThreshold
-      : parseInt(String(retry.emptyStreamSwitchThreshold), 10);
+      : NaN;
     if (Number.isFinite(emptyStreamSwitchThreshold) && emptyStreamSwitchThreshold < 0) {
       throw new Error(`retry.emptyStreamSwitchThreshold ${emptyStreamSwitchThreshold} must be >= 0`);
     }
     // backoffFactor: must be > 0 (0 → all delays become 0, no backoff; negative → invalid)
     const backoffFactor = typeof retry.backoffFactor === "number"
       ? retry.backoffFactor
-      : parseFloat(String(retry.backoffFactor));
+      : NaN;
     if (Number.isFinite(backoffFactor) && backoffFactor <= 0) {
       throw new Error(`retry.backoffFactor ${backoffFactor} must be > 0`);
     }

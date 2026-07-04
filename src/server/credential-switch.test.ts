@@ -73,6 +73,19 @@ function successBody(text: string): string {
   });
 }
 
+async function captureConsoleLog<T>(fn: () => Promise<T>): Promise<{ result: T; logs: string[] }> {
+  const originalLog = console.log;
+  const logs: string[] = [];
+  console.log = (...args: unknown[]) => {
+    logs.push(args.map(String).join(" "));
+  };
+  try {
+    return { result: await fn(), logs };
+  } finally {
+    console.log = originalLog;
+  }
+}
+
 describe("credential auto-switching", () => {
   it("switches to the second credential after threshold consecutive failures", async () => {
     const config = makeConfig();
@@ -149,14 +162,16 @@ describe("credential auto-switching", () => {
       );
     }) as typeof fetch;
 
-    const handler = createFetchHandler({ config, auth, fetchImpl: mockFetch });
-    const resp = await handler(
-      new Request("http://localhost/v1/messages", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ model: "glm-4.6", max_tokens: 100, messages: [{ role: "user", content: "Hi" }] }),
-      }),
-    );
+    const { result: resp } = await captureConsoleLog(async () => {
+      const handler = createFetchHandler({ config, auth, fetchImpl: mockFetch });
+      return handler(
+        new Request("http://localhost/v1/messages", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ model: "glm-4.6", max_tokens: 100, messages: [{ role: "user", content: "Hi" }] }),
+        }),
+      );
+    });
 
     // All attempts should use credential A (no switching)
     expect(seenApiKeys.every(k => k === "key-AAA")).toBe(true);
@@ -186,19 +201,73 @@ describe("credential auto-switching", () => {
       );
     }) as typeof fetch;
 
-    const handler = createFetchHandler({ config, auth, fetchImpl: mockFetch });
-    const resp = await handler(
-      new Request("http://localhost/v1/messages", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ model: "glm-4.6", max_tokens: 100, messages: [{ role: "user", content: "Hi" }] }),
-      }),
-    );
+    const { result: resp } = await captureConsoleLog(async () => {
+      const handler = createFetchHandler({ config, auth, fetchImpl: mockFetch });
+      return handler(
+        new Request("http://localhost/v1/messages", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ model: "glm-4.6", max_tokens: 100, messages: [{ role: "user", content: "Hi" }] }),
+        }),
+      );
+    });
 
     // All attempts use credential A (no alternative to switch to)
     expect(seenApiKeys.every(k => k === "key-AAA")).toBe(true);
     expect(seenApiKeys.length).toBe(11); // 1 initial + 10 retries
     expect(resp.status).toBe(529);
+  });
+
+  it("logs single-credential switch unavailability only once per request", async () => {
+    const config = makeConfig({
+      retry: { maxRetries: 6, initialDelayMs: 1, maxDelayMs: 5, backoffFactor: 1, retryableStatuses: [529], credentialSwitchThreshold: 2, emptyStreamSwitchThreshold: 0 },
+    });
+    const auth = new AuthManager({
+      mode: "oauth",
+      provider: "zai",
+      listAllCredentials: async () => [CRED_A],
+    });
+    auth.setOAuthCredential(CRED_A);
+
+    let switchCalls = 0;
+    const originalSwitch = auth.switchToNextCredential.bind(auth);
+    auth.switchToNextCredential = async (excluded?: Set<string>) => {
+      switchCalls++;
+      return originalSwitch(excluded);
+    };
+
+    const seenApiKeys: string[] = [];
+    const mockFetch = (async (req: Request): Promise<Response> => {
+      const apiKey = req.headers.get("x-api-key") ?? "";
+      seenApiKeys.push(apiKey);
+      await req.text();
+      return new Response(
+        JSON.stringify({ type: "error", error: { type: "overloaded_error", message: "busy" } }),
+        { status: 529, headers: { "content-type": "application/json" } },
+      );
+    }) as typeof fetch;
+
+    const { result, logs } = await captureConsoleLog(async () => {
+      const handler = createFetchHandler({ config, auth, fetchImpl: mockFetch });
+      const resp = await handler(
+        new Request("http://localhost/v1/messages", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ model: "glm-4.6", max_tokens: 100, messages: [{ role: "user", content: "Hi" }] }),
+        }),
+      );
+      return resp;
+    });
+
+    expect(result.status).toBe(529);
+    expect(seenApiKeys.every(k => k === "key-AAA")).toBe(true);
+    expect(seenApiKeys.length).toBe(7); // 1 initial + 6 retries
+    expect(switchCalls).toBe(0);
+    const unavailableLogs = logs.filter(l =>
+      l.includes("no alternative credential available") &&
+      l.includes("only 1 credential configured")
+    );
+    expect(unavailableLogs.length).toBe(1);
   });
 
   it("does NOT cycle back to a previously-failed credential", async () => {
@@ -225,14 +294,16 @@ describe("credential auto-switching", () => {
       );
     }) as typeof fetch;
 
-    const handler = createFetchHandler({ config, auth, fetchImpl: mockFetch });
-    const resp = await handler(
-      new Request("http://localhost/v1/messages", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ model: "glm-4.6", max_tokens: 100, messages: [{ role: "user", content: "Hi" }] }),
-      }),
-    );
+    const { result: resp, logs } = await captureConsoleLog(async () => {
+      const handler = createFetchHandler({ config, auth, fetchImpl: mockFetch });
+      return handler(
+        new Request("http://localhost/v1/messages", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ model: "glm-4.6", max_tokens: 100, messages: [{ role: "user", content: "Hi" }] }),
+        }),
+      );
+    });
 
     // vceshi0.0.5+: end-of-loop switch grants 1 extra attempt when switching,
     // so total is 1 initial + 10 retries + 1 end-of-loop extra = 12 attempts.
@@ -254,6 +325,60 @@ describe("credential auto-switching", () => {
     // a new credential or wait for upstream quota reset.
     expect(resp.status).toBe(503);
     expect(resp.headers.get("retry-after")).toBe("300");
+    expect(logs.some(l => l.includes("retry 11/10"))).toBe(false);
+    expect(logs.some(l => l.includes("retry 11/11"))).toBe(true);
+  });
+
+  it("does not repeatedly attempt or log switching after all credentials are tried", async () => {
+    const config = makeConfig({
+      retry: { maxRetries: 4, initialDelayMs: 1, maxDelayMs: 5, backoffFactor: 1, retryableStatuses: [529], credentialSwitchThreshold: 2, emptyStreamSwitchThreshold: 0 },
+    });
+    const auth = new AuthManager({
+      mode: "oauth",
+      provider: "zai",
+      listAllCredentials: async () => [CRED_A, CRED_B],
+    });
+    auth.setOAuthCredential(CRED_A);
+
+    let switchCalls = 0;
+    const originalSwitch = auth.switchToNextCredential.bind(auth);
+    auth.switchToNextCredential = async (excluded?: Set<string>) => {
+      switchCalls++;
+      return originalSwitch(excluded);
+    };
+
+    const seenApiKeys: string[] = [];
+    const mockFetch = (async (req: Request): Promise<Response> => {
+      const apiKey = req.headers.get("x-api-key") ?? "";
+      seenApiKeys.push(apiKey);
+      await req.text();
+      return new Response(
+        JSON.stringify({ type: "error", error: { type: "overloaded_error", message: "busy" } }),
+        { status: 529, headers: { "content-type": "application/json" } },
+      );
+    }) as typeof fetch;
+
+    const { result, logs } = await captureConsoleLog(async () => {
+      const handler = createFetchHandler({ config, auth, fetchImpl: mockFetch });
+      const resp = await handler(
+        new Request("http://localhost/v1/messages", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ model: "glm-4.6", max_tokens: 100, messages: [{ role: "user", content: "Hi" }] }),
+        }),
+      );
+      return resp;
+    });
+
+    expect(result.status).toBe(503);
+    expect(seenApiKeys.slice(0, 2).every(k => k === "key-AAA")).toBe(true);
+    expect(seenApiKeys.slice(2).every(k => k === "key-BBB")).toBe(true);
+    expect(switchCalls).toBe(1);
+    const unavailableLogs = logs.filter(l =>
+      l.includes("no alternative credential available") &&
+      l.includes("tried 2 of 2 credential(s)")
+    );
+    expect(unavailableLogs.length).toBe(1);
   });
 
   it("switches at threshold=1 (switch on every failure)", async () => {
@@ -350,7 +475,7 @@ describe("credential auto-switching", () => {
     expect(seenApiKeys.length).toBe(7);
   });
 
-  it("counts network errors toward the credential-switch threshold", async () => {
+  it("counts initial and retry network errors toward the credential-switch threshold", async () => {
     const config = makeConfig({
       retry: { maxRetries: 8, initialDelayMs: 1, maxDelayMs: 5, backoffFactor: 1, retryableStatuses: [529], credentialSwitchThreshold: 3, emptyStreamSwitchThreshold: 3 },
     });
@@ -388,16 +513,12 @@ describe("credential auto-switching", () => {
       }),
     );
 
-    // The initial attempt with A throws (counter=1). Then retries 1, 2 with A
-    // also throw (counter=2, 3). At retry 3, threshold (3) is reached → switch to B.
-    // But wait: the initial fetch is OUTSIDE the retry loop and throws → returns 502
-    // immediately without entering the retry loop. So switching never happens for
-    // network errors on the initial attempt.
-    //
-    // This is the existing behavior — the initial network error is NOT retried.
-    // Only errors INSIDE the retry loop are retried (and counted for switching).
-    // So we expect a 502 here.
-    expect(resp.status).toBe(502);
+    // The initial attempt with A throws (counter=1). Then retries 1 and 2
+    // with A also throw (counter=2, 3). At retry 3, threshold (3) is reached
+    // before fetching, so the proxy switches to B and succeeds.
+    expect(resp.status).toBe(200);
+    expect(seenApiKeys).toEqual(["key-AAA", "key-AAA", "key-AAA", "key-BBB"]);
+    expect(callCount).toBe(4);
   });
 });
 

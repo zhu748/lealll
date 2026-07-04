@@ -23,6 +23,19 @@ function mockFetch(responses: Record<string, (body?: string) => Response>): type
   }) as typeof fetch;
 }
 
+function hangingFetch(): typeof fetch {
+  return ((_: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    return new Promise((_resolve, reject) => {
+      const signal = init?.signal;
+      if (signal?.aborted) {
+        reject(new Error("aborted"));
+        return;
+      }
+      signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+    });
+  }) as typeof fetch;
+}
+
 describe("KeyResolver", () => {
   it("resolveZaiBizToken exchanges access token for biz token", async () => {
     const fetchImpl = mockFetch({
@@ -33,6 +46,103 @@ describe("KeyResolver", () => {
     const resolver = new KeyResolver(fetchImpl);
     const bizToken = await resolver.resolveZaiBizToken("access_abc");
     expect(bizToken).toBe("biz_token_123");
+  });
+
+  it("resolveZaiBizToken rejects a successful response without a usable token", async () => {
+    const fetchImpl = mockFetch({
+      "/auth/z/login": () => new Response(JSON.stringify({
+        data: { access_token: "   " },
+      }), { status: 200, headers: { "content-type": "application/json" } }),
+    });
+    const resolver = new KeyResolver(fetchImpl);
+    await expect(resolver.resolveZaiBizToken("access_abc"))
+      .rejects.toThrow(/missing access_token/);
+  });
+
+  it("resolveZaiBizToken times out instead of hanging forever", async () => {
+    const resolver = new KeyResolver(hangingFetch(), 5);
+    const keepAlive = setInterval(() => {}, 1);
+    try {
+      await expect(resolver.resolveZaiBizToken("access_abc")).rejects.toThrow(/timeout after 5ms/);
+    } finally {
+      clearInterval(keepAlive);
+    }
+  });
+
+  it("resolveZaiBizToken times out when the response body stalls after headers", async () => {
+    let canceled = false;
+    const fetchImpl = mockFetch({
+      "/auth/z/login": () => new Response(new ReadableStream<Uint8Array>({
+        pull() {
+          return new Promise<void>(() => {});
+        },
+        cancel() {
+          canceled = true;
+        },
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    });
+    const resolver = new KeyResolver(fetchImpl, 5);
+    const keepAlive = setInterval(() => {}, 1);
+    try {
+      await expect(resolver.resolveZaiBizToken("access_abc"))
+        .rejects.toThrow(/JSON response read timeout after 5ms/);
+      expect(canceled).toBe(true);
+    } finally {
+      clearInterval(keepAlive);
+    }
+  });
+
+  it("resolveZaiBizToken unrefs the Biz API request timeout timer", async () => {
+    const originalSetTimeout = globalThis.setTimeout as any;
+    const unrefDelays: number[] = [];
+    (globalThis as any).setTimeout = (handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
+      const timer = originalSetTimeout(handler, timeout, ...args) as any;
+      const originalUnref = timer.unref?.bind(timer);
+      timer.unref = () => {
+        unrefDelays.push(Number(timeout));
+        return originalUnref?.();
+      };
+      return timer;
+    };
+
+    try {
+      const fetchImpl = mockFetch({
+        "/auth/z/login": () => new Response(JSON.stringify({
+          access_token: "biz_token_123",
+        }), { status: 200, headers: { "content-type": "application/json" } }),
+      });
+      const resolver = new KeyResolver(fetchImpl, 1234);
+      await resolver.resolveZaiBizToken("access_abc");
+      expect(unrefDelays).toContain(1234);
+    } finally {
+      (globalThis as any).setTimeout = originalSetTimeout;
+    }
+  });
+
+  it("resolveZaiBizToken normalizes pathological request timeout values before scheduling timers", async () => {
+    const originalSetTimeout = globalThis.setTimeout as any;
+    const scheduledDelays: number[] = [];
+    (globalThis as any).setTimeout = (handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
+      scheduledDelays.push(Number(timeout));
+      return originalSetTimeout(handler, timeout, ...args);
+    };
+
+    try {
+      const fetchImpl = mockFetch({
+        "/auth/z/login": () => new Response(JSON.stringify({
+          access_token: "biz_token_123",
+        }), { status: 200, headers: { "content-type": "application/json" } }),
+      });
+      const resolver = new KeyResolver(fetchImpl, Number.POSITIVE_INFINITY);
+      await resolver.resolveZaiBizToken("access_abc");
+      expect(scheduledDelays.every((delay) => Number.isFinite(delay) && delay >= 1)).toBe(true);
+      expect(scheduledDelays).toContain(15_000);
+    } finally {
+      (globalThis as any).setTimeout = originalSetTimeout;
+    }
   });
 
   it("resolveCustomerInfo picks default org using bundle field names", async () => {
@@ -73,6 +183,30 @@ describe("KeyResolver", () => {
     });
     const resolver = new KeyResolver(fetchImpl);
     expect(resolver.resolveCustomerInfo("https://api.z.ai", "Bearer tok")).rejects.toThrow(/No organizations/);
+  });
+
+  it("resolveCustomerInfo rejects oversized JSON responses before reading the body", async () => {
+    let canceled = false;
+    const fetchImpl = mockFetch({
+      "getCustomerInfo": () => new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode("{}"));
+        },
+        cancel() {
+          canceled = true;
+        },
+      }), {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+          "content-length": String(2 * 1024 * 1024 + 1),
+        },
+      }),
+    });
+    const resolver = new KeyResolver(fetchImpl);
+    await expect(resolver.resolveCustomerInfo("https://api.z.ai", "Bearer tok"))
+      .rejects.toThrow(/byte limit/);
+    expect(canceled).toBe(true);
   });
 
   it("findOrCreateApiKey finds existing key named zcode-api-key", async () => {
@@ -154,6 +288,31 @@ describe("KeyResolver.resolveCredential — start-plan graceful fallback", () =>
     expect(cred.secret).toBe("mySecret");
     expect(cred.plan).toBe("start-plan");
     expect(cred.jwt).toBe("planJWT");
+  });
+
+  it("start-plan: falls back to JWT-only when z/login omits access_token", async () => {
+    const fetchImpl = mockFetch({
+      "/auth/z/login": () => new Response(JSON.stringify({ data: {} }), {
+        status: 200, headers: { "content-type": "application/json" },
+      }),
+    });
+    const resolver = new KeyResolver(fetchImpl);
+    const cred = await resolver.resolveCredential(
+      "accessTok",
+      "zai",
+      "user-start",
+      "start-plan",
+      "jwt-start-token",
+      "user@example.com",
+    );
+    expect(cred).toEqual({
+      apiKey: "jwt-start-token",
+      provider: "zai",
+      plan: "start-plan",
+      jwt: "jwt-start-token",
+      userId: "user-start",
+      email: "user@example.com",
+    });
   });
 
   // biz API fails → start-plan MUST fall back to a JWT-only credential instead

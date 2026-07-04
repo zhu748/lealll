@@ -5,25 +5,146 @@ import type { FetchFn } from "./oauth.js";
 const ZAI_API_KEY_NAME = "zcode-api-key";
 const DEFAULT_ORG_MARKER = "\u9ED8\u8BA4\u673A\u6784"; // 默认机构
 const DEFAULT_PROJECT_MARKER = "\u9ED8\u8BA4\u9879\u76EE"; // 默认项目
+const DEFAULT_BIZ_API_TIMEOUT_MS = 15_000;
+const MAX_TIMER_MS = 2_147_483_647;
+const MAX_BIZ_JSON_BYTES = 2 * 1024 * 1024;
+
+function parseContentLength(headers: Headers): number | undefined {
+  const raw = headers.get("content-length");
+  if (!raw) return undefined;
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) return undefined;
+  const n = Number(trimmed);
+  return Number.isSafeInteger(n) ? n : undefined;
+}
+
+async function readJsonLimited(
+  resp: Response,
+  maxBytes = MAX_BIZ_JSON_BYTES,
+  timeoutMs = DEFAULT_BIZ_API_TIMEOUT_MS,
+): Promise<any> {
+  const limit = Math.max(1, Math.floor(maxBytes));
+  const declaredLength = parseContentLength(resp.headers);
+  if (declaredLength !== undefined && declaredLength > limit) {
+    void resp.body?.cancel().catch(() => {});
+    throw new Error(`Biz API JSON response exceeds ${limit} byte limit (content-length ${declaredLength})`);
+  }
+  if (!resp.body) return {};
+
+  const reader = resp.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await readChunkWithTimeout(reader, timeoutMs);
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > limit) {
+        try { await reader.cancel(); } catch {}
+        throw new Error(`Biz API JSON response exceeds ${limit} byte limit`);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    try { reader.releaseLock(); } catch {}
+  }
+
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  const text = new TextDecoder().decode(bytes);
+  return text ? JSON.parse(text) : {};
+}
+
+async function readChunkWithTimeout(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  timeoutMs: number,
+): ReturnType<ReadableStreamDefaultReader<Uint8Array>["read"]> {
+  const timeout = normalizeTimerMs(timeoutMs);
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const result = await Promise.race([
+    reader.read(),
+    new Promise<"timeout">(resolve => {
+      timer = setTimeout(() => resolve("timeout"), timeout);
+      timer.unref?.();
+    }),
+  ]).finally(() => {
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  });
+  if (result === "timeout") {
+    const err = new Error(`Biz API JSON response read timeout after ${timeout}ms`);
+    void reader.cancel(err).catch(() => {});
+    throw err;
+  }
+  return result;
+}
+
+async function fetchWithTimeout(
+  fetchImpl: FetchFn,
+  input: RequestInfo | URL,
+  init: RequestInit | undefined,
+  timeoutMs: number,
+): Promise<Response> {
+  const timeout = normalizeTimerMs(timeoutMs);
+  const ctrl = new AbortController();
+  const upstreamSignal = init?.signal;
+  let upstreamAborted = false;
+  const onUpstreamAbort = () => {
+    upstreamAborted = true;
+    ctrl.abort();
+  };
+  if (upstreamSignal) {
+    if (upstreamSignal.aborted) onUpstreamAbort();
+    else upstreamSignal.addEventListener("abort", onUpstreamAbort, { once: true });
+  }
+  const timer = setTimeout(() => ctrl.abort(), timeout);
+  timer.unref?.();
+  try {
+    return await fetchImpl(input, { ...init, signal: ctrl.signal });
+  } catch (err) {
+    if (ctrl.signal.aborted && !upstreamAborted) {
+      throw new Error(`Biz API request timeout after ${timeout}ms`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+    if (upstreamSignal) upstreamSignal.removeEventListener("abort", onUpstreamAbort);
+  }
+}
+
+function normalizeTimerMs(raw: number, fallback = DEFAULT_BIZ_API_TIMEOUT_MS): number {
+  const candidate = Number.isFinite(raw) && raw > 0 ? raw : fallback;
+  const safe = Number.isFinite(candidate) && candidate > 0 ? candidate : DEFAULT_BIZ_API_TIMEOUT_MS;
+  return Math.min(MAX_TIMER_MS, Math.max(1, Math.floor(safe)));
+}
 
 async function requestBizApi(
   fetchImpl: FetchFn,
   url: string,
   authorization: string,
   init?: RequestInit,
+  timeoutMs = DEFAULT_BIZ_API_TIMEOUT_MS,
 ): Promise<any> {
-  const resp = await fetchImpl(url, {
+  const resp = await fetchWithTimeout(fetchImpl, url, {
     ...init,
     headers: {
       Authorization: authorization,
       "Content-Type": "application/json",
       ...(init?.headers ?? {}),
     },
-  });
+  }, timeoutMs);
   if (!resp.ok) {
+    void resp.body?.cancel().catch(() => {});
     throw new Error(`Biz API ${url} failed: ${resp.status}`);
   }
-  const body = await resp.json();
+  const body = await readJsonLimited(resp, MAX_BIZ_JSON_BYTES, timeoutMs);
   const code = body.code ?? body.status;
   if (code != null && code !== 0 && code !== 200 && code !== "0" && code !== "200") {
     throw new Error(body.msg ?? `Biz API error ${code}`);
@@ -32,19 +153,27 @@ async function requestBizApi(
 }
 
 export class KeyResolver {
-  constructor(private fetchImpl: FetchFn = fetch) {}
+  constructor(
+    private fetchImpl: FetchFn = fetch,
+    private requestTimeoutMs: number = DEFAULT_BIZ_API_TIMEOUT_MS,
+  ) {}
 
   async resolveZaiBizToken(accessToken: string): Promise<string> {
-    const resp = await this.fetchImpl("https://api.z.ai/api/auth/z/login", {
+    const resp = await fetchWithTimeout(this.fetchImpl, "https://api.z.ai/api/auth/z/login", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ token: accessToken }),
-    });
+    }, this.requestTimeoutMs);
     if (!resp.ok) {
+      void resp.body?.cancel().catch(() => {});
       throw new Error(`z/login failed: ${resp.status}`);
     }
-    const data = await resp.json();
-    return data.access_token ?? data.accessToken ?? data.data?.access_token;
+    const data = await readJsonLimited(resp, MAX_BIZ_JSON_BYTES, this.requestTimeoutMs);
+    const token = data.access_token ?? data.accessToken ?? data.data?.access_token;
+    if (typeof token !== "string" || token.trim() === "") {
+      throw new Error("z/login response missing access_token");
+    }
+    return token.trim();
   }
 
   async resolveCustomerInfo(
@@ -56,6 +185,7 @@ export class KeyResolver {
       `${host}/api/biz/customer/getCustomerInfo`,
       authorization,
       { method: "GET" },
+      this.requestTimeoutMs,
     );
 
     const orgs: any[] = data.organizations ?? data.orgs ?? [];
@@ -89,7 +219,7 @@ export class KeyResolver {
 
     let existing: any[] = [];
     try {
-      existing = await requestBizApi(this.fetchImpl, listUrl, authorization, { method: "GET" }) ?? [];
+      existing = await requestBizApi(this.fetchImpl, listUrl, authorization, { method: "GET" }, this.requestTimeoutMs) ?? [];
     } catch { /* ignore — will create */ }
 
     if (Array.isArray(existing)) {
@@ -102,7 +232,7 @@ export class KeyResolver {
     const created = await requestBizApi(this.fetchImpl, listUrl, authorization, {
       method: "POST",
       body: JSON.stringify({ name: ZAI_API_KEY_NAME }),
-    });
+    }, this.requestTimeoutMs);
     return { apiKey: created.apiKey };
   }
 
@@ -114,7 +244,7 @@ export class KeyResolver {
     apiKey: string,
   ): Promise<string> {
     const url = `${host}/api/biz/v1/organization/${orgId}/projects/${projectId}/api_keys/copy/${encodeURIComponent(apiKey)}`;
-    const data = await requestBizApi(this.fetchImpl, url, authorization, { method: "GET" });
+    const data = await requestBizApi(this.fetchImpl, url, authorization, { method: "GET" }, this.requestTimeoutMs);
     return data.secretKey ?? data.secret_key ?? "";
   }
 

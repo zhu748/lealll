@@ -51,8 +51,9 @@
  *     `rm -rf header-debug/` when done debugging.
  *
  * Performance:
- *   - All file I/O is async (atomicWriteFile) and fire-and-forget — the
- *     request path never awaits or blocks on debug logging.
+ *   - All file I/O is async (atomicWriteFile) and processed through a
+ *     bounded background queue — the request path never awaits debug logging,
+ *     and debug-mode request storms cannot spawn unlimited filesystem writes.
  *   - The dir is created once (memoized), not per-write.
  *   - When headerDebug is disabled (the default), recordHeaders is a no-op
  *     checked at the call site, so there's zero overhead in normal operation.
@@ -133,6 +134,198 @@ function headersToRecord(headers: Headers): Record<string, string> {
 
 /** Max bytes of the transformed request body to include in the debug file. */
 const MAX_BODY_PREVIEW_BYTES = 16 * 1024;
+const DEFAULT_MAX_PENDING_RECORDS = 100;
+const MAX_PENDING_RECORDS_LIMIT = 10_000;
+const DEFAULT_MAX_CONCURRENT_WRITES = 2;
+const MAX_CONCURRENT_WRITES_LIMIT = 16;
+const DROP_WARN_INTERVAL_MS = 30_000;
+const utf8Encoder = new TextEncoder();
+const utf8Decoder = new TextDecoder();
+
+function resolveBoundedPositiveInt(raw: string | undefined, fallback: number, max: number): number {
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) return fallback;
+  const n = Number(trimmed);
+  if (!Number.isSafeInteger(n) || n <= 0) return fallback;
+  return Math.min(n, max);
+}
+
+export function resolveHeaderDebugMaxPendingRecords(raw = process.env.ZCODE_PROXY_HEADER_DEBUG_MAX_PENDING): number {
+  return resolveBoundedPositiveInt(raw, DEFAULT_MAX_PENDING_RECORDS, MAX_PENDING_RECORDS_LIMIT);
+}
+
+export function resolveHeaderDebugMaxConcurrentWrites(raw = process.env.ZCODE_PROXY_HEADER_DEBUG_CONCURRENCY): number {
+  return resolveBoundedPositiveInt(raw, DEFAULT_MAX_CONCURRENT_WRITES, MAX_CONCURRENT_WRITES_LIMIT);
+}
+
+function maxPendingRecords(): number {
+  return resolveHeaderDebugMaxPendingRecords();
+}
+
+function maxConcurrentWrites(): number {
+  return resolveHeaderDebugMaxConcurrentWrites();
+}
+
+function truncateBodyPreview(value: string): string {
+  const bytes = utf8Encoder.encode(value);
+  if (bytes.byteLength <= MAX_BODY_PREVIEW_BYTES) return value;
+  let end = MAX_BODY_PREVIEW_BYTES;
+  while (end > 0 && bytes[end] !== undefined && (bytes[end] & 0xc0) === 0x80) {
+    end--;
+  }
+  const preview = utf8Decoder.decode(bytes.subarray(0, end));
+  return `${preview}...(truncated, total ${bytes.byteLength} bytes)`;
+}
+
+type HeaderDebugRequestSnapshot = {
+  method: string;
+  url: string;
+  headers: Record<string, string>;
+};
+
+type HeaderDebugJob = {
+  inbound: HeaderDebugRequestSnapshot;
+  upstream: HeaderDebugRequestSnapshot;
+  reqId: string;
+  format: string;
+  transformedBodyPreview?: string;
+  inboundBodyPreview?: string;
+};
+
+const pendingJobs: HeaderDebugJob[] = [];
+let pendingJobHead = 0;
+let activeWrites = 0;
+let droppedJobs = 0;
+let lastDropWarnAt = 0;
+let writeGateForTesting: Promise<void> | null = null;
+
+function pendingJobCount(): number {
+  return pendingJobs.length - pendingJobHead;
+}
+
+function dequeueHeaderDebugJob(): HeaderDebugJob | undefined {
+  if (pendingJobHead >= pendingJobs.length) return undefined;
+  const job = pendingJobs[pendingJobHead++];
+  // Compact after enough O(1) dequeues so long debug sessions do not retain
+  // references to old Request objects forever.
+  if (pendingJobHead > 128 && pendingJobHead * 2 >= pendingJobs.length) {
+    pendingJobs.splice(0, pendingJobHead);
+    pendingJobHead = 0;
+  }
+  return job;
+}
+
+function warnDroppedJobs(): void {
+  const now = Date.now();
+  if (now - lastDropWarnAt < DROP_WARN_INTERVAL_MS) return;
+  lastDropWarnAt = now;
+  console.warn(
+    `[header-debug] dropping records because async write queue is full ` +
+    `(dropped=${droppedJobs}, pending=${pendingJobCount()}, active=${activeWrites})`,
+  );
+}
+
+function scheduleHeaderDebugJob(job: HeaderDebugJob): void {
+  if (pendingJobCount() >= maxPendingRecords()) {
+    droppedJobs++;
+    warnDroppedJobs();
+    return;
+  }
+  pendingJobs.push(job);
+  pumpHeaderDebugQueue();
+}
+
+function pumpHeaderDebugQueue(): void {
+  const concurrency = maxConcurrentWrites();
+  while (activeWrites < concurrency && pendingJobCount() > 0) {
+    const job = dequeueHeaderDebugJob();
+    if (!job) break;
+    activeWrites++;
+    void writeHeaderDebugRecord(job)
+      .catch((err) => {
+        // Never throw — debug logging is best-effort. Surface to console so the
+        // operator notices if the debug dir is unwritable, but keep the request
+        // flowing.
+        console.warn(`[header-debug] failed to write record for ${job.reqId}: ${(err as Error).message}`);
+      })
+      .finally(() => {
+        activeWrites--;
+        pumpHeaderDebugQueue();
+      });
+  }
+}
+
+async function writeHeaderDebugRecord(job: HeaderDebugJob): Promise<void> {
+  if (writeGateForTesting) await writeGateForTesting;
+  const {
+    inbound,
+    upstream,
+    reqId,
+    format,
+    transformedBodyPreview,
+    inboundBodyPreview,
+  } = job;
+  const dir = await getDebugDir();
+  // Shared prefix: timestamp (sortable, filesystem-safe) + reqId.
+  // Both files use the same prefix so they're adjacent in `ls` output
+  // and trivial to pair in diff tools.
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const prefix = `${timestamp}_${reqId}`;
+  const inboundPath = join(dir, `${prefix}_inbound.json`);
+  const upstreamPath = join(dir, `${prefix}_upstream.json`);
+  const isoTs = new Date().toISOString();
+
+  // --- Inbound file: the raw client request as received ---
+  const inboundRecord: InboundHeaderDebugRecord = {
+    reqId,
+    timestamp: isoTs,
+    format,
+    side: "inbound",
+    method: inbound.method,
+    url: inbound.url,
+    headers: inbound.headers,
+    ...(inboundBodyPreview
+      ? {
+          bodyPreview: inboundBodyPreview,
+        }
+      : {}),
+  };
+
+  // --- Upstream file: the translated request sent to z.ai ---
+  const upstreamRecord: UpstreamHeaderDebugRecord = {
+    reqId,
+    timestamp: isoTs,
+    format,
+    side: "upstream",
+    method: upstream.method,
+    url: upstream.url,
+    headers: upstream.headers,
+    ...(transformedBodyPreview
+      ? {
+          bodyPreview: transformedBodyPreview,
+        }
+      : {}),
+  };
+
+  // Write both files in parallel. atomicWriteFile (temp+rename) is safe
+  // against partial writes if the process crashes mid-debug-log. 2-space
+  // indent for readability in a text editor / diff tool.
+  const inboundJson = JSON.stringify(inboundRecord, null, 2) + "\n";
+  const upstreamJson = JSON.stringify(upstreamRecord, null, 2) + "\n";
+  await Promise.all([
+    atomicWriteFile(inboundPath, inboundJson, "utf-8"),
+    atomicWriteFile(upstreamPath, upstreamJson, "utf-8"),
+  ]);
+}
+
+function snapshotRequest(req: Request): HeaderDebugRequestSnapshot {
+  return {
+    method: req.method,
+    url: req.url,
+    headers: headersToRecord(req.headers),
+  };
+}
 
 /**
  * Inbound record — the RAW request the proxy received from the client,
@@ -220,70 +413,44 @@ export function recordHeaders(
   inboundBody?: string,
 ): void {
   // Fire-and-forget — never let disk I/O or errors block the request path.
-  void (async () => {
-    try {
-      const dir = await getDebugDir();
-      // Shared prefix: timestamp (sortable, filesystem-safe) + reqId.
-      // Both files use the same prefix so they're adjacent in `ls` output
-      // and trivial to pair in diff tools.
-      const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-      const prefix = `${timestamp}_${reqId}`;
-      const inboundPath = join(dir, `${prefix}_inbound.json`);
-      const upstreamPath = join(dir, `${prefix}_upstream.json`);
-      const isoTs = new Date().toISOString();
+  // The bounded queue prevents debug-mode request storms from spawning
+  // hundreds of concurrent filesystem writes on Windows.
+  //
+  // Store only bounded previews in the async queue. The previous shape kept the
+  // complete Request objects and body strings until the background writer got
+  // to the job, so debug-mode bursts with large requests could retain many MB
+  // per queued item even though the final JSON file only wrote a 16KB preview.
+  scheduleHeaderDebugJob({
+    inbound: snapshotRequest(inboundReq),
+    upstream: snapshotRequest(upstreamReq),
+    reqId,
+    format,
+    transformedBodyPreview: transformedBody ? truncateBodyPreview(transformedBody) : undefined,
+    inboundBodyPreview: inboundBody ? truncateBodyPreview(inboundBody) : undefined,
+  });
+}
 
-      // --- Inbound file: the raw client request as received ---
-      const inboundRecord: InboundHeaderDebugRecord = {
-        reqId,
-        timestamp: isoTs,
-        format,
-        side: "inbound",
-        method: inboundReq.method,
-        url: inboundReq.url,
-        headers: headersToRecord(inboundReq.headers),
-        ...(inboundBody
-          ? {
-              bodyPreview: inboundBody.length > MAX_BODY_PREVIEW_BYTES
-                ? inboundBody.slice(0, MAX_BODY_PREVIEW_BYTES) +
-                  `...(truncated, total ${inboundBody.length} chars)`
-                : inboundBody,
-            }
-          : {}),
-      };
+export function _headerDebugQueueStatsForTesting(): { pending: number; active: number; dropped: number } {
+  return { pending: pendingJobCount(), active: activeWrites, dropped: droppedJobs };
+}
 
-      // --- Upstream file: the translated request sent to z.ai ---
-      const upstreamRecord: UpstreamHeaderDebugRecord = {
-        reqId,
-        timestamp: isoTs,
-        format,
-        side: "upstream",
-        method: upstreamReq.method,
-        url: upstreamReq.url,
-        headers: headersToRecord(upstreamReq.headers),
-        ...(transformedBody
-          ? {
-              bodyPreview: transformedBody.length > MAX_BODY_PREVIEW_BYTES
-                ? transformedBody.slice(0, MAX_BODY_PREVIEW_BYTES) +
-                  `...(truncated, total ${transformedBody.length} chars)`
-                : transformedBody,
-            }
-          : {}),
-      };
+export function _headerDebugQueuedPreviewBytesForTesting(): Array<{ inbound: number; upstream: number }> {
+  return pendingJobs.slice(pendingJobHead).map(job => ({
+    inbound: job.inboundBodyPreview ? utf8Encoder.encode(job.inboundBodyPreview).byteLength : 0,
+    upstream: job.transformedBodyPreview ? utf8Encoder.encode(job.transformedBodyPreview).byteLength : 0,
+  }));
+}
 
-      // Write both files in parallel. atomicWriteFile (temp+rename) is safe
-      // against partial writes if the process crashes mid-debug-log. 2-space
-      // indent for readability in a text editor / diff tool.
-      const inboundJson = JSON.stringify(inboundRecord, null, 2) + "\n";
-      const upstreamJson = JSON.stringify(upstreamRecord, null, 2) + "\n";
-      await Promise.all([
-        atomicWriteFile(inboundPath, inboundJson, "utf-8"),
-        atomicWriteFile(upstreamPath, upstreamJson, "utf-8"),
-      ]);
-    } catch (err) {
-      // Never throw — debug logging is best-effort. Surface to console so the
-      // operator notices if the debug dir is unwritable, but keep the request
-      // flowing.
-      console.warn(`[header-debug] failed to write record for ${reqId}: ${(err as Error).message}`);
-    }
-  })();
+export function _setHeaderDebugWriteGateForTesting(gate: Promise<void> | null): void {
+  writeGateForTesting = gate;
+}
+
+export function _resetHeaderDebugForTesting(): void {
+  _resetHeaderDebugDirCacheForTesting();
+  pendingJobs.length = 0;
+  pendingJobHead = 0;
+  activeWrites = 0;
+  droppedJobs = 0;
+  lastDropWarnAt = 0;
+  writeGateForTesting = null;
 }

@@ -30,7 +30,7 @@ import { pickProxy, markProxyFailed, getMaxRotations, getCurrentWorkingProxy, se
 import { wrapFetchWithSocksBridge } from "./proxied-fetch.js";
 import { recordStat, recordDebugDump, appendLog } from "../admin/api.js";
 import { sleep } from "../utils/sleep.js";
-import { exportAccounts, switchAccount, maskApiKey } from "../auth/store.js";
+import { exportAccounts, switchAccount, maskApiKey, credentialStatsKey } from "../auth/store.js";
 import { recordHeaders } from "../utils/header-debug.js";
 import { RETRY as RETRY_CONST, PROXY_POOL as PROXY_POOL_CONST, WAF as WAF_CONST, SSE as SSE_CONST, SSE_HEARTBEAT as SSE_HEARTBEAT_CONST } from "../utils/constants.js";
 
@@ -40,6 +40,8 @@ export interface ProxyHandlerOptions {
   auth: AuthManager;
   /** Override the global fetch (for testing). Defaults to global `fetch`. */
   fetchImpl?: typeof fetch;
+  /** Override captcha solving in focused request-flow tests. */
+  captchaTokenProvider?: typeof getCaptchaToken;
   /**
    * Resolve the TCP-remote client IP for a request. In production this is
    * wired to Bun's `server.requestIP(req)?.address`, which reads the real
@@ -58,8 +60,8 @@ export interface ProxyHandlerOptions {
 
 export function startPlanCaptchaPreflightEnabled(): boolean {
   const raw = process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT?.trim().toLowerCase();
-  if (!raw) return true;
-  return raw !== "0" && raw !== "false" && raw !== "off" && raw !== "never";
+  if (!raw) return false;
+  return raw === "1" || raw === "true" || raw === "on" || raw === "yes" || raw === "always";
 }
 
 /**
@@ -98,6 +100,103 @@ export function startPlanCaptchaPreflightEnabled(): boolean {
  */
 const DEFAULT_UPSTREAM_TIMEOUT_STREAM_MS = 10 * 60_000;
 const DEFAULT_UPSTREAM_TIMEOUT_BATCH_MS = 5 * 60_000;
+const DEFAULT_MAX_REQUEST_BODY_BYTES = 64 * 1024 * 1024;
+const DEFAULT_REQUEST_BODY_IDLE_TIMEOUT_MS = 30_000;
+const ERROR_RESPONSE_PREVIEW_BYTES = 64 * 1024;
+const PASSTHROUGH_USAGE_PREVIEW_BYTES = 2 * 1024 * 1024;
+const DEFAULT_TRANSLATED_UPSTREAM_BODY_BYTES = 32 * 1024 * 1024;
+const MAX_TIMER_MS = 2_147_483_647;
+const SAFE_RETRY_INITIAL_DELAY_MS = 1_000;
+const SAFE_RETRY_MAX_DELAY_MS = 8_000;
+const HTTP_DAY = "(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)";
+const HTTP_DAY_LONG = "(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)";
+const HTTP_MONTH = "(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)";
+const HTTP_TIME = "\\d{2}:\\d{2}:\\d{2}";
+const RETRY_AFTER_HTTP_DATE_RE = new RegExp(
+  `^(?:${HTTP_DAY}, \\d{2} ${HTTP_MONTH} \\d{4} ${HTTP_TIME} GMT|` +
+  `${HTTP_DAY_LONG}, \\d{2}-${HTTP_MONTH}-\\d{2} ${HTTP_TIME} GMT|` +
+  `${HTTP_DAY} ${HTTP_MONTH} [ \\d]\\d ${HTTP_TIME} \\d{4})$`,
+  "i",
+);
+
+let requestBodyIdleTimeoutMsForTesting: number | undefined;
+
+export function _setRequestBodyIdleTimeoutForTesting(timeoutMs?: number): void {
+  requestBodyIdleTimeoutMsForTesting = typeof timeoutMs === "number" && Number.isFinite(timeoutMs)
+    ? Math.max(1, Math.floor(timeoutMs))
+    : undefined;
+}
+
+export function parseRetryAfterMs(raw: string | null | undefined, now = Date.now()): number | undefined {
+  const value = raw?.trim();
+  if (!value) return undefined;
+
+  if (/^\d+$/.test(value)) {
+    const seconds = Number(value);
+    if (!Number.isSafeInteger(seconds) || seconds <= 0 || seconds > Number.MAX_SAFE_INTEGER / 1000) {
+      return undefined;
+    }
+    return seconds * 1000;
+  }
+
+  if (!RETRY_AFTER_HTTP_DATE_RE.test(value)) return undefined;
+  const dateMs = Date.parse(value);
+  if (!Number.isFinite(dateMs)) return undefined;
+  const delayMs = dateMs - now;
+  return delayMs > 0 ? delayMs : undefined;
+}
+
+function normalizeRetryDelayMs(raw: number, fallback: number): number {
+  const n = Number.isFinite(raw) && raw > 0 ? raw : fallback;
+  const safe = Number.isFinite(n) && n > 0 ? n : SAFE_RETRY_INITIAL_DELAY_MS;
+  return Math.max(1, Math.min(Math.floor(safe), MAX_TIMER_MS));
+}
+
+function normalizeTimerMs(raw: number, fallback: number): number {
+  const n = Number.isFinite(raw) && raw > 0 ? raw : fallback;
+  const safe = Number.isFinite(n) && n > 0 ? n : fallback;
+  return Math.max(1, Math.min(Math.floor(safe), MAX_TIMER_MS));
+}
+
+function normalizeRetryBackoffFactor(raw: number): number {
+  return Number.isFinite(raw) && raw > 0 ? raw : 1;
+}
+
+function normalizeJitterRandom(raw: number): number {
+  if (!Number.isFinite(raw)) return 0;
+  if (raw <= 0) return 0;
+  if (raw >= 1) return 1;
+  return raw;
+}
+
+export function computeRetryDelayMs(
+  retry: Pick<ProxyConfig["retry"], "initialDelayMs" | "maxDelayMs" | "backoffFactor">,
+  attempt: number,
+  retryAfter: string | null | undefined,
+  now = Date.now(),
+  random: () => number = Math.random,
+): number {
+  const maxDelayMs = normalizeRetryDelayMs(retry.maxDelayMs, SAFE_RETRY_MAX_DELAY_MS);
+  const initialDelayMs = Math.min(
+    normalizeRetryDelayMs(retry.initialDelayMs, SAFE_RETRY_INITIAL_DELAY_MS),
+    maxDelayMs,
+  );
+  const backoffFactor = normalizeRetryBackoffFactor(retry.backoffFactor);
+  const exponent = Number.isFinite(attempt) ? Math.max(0, Math.floor(attempt) - 1) : 0;
+  const rawDelay = initialDelayMs * Math.pow(backoffFactor, exponent);
+  let delayMs = Number.isFinite(rawDelay) && rawDelay > 0
+    ? Math.min(rawDelay, maxDelayMs)
+    : maxDelayMs;
+
+  const retryAfterMs = parseRetryAfterMs(retryAfter, now);
+  if (retryAfterMs !== undefined) {
+    delayMs = Math.max(delayMs, Math.min(retryAfterMs, maxDelayMs));
+  }
+
+  const jitter = delayMs * 0.25 * normalizeJitterRandom(random());
+  const rounded = Math.round(delayMs + jitter);
+  return Math.max(1, Math.min(rounded, maxDelayMs));
+}
 
 export async function proxyRequest(
   clientReq: Request,
@@ -135,13 +234,29 @@ export async function proxyRequest(
   const debugLoggingEnabled = config.logging?.debug === true
     || process.env.ZCODE_PROXY_DEBUG_LOGGING === "1";
 
-  const body = await readBody(clientReq);
+  let body: string | undefined;
+  try {
+    body = await readBody(clientReq, config.server.maxRequestBodyBytes ?? DEFAULT_MAX_REQUEST_BODY_BYTES);
+  } catch (err) {
+    if (err instanceof RequestBodyTooLargeError) {
+      const meta: RequestMeta = { model: "-", stream: false };
+      printRow(reqId, format, meta, 413, started, Date.now(), 0, 0, 0);
+      return errorResponse(413, "request_body_too_large", err.message);
+    }
+    if (err instanceof RequestBodyTimeoutError) {
+      const meta: RequestMeta = { model: "-", stream: false };
+      printRow(reqId, format, meta, 408, started, Date.now(), 0, 0, 0);
+      return errorResponse(408, "request_timeout", err.message);
+    }
+    throw err;
+  }
 
   // G7: Log actual body size (more accurate than Content-Length header, which
   // may be absent for chunked transfers or inaccurate for compressed bodies).
   if (body && body.length > 0) {
-    const sizeKB = (body.length / 1024).toFixed(1);
-    console.log(`${reqId} body size: ${sizeKB}KB (${body.length} bytes)`);
+    const bodyBytes = utf8ByteLength(body);
+    const sizeKB = (bodyBytes / 1024).toFixed(1);
+    console.log(`${reqId} body size: ${sizeKB}KB (${bodyBytes} bytes)`);
   }
 
   // Parse the body once and reuse the parsed object throughout the pipeline.
@@ -305,6 +420,7 @@ export async function proxyRequest(
     return c.jwt ? "start-plan" : config.plan;
   };
   let currentPlan: "coding-plan" | "start-plan" = effectivePlanForCred(cred);
+  const currentCredentialStatsKey = (): string => credentialStatsKey(cred);
   if (currentPlan !== config.plan) {
     console.log(`${reqId} plan resolved from active credential: ${config.plan} → ${currentPlan}`);
   }
@@ -394,19 +510,29 @@ export async function proxyRequest(
 
   let totalCaptchaMs = 0;
   let captchaRetryHeaders: Record<string, string> | undefined;
+  let hadRetryAttempt = false;
 
-  const isCaptchaVerifyFailed = async (resp: Response): Promise<boolean> => {
-    if (currentPlan !== "start-plan" || resp.status !== 403) return false;
+  const checkCaptchaVerifyFailed = async (resp: Response): Promise<{ failed: boolean; response: Response }> => {
+    if (currentPlan !== "start-plan" || resp.status !== 403) return { failed: false, response: resp };
     try {
-      const text = await resp.clone().text();
-      return /"code"\s*:\s*3007/.test(text) || /captcha verify failed/i.test(text);
+      const split = splitResponseForPreview(resp);
+      const previewResp = split?.preview ?? resp;
+      const { text } = await readResponseTextPreview(previewResp, {
+        maxBytes: ERROR_RESPONSE_PREVIEW_BYTES,
+        timeoutMs: 2_000,
+        clone: !split,
+      });
+      return {
+        failed: /"code"\s*:\s*3007/.test(text) || /captcha verify failed/i.test(text),
+        response: split?.passthrough ?? resp,
+      };
     } catch {
-      return false;
+      return { failed: false, response: resp };
     }
   };
 
   const refreshCaptchaHeaders = async (solver?: "chrome"): Promise<Record<string, string>> => {
-    const solved = await getCaptchaToken(reqId, {
+    const solved = await (opts.captchaTokenProvider ?? getCaptchaToken)(reqId, {
       appVersion: config.identity.appVersion,
       solver,
     });
@@ -415,6 +541,12 @@ export async function proxyRequest(
       [RETRY_HEADERS.PARAM]: solved.verifyParam,
       [RETRY_HEADERS.REGION]: solved.region,
     };
+  };
+
+  type CaptchaChallengeResult = { response: Response; error?: Error; retried: boolean };
+
+  const cancelResponseBody = async (resp: Response): Promise<void> => {
+    try { await resp.body?.cancel(); } catch { /* best-effort */ }
   };
 
   // Factory that builds a FRESH Request object for each fetch call.
@@ -543,9 +675,10 @@ export async function proxyRequest(
     // vs batch timeouts should leave this unset and rely on the defaults.
     const configuredTimeout = config.server.upstreamTimeoutMs ?? 0;
     const defaultTimeout = meta.stream ? DEFAULT_UPSTREAM_TIMEOUT_STREAM_MS : DEFAULT_UPSTREAM_TIMEOUT_BATCH_MS;
-    const timeoutMs = configuredTimeout > 0 ? configuredTimeout : defaultTimeout;
+    const timeoutMs = normalizeTimerMs(configuredTimeout > 0 ? configuredTimeout : defaultTimeout, defaultTimeout);
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    timer.unref?.();
     // Bun's native fetch accepts `{ proxy: "http://..." }` / `socks5://...`
     // Cast through `any` because the option is Bun-specific and not in the
     // standard TypeScript DOM RequestInit type.
@@ -598,7 +731,7 @@ export async function proxyRequest(
       }
       throw err;
     }
-    clearTimeout(timer);
+    resp = wrapResponseBodyWithUpstreamTimeout(resp, ctrl, timer, timeoutMs);
     // vceshi0.0.6+: verbose logging — log the upstream request headers + body
     // when logging.verbose is enabled. Auth tokens are masked to avoid leaking
     // secrets to the dashboard log panel. Truncated to 2000 chars to avoid
@@ -640,19 +773,57 @@ export async function proxyRequest(
     // response. This is the "调试日志" the user requested: "无论返回什么
     // 都能看到它具体返回啥的东西，比如529还是空回200都能看到具体返回的参数".
     if (debugLoggingEnabled) {
-      logUpstreamResponseDebug(reqId, resp, meta.stream);
+      const split = splitResponseForPreview(resp);
+      if (split) {
+        resp = split.passthrough;
+        logUpstreamResponseDebug(reqId, split.preview, meta.stream, true);
+      } else {
+        logUpstreamResponseDebug(reqId, resp, meta.stream, false);
+      }
     }
     return resp;
+  };
+
+  const retryStartPlanCaptchaChallenge = async (
+    resp: Response,
+    context: string,
+  ): Promise<CaptchaChallengeResult> => {
+    const captchaCheck = await checkCaptchaVerifyFailed(resp);
+    const checkedResp = captchaCheck.response;
+    if (!captchaCheck.failed) return { response: checkedResp, retried: false };
+
+    await cancelResponseBody(checkedResp);
+    console.log(`${reqId} start-plan captcha verify failed${context}; solving Aliyun captcha with Chrome and retrying once...`);
+    hadRetryAttempt = true;
+    try {
+      captchaRetryHeaders = await refreshCaptchaHeaders("chrome");
+      const retryResp = await fetchUpstreamDetected(captchaRetryHeaders);
+      if (!startPlanCaptchaPreflightEnabled()) captchaRetryHeaders = undefined;
+      const retryCheck = await checkCaptchaVerifyFailed(retryResp);
+      const checkedRetryResp = retryCheck.response;
+      if (retryCheck.failed) {
+        await cancelResponseBody(checkedRetryResp);
+        return {
+          response: checkedRetryResp,
+          retried: true,
+          error: new Error("captcha verify failed after solving once"),
+        };
+      }
+      return { response: checkedRetryResp, retried: true };
+    } catch (err) {
+      if (!startPlanCaptchaPreflightEnabled()) captchaRetryHeaders = undefined;
+      return { response: checkedResp, retried: true, error: err as Error };
+    }
   };
 
   let upstreamResp: Response;
   try {
     if (currentPlan === "start-plan" && startPlanCaptchaPreflightEnabled()) {
-      console.log(`${reqId} start-plan preflight: refreshing provider runtime captcha headers before model request...`);
+      console.log(`${reqId} start-plan captcha preflight enabled: refreshing runtime headers before model request...`);
       try {
         captchaRetryHeaders = await refreshCaptchaHeaders();
       } catch (err) {
-        printRow(reqId, format, meta, 503, started, Date.now(), 0, 0, 0, false, 0, maskApiKey(cred.apiKey), totalCaptchaMs);
+        printRow(reqId, format, meta, 503, started, Date.now(), 0, 0, 0, false, 0, currentCredentialStatsKey(), totalCaptchaMs);
         return errorResponse(503, "captcha_failed", (err as Error).message);
       }
     }
@@ -661,19 +832,29 @@ export async function proxyRequest(
     // here. Retries below call fetchUpstreamDetected without this flag, so
     // only the first attempt is logged.
     upstreamResp = await fetchUpstreamDetected(captchaRetryHeaders, true);
-    if (await isCaptchaVerifyFailed(upstreamResp)) {
-      console.log(`${reqId} start-plan captcha verify failed; solving Aliyun captcha with Chrome and retrying once...`);
-      try {
-        captchaRetryHeaders = await refreshCaptchaHeaders("chrome");
-        upstreamResp = await fetchUpstreamDetected(captchaRetryHeaders);
-      } catch (err) {
-        printRow(reqId, format, meta, 503, started, Date.now(), 0, 0, 0, false, 0, maskApiKey(cred.apiKey), totalCaptchaMs);
-        return errorResponse(503, "captcha_failed", (err as Error).message);
-      }
+    const captchaResult = await retryStartPlanCaptchaChallenge(upstreamResp, "");
+    upstreamResp = captchaResult.response;
+    if (captchaResult.error) {
+      printRow(reqId, format, meta, 503, started, Date.now(), 0, 0, 0, hadRetryAttempt, 0, currentCredentialStatsKey(), totalCaptchaMs);
+      return errorResponse(503, "captcha_failed", captchaResult.error.message);
     }
   } catch (err) {
-    printRow(reqId, format, meta, 502, started, Date.now(), 0, 0, 0);
-    return errorResponse(502, "upstream_unreachable", (err as Error).message);
+    const errMsg = (err as Error).message ?? String(err);
+    if (config.retry.maxRetries <= 0) {
+      printRow(reqId, format, meta, 502, started, Date.now(), 0, 0, 0);
+      return errorResponse(502, "upstream_unreachable", errMsg);
+    }
+    console.log(`${reqId} initial upstream fetch failed: ${errMsg}; entering retry loop...`);
+    upstreamResp = new Response(
+      JSON.stringify({ error: { type: "upstream_unreachable", message: errMsg } }),
+      {
+        status: 502,
+        headers: {
+          "content-type": "application/json",
+          "x-zcode-network-error": "1",
+        },
+      },
+    );
   }
   let headersAt = Date.now();
 
@@ -755,11 +936,12 @@ export async function proxyRequest(
       console.log(`${reqId} WAF rotation ${rot + 1}/${maxRotations}: switching to proxy ${nextProxy}`);
 
       // Cancel the old response body before refetching.
-      try { upstreamResp.body?.cancel(); } catch (e) { void e; }
+      await cancelResponseBody(upstreamResp);
 
       // Refetch with the new proxy. Keep the same official header shape — no
       // captcha headers are added on start-plan.
       try {
+        hadRetryAttempt = true;
         upstreamResp = await fetchUpstreamDetected();
         headersAt = Date.now();
       } catch (err) {
@@ -773,7 +955,24 @@ export async function proxyRequest(
       // loop and try the next proxy. If it's NOT a WAF block, we're done.
       const rotWafCheck = await checkWafBlock(upstreamResp);
       if (!rotWafCheck.wafBlocked) {
-        upstreamResp = rotWafCheck.response;
+        const captchaResult = await retryStartPlanCaptchaChallenge(
+          rotWafCheck.response,
+          ` after WAF rotation ${rot + 1}`,
+        );
+        upstreamResp = captchaResult.response;
+        if (captchaResult.error) {
+          printRow(reqId, format, meta, 503, started, headersAt, 0, 0, 0, hadRetryAttempt, 0, currentCredentialStatsKey(), totalCaptchaMs);
+          return errorResponse(503, "captcha_failed", captchaResult.error.message);
+        }
+        if (captchaResult.retried) {
+          const postCaptchaWafCheck = await checkWafBlock(upstreamResp);
+          if (postCaptchaWafCheck.wafBlocked) {
+            try { await markProxyFailed(nextProxy); } catch { /* non-fatal */ }
+            console.log(`${reqId} WAF rotation ${rot + 1} captcha retry was blocked on proxy ${nextProxy}`);
+            continue;
+          }
+          upstreamResp = postCaptchaWafCheck.response;
+        }
         console.log(`${reqId} WAF rotation ${rot + 1} succeeded — request now proceeds with proxy ${nextProxy}`);
         rotated = true;
         break;
@@ -786,8 +985,8 @@ export async function proxyRequest(
 
     if (!rotated) {
       // All rotations failed (or none were possible). Return the WAF error.
-      try { upstreamResp.body?.cancel(); } catch (e) { void e; }
-      printRow(reqId, format, meta, upstreamResp.status, started, headersAt, 0, 0, 0, false, 0, maskApiKey(cred.apiKey), totalCaptchaMs);
+      await cancelResponseBody(upstreamResp);
+      printRow(reqId, format, meta, upstreamResp.status, started, headersAt, 0, 0, 0, hadRetryAttempt, 0, currentCredentialStatsKey(), totalCaptchaMs);
       return errorResponse(
         503,
         "waf_blocked",
@@ -803,14 +1002,15 @@ export async function proxyRequest(
   }
 
   if (upstreamResp.status === 401 && currentPlan === "start-plan") {
-    printRow(reqId, format, meta, 401, started, headersAt, 0, 0, 0, false, 0, maskApiKey(cred.apiKey), totalCaptchaMs);
+    printRow(reqId, format, meta, 401, started, headersAt, 0, 0, 0, hadRetryAttempt, 0, currentCredentialStatsKey(), totalCaptchaMs);
     return errorResponse(401, "start_plan_jwt_invalid", "Start-plan JWT was rejected. Re-run: zcode-proxy auth login");
   }
 
-  // Official start-plan path: do not answer 403s by synthesizing Aliyun
-  // captcha headers. If the response is an Aliyun WAF HTML page, checkWafBlock
-  // above already converts it to a clear waf_blocked error. Non-WAF 403s are
-  // forwarded normally so the caller sees the real upstream/auth failure.
+  // Official start-plan path: the first request is sent without synthetic
+  // captcha headers by default, matching the normal ZCode message path. If
+  // upstream returns the explicit Aliyun 3007 JSON challenge, we solve once and
+  // retry with a fresh one-shot runtime header. Operators can opt into the old
+  // pre-send refresh behavior with ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT=1.
 
   // SSE error detection for the initial response is already handled inside
   // fetchUpstreamDetected() above. The standalone detection block that used
@@ -830,7 +1030,9 @@ export async function proxyRequest(
   // lives outside the block, after the retry loop ends) can read it. Without
   // this outer scope, TypeScript would reject the reference as out-of-scope.
   let allCredentialsExhausted = false;
-  if (config.retry.maxRetries > 0 && config.retry.retryableStatuses.includes(upstreamResp.status)) {
+  const isInitialNetworkError = upstreamResp.status === 502 &&
+    upstreamResp.headers.get("x-zcode-network-error") === "1";
+  if (config.retry.maxRetries > 0 && (isInitialNetworkError || config.retry.retryableStatuses.includes(upstreamResp.status))) {
     // Detect empty-stream 529 (set by sse-error-detector.ts when the upstream
     // returned HTTP 200 + text/event-stream with zero SSE events — typical
     // quota-exhausted signature). This gets a dedicated retry policy:
@@ -845,7 +1047,7 @@ export async function proxyRequest(
     const isEmptyStream529 = upstreamResp.status === 529 &&
       upstreamResp.headers.get("x-zcode-empty-stream") === "1";
 
-    try { upstreamResp.body?.cancel(); } catch (e) { /* v0.2.0.8: surface cancel failures for diagnostics — cancel() shouldn't throw, but if Bun's internal stream state is weird we want a trace */ void e; }
+    await cancelResponseBody(upstreamResp);
 
     // Credential switching: track consecutive failures with the current
     // credential. When the threshold (config.retry.credentialSwitchThreshold)
@@ -901,6 +1103,46 @@ export async function proxyRequest(
       if (totalAvailableCredentials === 0) totalAvailableCredentials = 1;
     } catch { /* ignore — fall back to 1 */ }
 
+    // Per-request switch suppression: once the current request has already
+    // proven that the configured credential set has no alternative, avoid
+    // hammering the credential store and flooding the dashboard log with the
+    // same message on every retry. We still refresh the count right before
+    // suppressing so a credential added during a long request can be picked up.
+    let loggedSingleCredentialNoAlternative = false;
+    let loggedExhaustedCredentialsNoAlternative = false;
+    const refreshAvailableCredentialCount = async (): Promise<void> => {
+      try {
+        const count = await auth.getAvailableCredentialCount();
+        totalAvailableCredentials = count > 0 ? count : 1;
+      } catch { /* keep the last known count */ }
+    };
+    const canAttemptCredentialSwitch = async (): Promise<boolean> => {
+      if (totalAvailableCredentials <= 1 || triedApiKeys.size >= totalAvailableCredentials) {
+        await refreshAvailableCredentialCount();
+      }
+      return totalAvailableCredentials > 1 && triedApiKeys.size < totalAvailableCredentials;
+    };
+    const logNoAlternativeCredential = (context: string): void => {
+      if (totalAvailableCredentials > 1) {
+        allCredentialsExhausted = true;
+        if (!loggedExhaustedCredentialsNoAlternative) {
+          console.log(
+            `${reqId} ${context} but no alternative credential available ` +
+            `(tried ${triedApiKeys.size} of ${totalAvailableCredentials} credential(s)). ` +
+            `Will return 503 (not 529) after retries exhaust to stop client retry loops.`,
+          );
+          loggedExhaustedCredentialsNoAlternative = true;
+        }
+      } else if (!loggedSingleCredentialNoAlternative) {
+        console.log(
+          `${reqId} ${context} but no alternative credential available ` +
+          `(only ${totalAvailableCredentials} credential configured). Continuing with current — ` +
+          `forwarding 529 (retryable) to client since this may be transient overload.`,
+        );
+        loggedSingleCredentialNoAlternative = true;
+      }
+    };
+
     // v0.2.2+ FIX (infinite retry loop): hard cap on total attempts.
     // `extraAttemptsFromSwitches` increments on every credential switch,
     // so under concurrent dashboard imports / large credential pools the
@@ -911,8 +1153,10 @@ export async function proxyRequest(
       config.retry.maxRetries * RETRY_CONST.MAX_TOTAL_ATTEMPTS_FACTOR + RETRY_CONST.MAX_TOTAL_ATTEMPTS_FLAT,
       RETRY_CONST.MAX_TOTAL_ATTEMPTS_CAP,
     );
+    const effectiveRetryLimit = (): number =>
+      Math.min(config.retry.maxRetries + extraAttemptsFromSwitches, MAX_TOTAL_ATTEMPTS);
 
-    for (let attempt = 1; attempt <= Math.min(config.retry.maxRetries + extraAttemptsFromSwitches, MAX_TOTAL_ATTEMPTS); attempt++) {
+    for (let attempt = 1; attempt <= effectiveRetryLimit(); attempt++) {
       // v0.2.2+ safety: if we've hit the hard cap, force-exit the loop
       // immediately. This catches the edge case where extraAttemptsFromSwitches
       // grew faster than the cap check (the for-condition only re-evaluates
@@ -922,39 +1166,21 @@ export async function proxyRequest(
         allCredentialsExhausted = totalAvailableCredentials > 1;
         break;
       }
-      // Calculate backoff delay: initialDelay * backoffFactor^(attempt-1), capped at maxDelay
-      const rawDelay = config.retry.initialDelayMs * Math.pow(config.retry.backoffFactor, attempt - 1);
-      let delayMs = Math.min(rawDelay, config.retry.maxDelayMs);
-
       // Respect Retry-After header. Per RFC 7231 §7.1.3 the value can be:
       //   - delta-seconds (e.g. "120"), OR
       //   - HTTP-date   (e.g. "Wed, 21 Oct 2025 07:28:00 GMT")
       // The old code only parsed delta-seconds and silently ignored HTTP-date
       // values — meaning the proxy would retry sooner than the upstream
-      // explicitly requested.
+      // explicitly requested. Keep the operator's maxDelayMs as a hard cap:
+      // a malicious or broken upstream can legally send Retry-After: 3600,
+      // but holding a client request open for an hour looks like a hung proxy.
       const retryAfter = upstreamResp.headers.get("retry-after");
-      if (retryAfter) {
-        let retryAfterMs: number;
-        const asNum = parseFloat(retryAfter);
-        if (Number.isFinite(asNum)) {
-          retryAfterMs = asNum * 1000;
-        } else {
-          // Try HTTP-date format
-          const dateMs = Date.parse(retryAfter);
-          retryAfterMs = Number.isFinite(dateMs) ? dateMs - Date.now() : NaN;
-        }
-        if (Number.isFinite(retryAfterMs) && retryAfterMs > 0) {
-          delayMs = Math.max(delayMs, retryAfterMs);
-        }
-      }
-
-      // Add small random jitter (0–25% of delay) to avoid thundering herd
-      const jitter = delayMs * 0.25 * Math.random();
-      delayMs = Math.round(delayMs + jitter);
+      const delayMs = computeRetryDelayMs(config.retry, attempt, retryAfter);
 
       console.log(
-        `${reqId} upstream returned ${upstreamResp.status}, retry ${attempt}/${config.retry.maxRetries} in ${delayMs}ms...`,
+        `${reqId} upstream returned ${upstreamResp.status}, retry ${attempt}/${effectiveRetryLimit()} in ${delayMs}ms...`,
       );
+      hadRetryAttempt = true;
       await sleep(delayMs);
 
       // Credential switching: if the current credential has failed
@@ -976,14 +1202,16 @@ export async function proxyRequest(
       if (shouldSwitchForEmptyStream ||
           (switchThreshold > 0 && consecutiveCredFailures >= switchThreshold)) {
         const failedCount = consecutiveCredFailures;
-        const newCred = await auth.switchToNextCredential(triedApiKeys);
+        const newCred = await canAttemptCredentialSwitch()
+          ? await auth.switchToNextCredential(triedApiKeys)
+          : null;
         if (newCred) {
           const reason = shouldSwitchForEmptyStream
             ? `${consecutiveEmptyStreams} consecutive empty-stream responses`
             : `${failedCount} consecutive failures`;
           console.log(
             `${reqId} credential switched after ${reason} ` +
-            `(retry ${attempt}/${Math.min(config.retry.maxRetries + extraAttemptsFromSwitches, MAX_TOTAL_ATTEMPTS)}): ${maskApiKey(cred.apiKey)} → ${maskApiKey(newCred.apiKey)}`,
+            `(retry ${attempt}/${effectiveRetryLimit()}): ${maskApiKey(cred.apiKey)} → ${maskApiKey(newCred.apiKey)}`,
           );
           cred = newCred;
           // Sync currentPlan to the new credential's plan (vceshi0.0.5+ fix for
@@ -1056,24 +1284,9 @@ export async function proxyRequest(
           }
         } else {
           // No alternative credential available (or all alternatives already
-          // tried in this request). Mark exhausted ONLY when there were
-          // multiple credentials to begin with — if there's only one, the
-          // failure might be transient upstream overload and forwarding 529
-          // (retryable) is the correct behavior.
-          if (totalAvailableCredentials > 1) {
-            allCredentialsExhausted = true;
-            console.log(
-              `${reqId} credential switch threshold reached but no alternative credential available ` +
-              `(tried ${triedApiKeys.size} of ${totalAvailableCredentials} credential(s)). ` +
-              `Will return 503 (not 529) after retries exhaust to stop client retry loops.`,
-            );
-          } else {
-            console.log(
-              `${reqId} credential switch threshold reached but no alternative credential available ` +
-              `(only ${totalAvailableCredentials} credential configured). Continuing with current — ` +
-              `forwarding 529 (retryable) to client since this may be transient overload.`,
-            );
-          }
+          // tried in this request). Mark/log through the shared helper so this
+          // request emits the diagnostic once instead of once per retry.
+          logNoAlternativeCredential("credential switch threshold reached");
         }
       }
 
@@ -1082,18 +1295,21 @@ export async function proxyRequest(
         // fetchUpstreamDetected also runs SSE error detection so 200 streams
         // with hidden errors get caught on every attempt.
         //
-        // start-plan alignment: the desktop agent refreshes provider runtime
-        // headers before every model attempt. Aliyun verify params are
-        // one-shot, so a retry after 529/429 must not reuse the token consumed
-        // by the previous attempt.
+        // start-plan captcha alignment: by default retries are sent without
+        // captcha headers and only solve on an explicit 3007 challenge. If the
+        // operator enables preflight, refresh before every retry because Aliyun
+        // verify params are one-shot and cannot be reused.
         if (currentPlan === "start-plan" && startPlanCaptchaPreflightEnabled()) {
           captchaRetryHeaders = await refreshCaptchaHeaders();
+        } else {
+          captchaRetryHeaders = undefined;
         }
         upstreamResp = await fetchUpstreamDetected(captchaRetryHeaders);
-        if (await isCaptchaVerifyFailed(upstreamResp)) {
-          console.log(`${reqId} start-plan captcha verify failed on retry ${attempt}; re-solving with Chrome...`);
-          captchaRetryHeaders = await refreshCaptchaHeaders("chrome");
-          upstreamResp = await fetchUpstreamDetected(captchaRetryHeaders);
+        const retryCaptchaResult = await retryStartPlanCaptchaChallenge(upstreamResp, ` on retry ${attempt}`);
+        upstreamResp = retryCaptchaResult.response;
+        if (retryCaptchaResult.error) {
+          printRow(reqId, format, meta, 503, started, Date.now(), 0, 0, 0, hadRetryAttempt, 0, currentCredentialStatsKey(), totalCaptchaMs);
+          return errorResponse(503, "captcha_failed", retryCaptchaResult.error.message);
         }
         headersAt = Date.now();
 
@@ -1126,47 +1342,65 @@ export async function proxyRequest(
             const retryMaxRotations = await getMaxRotations().catch(() => 3);
             if (retryMaxRotations > 0) {
               for (let rot = 0; rot < retryMaxRotations; rot++) {
-              currentRequestProxy = undefined;
-              let nextProxy: string | null = null;
-              try {
-                nextProxy = await pickProxy(triedProxySetView());
-              } catch (e) {
-                console.log(`${reqId} retry proxy pool rotation failed: ${(e as Error).message}`);
-                break;
-              }
-              if (!nextProxy) {
-                console.log(`${reqId} retry proxy pool exhausted after ${rot} rotation(s)`);
-                break;
-              }
-              currentRequestProxy = nextProxy;
-              markProxyTried(nextProxy);
-              console.log(`${reqId} retry WAF rotation ${rot + 1}/${retryMaxRotations}: switching to proxy ${nextProxy}`);
+                currentRequestProxy = undefined;
+                let nextProxy: string | null = null;
+                try {
+                  nextProxy = await pickProxy(triedProxySetView());
+                } catch (e) {
+                  console.log(`${reqId} retry proxy pool rotation failed: ${(e as Error).message}`);
+                  break;
+                }
+                if (!nextProxy) {
+                  console.log(`${reqId} retry proxy pool exhausted after ${rot} rotation(s)`);
+                  break;
+                }
+                currentRequestProxy = nextProxy;
+                markProxyTried(nextProxy);
+                console.log(`${reqId} retry WAF rotation ${rot + 1}/${retryMaxRotations}: switching to proxy ${nextProxy}`);
 
-              try { upstreamResp.body?.cancel(); } catch (e) { void e; }
-              try {
-                upstreamResp = await fetchUpstreamDetected();
-                headersAt = Date.now();
-              } catch (err) {
-                console.log(`${reqId} retry WAF rotation ${rot + 1} fetch failed: ${(err as Error).message}`);
+                await cancelResponseBody(upstreamResp);
+                try {
+                  hadRetryAttempt = true;
+                  upstreamResp = await fetchUpstreamDetected();
+                  headersAt = Date.now();
+                } catch (err) {
+                  console.log(`${reqId} retry WAF rotation ${rot + 1} fetch failed: ${(err as Error).message}`);
+                  try { await markProxyFailed(nextProxy); } catch { /* non-fatal */ }
+                  continue;
+                }
+                const rotWafCheck = await checkWafBlock(upstreamResp);
+                if (!rotWafCheck.wafBlocked) {
+                  const captchaResult = await retryStartPlanCaptchaChallenge(
+                    rotWafCheck.response,
+                    ` after retry ${attempt} WAF rotation ${rot + 1}`,
+                  );
+                  upstreamResp = captchaResult.response;
+                  if (captchaResult.error) {
+                    printRow(reqId, format, meta, 503, started, headersAt, 0, 0, 0, hadRetryAttempt, 0, currentCredentialStatsKey(), totalCaptchaMs);
+                    return errorResponse(503, "captcha_failed", captchaResult.error.message);
+                  }
+                  if (captchaResult.retried) {
+                    const postCaptchaWafCheck = await checkWafBlock(upstreamResp);
+                    if (postCaptchaWafCheck.wafBlocked) {
+                      try { await markProxyFailed(nextProxy); } catch { /* non-fatal */ }
+                      console.log(`${reqId} retry WAF rotation ${rot + 1} captcha retry was blocked on ${nextProxy}`);
+                      continue;
+                    }
+                    upstreamResp = postCaptchaWafCheck.response;
+                  }
+                  console.log(`${reqId} retry WAF rotation ${rot + 1} succeeded — proxy ${nextProxy}`);
+                  retryRotated = true;
+                  break;
+                }
                 try { await markProxyFailed(nextProxy); } catch { /* non-fatal */ }
-                continue;
-              }
-              const rotWafCheck = await checkWafBlock(upstreamResp);
-              if (!rotWafCheck.wafBlocked) {
-                upstreamResp = rotWafCheck.response;
-                console.log(`${reqId} retry WAF rotation ${rot + 1} succeeded — proxy ${nextProxy}`);
-                retryRotated = true;
-                break;
-              }
-              try { await markProxyFailed(nextProxy); } catch { /* non-fatal */ }
-              console.log(`${reqId} retry WAF rotation ${rot + 1} still blocked on ${nextProxy}`);
+                console.log(`${reqId} retry WAF rotation ${rot + 1} still blocked on ${nextProxy}`);
               }
             }
           }
 
           if (!retryRotated) {
-            try { upstreamResp.body?.cancel(); } catch (e) { void e; }
-            printRow(reqId, format, meta, upstreamResp.status, started, headersAt, 0, 0, 0, false, 0, maskApiKey(cred.apiKey), totalCaptchaMs);
+            await cancelResponseBody(upstreamResp);
+            printRow(reqId, format, meta, upstreamResp.status, started, headersAt, 0, 0, 0, hadRetryAttempt, 0, currentCredentialStatsKey(), totalCaptchaMs);
             return errorResponse(
               503,
               "waf_blocked",
@@ -1186,7 +1420,7 @@ export async function proxyRequest(
         const errMsg = (err as Error).message ?? String(err);
         // Network errors count toward the credential-switch failure counter.
         consecutiveCredFailures++;
-        if (attempt < Math.min(config.retry.maxRetries + extraAttemptsFromSwitches, MAX_TOTAL_ATTEMPTS)) {
+        if (attempt < effectiveRetryLimit()) {
           console.log(`${reqId} fetch failed on retry ${attempt}: ${errMsg}, will retry again...`);
           // Network errors are ALWAYS retryable — they are the most common
           // retry scenario (upstream blip, transient DNS, ECONNREFUSED during
@@ -1198,7 +1432,7 @@ export async function proxyRequest(
           continue;
         }
         console.log(`${reqId} fetch failed on final retry ${attempt}: ${errMsg}`);
-        printRow(reqId, format, meta, 502, started, Date.now(), 0, 0, 0, false, 0, maskApiKey(cred.apiKey), totalCaptchaMs);
+        printRow(reqId, format, meta, 502, started, Date.now(), 0, 0, 0, hadRetryAttempt, 0, currentCredentialStatsKey(), totalCaptchaMs);
         return errorResponse(502, "upstream_unreachable", errMsg);
       }
 
@@ -1243,14 +1477,16 @@ export async function proxyRequest(
         // Try to switch — if a new cred is available, grant an extra attempt
         // and continue the loop instead of breaking.
         const failedCount = consecutiveCredFailures;
-        const newCred = await auth.switchToNextCredential(triedApiKeys);
+        const newCred = await canAttemptCredentialSwitch()
+          ? await auth.switchToNextCredential(triedApiKeys)
+          : null;
         if (newCred) {
           const reason = (EMPTY_STREAM_SWITCH_THRESHOLD > 0 && consecutiveEmptyStreams >= EMPTY_STREAM_SWITCH_THRESHOLD)
             ? `${consecutiveEmptyStreams} consecutive empty-stream responses`
             : `${failedCount} consecutive failures`;
           console.log(
             `${reqId} credential switched (end-of-loop) after ${reason} ` +
-            `(retry ${attempt}/${Math.min(config.retry.maxRetries + extraAttemptsFromSwitches, MAX_TOTAL_ATTEMPTS)}): ${maskApiKey(cred.apiKey)} → ${maskApiKey(newCred.apiKey)}`,
+            `(retry ${attempt}/${effectiveRetryLimit()}): ${maskApiKey(cred.apiKey)} → ${maskApiKey(newCred.apiKey)}`,
           );
           cred = newCred;
           const newPlan = effectivePlanForCred(newCred);
@@ -1296,26 +1532,12 @@ export async function proxyRequest(
           } catch (e) {
             console.log(`${reqId} could not persist credential switch: ${(e as Error).message}`);
           }
-          try { upstreamResp.body?.cancel(); } catch (e) { /* v0.2.0.8: surface cancel failures for diagnostics — cancel() shouldn't throw, but if Bun's internal stream state is weird we want a trace */ void e; }
+          await cancelResponseBody(upstreamResp);
           continue; // skip the break, give the new cred a chance
         }
-        // No alternative credential — mark exhausted ONLY if we had multiple
-        // to begin with (single-credential failure may be transient overload,
-        // forward 529). Fall through to break.
-        if (totalAvailableCredentials > 1) {
-          allCredentialsExhausted = true;
-          console.log(
-            `${reqId} no alternative credential available after switch threshold ` +
-            `(tried ${triedApiKeys.size} of ${totalAvailableCredentials} credential(s)). ` +
-            `Will return 503 to stop client retries.`,
-          );
-        } else {
-          console.log(
-            `${reqId} no alternative credential available ` +
-            `(only ${totalAvailableCredentials} credential configured). ` +
-            `Forwarding 529 (retryable) — may be transient overload.`,
-          );
-        }
+        // No alternative credential — mark/log through the shared helper so
+        // exhausted retry loops do not spam duplicate diagnostics.
+        logNoAlternativeCredential("credential switch threshold reached (end-of-loop)");
       }
 
       // Still a retryable status — if this was the last attempt, keep the
@@ -1323,13 +1545,13 @@ export async function proxyRequest(
       // client with a body. Previously the code cancelled the body then
       // refetched — but that refetch reused the consumed Request object
       // and always failed. Keeping the body is simpler and correct.
-      if (attempt === Math.min(config.retry.maxRetries + extraAttemptsFromSwitches, MAX_TOTAL_ATTEMPTS)) {
-        console.log(`${reqId} all ${Math.min(config.retry.maxRetries + extraAttemptsFromSwitches, MAX_TOTAL_ATTEMPTS)} retries exhausted, returning ${upstreamResp.status}`);
+      if (attempt === effectiveRetryLimit()) {
+        console.log(`${reqId} all ${effectiveRetryLimit()} retries exhausted, returning ${upstreamResp.status}`);
         break;
       }
 
       // More retries left — cancel the body before looping
-      try { upstreamResp.body?.cancel(); } catch (e) { /* v0.2.0.8: surface cancel failures for diagnostics — cancel() shouldn't throw, but if Bun's internal stream state is weird we want a trace */ void e; }
+      await cancelResponseBody(upstreamResp);
     }
   }
 
@@ -1357,8 +1579,8 @@ export async function proxyRequest(
       `${reqId} all credentials exhausted + upstream ${upstreamResp.status}, ` +
       `returning 503 (Retry-After: 300) to stop client retry loops`,
     );
-    printRow(reqId, format, meta, 503, started, headersAt, 0, 0, 0, false, 0, maskApiKey(cred.apiKey), totalCaptchaMs);
-    try { upstreamResp.body?.cancel(); } catch (e) { /* v0.2.0.8: surface cancel failures for diagnostics — cancel() shouldn't throw, but if Bun's internal stream state is weird we want a trace */ void e; }
+    printRow(reqId, format, meta, 503, started, headersAt, 0, 0, 0, hadRetryAttempt, 0, currentCredentialStatsKey(), totalCaptchaMs);
+    await cancelResponseBody(upstreamResp);
     const body = JSON.stringify({
       error: {
         type: "all_credentials_exhausted",
@@ -1418,10 +1640,12 @@ export async function proxyRequest(
   // peek below; the SSE error detector converts errored/empty SSE to non-2xx
   // JSON before we reach here, so isSSE=false for those).
   if (isSSE && upstreamResp.ok && !meta.stream && upstreamResp.body) {
-    const result = await anthropicSseToBatchMessage(upstreamResp.body, meta.model);
+    const result = await anthropicSseToBatchMessage(upstreamResp.body, meta.model, {
+      maxBytes: sseToBatchBodyLimitBytes(),
+    });
     if ("error" in result) {
       console.log(`${reqId} SSE->batch reassembly error: ${result.error}`);
-      printRow(reqId, format, meta, 502, started, headersAt, 0, 0, 0, false, 0, maskApiKey(cred.apiKey), totalCaptchaMs);
+      printRow(reqId, format, meta, 502, started, headersAt, 0, 0, 0, hadRetryAttempt, 0, currentCredentialStatsKey(), totalCaptchaMs);
       return errorResponse(502, "upstream_stream_error", result.error);
     }
     const json = JSON.stringify(result.message);
@@ -1449,9 +1673,18 @@ export async function proxyRequest(
   // the exact transformed body via /admin/api/debug-dumps without writing
   // files to disk. The old code wrote to <cwd>/zcode-proxy-debug-*.json
   // which leaked user conversation content to disk forever.
+  let upstreamErrorPreview: string | null = null;
   if (!upstreamResp.ok && upstreamResp.status >= 400 && upstreamResp.status < 500) {
-    const errPeek = await upstreamResp.text().catch(() => "");
-    console.log(`${reqId} upstream ${upstreamResp.status} ${errPeek.slice(0, 200)}`);
+    const split = splitResponseForPreview(upstreamResp);
+    if (split) upstreamResp = split.passthrough;
+    const errPeek = await readResponseTextPreview(split?.preview ?? upstreamResp, {
+      maxBytes: ERROR_RESPONSE_PREVIEW_BYTES,
+      timeoutMs: 3_000,
+      clone: !split,
+    }).catch(() => ({ text: "", truncated: false, timedOut: false, complete: false }));
+    upstreamErrorPreview = errPeek.text;
+    const suffix = errPeek.truncated ? `...(truncated at ${ERROR_RESPONSE_PREVIEW_BYTES} bytes)` : errPeek.timedOut ? "...(preview timed out)" : "";
+    console.log(`${reqId} upstream ${upstreamResp.status} ${upstreamErrorPreview.slice(0, 200)}${suffix}`);
     console.log(`${reqId} transformed request summary: ${summarizeBody(transformedObj ?? parsedBody)}`);
     // Also log the anthropic-beta header that was actually sent upstream —
     // mismatched beta flags vs body is a common 3001 cause on ZCode gateway.
@@ -1465,7 +1698,7 @@ export async function proxyRequest(
         recordDebugDump({
           id: reqId,
           status: upstreamResp.status,
-          upstreamError: errPeek.slice(0, 500),
+          upstreamError: upstreamErrorPreview.slice(0, 500),
           anthropicBeta: lastSentBeta ?? "",
           bodySummary: summarizeBody(transformedObj ?? parsedBody),
           body: transformedBody,
@@ -1474,24 +1707,20 @@ export async function proxyRequest(
         console.log(`${reqId} failed to record debug dump: ${(e as Error).message}`);
       }
     }
-    // Reconstruct the response with the peeked body so the passthrough below
-    // still has something to send. upstreamResp.text() consumed the body.
-    //
-    // v0.2.2+ note: content-encoding is PRESERVED because passthrough mode
-    // uses `decompress: false` — the peeked text is the raw compressed bytes
-    // (or plain text if upstream didn't compress). The encoding header
-    // correctly describes the body either way.
-    upstreamResp = new Response(errPeek, {
-      status: upstreamResp.status,
-      statusText: upstreamResp.statusText,
-      headers: upstreamResp.headers,
-    });
   }
 
   if (translateMode) {
     if (!upstreamResp.ok) {
-      const errBody = await upstreamResp.text().catch(() => "");
-      printRow(reqId, format, meta, upstreamResp.status, started, headersAt, 0, 0, 0, false, 0, maskApiKey(cred.apiKey), totalCaptchaMs);
+      const errBody = upstreamErrorPreview ?? (await readResponseTextPreview(upstreamResp, {
+        maxBytes: ERROR_RESPONSE_PREVIEW_BYTES,
+        timeoutMs: 3_000,
+      }).then(r => r.text).catch(() => ""));
+      // Translation mode returns a local JSON error instead of forwarding the
+      // upstream response body. If the 4xx diagnostic path tee'd the body for a
+      // preview, the passthrough branch would otherwise remain open until the
+      // upstream/bridge times out.
+      try { await upstreamResp.body?.cancel(); } catch (e) { void e; }
+      printRow(reqId, format, meta, upstreamResp.status, started, headersAt, 0, 0, 0, hadRetryAttempt, 0, currentCredentialStatsKey(), totalCaptchaMs);
       return errorResponse(upstreamResp.status, "upstream_error", `upstream returned ${upstreamResp.status}: ${errBody.slice(0, 200)}`);
     }
     if (format === "openai-responses") {
@@ -1501,38 +1730,37 @@ export async function proxyRequest(
         // v0.2.0.8: pipe through an inline stats TransformStream instead of
         // tee()+parallel reader — avoids buffering the whole stream when the
         // stats reader falls behind (see createStatsTransform docs).
-        const stats = createStatsTransform(reqId, format, meta, upstreamResp.status, started, null, maskApiKey(cred.apiKey), totalCaptchaMs);
+        const stats = createStatsTransform(reqId, format, meta, upstreamResp.status, started, null, currentCredentialStatsKey(), totalCaptchaMs, hadRetryAttempt);
         // v0.2.1.7: heartbeat AFTER stats (closer to client). Stats sees
         // only real upstream bytes; heartbeat comment lines flow straight
         // to the client without stats inspecting them.
-        const heartbeat = createSseHeartbeatTransform(config.server.sseHeartbeatMs ?? 0);
-        return translatedSseResponse(translated.pipeThrough(stats.transform).pipeThrough(heartbeat));
+        return translatedSseResponse(withSseHeartbeat(observeStatsStream(translated, stats), config.server.sseHeartbeatMs ?? 0));
       }
       return await translatedResponsesBatchResponse(
         clientReq, upstreamResp, meta.model, reqId, format, meta, started, headersAt,
         (parsedBody as OpenAIResponseRequest | undefined)?.previous_response_id,
         (parsedBody as OpenAIResponseRequest | undefined)?.input,
-        maskApiKey(cred.apiKey),
+        currentCredentialStatsKey(),
         totalCaptchaMs,
+        hadRetryAttempt,
       );
     }
     // Chat Completions translation: use the original SSE / batch translators.
     if (isSSE && upstreamResp.body) {
       const translated = anthropicSseToOpenaiSse(upstreamResp.body, meta.model);
       // v0.2.0.8: inline stats transform (see createStatsTransform docs).
-      const stats = createStatsTransform(reqId, format, meta, upstreamResp.status, started, null, maskApiKey(cred.apiKey), totalCaptchaMs);
+      const stats = createStatsTransform(reqId, format, meta, upstreamResp.status, started, null, currentCredentialStatsKey(), totalCaptchaMs, hadRetryAttempt);
       // v0.2.1.7: heartbeat AFTER stats — see openai-responses branch above.
-      const heartbeat = createSseHeartbeatTransform(config.server.sseHeartbeatMs ?? 0);
-      return translatedSseResponse(translated.pipeThrough(stats.transform).pipeThrough(heartbeat));
+      return translatedSseResponse(withSseHeartbeat(observeStatsStream(translated, stats), config.server.sseHeartbeatMs ?? 0));
     }
-    return await translatedBatchResponse(clientReq, upstreamResp, meta.model, reqId, format, meta, started, headersAt, maskApiKey(cred.apiKey), totalCaptchaMs);
+    return await translatedBatchResponse(clientReq, upstreamResp, meta.model, reqId, format, meta, started, headersAt, currentCredentialStatsKey(), totalCaptchaMs, hadRetryAttempt);
   }
 
   if (isSSE && upstreamResp.body) {
     // v0.2.0.8: inline stats transform — pass content-encoding so compressed
     // streams skip SSE parsing (we'd only see gzip bytes, not SSE events).
     const contentEncoding = upstreamResp.headers.get("content-encoding");
-    const stats = createStatsTransform(reqId, format, meta, upstreamResp.status, started, contentEncoding, maskApiKey(cred.apiKey), totalCaptchaMs);
+    const stats = createStatsTransform(reqId, format, meta, upstreamResp.status, started, contentEncoding, currentCredentialStatsKey(), totalCaptchaMs, hadRetryAttempt);
     // v0.2.1.7: heartbeat AFTER stats — keeps the client connection alive
     // across CF's 100s Proxy Read Timeout when upstream is slow to TTFB
     // (e.g. GLM-5.2 thinking mode sitting silent for 60-180s).
@@ -1556,34 +1784,40 @@ export async function proxyRequest(
     // is a rare edge case. If you hit it, the fix is to use stream:true
     // on the client (which may route through translation mode) or disable
     // compression on the upstream.
-    const heartbeatInterval = contentEncoding ? 0 : (config.server.sseHeartbeatMs ?? 0);
-    const heartbeat = createSseHeartbeatTransform(heartbeatInterval);
-    return passthroughResponse(upstreamResp, upstreamResp.body.pipeThrough(stats.transform).pipeThrough(heartbeat));
+    const heartbeatInterval = isCompressedContentEncoding(contentEncoding) ? 0 : (config.server.sseHeartbeatMs ?? 0);
+    return passthroughResponse(upstreamResp, withSseHeartbeat(observeStatsStream(upstreamResp.body, stats), heartbeatInterval));
   }
 
-  // Non-streaming anthropic passthrough — try to extract usage from the response
-  // body for stats. We read the body once, parse usage, then reconstruct the
-  // Response for passthrough. (Response.clone() doesn't work reliably with all
-  // mock implementations, so we read-once-and-rebuild instead.)
+  // Non-streaming anthropic passthrough — try to extract usage from a bounded
+  // clone preview for stats. The original response body remains untouched for
+  // passthrough, so a huge JSON response is not fully materialized just to
+  // count tokens.
   let passthroughInputTokens = 0;
   let passthroughOutputTokens = 0;
-  let passthroughBody: ReadableStream<Uint8Array> | string | null = null;
   const ct = upstreamResp.headers.get("content-type") ?? "";
   let passthroughCacheReadTokens = 0;
   if (ct.includes("application/json") && upstreamResp.body) {
     try {
-      const raw = await upstreamResp.text();
-      passthroughBody = raw;
-      const usage = JSON.parse(raw)?.usage;
-      if (usage) {
-        passthroughInputTokens = usage.input_tokens ?? usage.prompt_tokens ?? 0;
-        passthroughOutputTokens = usage.output_tokens ?? usage.completion_tokens ?? 0;
-        // v0.2.0.6: extract cache_read_input_tokens for accurate input total
-        passthroughCacheReadTokens = usage.cache_read_input_tokens ?? 0;
+      const split = splitResponseForPreview(upstreamResp);
+      if (!split) throw new Error("response body is not readable");
+      upstreamResp = split.passthrough;
+      const preview = await readResponseTextPreview(split.preview, {
+        maxBytes: PASSTHROUGH_USAGE_PREVIEW_BYTES,
+        timeoutMs: 3_000,
+        clone: false,
+      });
+      if (preview.complete && !preview.truncated && !preview.timedOut) {
+        const usage = JSON.parse(preview.text)?.usage;
+        if (usage) {
+          passthroughInputTokens = usage.input_tokens ?? usage.prompt_tokens ?? 0;
+          passthroughOutputTokens = usage.output_tokens ?? usage.completion_tokens ?? 0;
+          // v0.2.0.6: extract cache_read_input_tokens for accurate input total
+          passthroughCacheReadTokens = usage.cache_read_input_tokens ?? 0;
+        }
       }
     } catch { /* non-JSON or parse error — leave as 0, fall back to original body */ }
   }
-  printRow(reqId, format, meta, upstreamResp.status, started, headersAt, passthroughOutputTokens, 0, 0, false, passthroughInputTokens, maskApiKey(cred.apiKey), totalCaptchaMs, passthroughCacheReadTokens);
+  printRow(reqId, format, meta, upstreamResp.status, started, headersAt, passthroughOutputTokens, 0, 0, hadRetryAttempt, passthroughInputTokens, currentCredentialStatsKey(), totalCaptchaMs, passthroughCacheReadTokens);
   // Reconstruct the response with the read body so passthrough still has content.
   //
   // v0.2.2+ note: passthrough mode uses `decompress: false` on the upstream
@@ -1596,22 +1830,434 @@ export async function proxyRequest(
   // The translation-format pipeline (body-transformer.ts alignZCodeRequestFormat)
   // is NOT touched here — this only affects the OUTBOUND response back to
   // the client, not the inbound request translation.
-  if (passthroughBody !== null) {
-    return new Response(passthroughBody, {
-      status: upstreamResp.status,
-      statusText: upstreamResp.statusText,
-      headers: upstreamResp.headers,
-    });
-  }
   return passthroughResponse(upstreamResp);
 }
 
+class RequestBodyTooLargeError extends Error {
+  constructor(maxBytes: number, actualBytes: number) {
+    super(`Request body is too large (${actualBytes} bytes, limit ${maxBytes} bytes)`);
+    this.name = "RequestBodyTooLargeError";
+  }
+}
+
+class RequestBodyTimeoutError extends Error {
+  constructor(timeoutMs: number) {
+    super(`Request body read timed out after ${timeoutMs}ms`);
+    this.name = "RequestBodyTimeoutError";
+  }
+}
+
+class ResponseBodyTooLargeError extends Error {
+  constructor(label: string, maxBytes: number, actualBytes: number) {
+    super(`${label} is too large (${actualBytes} bytes, limit ${maxBytes} bytes)`);
+    this.name = "ResponseBodyTooLargeError";
+  }
+}
+
+function parseContentLength(headers: Headers): number | undefined {
+  const raw = headers.get("content-length");
+  if (!raw) return undefined;
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) return undefined;
+  const n = Number(trimmed);
+  return Number.isSafeInteger(n) ? n : undefined;
+}
+
+function isCompressedContentEncoding(value: string | null): boolean {
+  return !!value && value.trim().toLowerCase() !== "identity";
+}
+
+const utf8ByteLengthEncoder = new TextEncoder();
+const utf8LogPreviewDecoder = new TextDecoder();
+
+function utf8ByteLength(value: string): number {
+  return utf8ByteLengthEncoder.encode(value).byteLength;
+}
+
+function truncateUtf8ForLog(value: string, maxBytes: number): { text: string; bytes: number; truncated: boolean } {
+  const limit = Math.max(0, Math.floor(maxBytes));
+  const bytes = utf8ByteLengthEncoder.encode(value);
+  if (bytes.byteLength <= limit) return { text: value, bytes: bytes.byteLength, truncated: false };
+  let end = limit;
+  while (end > 0 && bytes[end] !== undefined && (bytes[end] & 0xc0) === 0x80) {
+    end--;
+  }
+  return {
+    text: utf8LogPreviewDecoder.decode(bytes.subarray(0, end)),
+    bytes: bytes.byteLength,
+    truncated: true,
+  };
+}
+
+function parsePositiveIntegerLimit(raw: string | undefined, fallback: number): number {
+  if (!raw) return fallback;
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) return fallback;
+  const parsed = Number(trimmed);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) return fallback;
+  return parsed;
+}
+
+function translatedUpstreamBodyLimitBytes(): number {
+  return parsePositiveIntegerLimit(
+    process.env.ZCODE_TRANSLATED_RESPONSE_MAX_BYTES,
+    DEFAULT_TRANSLATED_UPSTREAM_BODY_BYTES,
+  );
+}
+
+function sseToBatchBodyLimitBytes(): number {
+  return parsePositiveIntegerLimit(
+    process.env.ZCODE_SSE_TO_BATCH_MAX_BYTES,
+    SSE_CONST.MAX_TO_BATCH_BYTES,
+  );
+}
+
+async function readResponseTextLimited(
+  resp: Response,
+  maxBytes: number,
+  label: string,
+): Promise<string> {
+  const limit = Math.max(1, Math.floor(maxBytes));
+  const declaredLength = parseContentLength(resp.headers);
+  if (declaredLength !== undefined && declaredLength > limit) {
+    void resp.body?.cancel().catch(() => {});
+    throw new ResponseBodyTooLargeError(label, limit, declaredLength);
+  }
+  if (!resp.body) return "";
+
+  const reader = resp.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > limit) {
+        try { await reader.cancel(); } catch {}
+        throw new ResponseBodyTooLargeError(label, limit, total);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    try { reader.releaseLock(); } catch {}
+  }
+
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(bytes);
+}
+
+interface ResponseTextPreviewOptions {
+  maxBytes: number;
+  timeoutMs: number;
+  clone?: boolean;
+}
+
+interface ResponseTextPreview {
+  text: string;
+  truncated: boolean;
+  timedOut: boolean;
+  complete: boolean;
+}
+
+async function readResponseTextPreview(
+  resp: Response,
+  opts: ResponseTextPreviewOptions,
+): Promise<ResponseTextPreview> {
+  const maxBytes = Math.max(0, Math.floor(opts.maxBytes));
+  const timeoutMs = normalizeTimerMs(opts.timeoutMs, 1_000);
+  const shouldClone = opts.clone !== false;
+  const declaredLength = parseContentLength(resp.headers);
+  if (maxBytes > 0 && declaredLength !== undefined && declaredLength > maxBytes) {
+    if (!shouldClone && resp.body) {
+      void resp.body.cancel().catch(() => {});
+    }
+    return { text: "", truncated: true, timedOut: false, complete: false };
+  }
+
+  let source = resp;
+  if (shouldClone) {
+    try {
+      source = resp.clone();
+    } catch {
+      return { text: "", truncated: false, timedOut: false, complete: false };
+    }
+  }
+  if (!source.body || maxBytes === 0) {
+    if (!shouldClone && source.body) {
+      void source.body.cancel().catch(() => {});
+    }
+    return { text: "", truncated: false, timedOut: false, complete: !source.body };
+  }
+
+  const reader = source.body.getReader();
+  const decoder = new TextDecoder();
+  const deadline = Date.now() + timeoutMs;
+  let text = "";
+  let readBytes = 0;
+  let truncated = false;
+  let timedOut = false;
+  let complete = false;
+
+  try {
+    while (readBytes < maxBytes) {
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
+        timedOut = true;
+        break;
+      }
+      let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
+      const result = await Promise.race([
+        reader.read(),
+        new Promise<"timeout">(resolve => {
+          timeoutTimer = setTimeout(() => resolve("timeout"), remainingMs);
+        }),
+      ]).finally(() => {
+        if (timeoutTimer) {
+          clearTimeout(timeoutTimer);
+          timeoutTimer = null;
+        }
+      });
+      if (result === "timeout") {
+        timedOut = true;
+        break;
+      }
+      const { done, value } = result;
+      if (done) {
+        complete = true;
+        break;
+      }
+      if (!value) continue;
+      const remainingBytes = maxBytes - readBytes;
+      const chunk = value.byteLength > remainingBytes ? value.slice(0, remainingBytes) : value;
+      text += decoder.decode(chunk, { stream: true });
+      readBytes += chunk.byteLength;
+      if (chunk.byteLength < value.byteLength) {
+        truncated = true;
+        break;
+      }
+    }
+    if (readBytes >= maxBytes && !complete) truncated = true;
+    const tail = decoder.decode();
+    if (complete) text += tail;
+  } finally {
+    if (!shouldClone || !complete) {
+      // Do not await cancel here. This preview often reads a branch produced by
+      // ReadableStream.tee(); in Bun, canceling one branch can wait until the
+      // passthrough branch is also canceled/consumed. Awaiting that would stall
+      // the real request while the client is still reading the other branch.
+      void reader.cancel().catch(() => {});
+    }
+    try { reader.releaseLock(); } catch {}
+  }
+
+  return { text, truncated, timedOut, complete };
+}
+
+function wrapResponseBodyWithUpstreamTimeout(
+  resp: Response,
+  ctrl: AbortController,
+  timer: ReturnType<typeof setTimeout>,
+  timeoutMs: number,
+): Response {
+  if (!resp.body) {
+    clearTimeout(timer);
+    return resp;
+  }
+
+  const reader = resp.body.getReader();
+  let finished = false;
+  let streamClosed = false;
+  let timedOut = false;
+  let activeController: ReadableStreamDefaultController<Uint8Array> | null = null;
+  const timeoutError = () => new Error(`upstream timeout after ${timeoutMs}ms`);
+  const cleanup = (releaseReader = true): void => {
+    if (finished) return;
+    finished = true;
+    clearTimeout(timer);
+    ctrl.signal.removeEventListener("abort", onAbort);
+    if (releaseReader) {
+      try { reader.releaseLock(); } catch {}
+    }
+  };
+  const safeClose = (controller: ReadableStreamDefaultController<Uint8Array>): void => {
+    if (streamClosed) return;
+    streamClosed = true;
+    try { controller.close(); } catch {}
+  };
+  const safeError = (controller: ReadableStreamDefaultController<Uint8Array>, err: unknown): void => {
+    if (streamClosed) return;
+    streamClosed = true;
+    try { controller.error(err); } catch {}
+  };
+  const safeEnqueue = (controller: ReadableStreamDefaultController<Uint8Array>, value: Uint8Array): boolean => {
+    if (streamClosed) return false;
+    try {
+      controller.enqueue(value);
+      return true;
+    } catch (err) {
+      safeError(controller, err);
+      return false;
+    }
+  };
+  const onAbort = (): void => {
+    if (finished) return;
+    timedOut = true;
+    const controller = activeController;
+    cleanup(false);
+    if (controller) {
+      safeError(controller, timeoutError());
+    }
+    void reader.cancel(timeoutError()).catch(() => {}).finally(() => {
+      try { reader.releaseLock(); } catch {}
+    });
+  };
+  ctrl.signal.addEventListener("abort", onAbort, { once: true });
+
+  const body = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (finished) {
+        if (timedOut) safeError(controller, timeoutError());
+        return;
+      }
+      if (ctrl.signal.aborted) {
+        onAbort();
+        return;
+      }
+      activeController = controller;
+      try {
+        const { done, value } = await reader.read();
+        if (finished) return;
+        if (done) {
+          cleanup();
+          safeClose(controller);
+          return;
+        }
+        if (value && !safeEnqueue(controller, value)) {
+          cleanup(false);
+          void reader.cancel("downstream closed").catch(() => {}).finally(() => {
+            try { reader.releaseLock(); } catch {}
+          });
+        }
+      } catch (err) {
+        if (finished) return;
+        cleanup();
+        safeError(controller, ctrl.signal.aborted ? timeoutError() : err);
+      } finally {
+        if (activeController === controller) activeController = null;
+      }
+    },
+    async cancel(reason) {
+      streamClosed = true;
+      cleanup(false);
+      ctrl.abort();
+      try { await reader.cancel(reason); } catch {}
+      try { reader.releaseLock(); } catch {}
+    },
+  });
+
+  return new Response(body, {
+    status: resp.status,
+    statusText: resp.statusText,
+    headers: resp.headers,
+  });
+}
+
+function splitResponseForPreview(resp: Response): { preview: Response; passthrough: Response } | null {
+  if (!resp.body) return null;
+  try {
+    const [previewBody, passthroughBody] = resp.body.tee();
+    const init: ResponseInit = {
+      status: resp.status,
+      statusText: resp.statusText,
+      headers: resp.headers,
+    };
+    return {
+      preview: new Response(previewBody, init),
+      passthrough: new Response(passthroughBody, init),
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function _readResponseTextPreviewForTesting(
+  resp: Response,
+  opts: ResponseTextPreviewOptions,
+): Promise<ResponseTextPreview> {
+  return readResponseTextPreview(resp, opts);
+}
+
+async function readRequestBodyChunk(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  timeoutMs: number,
+): Promise<Awaited<ReturnType<ReadableStreamDefaultReader<Uint8Array>["read"]>>> {
+  const timeout = normalizeTimerMs(timeoutMs, DEFAULT_REQUEST_BODY_IDLE_TIMEOUT_MS);
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const result = await Promise.race([
+    reader.read(),
+    new Promise<"timeout">(resolve => {
+      timer = setTimeout(() => resolve("timeout"), timeout);
+      timer.unref?.();
+    }),
+  ]).finally(() => {
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  });
+  if (result === "timeout") {
+    const err = new RequestBodyTimeoutError(timeout);
+    void reader.cancel(err).catch(() => {});
+    throw err;
+  }
+  return result;
+}
+
 /** Read the request body as a string, returning undefined for empty bodies. */
-async function readBody(req: Request): Promise<string | undefined> {
+async function readBody(req: Request, maxBytes: number): Promise<string | undefined> {
   if (req.method === "GET" || req.method === "HEAD") return undefined;
-  const text = await req.text();
-  if (text.length === 0) return undefined;
-  return text;
+  const limit = Number.isFinite(maxBytes) && maxBytes > 0 ? Math.floor(maxBytes) : 0;
+  const idleTimeoutMs = requestBodyIdleTimeoutMsForTesting ?? DEFAULT_REQUEST_BODY_IDLE_TIMEOUT_MS;
+  const declaredLength = parseContentLength(req.headers);
+  if (limit > 0 && declaredLength !== undefined && declaredLength > limit) {
+    void req.body?.cancel().catch(() => {});
+    throw new RequestBodyTooLargeError(limit, declaredLength);
+  }
+  if (!req.body) return undefined;
+
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await readRequestBodyChunk(reader, idleTimeoutMs);
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (limit > 0 && total > limit) {
+        try { await reader.cancel(); } catch {}
+        throw new RequestBodyTooLargeError(limit, total);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    try { reader.releaseLock(); } catch {}
+  }
+  if (total === 0) return undefined;
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(bytes);
 }
 
 /**
@@ -1708,31 +2354,45 @@ export async function checkWafBlock(resp: Response): Promise<{ wafBlocked: true 
   // error page (some upstreams return verbose HTML) this would block the
   // event loop and spike memory. Now we read up to MAX_PEEK_BYTES (32KB,
   // more than enough to contain any Aliyun WAF page) and stop early as
-  // soon as the WAF signature is found. If the body doesn't contain the
-  // signature within the cap, we treat it as "not a WAF block" and
-  // reconstruct the response with the peeked prefix.
+  // soon as the WAF signature is found. The cap is enforced in bytes, not
+  // decoded string length, so a single large upstream chunk cannot sneak
+  // past the limit. If the body doesn't contain the signature within the
+  // cap, we treat it as "not a WAF block" and reconstruct the response with
+  // the peeked prefix.
   try {
     const MAX_PEEK = WAF_CONST.MAX_PEEK_BYTES;
     let text = "";
+    let peekedBytes = 0;
     let bodyDone = false;
     if (resp.body) {
       const reader = resp.body.getReader();
       const decoder = new TextDecoder();
       try {
-        while (text.length < MAX_PEEK) {
+        while (peekedBytes < MAX_PEEK) {
           const { done, value } = await reader.read();
           if (done) { bodyDone = true; break; }
-          text += decoder.decode(value, { stream: true });
+          if (!value) continue;
+          const remainingBytes = MAX_PEEK - peekedBytes;
+          const chunk = value.byteLength > remainingBytes
+            ? value.subarray(0, remainingBytes)
+            : value;
+          peekedBytes += chunk.byteLength;
+          text += decoder.decode(chunk, { stream: true });
           // Early-exit: signature found, no need to keep reading.
           if (text.includes(WAF_CONST.SIGNATURE)) {
             bodyDone = false;  // there may be more body, but we don't need it
             break;
           }
+          if (chunk.byteLength < value.byteLength) break;
         }
-        if (text.length < MAX_PEEK && !bodyDone) {
+        if (bodyDone) {
           // Flush the decoder's internal buffer (final partial multi-byte
           // sequence) so the text is complete.
           text += decoder.decode();
+        } else {
+          // Drop a possible partial character at the byte cap instead of
+          // expanding the preview beyond MAX_PEEK_BYTES.
+          decoder.decode();
         }
       } finally {
         try { await reader.cancel(); } catch { /* best-effort */ }
@@ -2050,13 +2710,24 @@ async function translatedBatchResponse(
   headersAt: number,
   credKey?: string,
   captchaMs: number = 0,
+  retried: boolean = false,
 ): Promise<Response> {
-  const raw = await upstream.text();
+  let raw: string;
+  try {
+    raw = await readResponseTextLimited(
+      upstream,
+      translatedUpstreamBodyLimitBytes(),
+      "Translated upstream response",
+    );
+  } catch (err) {
+    printRow(reqId, format, meta, 502, started, headersAt, 0, 0, 0, retried, 0, credKey, captchaMs);
+    return errorResponse(502, "translation_failed", `failed to read upstream response body: ${(err as Error).message}`);
+  }
   let parsedAnthropic: AnthropicMessagesResponse;
   try {
     parsedAnthropic = JSON.parse(raw) as AnthropicMessagesResponse;
   } catch (err) {
-    printRow(reqId, format, meta, 502, started, headersAt, 0, 0, 0);
+    printRow(reqId, format, meta, 502, started, headersAt, 0, 0, 0, retried, 0, credKey, captchaMs);
     return errorResponse(502, "translation_failed", `upstream returned non-JSON body: ${(err as Error).message}`);
   }
   const openaiResp = translateResponseAnthropicToOpenAI(parsedAnthropic, model);
@@ -2077,7 +2748,7 @@ async function translatedBatchResponse(
 
   if (clientAcceptsGzip(clientReq)) {
     respHeaders.set("content-encoding", "gzip");
-    printRow(reqId, format, meta, upstream.status, started, headersAt, outTok, 0, 0, false, inTok, credKey, captchaMs, cacheReadTok);
+    printRow(reqId, format, meta, upstream.status, started, headersAt, outTok, 0, 0, retried, inTok, credKey, captchaMs, cacheReadTok);
     // v0.2.0.8: stream the payload through CompressionStream instead of
     // Bun.gzipSync — avoids blocking the event loop for large responses.
     return new Response(gzipPayloadStream(payload), {
@@ -2085,7 +2756,7 @@ async function translatedBatchResponse(
       headers: respHeaders,
     });
   }
-  printRow(reqId, format, meta, upstream.status, started, headersAt, outTok, 0, 0, false, inTok, credKey, captchaMs, cacheReadTok);
+  printRow(reqId, format, meta, upstream.status, started, headersAt, outTok, 0, 0, retried, inTok, credKey, captchaMs, cacheReadTok);
   return new Response(payload, {
     status: upstream.status,
     headers: respHeaders,
@@ -2123,13 +2794,24 @@ async function translatedResponsesBatchResponse(
   clientInput: unknown,
   credKey?: string,
   captchaMs: number = 0,
+  retried: boolean = false,
 ): Promise<Response> {
-  const raw = await upstream.text();
+  let raw: string;
+  try {
+    raw = await readResponseTextLimited(
+      upstream,
+      translatedUpstreamBodyLimitBytes(),
+      "Translated upstream response",
+    );
+  } catch (err) {
+    printRow(reqId, format, meta, 502, started, headersAt, 0, 0, 0, retried, 0, credKey, captchaMs);
+    return errorResponse(502, "translation_failed", `failed to read upstream response body: ${(err as Error).message}`);
+  }
   let parsedAnthropic: AnthropicMessagesResponse;
   try {
     parsedAnthropic = JSON.parse(raw) as AnthropicMessagesResponse;
   } catch (err) {
-    printRow(reqId, format, meta, 502, started, headersAt, 0, 0, 0);
+    printRow(reqId, format, meta, 502, started, headersAt, 0, 0, 0, retried, 0, credKey, captchaMs);
     return errorResponse(502, "translation_failed", `upstream returned non-JSON body: ${(err as Error).message}`);
   }
   const responsesResp = translateResponseAnthropicToResponses(parsedAnthropic, model, previousResponseId ?? null);
@@ -2157,14 +2839,14 @@ async function translatedResponsesBatchResponse(
 
   if (clientAcceptsGzip(clientReq)) {
     respHeaders.set("content-encoding", "gzip");
-    printRow(reqId, format, meta, upstream.status, started, headersAt, outTok, 0, 0, false, inTok, credKey, captchaMs, cacheReadTok);
+    printRow(reqId, format, meta, upstream.status, started, headersAt, outTok, 0, 0, retried, inTok, credKey, captchaMs, cacheReadTok);
     // v0.2.0.8: stream through CompressionStream (see gzipPayloadStream).
     return new Response(gzipPayloadStream(payload), {
       status: upstream.status,
       headers: respHeaders,
     });
   }
-  printRow(reqId, format, meta, upstream.status, started, headersAt, outTok, 0, 0, false, inTok, credKey, captchaMs, cacheReadTok);
+  printRow(reqId, format, meta, upstream.status, started, headersAt, outTok, 0, 0, retried, inTok, credKey, captchaMs, cacheReadTok);
   return new Response(payload, {
     status: upstream.status,
     headers: respHeaders,
@@ -2313,7 +2995,7 @@ function printRow(
   const ts = new Date(started).toISOString().slice(11, 19);
   const tag = format === "anthropic" ? "ANT" : format === "openai-responses" ? "RSP" : "OAI";
   const mode = meta.stream ? "stream" : "batch";
-  const ttfbMs = headersAt - started;
+  const ttfbMs = Math.max(0, headersAt - started);
   const ttfb = `${ttfbMs}ms`;
   const captcha = captchaMs > 0 ? `${captchaMs}ms` : "-";
   const total = streamEndAt > started ? `${streamEndAt - started}ms` : "-";
@@ -2335,7 +3017,7 @@ function printRow(
   const tps = avgTps > 0 ? avgTps.toFixed(1) : "-";
   // When captcha took a significant portion of TTFB, show the breakdown
   if (captchaMs > 0 && ttfbMs > 0) {
-    const netTtfb = ttfbMs - captchaMs;
+    const netTtfb = Math.max(0, ttfbMs - captchaMs);
     console.log(
       `| ${reqId.padEnd(4)} | ${ts.padEnd(10)} | ${tag} | ${meta.model.padEnd(11)} | ${mode.padEnd(6)} | ${String(status).padStart(4)} | ${ttfb.padStart(7)} | ${captcha.padStart(7)} | in:${inField} out:${outField} | ${tps.padStart(6)} | ${total.padStart(7)} |  TTFB=${ttfbMs}ms (net ${netTtfb}ms + captcha ${captchaMs}ms)`,
     );
@@ -2389,48 +3071,139 @@ function createStatsTransform(
   contentEncoding: string | null,
   credKey: string | undefined,
   captchaMs: number,
-): { transform: TransformStream<Uint8Array, Uint8Array>; done: Promise<void> } {
-  const compressed = contentEncoding !== null;
+  retried: boolean = false,
+): { transform: TransformStream<Uint8Array, Uint8Array>; done: Promise<void>; finalize: () => void } {
+  const compressed = isCompressedContentEncoding(contentEncoding);
   const state = {
     tokens: 0,
     inputTokens: 0,
     thinkingTokens: 0,
     cacheReadTokens: 0,
     sseBuffer: "",
+    statsParsingDisabled: false,
     firstChunkAt: 0,
   };
+  const decoder = compressed ? null : new TextDecoder();
 
+  let finished = false;
   let resolveDone: () => void;
   const done = new Promise<void>((r) => { resolveDone = r; });
-
-  const transform = new TransformStream<Uint8Array, Uint8Array>({
-    transform(chunk, controller) {
-      if (state.firstChunkAt === 0) state.firstChunkAt = Date.now();
-      if (!compressed) {
-        state.sseBuffer += new TextDecoder().decode(chunk, { stream: true });
-        const idx = state.sseBuffer.lastIndexOf("\n");
-        if (idx >= 0) {
-          observeStreamParseSse(state.sseBuffer.slice(0, idx), state);
-          state.sseBuffer = state.sseBuffer.slice(idx + 1);
-        }
+  const finalize = (): void => {
+    if (finished) return;
+    finished = true;
+    try {
+      if (!compressed && !state.statsParsingDisabled) {
+        const tail = decoder!.decode();
+        if (tail) state.sseBuffer += tail;
       }
-      // Pass the chunk straight through to the client — no buffering.
-      controller.enqueue(chunk);
-    },
-    flush() {
-      if (!compressed && state.sseBuffer) {
+      if (!compressed && !state.statsParsingDisabled && utf8ByteLength(state.sseBuffer) > SSE_CONST.MAX_STATS_BUFFERED_EVENT_BYTES) {
+        state.sseBuffer = "";
+        state.statsParsingDisabled = true;
+      }
+      if (!compressed && !state.statsParsingDisabled && state.sseBuffer) {
         observeStreamParseSse(state.sseBuffer, state);
       }
       const endAt = Date.now();
       const ttfbMs = (state.firstChunkAt > 0 ? state.firstChunkAt : endAt) - requestSentAt;
       const totalMs = endAt - requestSentAt;
       const avgTps = state.tokens > 0 && totalMs > 0 ? state.tokens / (totalMs / 1000) : 0;
-      printRow(reqId, format, meta, status, requestSentAt, requestSentAt + ttfbMs, state.tokens, avgTps, endAt, false, state.inputTokens, credKey, captchaMs, state.cacheReadTokens, state.thinkingTokens);
+      printRow(reqId, format, meta, status, requestSentAt, requestSentAt + ttfbMs, state.tokens, avgTps, endAt, retried, state.inputTokens, credKey, captchaMs, state.cacheReadTokens, state.thinkingTokens);
+    } finally {
       resolveDone();
+    }
+  };
+
+  const transform = new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      if (state.firstChunkAt === 0) state.firstChunkAt = Date.now();
+      if (!compressed && !state.statsParsingDisabled) {
+        state.sseBuffer += decoder!.decode(chunk, { stream: true });
+        const idx = state.sseBuffer.lastIndexOf("\n");
+        if (idx >= 0) {
+          observeStreamParseSse(state.sseBuffer.slice(0, idx), state);
+          state.sseBuffer = state.sseBuffer.slice(idx + 1);
+        }
+        if (utf8ByteLength(state.sseBuffer) > SSE_CONST.MAX_STATS_BUFFERED_EVENT_BYTES) {
+          state.sseBuffer = "";
+          state.statsParsingDisabled = true;
+        }
+      }
+      // Pass the chunk straight through to the client — no buffering.
+      controller.enqueue(chunk);
+    },
+    flush() {
+      finalize();
     },
   });
 
-  return { transform, done };
+  return { transform, done, finalize };
+}
+
+function observeStatsStream(
+  source: ReadableStream<Uint8Array>,
+  stats: ReturnType<typeof createStatsTransform>,
+): ReadableStream<Uint8Array> {
+  const reader = source.pipeThrough(stats.transform).getReader();
+  let closed = false;
+  const releaseReader = (): void => {
+    try { reader.releaseLock(); } catch {}
+  };
+  const closeStream = (controller: ReadableStreamDefaultController<Uint8Array>): void => {
+    if (closed) return;
+    closed = true;
+    try { controller.close(); } catch {}
+  };
+  const errorStream = (controller: ReadableStreamDefaultController<Uint8Array>, err: unknown): void => {
+    if (closed) return;
+    closed = true;
+    try { controller.error(err); } catch {}
+  };
+  const enqueueStream = (controller: ReadableStreamDefaultController<Uint8Array>, value: Uint8Array): boolean => {
+    if (closed) return false;
+    try {
+      controller.enqueue(value);
+      return true;
+    } catch (err) {
+      errorStream(controller, err);
+      return false;
+    }
+  };
+
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (closed) return;
+      try {
+        const { done, value } = await reader.read();
+        if (closed) return;
+        if (done) {
+          stats.finalize();
+          releaseReader();
+          closeStream(controller);
+          return;
+        }
+        if (value && !enqueueStream(controller, value)) {
+          stats.finalize();
+          releaseReader();
+        }
+      } catch (err) {
+        stats.finalize();
+        releaseReader();
+        errorStream(controller, err);
+      }
+    },
+    async cancel(reason) {
+      if (closed) return;
+      closed = true;
+      stats.finalize();
+      try {
+        await reader.cancel(reason);
+      } catch {
+        // Best-effort cancellation; downstream is already gone.
+      } finally {
+        releaseReader();
+      }
+    },
+  });
 }
 
 /**
@@ -2451,53 +3224,57 @@ function createStatsTransform(
  * Once the first real chunk arrives, the heartbeat stops immediately and
  * never re-fires — zero overhead after TTFB.
  *
- * Pipeline order: this transform is placed BEFORE createStatsTransform
- * (i.e. closer to the client). Reason: stats parses SSE events to count
- * tokens; if heartbeat comment lines flowed through stats, they'd be
- * harmlessly ignored (stats only looks at `event:` / `data:` lines), but
- * it's cleaner to keep heartbeat bytes out of stats entirely. Putting
- * heartbeat upstream-of-stats means stats sees only real upstream bytes.
+ * Pipeline order: heartbeat wraps the stream AFTER createStatsTransform
+ * (closer to the client). Stats still sees only real upstream bytes; heartbeat
+ * comments flow directly to the client and are not counted as model output.
  *
- * Wait — actually the opposite order is better: stats should see what the
- * CLIENT sees (including heartbeat), so stats' TTFB measurement reflects
- * when the client first saw bytes. So we place heartbeat AFTER stats
- * (closer to client). stats' TTFB is then "time to first real upstream
- * chunk", which is what we want to measure; heartbeat bytes flow to the
- * client without stats seeing them. This is the chosen order.
- *
- * Cancellation: if the client disconnects mid-stream, the underlying
- * Response stream is cancelled, which propagates a cancel signal up the
- * pipeline. We also guard the interval with a `closed` flag and clear it
- * in cancel() to prevent timer leaks. As a belt-and-suspenders defense,
- * if enqueue throws (stream errored/closed), we clear the interval.
+ * Cancellation: implemented as a ReadableStream wrapper rather than a
+ * TransformStream so downstream cancellation has a real `cancel()` hook. That
+ * hook clears the heartbeat timer immediately and cancels the upstream reader,
+ * avoiding timer leaks when the client disconnects before upstream TTFB.
  *
  * @param intervalMs Heartbeat interval in ms. 0 or negative = disabled
- *                  (the transform becomes a pure passthrough).
+ *                  (the source stream is returned unchanged).
  */
-function createSseHeartbeatTransform(intervalMs: number): TransformStream<Uint8Array, Uint8Array> {
+function withSseHeartbeat(source: ReadableStream<Uint8Array>, intervalMs: number): ReadableStream<Uint8Array> {
   // Disabled / invalid interval — pure passthrough, no timer.
   if (!intervalMs || intervalMs <= 0) {
-    return new TransformStream<Uint8Array, Uint8Array>({
-      transform(chunk, controller) { controller.enqueue(chunk); },
-    });
+    return source;
   }
 
   const commentBytes = new TextEncoder().encode(SSE_HEARTBEAT_CONST.COMMENT_LINE);
+  const reader = source.getReader();
   let firstChunkSeen = false;
   let closed = false;
   let timer: ReturnType<typeof setInterval> | null = null;
+  let readInFlight = false;
 
-  const flushHeartbeat = (controller: TransformStreamDefaultController<Uint8Array>): void => {
+  const stopHeartbeat = (): void => {
+    if (timer) {
+      clearInterval(timer);
+      timer = null;
+    }
+  };
+  const closeAll = (): void => {
+    closed = true;
+    stopHeartbeat();
+  };
+
+  const flushHeartbeat = (controller: ReadableStreamDefaultController<Uint8Array>): void => {
     if (closed || firstChunkSeen) return;
+    if (controller.desiredSize !== null && controller.desiredSize <= 0) return;
     try {
       controller.enqueue(commentBytes);
     } catch {
       // Stream errored or closed — stop the timer to prevent leak.
-      if (timer) { clearInterval(timer); timer = null; }
+      closeAll();
+      void reader.cancel("heartbeat enqueue failed").catch(() => {}).finally(() => {
+        try { reader.releaseLock(); } catch {}
+      });
     }
   };
 
-  return new TransformStream<Uint8Array, Uint8Array>({
+  return new ReadableStream<Uint8Array>({
     start(controller) {
       // Kick off the heartbeat immediately. We use setInterval (not
       // setTimeout chain) because it's cheaper and Bun's timer impl
@@ -2509,25 +3286,76 @@ function createSseHeartbeatTransform(intervalMs: number): TransformStream<Uint8A
       // loop alive anyway.
       if (timer && typeof timer.unref === "function") timer.unref();
     },
-    transform(chunk, controller) {
-      // First real chunk from upstream — stop the heartbeat forever.
-      if (!firstChunkSeen) {
-        firstChunkSeen = true;
-        if (timer) { clearInterval(timer); timer = null; }
+    async pull(controller) {
+      if (closed || readInFlight) return;
+      readInFlight = true;
+      const safeClose = (): void => {
+        if (closed) return;
+        closeAll();
+        try { controller.close(); } catch {}
+      };
+      const safeError = (err: unknown): void => {
+        if (closed) return;
+        closeAll();
+        try { controller.error(err); } catch {}
+      };
+      const safeEnqueue = (value: Uint8Array): boolean => {
+        if (closed) return false;
+        try {
+          controller.enqueue(value);
+          return true;
+        } catch (err) {
+          safeError(err);
+          return false;
+        }
+      };
+      try {
+        const { done, value } = await reader.read();
+        if (closed) return;
+        if (done) {
+          try { reader.releaseLock(); } catch {}
+          safeClose();
+          return;
+        }
+        // First real chunk from upstream — stop the heartbeat forever.
+        if (!firstChunkSeen) {
+          firstChunkSeen = true;
+          stopHeartbeat();
+        }
+        if (value && !safeEnqueue(value)) {
+          try { await reader.cancel("downstream closed"); } catch {}
+          try { reader.releaseLock(); } catch {}
+        }
+      } catch (err) {
+        try { reader.releaseLock(); } catch {}
+        safeError(err);
+      } finally {
+        readInFlight = false;
       }
-      controller.enqueue(chunk);
     },
-    flush() {
-      // flush fires on normal stream end OR when the downstream cancels
-      // (client disconnect) — both cases mean we should stop the timer.
-      closed = true;
-      if (timer) { clearInterval(timer); timer = null; }
+    async cancel(reason) {
+      closeAll();
+      try {
+        await reader.cancel(reason);
+      } catch {
+        // Best-effort cancellation; the downstream is already gone.
+      } finally {
+        try { reader.releaseLock(); } catch {}
+      }
     },
   });
 }
 
-/** Exported for testing — see handler.test.ts "SSE heartbeat" describe block. */
-export const _testing = { createSseHeartbeatTransform };
+/** Exported for focused transform tests. */
+export const _testing = {
+  withSseHeartbeat,
+  createStatsTransform,
+  observeStatsStream,
+  readResponseTextLimited,
+  readResponseTextPreview,
+  printRow,
+  wrapResponseBodyWithUpstreamTimeout,
+};
 
 /**
  * Inlined SSE parser for createStatsTransform — mirrors the logic in
@@ -2544,95 +3372,106 @@ export const _testing = { createSseHeartbeatTransform };
 function observeStreamParseSse(text: string, state: {
   tokens: number; inputTokens: number; thinkingTokens: number; cacheReadTokens: number;
 }): void {
-  for (const line of text.split("\n")) {
-    if (!line.startsWith("data:")) continue;
-    const dataStr = line.slice(5).trimStart();
-    if (!dataStr || dataStr === "[DONE]") continue;
-    // v0.2.2+ PERF: cheap substring check before JSON.parse. The markers
-    // below cover every branch that actually updates state — anything
-    // without one of these markers is guaranteed to be a no-op (the
-    // try/catch below would parse and discard it).
-    let hasMarker = false;
-    for (const marker of SSE_CONST.STATS_INTERESTING_MARKERS) {
-      if (dataStr.includes(marker)) { hasMarker = true; break; }
+  let lineStart = 0;
+  for (;;) {
+    const lineEnd = text.indexOf("\n", lineStart);
+    const end = lineEnd < 0 ? text.length : lineEnd;
+    if (text.startsWith("data:", lineStart)) {
+      observeStreamParseDataLine(text.slice(lineStart + 5, end).trimStart(), state);
     }
-    if (!hasMarker) continue;
-    try {
-      const j = JSON.parse(dataStr);
-      if (j.type === "message_start" && j.message?.usage) {
-        const u = j.message.usage;
-        if (typeof u.input_tokens === "number" && u.input_tokens > 0) state.inputTokens = u.input_tokens;
-        if (typeof u.cache_read_input_tokens === "number" && u.cache_read_input_tokens > 0) state.cacheReadTokens = u.cache_read_input_tokens;
-      }
-      if (j.usage?.completion_tokens) { state.tokens = j.usage.completion_tokens; }
-      if (j.usage?.output_tokens) { state.tokens = j.usage.output_tokens; }
-      if (j.usage?.prompt_tokens) { state.inputTokens = j.usage.prompt_tokens; }
-      if (j.usage?.input_tokens) { state.inputTokens = j.usage.input_tokens; }
-      if (j.usage?.cache_read_input_tokens) { state.cacheReadTokens = j.usage.cache_read_input_tokens; }
-      const oai = j.choices?.[0]?.delta?.content;
-      if (typeof oai === "string" && oai.length > 0) { state.tokens++; continue; }
-      if (j.type === "content_block_delta" && j.delta?.type === "thinking_delta") {
-        const t = j.delta?.thinking;
-        if (typeof t === "string" && t.length > 0) state.thinkingTokens++;
-        continue;
-      }
-      if (j.type === "content_block_delta" && j.delta?.type === "text_delta") {
-        const t = j.delta?.text;
-        if (typeof t === "string" && t.length > 0) state.tokens++;
-        continue;
-      }
-      if (j.type === "response.output_text.delta") {
-        const t = j.delta;
-        if (typeof t === "string" && t.length > 0) state.tokens++;
-        continue;
-      }
-      if (j.type === "response.completed" && j.response?.usage) {
-        const u = j.response.usage;
-        if (u.output_tokens) state.tokens = u.output_tokens;
-        if (u.input_tokens) state.inputTokens = u.input_tokens;
-        if (u.cache_read_input_tokens) state.cacheReadTokens = u.cache_read_input_tokens;
-        // v0.2.0.10: Responses API carries thinking token count in
-        // usage.output_tokens_details.reasoning_tokens. Prefer this
-        // authoritative value over chunk counting when present.
-        const rt = u.output_tokens_details?.reasoning_tokens;
-        if (typeof rt === "number" && rt > 0) state.thinkingTokens = rt;
-        continue;
-      }
-      if (j.type === "message_delta" && j.usage) {
-        if (j.usage.output_tokens) state.tokens = j.usage.output_tokens;
-        if (j.usage.input_tokens) state.inputTokens = j.usage.input_tokens;
-        if (j.usage.cache_read_input_tokens) state.cacheReadTokens = j.usage.cache_read_input_tokens;
-        // v0.2.0.10: GLM extension — message_delta.usage may carry an
-        // authoritative reasoning_tokens count. Prefer it over chunk counting.
-        if (typeof j.usage.reasoning_tokens === "number" && j.usage.reasoning_tokens > 0) state.thinkingTokens = j.usage.reasoning_tokens;
-        continue;
-      }
-      // v0.2.0.10: Chat Completions streaming — the final chunk carries usage
-      // with cache_read_input_tokens / reasoning_tokens as non-standard
-      // extension fields (added by sse-translator.ts). OpenAI chunks don't
-      // have a `type` field, so we match by the presence of `choices` +
-      // `usage`. This must run AFTER the message_delta / response.completed
-      // branches above so those take precedence on type collisions.
-      if (j.choices && j.usage) {
-        if (j.usage.cache_read_input_tokens) state.cacheReadTokens = j.usage.cache_read_input_tokens;
-        if (typeof j.usage.reasoning_tokens === "number" && j.usage.reasoning_tokens > 0) state.thinkingTokens = j.usage.reasoning_tokens;
-      }
-    } catch {}
+    if (lineEnd < 0) break;
+    lineStart = lineEnd + 1;
   }
+}
+
+function observeStreamParseDataLine(dataStr: string, state: {
+  tokens: number; inputTokens: number; thinkingTokens: number; cacheReadTokens: number;
+}): void {
+  if (!dataStr || dataStr === "[DONE]") return;
+  // v0.2.2+ PERF: cheap substring check before JSON.parse. The markers
+  // below cover every branch that actually updates state — anything
+  // without one of these markers is guaranteed to be a no-op (the
+  // try/catch below would parse and discard it).
+  let hasMarker = false;
+  for (const marker of SSE_CONST.STATS_INTERESTING_MARKERS) {
+    if (dataStr.includes(marker)) { hasMarker = true; break; }
+  }
+  if (!hasMarker) return;
+  try {
+    const j = JSON.parse(dataStr);
+    if (j.type === "message_start" && j.message?.usage) {
+      const u = j.message.usage;
+      if (typeof u.input_tokens === "number" && u.input_tokens > 0) state.inputTokens = u.input_tokens;
+      if (typeof u.cache_read_input_tokens === "number" && u.cache_read_input_tokens > 0) state.cacheReadTokens = u.cache_read_input_tokens;
+    }
+    if (j.usage?.completion_tokens) { state.tokens = j.usage.completion_tokens; }
+    if (j.usage?.output_tokens) { state.tokens = j.usage.output_tokens; }
+    if (j.usage?.prompt_tokens) { state.inputTokens = j.usage.prompt_tokens; }
+    if (j.usage?.input_tokens) { state.inputTokens = j.usage.input_tokens; }
+    if (j.usage?.cache_read_input_tokens) { state.cacheReadTokens = j.usage.cache_read_input_tokens; }
+    const oai = j.choices?.[0]?.delta?.content;
+    if (typeof oai === "string" && oai.length > 0) { state.tokens++; return; }
+    if (j.type === "content_block_delta" && j.delta?.type === "thinking_delta") {
+      const t = j.delta?.thinking;
+      if (typeof t === "string" && t.length > 0) state.thinkingTokens++;
+      return;
+    }
+    if (j.type === "content_block_delta" && j.delta?.type === "text_delta") {
+      const t = j.delta?.text;
+      if (typeof t === "string" && t.length > 0) state.tokens++;
+      return;
+    }
+    if (j.type === "response.output_text.delta") {
+      const t = j.delta;
+      if (typeof t === "string" && t.length > 0) state.tokens++;
+      return;
+    }
+    if (j.type === "response.completed" && j.response?.usage) {
+      const u = j.response.usage;
+      if (u.output_tokens) state.tokens = u.output_tokens;
+      if (u.input_tokens) state.inputTokens = u.input_tokens;
+      if (u.cache_read_input_tokens) state.cacheReadTokens = u.cache_read_input_tokens;
+      // v0.2.0.10: Responses API carries thinking token count in
+      // usage.output_tokens_details.reasoning_tokens. Prefer this
+      // authoritative value over chunk counting when present.
+      const rt = u.output_tokens_details?.reasoning_tokens;
+      if (typeof rt === "number" && rt > 0) state.thinkingTokens = rt;
+      return;
+    }
+    if (j.type === "message_delta" && j.usage) {
+      if (j.usage.output_tokens) state.tokens = j.usage.output_tokens;
+      if (j.usage.input_tokens) state.inputTokens = j.usage.input_tokens;
+      if (j.usage.cache_read_input_tokens) state.cacheReadTokens = j.usage.cache_read_input_tokens;
+      // v0.2.0.10: GLM extension — message_delta.usage may carry an
+      // authoritative reasoning_tokens count. Prefer it over chunk counting.
+      if (typeof j.usage.reasoning_tokens === "number" && j.usage.reasoning_tokens > 0) state.thinkingTokens = j.usage.reasoning_tokens;
+      return;
+    }
+    // v0.2.0.10: Chat Completions streaming — the final chunk carries usage
+    // with cache_read_input_tokens / reasoning_tokens as non-standard
+    // extension fields (added by sse-translator.ts). OpenAI chunks don't
+    // have a `type` field, so we match by the presence of `choices` +
+    // `usage`. This must run AFTER the message_delta / response.completed
+    // branches above so those take precedence on type collisions.
+    if (j.choices && j.usage) {
+      if (j.usage.cache_read_input_tokens) state.cacheReadTokens = j.usage.cache_read_input_tokens;
+      if (typeof j.usage.reasoning_tokens === "number" && j.usage.reasoning_tokens > 0) state.thinkingTokens = j.usage.reasoning_tokens;
+    }
+  } catch {}
 }
 
 /**
  * Debug log the upstream response — shows EXACTLY what the upstream returned.
  *
- * Uses `resp.clone()` to read a copy of the body without consuming the
- * original — the caller's retry / passthrough logic still sees the full
- * response. Response.clone() is supported by both Bun and the Fetch spec; it
- * internally buffers the body so both the clone and original can be read.
+ * The caller can pass a tee'd preview branch when the original response body
+ * must remain available for passthrough. This avoids relying on Response.clone()
+ * cancellation behavior, which is not fully isolated in Bun for streaming
+ * bodies.
  *
  * Logs:
  *   - HTTP status + key headers (content-type, retry-after, empty-stream flag,
  *     ratelimit headers)
- *   - Body preview: first 1000 chars (for JSON) or first 2KB (for SSE streams)
+  *   - Body preview: first 1000 bytes (for JSON) or first 8KB (for SSE streams)
  *
  * This is the "调试日志" the user requested: see what 529 / empty 200 / captcha
  * 403 actually returned, including the error JSON body. Enabled via
@@ -2640,7 +3479,7 @@ function observeStreamParseSse(text: string, state: {
  *
  * MUST never throw — all operations wrapped in try/catch.
  */
-async function logUpstreamResponseDebug(reqId: string, resp: Response, _isStream: boolean): Promise<void> {
+async function logUpstreamResponseDebug(reqId: string, resp: Response, _isStream: boolean, alreadyPreviewResponse = false): Promise<void> {
   try {
     const status = resp.status;
     const ct = resp.headers.get("content-type") ?? "";
@@ -2652,28 +3491,14 @@ async function logUpstreamResponseDebug(reqId: string, resp: Response, _isStream
 
     // Header summary — always logged
     const headerParts: string[] = [`status=${status}`, `ct=${ct || "(none)"}`];
-    if (ce && ce !== "identity") headerParts.push(`encoding=${ce}`);
+    if (isCompressedContentEncoding(ce)) headerParts.push(`encoding=${ce}`);
     if (retryAfter) headerParts.push(`retry-after=${retryAfter}`);
     if (emptyStream) headerParts.push(`empty-stream=${emptyStream}`);
     if (ratelimitRemaining) headerParts.push(`ratelimit-remaining=${ratelimitRemaining}`);
     console.log(`${reqId} [debug] upstream response: ${headerParts.join(" | ")}`);
 
-    // Body preview via clone() — doesn't consume the original response.
-    // clone() buffers the body internally; both the clone and original can
-    // be read independently. This is the cleanest way to inspect a Response
-    // without breaking downstream passthrough.
-    let clone: Response;
-    try {
-      clone = resp.clone();
-    } catch {
-      // Some Response implementations (e.g. streaming with non-cloneable
-      // bodies) may reject clone() — skip body preview in that case.
-      console.log(`${reqId} [debug] (body preview unavailable — response not cloneable)`);
-      return;
-    }
-
-    // Read the clone's body with a timeout so a hung stream doesn't block
-    // the request forever.
+    // Read a bounded body preview with a timeout so a hung stream doesn't
+    // block the request forever.
     //
     // v0.2.0.6: For SSE streams, the AUTHORITATIVE usage (including cache
     // token counts) is in the `message_delta` event near the END of the
@@ -2693,45 +3518,23 @@ async function logUpstreamResponseDebug(reqId: string, resp: Response, _isStream
     // prefix for diagnosis. JSON error responses stay at 3s (small bodies).
     const isSSE = ct.includes("text/event-stream");
     const PREVIEW_TIMEOUT_MS = isSSE ? 10_000 : 3_000;
-    const previewPromise = (async () => {
-      if (!clone.body) return "(no body)";
-      const reader = clone.body.getReader();
-      const decoder = new TextDecoder();
-      let preview = "";
-      const deadline = Date.now() + PREVIEW_TIMEOUT_MS;
-      const PREVIEW_CAP = isSSE ? 8192 : 2048;
-      while (preview.length < PREVIEW_CAP && Date.now() < deadline) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        preview += decoder.decode(value, { stream: true });
-        // For SSE: stop after we see message_delta (carries real usage)
-        // — this is the event we care about for token diagnostics.
-        if (isSSE && preview.includes('"type":"message_delta"')) break;
-        // For JSON: stop when we likely have the full body (small error responses)
-        if (ct.includes("application/json") && preview.length > 0 && preview.trim().endsWith("}")) break;
-      }
-      try { reader.cancel(); } catch {}
-      return preview;
-    })();
-
-    let preview: string;
-    try {
-      preview = await Promise.race([
-        previewPromise,
-        new Promise<string>(r => setTimeout(() => r(`(read timeout after ${PREVIEW_TIMEOUT_MS / 1000}s)`), PREVIEW_TIMEOUT_MS)),
-      ]);
-    } catch {
-      preview = "(body read failed)";
-    }
+    const PREVIEW_CAP = isSSE ? 8192 : 2048;
+    const previewResult = await readResponseTextPreview(resp, {
+      maxBytes: PREVIEW_CAP,
+      timeoutMs: PREVIEW_TIMEOUT_MS,
+      clone: !alreadyPreviewResponse,
+    }).catch(() => null);
+    const preview = previewResult
+      ? `${previewResult.text}${previewResult.truncated ? `...(truncated at ${PREVIEW_CAP} bytes)` : previewResult.timedOut ? `...(read timeout after ${PREVIEW_TIMEOUT_MS / 1000}s)` : ""}`
+      : "(body read failed)";
 
     // v0.2.0.6: For SSE streams, allow up to 8KB of preview so the
     // message_delta event (carrying usage / cache tokens) is visible.
     // JSON responses stay at 1KB (small error bodies don't need more).
-    const trimCap = ct.includes("text/event-stream") ? 8000 : 1000;
-    const trimmed = preview.length > trimCap
-      ? preview.slice(0, trimCap) + `...(truncated, total ${preview.length} chars)`
-      : preview;
-    console.log(`${reqId} [debug] body preview (${preview.length} chars): ${trimmed || "(empty body)"}`);
+    const trimCapBytes = ct.includes("text/event-stream") ? 8000 : 1000;
+    const trimmed = truncateUtf8ForLog(preview, trimCapBytes);
+    const suffix = trimmed.truncated ? `...(truncated, total ${trimmed.bytes} bytes)` : "";
+    console.log(`${reqId} [debug] body preview (${trimmed.bytes} bytes): ${trimmed.text}${suffix || (trimmed.text ? "" : "(empty body)")}`);
   } catch (err) {
     console.log(`${reqId} [debug] failed to log response: ${(err as Error).message}`);
   }

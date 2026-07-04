@@ -33,9 +33,9 @@ import type { Credential } from "./types.js";
  * (persistent disk) or `/tmp/zcode-proxy/.zcode-proxy` (ephemeral).
  *
  * In `auth.mode: apikey` the store is only used by the dashboard's
- * multi-account UI — if you never use that UI, an empty/unwritable store
- * is harmless (reads return null, writes are silently no-oped by the upper
- * layer's try/catch).
+ * multi-account UI. If you never use that UI, an empty store is harmless
+ * (reads return null); failed writes are reported to the caller so users do
+ * not mistake an in-memory-only credential for a durable save.
  */
 function resolveStoreDir(): string {
   return process.env.ZCODE_PROXY_STORE_DIR ?? join(homedir(), ".zcode-proxy");
@@ -51,6 +51,8 @@ function refreshStorePathFromEnv(): void {
   STORE_FILE = join(STORE_DIR, "credentials.json");
   cachedStore = undefined;
   cachedStoreMtimeMs = -1;
+  cachedStoreCtimeMs = -1;
+  cachedStoreSize = -1;
   undecryptableFilePresent = false;
   lastReadStoreNullReason = null;
 }
@@ -79,16 +81,22 @@ const ENV_LEGACY_SEED = "ZCODE_PROXY_LEGACY_SEED";
  * v0.1.5+ STALENESS DETECTION: cross-process writes (e.g. `auth login` from
  * start.bat while the proxy is running) won't invalidate this cache — they
  * happen in a separate process. To catch that case, loadCredential() and
- * exportAccounts() now stat() the file's mtimeMs and compare against the
- * cached value. If the file was modified externally, the cache is dropped
- * and the next read goes to disk. This is cheap (one stat per read) and
- * catches the common case of "user added a credential via CLI".
+ * exportAccounts() now stat() the file's mtimeMs + ctimeMs + size and compare
+ * against the cached fingerprint. If the file was modified externally, the
+ * cache is dropped and the next read goes to disk. This is cheap (one stat per
+ * read) and catches the common case of "user added a credential via CLI".
  */
 let cachedStore: StoreV2 | null | undefined = undefined;
 /** mtimeMs of the on-disk credentials.json at the time cachedStore was
  *  populated. Used to detect external writes (cross-process). -1 = unknown
  *  (force re-read on next access). 0 = file didn't exist. */
 let cachedStoreMtimeMs = -1;
+/** ctimeMs paired with cachedStoreMtimeMs. This catches same-size rewrites
+ *  where another process preserves mtime or the filesystem timestamp collides. */
+let cachedStoreCtimeMs = -1;
+/** File size paired with cachedStoreMtimeMs. Some filesystems have coarse
+ * timestamp precision, so size helps detect rapid cross-process rewrites. */
+let cachedStoreSize = -1;
 
 /**
  * Guard flag set by readStoreUncached() when credentials.json exists on disk
@@ -132,6 +140,13 @@ export interface StoredAccount {
   createdAt: number;
   /** The credential payload. */
   credential: Credential;
+}
+
+function cloneStoredAccount<T extends Omit<StoredAccount, "credential"> & { credential: Credential }>(account: T): T {
+  return {
+    ...account,
+    credential: { ...account.credential },
+  };
 }
 
 interface StoreV2 {
@@ -457,11 +472,133 @@ function defaultLabel(cred: Credential, createdAt: number): string {
   return `${cred.provider} · ${ts}`;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function normalizeNonEmptyString(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed ? trimmed : null;
+}
+
+function normalizeOptionalNonNegativeInteger(value: unknown): number | undefined {
+  if (typeof value === "number") {
+    if (!Number.isFinite(value) || value < 0) return undefined;
+    return Math.trunc(value);
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!/^\d+$/.test(trimmed)) return undefined;
+    const parsed = Number(trimmed);
+    if (!Number.isSafeInteger(parsed)) return undefined;
+    return parsed;
+  }
+  return undefined;
+}
+
+function normalizeProvider(value: unknown): Credential["provider"] | null {
+  return value === "zai" || value === "bigmodel" ? value : null;
+}
+
+function normalizePlan(value: unknown): Credential["plan"] | undefined {
+  const plan = normalizeNonEmptyString(value);
+  return plan === "coding-plan" || plan === "start-plan" ? plan : undefined;
+}
+
+function normalizeCredential(raw: unknown): Credential | null {
+  if (!isRecord(raw)) return null;
+  const apiKey = normalizeNonEmptyString(raw.apiKey);
+  const provider = normalizeProvider(raw.provider);
+  if (!apiKey || !provider) return null;
+
+  const cred: Credential = { apiKey, provider };
+  const secret = normalizeNonEmptyString(raw.secret);
+  if (secret) cred.secret = secret;
+  const plan = normalizePlan(raw.plan);
+  if (plan) cred.plan = plan;
+  const expiresAt = normalizeOptionalNonNegativeInteger(raw.expiresAt);
+  if (expiresAt !== undefined) cred.expiresAt = expiresAt;
+  const userId = normalizeNonEmptyString(raw.userId);
+  if (userId) cred.userId = userId;
+  const jwt = normalizeNonEmptyString(raw.jwt);
+  if (jwt) cred.jwt = jwt;
+  const proxy = normalizeNonEmptyString(raw.proxy);
+  if (proxy && validateProxyUrl(proxy).ok) cred.proxy = proxy;
+  const name = normalizeNonEmptyString(raw.name);
+  if (name) cred.name = name;
+  const email = normalizeNonEmptyString(raw.email);
+  if (email) cred.email = email;
+  if (raw.disabled === true) cred.disabled = true;
+  return cred;
+}
+
+function normalizeStoredAccount(
+  raw: unknown,
+  opts: { usedIds?: Set<string>; now?: number } = {},
+): StoredAccount | null {
+  if (!isRecord(raw)) return null;
+  const credential = normalizeCredential(raw.credential);
+  if (!credential) return null;
+
+  const usedIds = opts.usedIds;
+  let id = normalizeNonEmptyString(raw.id);
+  if (!id || usedIds?.has(id)) {
+    do {
+      id = genId();
+    } while (usedIds?.has(id));
+  }
+  usedIds?.add(id);
+
+  const createdAt = normalizeOptionalNonNegativeInteger(raw.createdAt) ?? opts.now ?? Date.now();
+  const label = normalizeNonEmptyString(raw.label) ?? defaultLabel(credential, createdAt);
+  return { id, label, createdAt, credential };
+}
+
+function normalizeStore(raw: unknown): StoreV2 | null {
+  if (!isRecord(raw) || raw.version !== 2 || !Array.isArray(raw.accounts)) {
+    return null;
+  }
+  const usedIds = new Set<string>();
+  const now = Date.now();
+  const accounts: StoredAccount[] = [];
+  for (const rawAccount of raw.accounts) {
+    const account = normalizeStoredAccount(rawAccount, { usedIds, now });
+    if (account) accounts.push(account);
+  }
+  const store: StoreV2 = {
+    version: 2,
+    activeId: normalizeNonEmptyString(raw.activeId),
+    accounts,
+  };
+  normalizeStoreActiveId(store);
+  return store;
+}
+
+function normalizeStoreInPlace(store: StoreV2): void {
+  const normalized = normalizeStore(store);
+  if (!normalized) {
+    store.version = 2;
+    store.activeId = null;
+    store.accounts = [];
+    return;
+  }
+  store.version = 2;
+  store.activeId = normalized.activeId;
+  store.accounts = normalized.accounts;
+}
+
+function normalizeStoreActiveId(store: StoreV2): void {
+  const active = store.activeId ? store.accounts.find(a => a.id === store.activeId) : undefined;
+  if (active && !active.credential.disabled) return;
+  store.activeId = store.accounts.find(a => !a.credential.disabled)?.id ?? null;
+}
+
 /**
  * Read the store, using the in-memory cache when fresh. Detects external
- * writes by stat-ing the file's mtimeMs — if the file changed on disk
- * (e.g. `auth login` from start.bat in another process added a credential),
- * the cache is dropped and the next read goes to disk.
+ * writes by stat-ing the file's mtimeMs, ctimeMs, and size — if the file
+ * changed on disk (e.g. `auth login` from start.bat in another process added a
+ * credential), the cache is dropped and the next read goes to disk.
  *
  * The stat() call is ~50µs on Linux/macOS and ~200µs on Windows — negligible
  * compared to the JSON parse + AES-256-GCM decrypt we'd otherwise do (~1ms).
@@ -474,13 +611,17 @@ async function readStore(): Promise<StoreV2 | null> {
     // have created credentials.json after the server started with no store.
     try {
       const st = statSync(STORE_FILE);
-      if (st.mtimeMs === cachedStoreMtimeMs) {
+      if (st.mtimeMs === cachedStoreMtimeMs &&
+          st.ctimeMs === cachedStoreCtimeMs &&
+          st.size === cachedStoreSize) {
         return cachedStore; // fresh
       }
       // mtime changed — external write. Drop cache + fall through.
-      console.log("[store] credentials.json mtime changed — external write detected, refreshing cache");
+      console.log("[store] credentials.json fingerprint changed — external write detected, refreshing cache");
       cachedStore = undefined;
       cachedStoreMtimeMs = -1;
+      cachedStoreCtimeMs = -1;
+      cachedStoreSize = -1;
     } catch (err) {
       const code = (err as NodeJS.ErrnoException)?.code;
       if (code === "ENOENT") {
@@ -490,11 +631,15 @@ async function readStore(): Promise<StoreV2 | null> {
           console.log("[store] credentials.json disappeared — external delete detected, refreshing cache");
           cachedStore = undefined;
           cachedStoreMtimeMs = -1;
+          cachedStoreCtimeMs = -1;
+          cachedStoreSize = -1;
         }
       } else {
         // EPERM/EBUSY/etc — be conservative, drop cache.
         cachedStore = undefined;
         cachedStoreMtimeMs = -1;
+        cachedStoreCtimeMs = -1;
+        cachedStoreSize = -1;
       }
     }
   }
@@ -507,11 +652,18 @@ async function readStore(): Promise<StoreV2 | null> {
     // but could not be read/parsed/decrypted". The latter must be retried
     // on the next access and must never be treated as a safe empty store.
     cachedStoreMtimeMs = lastReadStoreNullReason === "missing" ? 0 : -1;
+    cachedStoreCtimeMs = lastReadStoreNullReason === "missing" ? 0 : -1;
+    cachedStoreSize = lastReadStoreNullReason === "missing" ? 0 : -1;
   } else {
     try {
-      cachedStoreMtimeMs = statSync(STORE_FILE).mtimeMs;
+      const st = statSync(STORE_FILE);
+      cachedStoreMtimeMs = st.mtimeMs;
+      cachedStoreCtimeMs = st.ctimeMs;
+      cachedStoreSize = st.size;
     } catch {
       cachedStoreMtimeMs = -1; // unknown — force re-stat next time
+      cachedStoreCtimeMs = -1;
+      cachedStoreSize = -1;
     }
   }
   return cachedStore;
@@ -529,6 +681,8 @@ export function invalidateStoreCache(): void {
   refreshStorePathFromEnv();
   cachedStore = undefined;
   cachedStoreMtimeMs = -1;
+  cachedStoreCtimeMs = -1;
+  cachedStoreSize = -1;
 }
 
 /** Uncached inner implementation. Does the actual disk + decrypt work. */
@@ -666,9 +820,23 @@ async function readStoreUncached(): Promise<StoreV2 | null> {
       // Without this, a user who recovers via ZCODE_PROXY_LEGACY_SEED would
       // be able to READ but not WRITE (the guard from the initial failed read
       // would persist forever, locking them out of saving any changes).
+      let decryptedStore: unknown;
+      try {
+        decryptedStore = JSON.parse(json);
+      } catch (err) {
+        console.warn(`[store] Decrypted v2 credential store is not valid JSON: ${(err as Error).message}`);
+        backupCorruptedStore(raw);
+        undecryptableFilePresent = true;
+        return markStoreNull("invalid_json");
+      }
+      const store = normalizeStore(decryptedStore);
+      if (!store) {
+        console.warn("[store] Decrypted v2 credential store has an unsupported format.");
+        return markStoreNull("unsupported_format");
+      }
       undecryptableFilePresent = false;
       clearStoreNullReason();
-      return JSON.parse(json) as StoreV2;
+      return store;
     }
 
     // v1: encrypted blob is a single Credential — migrate to a single-account store.
@@ -676,7 +844,20 @@ async function readStoreUncached(): Promise<StoreV2 | null> {
     // this, every readStore() call generates a NEW random id for the migrated
     // account, so setAccountPlan(id) called after listAccounts(id) would never
     // find the account (different id on the second read).
-    const cred = JSON.parse(json) as Credential;
+    let decryptedCredential: unknown;
+    try {
+      decryptedCredential = JSON.parse(json);
+    } catch (err) {
+      console.warn(`[store] Decrypted v1 credential is not valid JSON: ${(err as Error).message}`);
+      backupCorruptedStore(raw);
+      undecryptableFilePresent = true;
+      return markStoreNull("invalid_json");
+    }
+    const cred = normalizeCredential(decryptedCredential);
+    if (!cred) {
+      console.warn("[store] Decrypted v1 credential has an unsupported format.");
+      return markStoreNull("unsupported_format");
+    }
     const account: StoredAccount = {
       id: genId(),
       label: defaultLabel(cred, Date.now()),
@@ -684,6 +865,7 @@ async function readStoreUncached(): Promise<StoreV2 | null> {
       credential: cred,
     };
     const migrated: StoreV2 = { version: 2, activeId: account.id, accounts: [account] };
+    normalizeStoreActiveId(migrated);
     try {
       await writeStore(migrated);
       console.log(`[store] Migrated v1 credential store to v2 format on disk.`);
@@ -705,9 +887,14 @@ async function readStoreUncached(): Promise<StoreV2 | null> {
   // (or use a temp HOME + ZCODE_PROXY_CREDENTIAL_SECRET).
   if (process.env.ZCODE_PROXY_ALLOW_PLAINTEXT_STORE === "1"
       && parsed && (parsed as any).version === 2 && Array.isArray((parsed as any).accounts)) {
+    const store = normalizeStore(parsed);
+    if (!store) {
+      console.warn("[store] Plaintext credential store has an unsupported format.");
+      return markStoreNull("unsupported_format");
+    }
     undecryptableFilePresent = false;
     clearStoreNullReason();
-    return parsed as StoreV2;
+    return store;
   }
 
   // Plaintext file present but env not set — refuse to load and warn.
@@ -905,6 +1092,7 @@ async function withStoreLock<T>(
  */
 async function withExistingStoreLock<T>(
   fn: (store: StoreV2) => Promise<T | false> | (T | false),
+  opts: { allowEmptyWrite?: boolean } = {},
 ): Promise<T | null> {
   return storeWriteMutex.run(async () => {
     const store = await readStore();
@@ -933,7 +1121,7 @@ async function withExistingStoreLock<T>(
     // happened). Returning false means "no change" (e.g. id not found),
     // so skip the write to avoid needless disk churn + AV interference.
     if (result === false) return result as T;
-    await writeStore(store);
+    await writeStore(store, { allowEmpty: opts.allowEmptyWrite });
     return result;
   });
 }
@@ -953,12 +1141,15 @@ async function withExistingStoreLock<T>(
  * drop one writer's changes).
  *
  * ENCRYPTION: Errors from encrypt() (randomBytes, createCipheriv) propagate
- * to the caller — these are unrecoverable and should surface, not be swallowed.
- * Disk-write errors are caught and logged so the proxy keeps serving from the
- * in-memory copy (matches the old behavior for read-only filesystems).
+ * to the caller -- these are unrecoverable and should surface, not be swallowed.
+ *
+ * PERSISTENCE: Disk-write errors also propagate. Treating a failed write as a
+ * successful save makes the dashboard/CLI report "saved", then the credential
+ * disappears after restart because it only lived in memory.
  */
-async function writeStore(store: StoreV2): Promise<void> {
+async function writeStore(store: StoreV2, opts: { allowEmpty?: boolean } = {}): Promise<void> {
   refreshStorePathFromEnv();
+  normalizeStoreInPlace(store);
   // Guard against the "silent overwrite" footgun: if a previous read found
   // credentials.json on disk but couldn't decrypt it (e.g. encryption key
   // changed after a binary update), the original file is preserved as a
@@ -993,7 +1184,7 @@ async function writeStore(store: StoreV2): Promise<void> {
   // This log is still useful: if the user sees "writeStore: writing EMPTY
   // store" in the logs without having explicitly removed their last account,
   // they know something is wrong and can investigate.
-  if (store.accounts.length === 0) {
+  if (store.accounts.length === 0 && !opts.allowEmpty) {
     console.warn(
       `[store] writeStore: writing EMPTY store to ${STORE_FILE}. ` +
       `If you didn't intend to delete all accounts, this is a bug — ` +
@@ -1023,22 +1214,38 @@ async function writeStore(store: StoreV2): Promise<void> {
   } catch (err) {
     // Read-only filesystem (e.g. Render container without a persistent disk
     // mounted at STORE_DIR), OR Windows EPERM/EBUSY that exhausted the
-    // safeRename retry budget. Don't crash the process — log and keep the
-    // in-memory copy so the current request can still complete. The next
-    // restart will start with whatever's on disk (possibly stale, but not
-    // corrupted — atomicWriteFile guarantees the file is either the OLD or
-    // the NEW content, never a partial mix).
-    console.warn(`[store] Could not persist credentials to ${STORE_FILE}: ${(err as Error).message}`);
+    // safeRename retry budget. Surface this to the caller instead of keeping
+    // a fake in-memory success that vanishes on restart.
+    //
+    // If `store` came from readStore() it may be the same object as
+    // cachedStore and may already have been mutated in-place by the caller.
+    // Drop the cache so the next read is forced back to the last durable
+    // on-disk state.
+    cachedStore = undefined;
+    cachedStoreMtimeMs = -1;
+    cachedStoreCtimeMs = -1;
+    cachedStoreSize = -1;
+    const message = (err as Error).message;
+    console.warn(`[store] Could not persist credentials to ${STORE_FILE}: ${message}`);
     console.warn(`[store] Set ZCODE_PROXY_STORE_DIR to a writable path (e.g. /data/.zcode-proxy on Render with a disk, or /tmp/.zcode-proxy for ephemeral storage).`);
+    throw new Error(
+      `Could not persist credentials to ${STORE_FILE}: ${message}. ` +
+      `Set ZCODE_PROXY_STORE_DIR to a writable path.`,
+    );
   }
   cachedStore = store; // keep cache in sync with what we intended to write
   clearStoreNullReason();
   // Capture the post-write mtime so subsequent reads see "fresh" without
   // having to re-stat (we know we just wrote it).
   try {
-    cachedStoreMtimeMs = statSync(STORE_FILE).mtimeMs;
+    const st = statSync(STORE_FILE);
+    cachedStoreMtimeMs = st.mtimeMs;
+    cachedStoreCtimeMs = st.ctimeMs;
+    cachedStoreSize = st.size;
   } catch {
     cachedStoreMtimeMs = -1;
+    cachedStoreCtimeMs = -1;
+    cachedStoreSize = -1;
   }
 }
 
@@ -1059,9 +1266,13 @@ async function writeStore(store: StoreV2): Promise<void> {
  *   "Add API Key" form).
  */
 export async function saveCredential(cred: Credential, opts?: { keepActive?: boolean }): Promise<void> {
+  const normalizedCred = normalizeCredential(cred);
+  if (!normalizedCred) {
+    throw new Error("Invalid credential: provider must be zai/bigmodel and apiKey must be a non-empty string.");
+  }
   await withStoreLock((store) => {
     const existingIdx = store.accounts.findIndex(
-      a => a.credential.provider === cred.provider && a.credential.apiKey === cred.apiKey,
+      a => a.credential.provider === normalizedCred.provider && a.credential.apiKey === normalizedCred.apiKey,
     );
 
     if (existingIdx >= 0) {
@@ -1069,15 +1280,15 @@ export async function saveCredential(cred: Credential, opts?: { keepActive?: boo
       const old = store.accounts[existingIdx];
       store.accounts[existingIdx] = {
         ...old,
-        credential: cred,
-        label: old.label.startsWith(`${cred.provider} · `) ? defaultLabel(cred, old.createdAt) : old.label,
+        credential: normalizedCred,
+        label: old.label.startsWith(`${normalizedCred.provider} · `) ? defaultLabel(normalizedCred, old.createdAt) : old.label,
       };
     } else {
       const account: StoredAccount = {
         id: genId(),
-        label: defaultLabel(cred, Date.now()),
+        label: defaultLabel(normalizedCred, Date.now()),
         createdAt: Date.now(),
-        credential: cred,
+        credential: normalizedCred,
       };
       store.accounts.push(account);
       // BUGFIX: previously always `store.activeId = account.id`, which silently
@@ -1098,7 +1309,8 @@ export async function loadCredential(): Promise<Credential | null> {
   const store = await readStore();
   if (!store || !store.activeId) return null;
   const account = store.accounts.find(a => a.id === store.activeId);
-  return account?.credential ?? null;
+  if (!account || account.credential.disabled) return null;
+  return { ...account.credential };
 }
 
 /**
@@ -1127,6 +1339,8 @@ export async function clearCredentialAsync(): Promise<void> {
       // File already gone — just reset state.
       cachedStore = null;
       cachedStoreMtimeMs = 0;
+      cachedStoreCtimeMs = 0;
+      cachedStoreSize = 0;
       cachedKey = null;
       undecryptableFilePresent = false;
       lastReadStoreNullReason = "missing";
@@ -1161,6 +1375,8 @@ export async function clearCredentialAsync(): Promise<void> {
     if (lastErr) throw lastErr;
     cachedStore = null;       // file gone, cache reflects that
     cachedStoreMtimeMs = 0;   // confirmed missing marker
+    cachedStoreCtimeMs = 0;
+    cachedStoreSize = 0;
     cachedKey = null;
     undecryptableFilePresent = false;
     lastReadStoreNullReason = "missing";
@@ -1227,6 +1443,8 @@ export function clearCredential(): void {
   }
   cachedStore = null; // invalidate store cache
   cachedStoreMtimeMs = 0; // confirmed missing marker
+  cachedStoreCtimeMs = 0;
+  cachedStoreSize = 0;
   cachedKey = null;   // invalidate key cache (will be repopulated with the same fixed key)
   // Clear the guard flag — once the user has explicitly cleared credentials,
   // they're free to save new ones without the "refusing to overwrite" error.
@@ -1250,6 +1468,24 @@ export function maskApiKey(apiKey: string): string {
   return apiKey.slice(0, 8) + "..." + apiKey.slice(-4);
 }
 
+/**
+ * Stable non-secret key used to join request stats back to stored accounts.
+ *
+ * `maskApiKey()` is only a display label and can collide when two API keys
+ * share the same first 8 / last 4 characters. A short SHA-256 digest of
+ * provider + apiKey avoids merging usage stats for distinct accounts while
+ * still keeping the plaintext API key out of dashboard responses.
+ */
+export function credentialStatsKey(cred: Pick<Credential, "provider" | "apiKey">): string {
+  if (!cred.apiKey) return "";
+  return `sha256:${createHash("sha256")
+    .update(cred.provider)
+    .update("\0")
+    .update(cred.apiKey)
+    .digest("hex")
+    .slice(0, 16)}`;
+}
+
 /** List all stored accounts (without exposing secret material — apiKey is masked).
  *
  * Accounts are returned sorted by `createdAt` ascending (oldest first),
@@ -1260,6 +1496,7 @@ export async function listAccounts(): Promise<{
   accounts: Array<Omit<StoredAccount, "credential"> & {
     provider: string;
     apiKeyMask: string;
+    credentialKey: string;
     hasSecret: boolean;
     userId?: string;
     expiresAt?: number;
@@ -1292,6 +1529,7 @@ export async function listAccounts(): Promise<{
       createdAt: a.createdAt,
       provider: a.credential.provider,
       apiKeyMask: maskApiKey(a.credential.apiKey),
+      credentialKey: credentialStatsKey(a.credential),
       hasSecret: !!a.credential.secret,
       userId: a.credential.userId,
       expiresAt: a.credential.expiresAt,
@@ -1374,7 +1612,7 @@ export async function removeAccount(id: string): Promise<boolean | null> {
       store.activeId = store.accounts[0]?.id ?? null;
     }
     return true;
-  });
+  }, { allowEmptyWrite: true });
 }
 
 /**
@@ -1486,6 +1724,9 @@ export function validateProxyUrl(url: string): { ok: true } | { ok: false; messa
   if (!host) {
     return { ok: false, message: "Proxy URL is missing a hostname" };
   }
+  if (parsed.port === "0") {
+    return { ok: false, message: "Proxy URL port must be between 1 and 65535" };
+  }
   // Block only cloud-metadata / unspecified addresses (see SSRF scope above).
   const ipCheck = isMetadataOrUnspecifiedIp(host);
   if (ipCheck) {
@@ -1508,9 +1749,12 @@ export function validateProxyUrl(url: string): { ok: true } | { ok: false; messa
  * Loopback, private, and ULA ranges are NOT blocked (legitimate local proxy use).
  */
 function isMetadataOrUnspecifiedIp(host: string): string | null {
+  const ipHost = host.startsWith("[") && host.endsWith("]")
+    ? host.slice(1, -1)
+    : host;
   // IPv4 dotted-quad check.
-  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) {
-    const parts = host.split(".").map(Number);
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(ipHost)) {
+    const parts = ipHost.split(".").map(Number);
     if (parts.some(p => p > 255)) return null; // not actually a valid IP
     const [a, b] = parts;
     if (a === 0) return "0.0.0.0/8 unspecified address";
@@ -1518,7 +1762,7 @@ function isMetadataOrUnspecifiedIp(host: string): string | null {
     return null;
   }
   // IPv6 literals.
-  const lower = host.toLowerCase();
+  const lower = ipHost.toLowerCase();
   if (lower === "::") return ":: unspecified";
   // fe80::/10 link-local (IPv6 equivalent of 169.254/16) — also block.
   if (lower.startsWith("fe8") || lower.startsWith("fe9") || lower.startsWith("fea") || lower.startsWith("feb")) {
@@ -1577,9 +1821,8 @@ export async function setAccountEmail(id: string, email: string): Promise<boolea
  *   - Excluded from `switchToNextCredential` (won't be picked as fallback)
  *   - Refused by `switchAccount` (can't be manually activated)
  *
- * If the currently-active account is disabled, it remains active (so in-flight
- * requests continue) but the next auto-switch will skip it. The dashboard
- * should warn the user when disabling the active account.
+ * If the currently-active account is disabled, activeId falls back to the
+ * first remaining enabled account; if none are enabled, activeId is cleared.
  */
 export async function setAccountDisabled(id: string, disabled: boolean): Promise<boolean | null> {
   return withExistingStoreLock((store) => {
@@ -1589,6 +1832,9 @@ export async function setAccountDisabled(id: string, disabled: boolean): Promise
       account.credential.disabled = true;
     } else {
       delete account.credential.disabled;
+    }
+    if (disabled && store.activeId === id) {
+      store.activeId = store.accounts.find(a => a.id !== id && !a.credential.disabled)?.id ?? null;
     }
     return true;
   });
@@ -1629,7 +1875,7 @@ export async function exportSingleAccount(id: string): Promise<{
 export async function exportAccounts(): Promise<Array<Omit<StoredAccount, "credential"> & { credential: Credential }>> {
   const store = await readStore();
   if (!store) return [];
-  return store.accounts;
+  return store.accounts.map(cloneStoredAccount);
 }
 
 /**
@@ -1663,15 +1909,19 @@ export async function importAccounts(
   return withStoreLock((store) => {
     let added = 0;
     let updated = 0;
-    for (const acc of incoming) {
-      const idx = store.accounts.findIndex(a => a.id === acc.id);
+    const records = Array.isArray(incoming) ? incoming : [];
+    for (const acc of records) {
+      const normalized = normalizeStoredAccount(acc);
+      if (!normalized) continue;
+      const cloned = cloneStoredAccount(normalized);
+      const idx = store.accounts.findIndex(a => a.id === normalized.id);
       if (idx >= 0) {
-        store.accounts[idx] = acc;
+        store.accounts[idx] = cloned;
         updated++;
       } else {
-        store.accounts.push(acc);
+        store.accounts.push(cloned);
         added++;
-        if (!store.activeId) store.activeId = acc.id;
+        if (!store.activeId) store.activeId = cloned.id;
       }
     }
     return { added, updated };

@@ -128,6 +128,33 @@ describe("anthropicSseToBatchMessage", () => {
     expect(result.message.id).toBe("msg_c");
   });
 
+  it("processes a final SSE event even when the stream closes without a trailing delimiter", async () => {
+    const sse = [
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_tail","model":"glm-4.6"}}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"tail ok"}}',
+    ].join("");
+
+    const result = await anthropicSseToBatchMessage(makeStream([sse]), "fallback");
+
+    if ("error" in result) throw new Error("unexpected error");
+    expect(result.message.id).toBe("msg_tail");
+    expect(result.message.content).toEqual([{ type: "text", text: "tail ok" }]);
+  });
+
+  it("handles CRLF SSE line endings", async () => {
+    const sse = [
+      'event: message_start\r\ndata: {"type":"message_start","message":{"id":"msg_crlf","model":"glm-4.6"}}\r\n\r\n',
+      'event: content_block_delta\r\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"CRLF ok"}}\r\n\r\n',
+      'event: message_stop\r\ndata: {"type":"message_stop"}\r\n\r\n',
+    ].join("");
+
+    const result = await anthropicSseToBatchMessage(makeStream([sse]), "fallback");
+
+    if ("error" in result) throw new Error("unexpected error");
+    expect(result.message.id).toBe("msg_crlf");
+    expect(result.message.content[0]).toEqual({ type: "text", text: "CRLF ok" });
+  });
+
   it("handles ping events (keepalive)", async () => {
     const sse = [
       'event: ping\ndata: {"type":"ping"}\n\n',
@@ -141,6 +168,41 @@ describe("anthropicSseToBatchMessage", () => {
     expect(result.message.content[0]).toEqual({ type: "text", text: "P" });
   });
 
+  it("handles many complete events in one merged chunk", async () => {
+    const deltas = Array.from({ length: 1000 }, (_, i) =>
+      `event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"${i % 10}"}}\n\n`,
+    ).join("");
+    const sse = [
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_many","model":"glm-4.6"}}\n\n',
+      deltas,
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ].join("");
+
+    const result = await anthropicSseToBatchMessage(makeStream([sse]), "fallback");
+
+    if ("error" in result) throw new Error("unexpected error");
+    expect(result.message.id).toBe("msg_many");
+    expect(result.message.content[0]).toEqual({
+      type: "text",
+      text: Array.from({ length: 1000 }, (_, i) => String(i % 10)).join(""),
+    });
+  });
+
+  it("joins multi-line data fields in one SSE event", async () => {
+    const sse = [
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_multiline","model":"glm-4.6"}}\n\n',
+      'event: content_block_delta\n',
+      'data: {"type":"content_block_delta","index":0,\n',
+      'data: "delta":{"type":"text_delta","text":"multi-line ok"}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ].join("");
+
+    const result = await anthropicSseToBatchMessage(makeStream([sse]), "fallback");
+
+    if ("error" in result) throw new Error("unexpected error");
+    expect(result.message.content[0]).toEqual({ type: "text", text: "multi-line ok" });
+  });
+
   it("returns error result on error event", async () => {
     const sse = [
       'event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"Server is overloaded"}}\n\n',
@@ -149,6 +211,28 @@ describe("anthropicSseToBatchMessage", () => {
     expect("error" in result).toBe(true);
     if (!("error" in result)) return;
     expect(result.error).toContain("Server is overloaded");
+  });
+
+  it("cancels the upstream stream when returning an SSE error event", async () => {
+    const encoder = new TextEncoder();
+    let upstreamCancelled = false;
+    const input = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(
+          'event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"Server is overloaded"}}\n\n',
+        ));
+      },
+      cancel() {
+        upstreamCancelled = true;
+      },
+    });
+
+    const result = await anthropicSseToBatchMessage(input, "fallback");
+
+    expect("error" in result).toBe(true);
+    if (!("error" in result)) return;
+    expect(result.error).toContain("Server is overloaded");
+    expect(upstreamCancelled).toBe(true);
   });
 
   it("ignores malformed JSON data lines", async () => {
@@ -314,5 +398,63 @@ describe("anthropicSseToBatchMessage", () => {
     // outputTokens comes from message_delta.usage.output_tokens (50) —
     // NOT inflated by the 2 thinking_delta chunks
     expect(result.outputTokens).toBe(50);
+  });
+
+  it("returns an error when the raw SSE stream exceeds the configured byte limit", async () => {
+    const sse = [
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_big","model":"glm-4.6"}}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"',
+      "x".repeat(2048),
+      '"}}\n\n',
+    ].join("");
+    const result = await anthropicSseToBatchMessage(makeStream([sse]), "fallback", { maxBytes: 512 });
+    expect("error" in result).toBe(true);
+    if (!("error" in result)) return;
+    expect(result.error).toContain("exceeded 512 byte limit");
+  });
+
+  it("returns an error when one unfinished SSE event grows past the buffer limit", async () => {
+    const result = await anthropicSseToBatchMessage(
+      makeStream(["data: " + "x".repeat(2048)]),
+      "fallback",
+      { maxBytes: 4096, maxBufferedEventBytes: 512 },
+    );
+    expect("error" in result).toBe(true);
+    if (!("error" in result)) return;
+    expect(result.error).toContain("buffered event exceeded 512 byte limit");
+  });
+
+  it("counts unfinished SSE event limits by UTF-8 bytes", async () => {
+    const result = await anthropicSseToBatchMessage(
+      makeStream(["data: " + "汉".repeat(171)]),
+      "fallback",
+      { maxBytes: 4096, maxBufferedEventBytes: 512 },
+    );
+    expect("error" in result).toBe(true);
+    if (!("error" in result)) return;
+    expect(result.error).toContain("buffered event exceeded 512 byte limit");
+  });
+
+  it("rejects invalid content block indexes before expanding the content array", async () => {
+    const sse = [
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":1000000,"delta":{"type":"text_delta","text":"boom"}}\n\n',
+    ].join("");
+    const result = await anthropicSseToBatchMessage(makeStream([sse]), "fallback", { maxContentBlockIndex: 16 });
+    expect("error" in result).toBe(true);
+    if (!("error" in result)) return;
+    expect(result.error).toContain("Invalid SSE content block index");
+  });
+
+  it("compacts sparse content block placeholders before returning the batch message", async () => {
+    const sse = [
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_sparse","model":"glm-4.6"}}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"sparse ok"}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ].join("");
+
+    const result = await anthropicSseToBatchMessage(makeStream([sse]), "fallback", { maxContentBlockIndex: 8 });
+
+    if ("error" in result) throw new Error("unexpected error");
+    expect(result.message.content).toEqual([{ type: "text", text: "sparse ok" }]);
   });
 });

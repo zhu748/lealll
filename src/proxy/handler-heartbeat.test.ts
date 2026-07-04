@@ -1,5 +1,5 @@
 /**
- * Tests for the SSE heartbeat transform.
+ * Tests for the SSE heartbeat stream wrapper.
  *
  * Verifies:
  *   1. Heartbeat comment lines are flushed while upstream is silent.
@@ -15,7 +15,7 @@
 import { test, expect } from "bun:test";
 import { _testing } from "./handler.js";
 
-const { createSseHeartbeatTransform } = _testing;
+const { withSseHeartbeat } = _testing;
 const COMMENT_LINE = ": keepalive\n\n";
 
 /** Helper: collect all chunks from a ReadableStream into a Uint8Array. */
@@ -56,8 +56,7 @@ test("heartbeat flushes comment lines while upstream is silent", async () => {
     },
   });
 
-  const heartbeat = createSseHeartbeatTransform(20);
-  const out = await collect(upstream.pipeThrough(heartbeat));
+  const out = await collect(withSseHeartbeat(upstream, 20));
   const text = decode(out);
 
   // Must contain the real SSE event.
@@ -84,8 +83,7 @@ test("heartbeat stops immediately after first real chunk", async () => {
     },
   });
 
-  const heartbeat = createSseHeartbeatTransform(20);
-  const out = await collect(upstream.pipeThrough(heartbeat));
+  const out = await collect(withSseHeartbeat(upstream, 20));
   const text = decode(out);
 
   // Both real chunks present, in order.
@@ -107,8 +105,7 @@ test("heartbeat with intervalMs=0 is pure passthrough", async () => {
     },
   });
 
-  const heartbeat = createSseHeartbeatTransform(0);
-  const out = await collect(upstream.pipeThrough(heartbeat));
+  const out = await collect(withSseHeartbeat(upstream, 0));
   const text = decode(out);
 
   expect(text).toBe("data: hello\n\n");
@@ -128,8 +125,7 @@ test("heartbeat comment line format is exactly ': keepalive\\n\\n'", async () =>
     },
   });
 
-  const heartbeat = createSseHeartbeatTransform(10);
-  const out = await collect(upstream.pipeThrough(heartbeat));
+  const out = await collect(withSseHeartbeat(upstream, 10));
   const text = decode(out);
 
   // Verify the exact comment line format appears at least once.
@@ -150,8 +146,7 @@ test("heartbeat cleans up timer on stream end (no leak)", async () => {
     },
   });
 
-  const heartbeat = createSseHeartbeatTransform(10);
-  const out = await collect(upstream.pipeThrough(heartbeat));
+  const out = await collect(withSseHeartbeat(upstream, 10));
   expect(decode(out)).toBe("data: done\n\n");
   // If we reach this point without hanging, the timer was cleaned up.
 });
@@ -167,10 +162,9 @@ test("heartbeat handles upstream error gracefully", async () => {
     },
   });
 
-  const heartbeat = createSseHeartbeatTransform(10);
   let threw = false;
   try {
-    await collect(upstream.pipeThrough(heartbeat));
+    await collect(withSseHeartbeat(upstream, 10));
   } catch (e) {
     threw = true;
     expect((e as Error).message).toContain("upstream blew up");
@@ -180,4 +174,38 @@ test("heartbeat handles upstream error gracefully", async () => {
   // Even if heartbeats were emitted before the error, collect() threw
   // before returning — the key assertion is that the error propagated
   // and didn't hang.
+});
+
+test("heartbeat clears timer after downstream cancellation before first upstream chunk", async () => {
+  let upstreamCancelled = false;
+  let upstreamTimer: ReturnType<typeof setTimeout> | null = null;
+  const upstream = new ReadableStream<Uint8Array>({
+    start() {
+      // Stay silent forever; this simulates upstream waiting on first token.
+      upstreamTimer = setTimeout(() => {}, 1000);
+    },
+    cancel() {
+      upstreamCancelled = true;
+      if (upstreamTimer) {
+        clearTimeout(upstreamTimer);
+        upstreamTimer = null;
+      }
+    },
+  });
+
+  try {
+    const reader = withSseHeartbeat(upstream, 10).getReader();
+    const first = await Promise.race([
+      reader.read(),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("heartbeat read timed out")), 200)),
+    ]);
+    expect(decode(first.value ?? new Uint8Array())).toBe(COMMENT_LINE);
+    await Promise.race([
+      reader.cancel("client disconnected"),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("cancel timed out")), 200)),
+    ]);
+    expect(upstreamCancelled).toBe(true);
+  } finally {
+    if (upstreamTimer) clearTimeout(upstreamTimer);
+  }
 });

@@ -15,6 +15,8 @@
 import { writeFile, rename, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
+let atomicTmpCounter = 0;
+
 /**
  * Windows-safe rename with retry. On POSIX, `rename` is atomic and
  * always succeeds (modulo permissions). On Windows, `rename` over an
@@ -69,7 +71,7 @@ export async function atomicWriteFile(
   content: string | Uint8Array,
   encoding: BufferEncoding = "utf-8",
 ): Promise<void> {
-  const tmp = join(dirname(path), `.${process.pid}.tmp-${Date.now()}`);
+  const tmp = join(dirname(path), `.${process.pid}.tmp-${Date.now()}-${++atomicTmpCounter}`);
   await writeFile(tmp, content, encoding);
   try {
     await safeRename(tmp, path);

@@ -71,6 +71,9 @@ const IDLE_TIMEOUT_MS = 60_000;
 /** Per-connection timeout for the SOCKS handshake (ms). */
 const HANDSHAKE_TIMEOUT_MS = 15_000;
 
+/** Max bytes accepted from the SOCKS proxy while the handshake is still pending. */
+const MAX_HANDSHAKE_BUFFER_BYTES = 64 * 1024;
+
 /** Set to true via ZCODE_PROXY_SOCKS_DEBUG=1 to enable per-connection logging. */
 const DEBUG = process.env.ZCODE_PROXY_SOCKS_DEBUG === "1";
 
@@ -131,6 +134,12 @@ class SocketReader {
   private closed = false;
 
   feed(data: Bytes): void {
+    if (this.err || this.closed) return;
+    const nextLen = this.buffer.length + data.length;
+    if (nextLen > MAX_HANDSHAKE_BUFFER_BYTES) {
+      this.feedError(new Error(`SOCKS handshake buffer exceeded ${MAX_HANDSHAKE_BUFFER_BYTES} bytes`));
+      return;
+    }
     this.buffer = concatBytes(this.buffer, data);
     this.poke();
   }
@@ -237,10 +246,7 @@ export function getSocksBridge(socksUrl: string): SocksBridgeHandle {
       existing.idleTimer = null;
     }
     existing.refCount++;
-    return {
-      httpProxyUrl: `http://127.0.0.1:${existing.port}`,
-      release: () => releaseBridge(key),
-    };
+    return makeBridgeHandle(key, existing.port);
   }
 
   // Parse the SOCKS URL once and stash it in the socket handler closures.
@@ -249,6 +255,7 @@ export function getSocksBridge(socksUrl: string): SocksBridgeHandle {
   const username = parsed.username ? decodeURIComponent(parsed.username) : "";
   const password = parsed.password ? decodeURIComponent(parsed.password) : "";
   const scheme = parsed.protocol.replace(":", "").toLowerCase();
+  const socksPort = parsedPort(parsed);
 
   // Bun.listen's socket handler is shared across all connections. Per-connection
   // state lives on `socket.data` (typed via the generic param).
@@ -257,7 +264,10 @@ export function getSocksBridge(socksUrl: string): SocksBridgeHandle {
     port: 0,
     socket: {
       open(socket) {
-        const state: ConnState = {
+        let state!: ConnState;
+        const handshakeTimer = setTimeout(() => onHandshakeTimeout(state), HANDSHAKE_TIMEOUT_MS);
+        handshakeTimer.unref?.();
+        state = {
           clientSocket: socket,
           socksSocket: null,
           socksReader: new SocketReader(),
@@ -266,14 +276,14 @@ export function getSocksBridge(socksUrl: string): SocksBridgeHandle {
           targetHost: "",
           targetPort: 0,
           socksUrlString: key,
-          handshakeTimer: setTimeout(() => onHandshakeTimeout(state), HANDSHAKE_TIMEOUT_MS),
+          handshakeTimer,
         };
         socket.data = state;
       },
       data(socket, data) {
         const state = socket.data;
         if (!state) return;
-        onClientData(state, data, scheme, parsed.hostname, parsedPort(parsed), username, password);
+        onClientData(state, data, scheme, parsed.hostname, socksPort, username, password);
       },
       close(socket) {
         const state = socket.data;
@@ -299,9 +309,18 @@ export function getSocksBridge(socksUrl: string): SocksBridgeHandle {
   bridges.set(key, entry);
   dbg(`bridge created for ${key} on 127.0.0.1:${server.port}`);
 
+  return makeBridgeHandle(key, server.port);
+}
+
+function makeBridgeHandle(key: string, port: number): SocksBridgeHandle {
+  let released = false;
   return {
-    httpProxyUrl: `http://127.0.0.1:${server.port}`,
-    release: () => releaseBridge(key),
+    httpProxyUrl: `http://127.0.0.1:${port}`,
+    release: () => {
+      if (released) return;
+      released = true;
+      releaseBridge(key);
+    },
   };
 }
 
@@ -315,12 +334,29 @@ function normalizeSocksUrl(url: string): string {
 
 /** Parse the port from a URL, defaulting to 1080 (typical SOCKS port). */
 function parsedPort(u: URL): number {
-  return u.port ? parseInt(u.port, 10) : 1080;
+  if (!u.port) return 1080;
+  const port = parseTargetPort(u.port);
+  if (port === null) throw new Error(`Invalid SOCKS proxy port: ${u.port}`);
+  return port;
+}
+
+function parseTargetPort(raw: string): number | null {
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) return null;
+  const port = Number(trimmed);
+  return Number.isSafeInteger(port) && port >= 1 && port <= 65535 ? port : null;
+}
+
+function parseIpv4Bytes(host: string): number[] | null {
+  if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) return null;
+  const parts = host.split(".").map((p) => Number(p));
+  return parts.every(p => Number.isInteger(p) && p >= 0 && p <= 255) ? parts : null;
 }
 
 function releaseBridge(key: string): void {
   const entry = bridges.get(key);
   if (!entry) return;
+  if (entry.refCount <= 0) return;
   entry.refCount--;
   dbg(`release: ${key} refCount=${entry.refCount}`);
   if (entry.refCount <= 0) {
@@ -333,6 +369,7 @@ function releaseBridge(key: string): void {
         dbg(`bridge idle-evicted for ${key}`);
       }
     }, IDLE_TIMEOUT_MS);
+    entry.idleTimer.unref?.();
   }
 }
 
@@ -343,6 +380,10 @@ export function _shutdownAllBridgesForTesting(): void {
     try { entry.server.stop(true); } catch { /* ignore */ }
   }
   bridges.clear();
+}
+
+export function _bridgeRefCountForTesting(socksUrl: string): number | undefined {
+  return bridges.get(normalizeSocksUrl(socksUrl))?.refCount;
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -413,12 +454,18 @@ function onClientData(
       if (close < 0) { failConnection(state, `bad IPv6 target: ${target}`); return; }
       host = target.slice(1, close);
       const rest = target.slice(close + 1);
-      if (rest.startsWith(":")) port = parseInt(rest.slice(1), 10) || 443;
+      if (rest.startsWith(":")) {
+        const parsed = parseTargetPort(rest.slice(1));
+        if (parsed === null) { failConnection(state, `bad target port: ${target}`); return; }
+        port = parsed;
+      }
     } else {
       const colon = target.lastIndexOf(":");
       if (colon < 0) { failConnection(state, `bad target: ${target}`); return; }
       host = target.slice(0, colon);
-      port = parseInt(target.slice(colon + 1), 10) || 443;
+      const parsed = parseTargetPort(target.slice(colon + 1));
+      if (parsed === null) { failConnection(state, `bad target port: ${target}`); return; }
+      port = parsed;
     }
     state.targetHost = host;
     state.targetPort = port;
@@ -470,6 +517,10 @@ function openSocksTunnel(
           s.socksReader.feed(data);
         },
         open(socket) {
+          if (state.phase === "closing" || !state.clientSocket) {
+            try { socket.end(); } catch { /* ignore */ }
+            return;
+          }
           // Start the handshake. We attach `state` to socket.data so the
           // data handler can find it.
           socket.data = state;
@@ -609,13 +660,12 @@ function buildSocks5ConnectRequest(host: string, port: number, useRemoteDns: boo
   const portBytes = [(port >> 8) & 0xff, port & 0xff];
   // If useRemoteDns (socks5h) OR host is a domain (not an IP literal), use ATYP=0x03 (domain).
   // Otherwise, send the resolved IP literal via ATYP=0x01 (IPv4) or 0x04 (IPv6).
-  const isIpv4 = /^\d{1,3}(\.\d{1,3}){3}$/.test(host);
+  const ipv4Bytes = parseIpv4Bytes(host);
   const isIpv6 = host.includes(":");
-  if (!useRemoteDns && isIpv4) {
-    const parts = host.split(".").map((p) => parseInt(p, 10));
+  if (!useRemoteDns && ipv4Bytes) {
     const out = new Uint8Array(4 + 4 + 2);
     out[0] = 0x05; out[1] = 0x01; out[2] = 0x00; out[3] = 0x01;
-    out[4] = parts[0]; out[5] = parts[1]; out[6] = parts[2]; out[7] = parts[3];
+    out[4] = ipv4Bytes[0]; out[5] = ipv4Bytes[1]; out[6] = ipv4Bytes[2]; out[7] = ipv4Bytes[3];
     out[8] = portBytes[0]; out[9] = portBytes[1];
     return out;
   }
@@ -676,11 +726,10 @@ async function socks4Handshake(
     // SOCKS4a: send a fake IP 0.0.0.1 to signal "use hostname".
     ipBytes = [0, 0, 0, 1];
   } else {
-    const isIpv4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.test(state.targetHost);
-    if (!isIpv4) {
+    const parts = parseIpv4Bytes(state.targetHost);
+    if (!parts) {
       throw new Error(`SOCKS4 (not 4a) requires IPv4 target, got: ${state.targetHost}`);
     }
-    const parts = state.targetHost.split(".").map((p) => parseInt(p, 10));
     ipBytes = parts;
   }
 

@@ -33,6 +33,10 @@ beforeEach(() => {
   delete process.env.ZCODE_RETRY_MAX_DELAY_MS;
   delete process.env.ZCODE_RETRY_BACKOFF_FACTOR;
   delete process.env.ZCODE_RETRY_STATUSES;
+  delete process.env.ZCODE_UPSTREAM_TIMEOUT_MS;
+  delete process.env.ZCODE_PROXY_SSE_HEARTBEAT_MS;
+  delete process.env.ZCODE_PROXY_MAX_REQUEST_BODY_BYTES;
+  delete process.env.ZCODE_PROXY_CORS_ALLOWLIST;
 });
 
 afterEach(() => {
@@ -84,6 +88,38 @@ auth:
     expect(cfg.providers.bigmodel.openaiBase).toBe("https://open.bigmodel.cn/api/coding/paas/v4");
   });
 
+  it("returns an isolated default retryableStatuses array", () => {
+    const path = writeYaml(`
+auth:
+  mode: apikey
+  apiKey: "abc"
+`);
+    const first = loadConfig(path);
+    first.retry.retryableStatuses.push(599);
+
+    const second = loadConfig(path);
+    expect(second.retry.retryableStatuses).toEqual([529, 429]);
+  });
+
+  it("normalizes models to trimmed strings and isolates the returned array", () => {
+    const path = writeYaml(`
+auth:
+  mode: apikey
+  apiKey: "abc"
+defaultModel: glm-4.6
+models:
+  - " glm-5.2 "
+  - 123
+  - ""
+`);
+    const first = loadConfig(path);
+    expect(first.models).toEqual(["glm-5.2", "glm-4.6"]);
+    first.models.push("mutated-model");
+
+    const second = loadConfig(path);
+    expect(second.models).toEqual(["glm-5.2", "glm-4.6"]);
+  });
+
   it("env vars override YAML values", () => {
     const path = writeYaml(`
 server:
@@ -116,6 +152,17 @@ auth:
     expect(() => loadConfig(path)).toThrow(/out of range/);
   });
 
+  it("throws when port has trailing junk", () => {
+    const path = writeYaml(`
+server:
+  port: "8080abc"
+auth:
+  mode: apikey
+  apiKey: "abc"
+`);
+    expect(() => loadConfig(path)).toThrow(/server\.port must be a valid number/);
+  });
+
   it("throws on invalid provider", () => {
     const path = writeYaml(`
 auth:
@@ -124,6 +171,16 @@ auth:
 provider: openai
 `);
     expect(() => loadConfig(path)).toThrow(/Invalid provider/);
+  });
+
+  it("throws on invalid plan instead of silently falling back", () => {
+    const path = writeYaml(`
+auth:
+  mode: apikey
+  apiKey: "abc"
+plan: enterprise-plan
+`);
+    expect(() => loadConfig(path)).toThrow(/Invalid plan/);
   });
 
   it("throws when auth.apiKey missing in apikey mode", () => {
@@ -273,6 +330,65 @@ retry:
     expect(cfg.retry.retryableStatuses).toEqual([529, 503]);
   });
 
+  it("retry: strictly normalizes retryableStatuses from YAML", () => {
+    const path = writeYaml(`
+auth:
+  mode: apikey
+  apiKey: "abc"
+retry:
+  retryableStatuses:
+    - 529
+    - "429"
+    - "503abc"
+    - 99
+    - 600
+    - 429
+`);
+    const cfg = loadConfig(path);
+    expect(cfg.retry.retryableStatuses).toEqual([529, 429]);
+  });
+
+  it("retry: strictly normalizes retryableStatuses from env and falls back when none are valid", () => {
+    const path = writeYaml(`
+auth:
+  mode: apikey
+  apiKey: "abc"
+retry:
+  retryableStatuses:
+    - 503
+`);
+    process.env.ZCODE_RETRY_STATUSES = "529, 429, 503abc, 99, 600, 529";
+    let cfg = loadConfig(path);
+    expect(cfg.retry.retryableStatuses).toEqual([529, 429]);
+
+    process.env.ZCODE_RETRY_STATUSES = "bad, 99, 600";
+    cfg = loadConfig(path);
+    expect(cfg.retry.retryableStatuses).toEqual([529, 429]);
+  });
+
+  it("retry: rejects numeric env values with trailing junk instead of prefix-parsing them", () => {
+    const path = writeYaml(`
+auth:
+  mode: apikey
+  apiKey: "abc"
+retry:
+  maxRetries: 4
+  initialDelayMs: 2000
+  maxDelayMs: 9000
+  backoffFactor: 3
+`);
+    process.env.ZCODE_RETRY_MAX = "7abc";
+    process.env.ZCODE_RETRY_INITIAL_DELAY_MS = "2500ms";
+    process.env.ZCODE_RETRY_MAX_DELAY_MS = "12000x";
+    process.env.ZCODE_RETRY_BACKOFF_FACTOR = "2x";
+
+    const cfg = loadConfig(path);
+    expect(cfg.retry.maxRetries).toBe(3);
+    expect(cfg.retry.initialDelayMs).toBe(1000);
+    expect(cfg.retry.maxDelayMs).toBe(8000);
+    expect(cfg.retry.backoffFactor).toBe(2);
+  });
+
   it("retry: maxRetries=0 disables retries", () => {
     const path = writeYaml(`
 auth:
@@ -404,5 +520,154 @@ auth:
 `);
     const cfg = loadConfig(path);
     expect(cfg.server.sseHeartbeatMs).toBe(0);
+  });
+
+  it("server.upstreamTimeoutMs: defaults to 0 so stream/batch handler defaults apply", () => {
+    const path = writeYaml(`
+auth:
+  mode: apikey
+  apiKey: "abc"
+`);
+    const cfg = loadConfig(path);
+    expect(cfg.server.upstreamTimeoutMs).toBe(0);
+  });
+
+  it("server.upstreamTimeoutMs: YAML override works", () => {
+    const path = writeYaml(`
+server:
+  upstreamTimeoutMs: 900000
+auth:
+  mode: apikey
+  apiKey: "abc"
+`);
+    const cfg = loadConfig(path);
+    expect(cfg.server.upstreamTimeoutMs).toBe(900000);
+  });
+
+  it("server.upstreamTimeoutMs: env var overrides YAML", () => {
+    process.env.ZCODE_UPSTREAM_TIMEOUT_MS = "1200000";
+    const path = writeYaml(`
+server:
+  upstreamTimeoutMs: 900000
+auth:
+  mode: apikey
+  apiKey: "abc"
+`);
+    const cfg = loadConfig(path);
+    expect(cfg.server.upstreamTimeoutMs).toBe(1200000);
+  });
+
+  it("timer-like millisecond config values are clamped to the JS timer ceiling", () => {
+    process.env.ZCODE_UPSTREAM_TIMEOUT_MS = "2147483648";
+    process.env.ZCODE_PROXY_SSE_HEARTBEAT_MS = "2147483648";
+    process.env.ZCODE_RETRY_INITIAL_DELAY_MS = "2147483648";
+    process.env.ZCODE_RETRY_MAX_DELAY_MS = "2147483648";
+    const path = writeYaml(`
+server:
+  maxRequestBodyBytes: 3000000000
+auth:
+  mode: apikey
+  apiKey: "abc"
+`);
+    const cfg = loadConfig(path);
+    expect(cfg.server.upstreamTimeoutMs).toBe(2_147_483_647);
+    expect(cfg.server.sseHeartbeatMs).toBe(2_147_483_647);
+    expect(cfg.retry.initialDelayMs).toBe(2_147_483_647);
+    expect(cfg.retry.maxDelayMs).toBe(2_147_483_647);
+    expect(cfg.server.maxRequestBodyBytes).toBe(3_000_000_000);
+  });
+
+  it("server.maxRequestBodyBytes: defaults to 64MiB when not set", () => {
+    const path = writeYaml(`
+auth:
+  mode: apikey
+  apiKey: "abc"
+`);
+    const cfg = loadConfig(path);
+    expect(cfg.server.maxRequestBodyBytes).toBe(67108864);
+  });
+
+  it("server.maxRequestBodyBytes: YAML override works", () => {
+    const path = writeYaml(`
+server:
+  maxRequestBodyBytes: 1048576
+auth:
+  mode: apikey
+  apiKey: "abc"
+`);
+    const cfg = loadConfig(path);
+    expect(cfg.server.maxRequestBodyBytes).toBe(1048576);
+  });
+
+  it("server.maxRequestBodyBytes: env var overrides YAML", () => {
+    process.env.ZCODE_PROXY_MAX_REQUEST_BODY_BYTES = "2097152";
+    try {
+      const path = writeYaml(`
+server:
+  maxRequestBodyBytes: 1048576
+auth:
+  mode: apikey
+  apiKey: "abc"
+`);
+      const cfg = loadConfig(path);
+      expect(cfg.server.maxRequestBodyBytes).toBe(2097152);
+    } finally {
+      delete process.env.ZCODE_PROXY_MAX_REQUEST_BODY_BYTES;
+    }
+  });
+
+  it("server.maxRequestBodyBytes: 0 disables request body guard", () => {
+    const path = writeYaml(`
+server:
+  maxRequestBodyBytes: 0
+auth:
+  mode: apikey
+  apiKey: "abc"
+`);
+    const cfg = loadConfig(path);
+    expect(cfg.server.maxRequestBodyBytes).toBe(0);
+  });
+
+  it("corsAllowList: loads YAML array and trims empty entries", () => {
+    const path = writeYaml(`
+corsAllowList:
+  - " https://dashboard.local "
+  - ""
+  - "https://chat.local"
+auth:
+  mode: apikey
+  apiKey: "abc"
+`);
+    const cfg = loadConfig(path);
+    expect(cfg.corsAllowList).toEqual(["https://dashboard.local", "https://chat.local"]);
+  });
+
+  it("corsAllowList: env var overrides YAML array", () => {
+    process.env.ZCODE_PROXY_CORS_ALLOWLIST = "https://env-one.local, https://env-two.local";
+    try {
+      const path = writeYaml(`
+corsAllowList:
+  - "https://yaml.local"
+auth:
+  mode: apikey
+  apiKey: "abc"
+`);
+      const cfg = loadConfig(path);
+      expect(cfg.corsAllowList).toEqual(["https://env-one.local", "https://env-two.local"]);
+    } finally {
+      delete process.env.ZCODE_PROXY_CORS_ALLOWLIST;
+    }
+  });
+
+  it("corsAllowList: rejects non-string YAML entries", () => {
+    const path = writeYaml(`
+corsAllowList:
+  - "https://ok.local"
+  - 123
+auth:
+  mode: apikey
+  apiKey: "abc"
+`);
+    expect(() => loadConfig(path)).toThrow("corsAllowList");
   });
 });

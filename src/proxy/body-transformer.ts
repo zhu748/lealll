@@ -872,6 +872,24 @@ function stripThinkingBlocksFromMessages(body: Record<string, unknown>): boolean
       continue;
     }
 
+    let firstThinkingBlock = -1;
+    for (let i = 0; i < content.length; i++) {
+      const block = content[i];
+      if (!isPlainObject(block)) continue;
+      const type = block.type;
+      if (type === "thinking" || type === "redacted_thinking") {
+        firstThinkingBlock = i;
+        break;
+      }
+    }
+
+    if (firstThinkingBlock < 0) {
+      // No thinking blocks found — keep message as-is and avoid allocating
+      // a replacement content array on the common large-history path.
+      surviving.push(msg);
+      continue;
+    }
+
     const filtered = content.filter((block: unknown) => {
       if (!isPlainObject(block)) return true;
       const type = block.type;
@@ -881,12 +899,6 @@ function stripThinkingBlocksFromMessages(body: Record<string, unknown>): boolean
       // GLM upstream rejects either as a content block in messages.
       return type !== "thinking" && type !== "redacted_thinking";
     });
-
-    if (filtered.length === content.length) {
-      // No thinking blocks found — keep message as-is
-      surviving.push(msg);
-      continue;
-    }
 
     changed = true;
     if (filtered.length === 0) {

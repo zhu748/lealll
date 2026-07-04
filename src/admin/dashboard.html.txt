@@ -1248,6 +1248,10 @@ td input{font-family:var(--font-mono)}
           <span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg></span>
           <span class="nav-text">代理池</span>
         </div>
+        <div class="nav-item" data-page="captcha-helper">
+          <span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg></span>
+          <span class="nav-text">验证码助手</span>
+        </div>
       </div>
       <div class="nav-section">
         <div class="nav-section-title">凭证</div>
@@ -1264,7 +1268,7 @@ td input{font-family:var(--font-mono)}
     <div class="sidebar-footer">
       <div class="version">
         <span class="dot"></span>
-        <span>v0.2.1.9</span>
+        <span>v0.2.2.0</span>
       </div>
       <div class="logout-btn" onclick="doLogout()">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
@@ -1363,7 +1367,7 @@ td input{font-family:var(--font-mono)}
             <div class="subtitle">配置代理服务器行为</div>
           </div>
           <div class="header-actions">
-            <button class="btn btn-ghost btn-sm" onclick="loadSettings()">
+            <button class="btn btn-ghost btn-sm" onclick="loadSettings(true)">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
               重新加载
             </button>
@@ -1390,6 +1394,7 @@ td input{font-family:var(--font-mono)}
               <div class="form-row">
                 <div class="form-group"><label class="form-label">端口</label><input id="cfgPort" type="number"><div class="form-help">监听的 TCP 端口</div></div>
                 <div class="form-group"><label class="form-label">主机</label><input id="cfgHost"><div class="form-help">绑定的网卡 IP，0.0.0.0 表示所有网卡</div></div>
+                <div class="form-group"><label class="form-label">最大请求体</label><input id="cfgMaxBody" type="number" min="0" step="1048576"><div class="form-help">单位字节，0 表示不限制</div></div>
               </div>
             </div>
           </div>
@@ -1476,10 +1481,10 @@ td input{font-family:var(--font-mono)}
             <div class="card-body">
               <div class="form-row">
                 <div class="form-group"><label class="form-label">最大重试次数</label><input id="cfgRetryMax" type="number"><div class="form-help">失败后的最大重试次数</div></div>
-                <div class="form-group"><label class="form-label">初始延迟（ms）</label><input id="cfgRetryDelay" type="number"><div class="form-help">第一次重试前的等待时间</div></div>
+                <div class="form-group"><label class="form-label">初始延迟（ms）</label><input id="cfgRetryDelay" type="number" min="1" max="60000" step="1"><div class="form-help">第一次重试前的等待时间</div></div>
               </div>
               <div class="form-row">
-                <div class="form-group"><label class="form-label">最大延迟（ms）</label><input id="cfgRetryMaxDelay" type="number"><div class="form-help">延迟上限，避免过长等待</div></div>
+                <div class="form-group"><label class="form-label">最大延迟（ms）</label><input id="cfgRetryMaxDelay" type="number" min="1" max="300000" step="1"><div class="form-help">延迟上限，避免过长等待</div></div>
                 <div class="form-group"><label class="form-label">退避因子</label><input id="cfgRetryBackoff" type="number" step="0.1"><div class="form-help">每次重试延迟乘以该因子</div></div>
               </div>
               <div class="form-group">
@@ -1543,7 +1548,7 @@ td input{font-family:var(--font-mono)}
               <div class="form-group">
                 <label class="form-label">调试响应日志</label>
                 <label class="switch"><input type="checkbox" id="cfgDebugLog"><span class="slider"></span></label>
-                <div class="form-help">开启后，每个请求在上游响应返回时输出完整响应详情：1) 状态码 + 关键响应头（content-type / retry-after / empty-stream / ratelimit-remaining）2) 响应体预览（JSON 前 1000 字符 / SSE 流前 2KB）。能看到 529 / 空回 200 / 验证码 403 具体返回了什么 JSON。用 resp.clone() 读取副本，不影响下游 passthrough。默认关闭。</div>
+                <div class="form-help">开启后，每个请求在上游响应返回时输出完整响应详情：1) 状态码 + 关键响应头（content-type / retry-after / empty-stream / ratelimit-remaining）2) 响应体预览（JSON 前 1000 字符 / SSE 流前 2KB）。能看到 529 / 空回 200 / 验证码 403 具体返回了什么 JSON。使用有界 tee 预览分支，不消耗下游 passthrough。默认关闭。</div>
               </div>
               <div class="form-group">
                 <label class="form-label">ZCode 思考等级</label>
@@ -1563,7 +1568,7 @@ td input{font-family:var(--font-mono)}
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
             保存设置
           </button>
-          <button class="btn btn-ghost" onclick="loadSettings()">
+          <button class="btn btn-ghost" onclick="loadSettings(true)">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>
             重置
           </button>
@@ -1578,7 +1583,7 @@ td input{font-family:var(--font-mono)}
             <div class="subtitle">管理 API Key 与存储的凭证</div>
           </div>
           <div class="header-right">
-            <button class="btn btn-ghost" onclick="loadAccountsList();loadAccountInfo();loadCredStore()" title="重新从磁盘加载账号列表（外部进程新增的凭证会立即显示）">
+            <button class="btn btn-ghost" onclick="refreshAccountViews()" title="重新从磁盘加载账号列表（外部进程新增的凭证会立即显示）">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
               刷新
             </button>
@@ -1621,7 +1626,7 @@ td input{font-family:var(--font-mono)}
               已存储账号 <span class="tag" id="accountCountTag">多账号</span>
             </div>
             <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-              <input id="accountSearch" class="filter-input" placeholder="搜索标签/API Key..." oninput="filterAccounts()" style="width:200px">
+              <input id="accountSearch" class="filter-input" placeholder="搜索标签/API Key..." oninput="scheduleFilterAccounts()" style="width:200px">
               <select id="accountFilterProvider" class="filter-select" onchange="filterAccounts()">
                 <option value="">所有提供商</option>
                 <option value="bigmodel">Bigmodel</option>
@@ -2047,7 +2052,7 @@ td input{font-family:var(--font-mono)}
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/></svg>
               保存配置
             </button>
-            <button class="btn btn-ghost" onclick="loadProxyPool()">
+            <button class="btn btn-ghost" onclick="reloadProxyPool()">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>
               重新加载
             </button>
@@ -2152,6 +2157,65 @@ td input{font-family:var(--font-mono)}
         </div>
       </div>
 
+      <!-- ============================================================ Captcha Helper ============================================================ -->
+      <div class="page" id="page-captcha-helper">
+        <div class="main-header">
+          <div class="header-left">
+            <h1>验证码助手</h1>
+            <div class="subtitle">Start-plan Chrome CDP 常驻验证状态</div>
+          </div>
+          <div class="header-actions">
+            <button class="btn btn-ghost btn-sm" onclick="loadCaptchaHelper()">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+              刷新
+            </button>
+          </div>
+        </div>
+        <div class="stats-grid">
+          <div class="stat-card">
+            <div class="stat-icon icon-success"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/></svg></div>
+            <div class="stat-value" id="captchaHelperRunning">-</div>
+            <div class="stat-label">运行状态</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-icon icon-info"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8 2v4M16 2v4M8 18v4M16 18v4M2 8h4M2 16h4M18 8h4M18 16h4"/></svg></div>
+            <div class="stat-value" id="captchaHelperMode">-</div>
+            <div class="stat-label">模式</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-icon icon-warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg></div>
+            <div class="stat-value" id="captchaHelperSolves">0</div>
+            <div class="stat-label">验证次数</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg></div>
+            <div class="stat-value" id="captchaHelperIdle">-</div>
+            <div class="stat-label">空闲回收</div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">
+              <span class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></span>
+              Chrome CDP
+            </div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              <button class="btn btn-primary btn-sm" onclick="warmupCaptchaHelper()">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+                预热
+              </button>
+              <button class="btn btn-ghost btn-sm" onclick="stopCaptchaHelper()">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12"/></svg>
+                停止
+              </button>
+            </div>
+          </div>
+          <div class="card-body" id="captchaHelperDetail">
+            <div class="skeleton" style="height:20px;width:220px"></div>
+          </div>
+        </div>
+      </div>
+
       <!-- ============================================================ Debug Dumps ============================================================ -->
       <div class="page" id="page-debug">
         <div class="main-header">
@@ -2191,7 +2255,7 @@ td input{font-family:var(--font-mono)}
         <div class="card" id="debugDetailCard" style="display:none">
           <div class="card-header">
             <div class="card-title"><span class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg></span>请求体详情 — <span id="debugDetailId"></span></div>
-            <button class="btn btn-ghost btn-sm" onclick="document.getElementById('debugDetailCard').style.display='none'">
+            <button class="btn btn-ghost btn-sm" onclick="hideDebugDetail()">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
               关闭
             </button>
@@ -2338,6 +2402,114 @@ let modelMappings=[];
 let glmCatalog=[];
 // Set of model ids (lowercased) for which thinking is force-enabled on /v1/responses.
 let responsesThinkingModels=new Set();
+const ACCOUNT_IMPORT_MAX_FILE_BYTES=2*1024*1024;
+const PROXY_IMPORT_MAX_FILE_BYTES=5*1024*1024;
+const ACCOUNT_MAX_RENDERED_ROWS=500;
+const ACCOUNT_FILTER_DEBOUNCE_MS=80;
+const ACCOUNT_REFRESH_DEBOUNCE_MS=60;
+const LOG_FILTER_DEBOUNCE_MS=80;
+const CONFIG_CACHE_TTL_MS=1000;
+const MUTATION_TIMEOUT_MS=10000;
+const LONG_MUTATION_TIMEOUT_MS=60000;
+const _exclusiveActions=new Set();
+function beginExclusiveAction(key,message='操作正在进行中'){
+  if(_exclusiveActions.has(key)){toast(message,'warn');return false;}
+  _exclusiveActions.add(key);
+  return true;
+}
+function endExclusiveAction(key){
+  _exclusiveActions.delete(key);
+}
+function formatFileBytes(bytes){
+  if(!Number.isFinite(bytes)||bytes<0)return '未知大小';
+  if(bytes<1024)return bytes+' B';
+  if(bytes<1024*1024)return (bytes/1024).toFixed(bytes<10*1024?1:0)+' KiB';
+  return (bytes/1024/1024).toFixed(bytes<10*1024*1024?1:0)+' MiB';
+}
+function checkImportFileSize(file,maxBytes,label){
+  if(file.size<=maxBytes)return true;
+  toast(`${label}文件过大：${formatFileBytes(file.size)}，上限 ${formatFileBytes(maxBytes)}`,'error');
+  return false;
+}
+let dashboardAbortController=new AbortController();
+function resetDashboardAbortController(){
+  if(dashboardAbortController.signal.aborted)dashboardAbortController=new AbortController();
+  return dashboardAbortController;
+}
+function abortDashboardRequests(){
+  try{dashboardAbortController.abort()}catch{}
+  dashboardAbortController=new AbortController();
+}
+function dashboardAbortApplies(input,init){
+  const method=String((init&&init.method)||(input&&typeof input==='object'&&'method'in input?input.method:'GET')||'GET').toUpperCase();
+  return method==='GET'||method==='HEAD'||method==='OPTIONS';
+}
+function createDashboardFetchContext(input,init={},timeoutMs=8000){
+  const ctrl=new AbortController();
+  const timeout=Math.max(1,Math.floor(timeoutMs)||8000);
+  let timedOut=false;
+  const timer=setTimeout(()=>{
+    timedOut=true;
+    ctrl.abort();
+  },timeout);
+  const upstreamSignal=init&&init.signal;
+  const dashboardSignal=dashboardAbortApplies(input,init)?resetDashboardAbortController().signal:null;
+  const linkedSignals=[];
+  const onAbort=()=>ctrl.abort();
+  const linkSignal=(signal)=>{
+    if(!signal)return;
+    if(signal.aborted){ctrl.abort();return;}
+    signal.addEventListener('abort',onAbort,{once:true});
+    linkedSignals.push(signal);
+  }
+  linkSignal(upstreamSignal);
+  if(dashboardSignal&&dashboardSignal!==upstreamSignal)linkSignal(dashboardSignal);
+  const cleanup=()=>{
+    clearTimeout(timer);
+    for(const signal of linkedSignals)signal.removeEventListener('abort',onAbort);
+  };
+  return {ctrl,timeout,cleanup,get timedOut(){return timedOut;}};
+}
+function dashboardFetchTimeoutError(timeout){
+  return new Error(`request timeout after ${timeout}ms`);
+}
+function fetchWithTimeout(input,init={},timeoutMs=8000){
+  const ctx=createDashboardFetchContext(input,init,timeoutMs);
+  return fetch(input,{...init,signal:ctx.ctrl.signal}).catch(err=>{
+    if(ctx.timedOut)throw dashboardFetchTimeoutError(ctx.timeout);
+    throw err;
+  }).finally(ctx.cleanup);
+}
+async function fetchJsonWithTimeout(input,init={},timeoutMs=8000){
+  const ctx=createDashboardFetchContext(input,init,timeoutMs);
+  try{
+    const r=await fetch(input,{...init,signal:ctx.ctrl.signal});
+    let d={};
+    try{
+      d=await r.json();
+    }catch(err){
+      if(ctx.ctrl.signal.aborted)throw err;
+      if(r.ok)throw new Error('Invalid JSON response');
+    }
+    if(!r.ok){
+      const msg=d&&d.error&&typeof d.error==='object'&&d.error.message
+        ?d.error.message
+        :d&&typeof d.error==='string'
+          ?d.error
+          :d&&d.message?d.message:'HTTP '+r.status;
+      throw new Error(msg);
+    }
+    return d;
+  }catch(err){
+    if(ctx.timedOut)throw dashboardFetchTimeoutError(ctx.timeout);
+    throw err;
+  }finally{
+    ctx.cleanup();
+  }
+}
+async function fetchJsonMutationWithTimeout(input,init={},timeoutMs=MUTATION_TIMEOUT_MS){
+  return await fetchJsonWithTimeout(input,init,timeoutMs);
+}
 
 // --- Login ---
 async function doLogin(){
@@ -2346,8 +2518,7 @@ async function doLogin(){
   if(!key){errEl.textContent='请输入 API Key';return toast('请输入 API Key','error');}
   errEl.textContent='';
   try{
-    const r=await fetch(API+'/admin/api/verify',{headers:{'Authorization':'Bearer '+key}});
-    if(!r.ok)throw new Error();
+    await fetchJsonWithTimeout(API+'/admin/api/verify',{headers:{'Authorization':'Bearer '+key}},5000);
     authToken=key;
     // Use sessionStorage (not localStorage) so the token is cleared when
     // the browser closes — limits the window of XSS exposure.
@@ -2366,15 +2537,16 @@ document.getElementById('loginKey').addEventListener('keydown',e=>{if(e.key==='E
 let uptimeIntervalId=null;
 // statsIntervalId is declared further down (near its setInterval call)
 // to keep the related logic together.
+let dashboardInitGeneration=0;
 
 // Auto-login on page load if a token was previously stored.
 // Surfaces a visible warning when the server has no proxyApiKey configured
 // so the user knows the dashboard is open to anyone with network access.
 (async function autoLogin(){
   try{
-    const testR=await fetch(API+'/admin/api/verify');
-    if(testR.ok){
-      const d=await testR.json().catch(()=>({}));
+    let d=null;
+    try{d=await fetchJsonWithTimeout(API+'/admin/api/verify',{},5000)}catch{}
+    if(d){
       if(d.valid){
         if(d.warning==='no_auth'){
           // Server is running with no proxyApiKey — show a banner after login.
@@ -2386,11 +2558,20 @@ let uptimeIntervalId=null;
         return;
       }
     }
-    const saved=sessionStorage.getItem('zcodeProxyAuth')||localStorage.getItem('zcodeProxyAuth');
+    const savedSession=sessionStorage.getItem('zcodeProxyAuth');
+    const savedLocal=localStorage.getItem('zcodeProxyAuth');
+    const saved=savedSession||savedLocal;
     if(!saved)return;
-    const r=await fetch(API+'/admin/api/verify',{headers:{'Authorization':'Bearer '+saved}});
-    if(!r.ok){try{sessionStorage.removeItem('zcodeProxyAuth')}catch{};try{localStorage.removeItem('zcodeProxyAuth')}catch{};return}
+    try{
+      await fetchJsonWithTimeout(API+'/admin/api/verify',{headers:{'Authorization':'Bearer '+saved}},5000);
+    }catch{
+      try{sessionStorage.removeItem('zcodeProxyAuth')}catch{}
+      try{localStorage.removeItem('zcodeProxyAuth')}catch{}
+      return;
+    }
     authToken=saved;
+    try{sessionStorage.setItem('zcodeProxyAuth',saved)}catch{}
+    if(savedLocal){try{localStorage.removeItem('zcodeProxyAuth')}catch{}}
     document.getElementById('loginWrap').style.display='none';
     document.getElementById('app').classList.add('show');
     initDashboard();
@@ -2398,17 +2579,34 @@ let uptimeIntervalId=null;
 })();
 
 function doLogout(){
+  dashboardInitGeneration++;
+  abortDashboardRequests();
   authToken='';
   try{sessionStorage.removeItem('zcodeProxyAuth')}catch{}
   try{localStorage.removeItem('zcodeProxyAuth')}catch{}
+  clearLogReconnectTimer();
   if(logEventSource){try{logEventSource.close()}catch{};logEventSource=null}
   // vceshi0.0.7+: clear periodic intervals so they don't keep firing
   // (and holding their closures alive) after logout.
   if(uptimeIntervalId){clearInterval(uptimeIntervalId);uptimeIntervalId=null}
   if(statsIntervalId){clearInterval(statsIntervalId);statsIntervalId=null}
+  invalidateStatsLoads();
+  clearAccountFilterTimer();
+  clearAccountViewsRefreshTimer();
+  clearLogRenderTimer();
+  clearLogFilterTimer();
+  invalidateConfigSnapshot();
+  clearProxyPoolPollTimer();
+  clearProxyPoolProgressHideTimer();
+  invalidateProxyPoolLoads();
+  invalidateCaptchaHelperLoads();
+  ppTestAllRunning=false;
+  ppTestPollErrorCount=0;
   // vceshi0.0.7+: cancel any in-flight OAuth poll loop.
-  oauthPollCancelled=true;
-  if(oauthExpiryTimer){clearInterval(oauthExpiryTimer);oauthExpiryTimer=null}
+  cancelOAuthPoll();
+  currentFlowId=null;
+  try{sessionStorage.removeItem('zcodeOAuthFlowId')}catch{}
+  clearOauthExpiryTimer();
   document.getElementById('app').classList.remove('show');
   document.getElementById('loginWrap').style.display='flex';
   document.getElementById('loginKey').value='';
@@ -2493,6 +2691,7 @@ document.querySelectorAll('.nav-item').forEach(el=>{
     // to the bottom, which looks empty).
     const main=document.querySelector('.main-content');
     if(main)main.scrollTop=0;
+    if(el.dataset.page==='captcha-helper')loadCaptchaHelper();
   });
 });
 
@@ -2507,12 +2706,99 @@ document.querySelectorAll('#settingsTabs .tab').forEach(tab=>{
 });
 
 function authHeaders(){return{'Authorization':'Bearer '+authToken,'Content-Type':'application/json'}}
+function dashboardActive(){return document.getElementById('app')?.classList.contains('show')}
+function dashboardCanUpdate(){return !document.hidden&&dashboardActive()}
+function dashboardActionCurrent(initGeneration,token){return initGeneration===dashboardInitGeneration&&token===authToken&&dashboardActive()}
+let _configSnapshotCache=null;
+let _configSnapshotTs=0;
+let _configSnapshotInFlight=null;
+let _configSnapshotInFlightKey='';
+let _configSnapshotGeneration=0;
+function cloneJson(value){
+  if(typeof structuredClone==='function')return structuredClone(value);
+  return JSON.parse(JSON.stringify(value));
+}
+function applyConfigSnapshotCache(config){
+  _configSnapshotCache=config;
+  _configSnapshotTs=Date.now();
+  window.__config=cloneJson(config);
+  return config;
+}
+function syncConfigModelsForUi(models){
+  if(!Array.isArray(models))return;
+  window.__config={...(window.__config||{}),models:[...models]};
+}
+function invalidateConfigSnapshot(){
+  _configSnapshotGeneration++;
+  _configSnapshotCache=null;
+  _configSnapshotTs=0;
+  _configSnapshotInFlight=null;
+  _configSnapshotInFlightKey='';
+}
+async function fetchConfigSnapshot(options={}){
+  const force=!!options.force;
+  const now=Date.now();
+  if(!force&&_configSnapshotCache&&(now-_configSnapshotTs)<CONFIG_CACHE_TTL_MS){
+    return cloneJson(_configSnapshotCache);
+  }
+  const requestAuthToken=authToken;
+  const requestInitGeneration=dashboardInitGeneration;
+  const requestConfigGeneration=_configSnapshotGeneration;
+  const requestKey=requestConfigGeneration+'|'+requestInitGeneration+'|'+requestAuthToken;
+  if(force||!_configSnapshotInFlight||_configSnapshotInFlightKey!==requestKey){
+    const request=fetchJsonWithTimeout(API+'/admin/api/config',{headers:authHeaders()},5000)
+      .then(c=>{
+        if(requestConfigGeneration!==_configSnapshotGeneration||requestAuthToken!==authToken||requestInitGeneration!==dashboardInitGeneration)return c;
+        return applyConfigSnapshotCache(c);
+      })
+      .finally(()=>{if(_configSnapshotInFlight===request){_configSnapshotInFlight=null;_configSnapshotInFlightKey='';}});
+    _configSnapshotInFlight=request;
+    _configSnapshotInFlightKey=requestKey;
+  }
+  return cloneJson(await _configSnapshotInFlight);
+}
+
+let uptimeBaseMs=0;
+let uptimeBaseClientTs=0;
+function formatUptime(ms){
+  const s=Math.floor(Math.max(0,ms||0)/1000);
+  const h=Math.floor(s/3600),m=Math.floor(s%3600/60),ss=s%60;
+  return `${h}h ${String(m).padStart(2,'0')}m ${String(ss).padStart(2,'0')}s`;
+}
+function setUptimeDisplay(ms){
+  const uptimeStr=formatUptime(ms);
+  document.getElementById('statUptime').textContent=uptimeStr;
+  document.getElementById('heroUptime').textContent=uptimeStr;
+}
+function tickUptimeDisplay(){
+  if(!uptimeBaseClientTs)return;
+  setUptimeDisplay(uptimeBaseMs+(Date.now()-uptimeBaseClientTs));
+}
+function applyStatsSnapshot(d){
+  if(typeof d.uptime==='number'){
+    uptimeBaseMs=d.uptime;
+    uptimeBaseClientTs=Date.now();
+    setUptimeDisplay(d.uptime);
+  }
+  document.getElementById('statRequests').textContent=d.total||0;
+  document.getElementById('statRetries').textContent=d.retried||0;
+  if(d.byCredential){
+    _cachedByCredential=d.byCredential;
+    const accountsPage=document.getElementById('page-accounts');
+    if(accountsPage&&accountsPage.classList.contains('active')&&_cachedAccounts.length>0){
+      filterAccounts();
+    }
+  }
+}
 
 // --- Init ---
 async function initDashboard(){
+  const initGeneration=++dashboardInitGeneration;
+  initProxyPoolConfigDirtyTracking();
   // If the server reported no_auth, surface a banner at the top of the app.
-  if(window.__noAuthWarning){
+  if(window.__noAuthWarning&&!document.getElementById('noAuthWarningBanner')){
     const banner=document.createElement('div');
+    banner.id='noAuthWarningBanner';
     banner.className='hint hint-danger';
     banner.style.margin='0 0 16px';
     banner.style.borderRadius='0';
@@ -2541,13 +2827,13 @@ async function initDashboard(){
     await Promise.all([
       loadOverview(),
       loadSettings(),
-      loadAccountInfo(),
+      loadCredentialViews(),
       loadAccountsList(),
-      loadCredStore(),
     ]);
   } catch (e) {
     console.error('initDashboard batch 1 failed:', e);
   }
+  if(initGeneration!==dashboardInitGeneration||!dashboardActive())return;
   initImportCard();
   // Batch 2: background-load the rest. Don't await — let the user interact
   // with the dashboard while these load.
@@ -2560,6 +2846,7 @@ async function initDashboard(){
     loadStats(),
     loadDebugDumps(),
     loadProxyPool(),
+    loadCaptchaHelper(),
     checkRunningTestJob(),
   ]).catch(e => console.error('initDashboard batch 2 failed:', e));
   connectLogStream();
@@ -2573,15 +2860,18 @@ async function initDashboard(){
 
 // --- Overview ---
 async function loadOverview(){
+  const requestAuthToken=authToken;
+  const requestInitGeneration=dashboardInitGeneration;
   try{
-    const r=await fetch(API+'/admin/api/config',{headers:authHeaders()});
-    const c=await r.json();
+    const c=await fetchConfigSnapshot();
+    if(!dashboardCanUpdate()||!dashboardActionCurrent(requestInitGeneration,requestAuthToken))return;
     document.getElementById('statProvider').textContent=c.provider;
     document.getElementById('statPlan').textContent=c.plan?.replace('-',' ');
     document.getElementById('statModels').textContent=c.models?.length||0;
     document.getElementById('heroProvider').textContent=c.provider;
     document.getElementById('heroPlan').textContent=c.plan?.replace('-',' ');
-    const health=await fetch(API+'/health',{headers:authHeaders()});
+    const health=await fetchWithTimeout(API+'/health',{headers:authHeaders()},3000);
+    if(!dashboardCanUpdate()||!dashboardActionCurrent(requestInitGeneration,requestAuthToken))return;
     const heroIcon=document.getElementById('heroIcon');
     const heroTitle=document.getElementById('heroTitle');
     if(health.ok){
@@ -2593,64 +2883,156 @@ async function loadOverview(){
       heroTitle.textContent='服务异常';
       heroIcon.classList.add('danger');
     }
-  }catch(e){console.error('loadOverview failed:',e);document.getElementById('healthInfo').innerHTML='<span class="badge badge-danger">加载失败</span>'}
-  loadUptimeFromServer();
-  // vceshi0.0.7+: poll every 2s instead of 1s. The 1s interval was overkill
-  // for a uptime display (humans don't perceive 1s vs 2s freshness) and
-  // duplicated work that the 10s loadStats interval was already doing.
-  //
-  // === PERFORMANCE FIX (运行久了刷新卡顿) ===
-  // Changed from 2s to 5s. The 2s interval was calling /admin/api/stats,
-  // which on Windows with sync I/O + AV interference could take 50-200ms
-  // per call. Combined with the 10s stats interval (separate setInterval
-  // in startStatsInterval), the dashboard was hitting /admin/api/stats
-  // ~6 times per 10s — needlessly competing for I/O with the user's actual
-  // dashboard interactions. 5s is still fast enough for an uptime display
-  // and cuts the polling load by 60%.
-  // The handle is tracked so doLogout() can clear it (previously leaked).
+  }catch(e){
+    if(dashboardCanUpdate()&&dashboardActionCurrent(requestInitGeneration,requestAuthToken)){
+      console.error('loadOverview failed:',e);
+      document.getElementById('healthInfo').innerHTML='<span class="badge badge-danger">加载失败</span>';
+    }
+  }
+  // Keep uptime ticking locally after the stats snapshot arrives from
+  // loadStats(). Avoid a separate /admin/api/stats request here; initDashboard
+  // already schedules loadStats() in the background batch.
   if(uptimeIntervalId)clearInterval(uptimeIntervalId);
-  uptimeIntervalId=setInterval(loadUptimeFromServer,5000);
+  uptimeIntervalId=(dashboardCanUpdate()&&dashboardActionCurrent(requestInitGeneration,requestAuthToken))?setInterval(tickUptimeDisplay,1000):null;
 }
 async function loadUptimeFromServer(){
-  // Guard: skip the request when not authenticated (e.g. after logout).
-  // Without this, the interval keeps firing 401s forever.
-  if(!authToken)return;
+  // Guard: skip the request when the dashboard is no longer active (e.g. after
+  // logout). This also supports the local no-auth dev mode where authToken is
+  // intentionally empty but the dashboard is allowed on loopback.
+  if(document.hidden||!dashboardActive())return;
+  const requestAuthToken=authToken;
+  const requestInitGeneration=dashboardInitGeneration;
   try{
-    const r=await fetch(API+'/admin/api/stats',{headers:authHeaders()});
-    const d=await r.json();
-    const s=Math.floor((d.uptime||0)/1000);
-    const h=Math.floor(s/3600),m=Math.floor(s%3600/60),ss=s%60;
-    const uptimeStr=`${h}h ${String(m).padStart(2,'0')}m ${String(ss).padStart(2,'0')}s`;
-    document.getElementById('statUptime').textContent=uptimeStr;
-    document.getElementById('heroUptime').textContent=uptimeStr;
-    // Also refresh overview stats (total requests, retries) so the overview
-    // page doesn't sit stale while the user is on it.
-    document.getElementById('statRequests').textContent=d.total||0;
-    document.getElementById('statRetries').textContent=d.retried||0;
-    // vceshi0.0.7+: also update _cachedByCredential so the accounts page
-    // usage counts stay fresh without waiting for the 10s loadStats interval.
-    // Only re-render the accounts table if it's currently visible.
-    if(d.byCredential){
-      _cachedByCredential=d.byCredential;
-      const accountsPage=document.getElementById('page-accounts');
-      // Use classList check — pages use .active class to show/hide.
-      if(accountsPage&&accountsPage.classList.contains('active')&&_cachedAccounts.length>0){
-        filterAccounts();
-      }
-    }
+    const d=await fetchJsonWithTimeout(API+'/admin/api/stats',{headers:authHeaders()},5000);
+    if(document.hidden||!dashboardActionCurrent(requestInitGeneration,requestAuthToken))return;
+    applyStatsSnapshot(d);
   }catch{}
 }
 
-// --- Settings ---
-async function loadSettings(){
+function formatTimestamp(ts){
+  if(!ts)return'-';
+  try{return new Date(ts).toLocaleString()}catch{return'-'}
+}
+
+function formatDurationMs(ms){
+  if(!ms||ms<=0)return'关闭';
+  const s=Math.max(0,Math.floor(ms/1000));
+  const m=Math.floor(s/60),ss=s%60;
+  if(m>=60){const h=Math.floor(m/60);return `${h}h ${String(m%60).padStart(2,'0')}m`}
+  return `${m}m ${String(ss).padStart(2,'0')}s`;
+}
+
+let captchaHelperLoadInFlight=false;
+let captchaHelperLoadPending=false;
+let captchaHelperGeneration=0;
+function invalidateCaptchaHelperLoads(){
+  captchaHelperGeneration++;
+  captchaHelperLoadPending=false;
+}
+
+function renderCaptchaHelperStatus(d){
+  const running=d&&d.running;
+  document.getElementById('captchaHelperRunning').textContent=d?.busy?'验证中':(running?'运行中':'未运行');
+  document.getElementById('captchaHelperMode').textContent=d?.mode==='persistent'?'常驻':'单次';
+  document.getElementById('captchaHelperSolves').textContent=String(d?.solveCount??0);
+  const idleText=d?.nextIdleShutdownAt?formatDurationMs(d.nextIdleShutdownAt-Date.now()):formatDurationMs(d?.idleTimeoutMs??0);
+  document.getElementById('captchaHelperIdle').textContent=idleText;
+  const badge=d?.busy?'<span class="badge badge-warn"><span class="badge-dot"></span>验证中</span>':(running?'<span class="badge badge-success"><span class="badge-dot"></span>运行中</span>':'<span class="badge badge-muted">未运行</span>');
+  document.getElementById('captchaHelperDetail').innerHTML=`
+    <div class="kv-grid">
+      <span class="kv-key">状态</span><span class="kv-val">${badge}</span>
+      <span class="kv-key">Keepalive</span><span class="kv-val">${d?.keepAlive?'开启':'关闭'}</span>
+      <span class="kv-key">SDK</span><span class="kv-val">${d?.sdkReady?'已预热':'未预热'}</span>
+      <span class="kv-key">Chrome</span><span class="kv-val"><code class="code-inline">${escapeHtml(d?.chromePath||'未找到')}</code></span>
+      <span class="kv-key">Profile</span><span class="kv-val"><code class="code-inline">${escapeHtml(d?.userDataDir||'-')}</code></span>
+      <span class="kv-key">端口</span><span class="kv-val">${d?.port??'-'}</span>
+      <span class="kv-key">窗口</span><span class="kv-val">${d?.visible?'可见':'隐藏'}</span>
+      <span class="kv-key">启动时间</span><span class="kv-val">${formatTimestamp(d?.startedAt)}</span>
+      <span class="kv-key">最近验证</span><span class="kv-val">${formatTimestamp(d?.lastSolveAt)}</span>
+      <span class="kv-key">交互次数</span><span class="kv-val">${d?.interactiveCount??0}</span>
+      ${d?.sdkPreloadError?`<span class="kv-key">SDK 错误</span><span class="kv-val"><span class="badge badge-warn">${escapeHtml(d.sdkPreloadError)}</span></span>`:''}
+      ${d?.lastError?`<span class="kv-key">最近错误</span><span class="kv-val"><span class="badge badge-danger">${escapeHtml(d.lastError)}</span></span>`:''}
+    </div>`;
+}
+
+async function loadCaptchaHelper(){
+  if(document.hidden||!dashboardActive())return;
+  if(captchaHelperLoadInFlight){captchaHelperLoadPending=true;return;}
+  captchaHelperLoadPending=false;
+  const generation=captchaHelperGeneration;
+  const requestAuthToken=authToken;
+  const requestInitGeneration=dashboardInitGeneration;
+  captchaHelperLoadInFlight=true;
   try{
-    const r=await fetch(API+'/admin/api/config',{headers:authHeaders()});
-    const c=await r.json();
+    const d=await fetchJsonWithTimeout(API+'/admin/api/captcha-helper',{headers:authHeaders()},5000);
+    if(generation!==captchaHelperGeneration||document.hidden||!dashboardActionCurrent(requestInitGeneration,requestAuthToken))return;
+    renderCaptchaHelperStatus(d);
+  }catch(e){
+    if(generation===captchaHelperGeneration&&!document.hidden&&dashboardActionCurrent(requestInitGeneration,requestAuthToken)){
+      console.error('loadCaptchaHelper failed:',e);
+      document.getElementById('captchaHelperDetail').innerHTML='<span class="badge badge-danger">加载失败</span>';
+    }
+  }finally{
+    captchaHelperLoadInFlight=false;
+    if(captchaHelperLoadPending&&!document.hidden&&dashboardActionCurrent(requestInitGeneration,requestAuthToken)){
+      captchaHelperLoadPending=false;
+      loadCaptchaHelper();
+    }
+  }
+}
+
+async function warmupCaptchaHelper(){
+  if(!beginExclusiveAction('captchaHelperAction','验证码助手操作正在进行中，请稍候'))return;
+  invalidateCaptchaHelperLoads();
+  const generation=captchaHelperGeneration;
+  try{
+    const d=await fetchJsonMutationWithTimeout(API+'/admin/api/captcha-helper/warmup',{method:'POST',headers:authHeaders()});
+    if(generation!==captchaHelperGeneration||document.hidden||!dashboardActive())return;
+    renderCaptchaHelperStatus(d);
+    toast(d.running?'验证码助手已预热':'验证码助手未启用常驻模式',d.running?'success':'warn');
+  }catch(e){
+    if(generation===captchaHelperGeneration&&!document.hidden&&dashboardActive()){
+      console.error('warmupCaptchaHelper failed:',e);
+      toast('预热失败：'+e.message,'error');
+      loadCaptchaHelper();
+    }
+  }finally{
+    endExclusiveAction('captchaHelperAction');
+  }
+}
+
+async function stopCaptchaHelper(){
+  if(!beginExclusiveAction('captchaHelperAction','验证码助手操作正在进行中，请稍候'))return;
+  invalidateCaptchaHelperLoads();
+  const generation=captchaHelperGeneration;
+  try{
+    const d=await fetchJsonMutationWithTimeout(API+'/admin/api/captcha-helper/stop',{method:'POST',headers:authHeaders()});
+    if(generation!==captchaHelperGeneration||document.hidden||!dashboardActive())return;
+    renderCaptchaHelperStatus(d);
+    toast('验证码助手已停止');
+  }catch(e){
+    if(generation===captchaHelperGeneration&&!document.hidden&&dashboardActive()){
+      console.error('stopCaptchaHelper failed:',e);
+      toast('停止失败：'+e.message,'error');
+    }
+  }finally{
+    endExclusiveAction('captchaHelperAction');
+  }
+}
+
+// --- Settings ---
+async function loadSettings(force=false){
+  const requestAuthToken=authToken;
+  const requestInitGeneration=dashboardInitGeneration;
+  try{
+    const c=await fetchConfigSnapshot({force});
+    if(!dashboardCanUpdate()||!dashboardActionCurrent(requestInitGeneration,requestAuthToken))return;
     // Note: use ?? for port — `||` would treat a legitimately configured
     // port of 0 (which on some systems means "let the OS pick a random
     // free port") as falsy and silently overwrite it with 8080.
     document.getElementById('cfgPort').value=c.server?.port??8080;
     document.getElementById('cfgHost').value=c.server?.host??'0.0.0.0';
+    document.getElementById('cfgMaxBody').value=c.server?.maxRequestBodyBytes??67108864;
     document.getElementById('cfgProvider').value=c.provider||'zai';
     document.getElementById('cfgPlan').value=c.plan||'coding-plan';
     document.getElementById('cfgAuthMode').value=c.auth?.mode||'apikey';
@@ -2672,65 +3054,86 @@ async function loadSettings(){
     document.getElementById('cfgVerboseLog').checked=!!c.logging?.verbose;
     document.getElementById('cfgDebugLog').checked=!!c.logging?.debug;
     document.getElementById('cfgThinkingLevel').value=(c.thinkingLevel==='high'?'high':'max');
-  }catch(e){console.error('loadSettings failed:',e);toast('加载设置失败','error')}
+  }catch(e){if(dashboardCanUpdate()&&dashboardActionCurrent(requestInitGeneration,requestAuthToken)){console.error('loadSettings failed:',e);toast('加载设置失败','error')}}
+}
+function readSettingsNumberInput(id,label,opts={}){
+  const raw=document.getElementById(id).value.trim();
+  if(raw===''){
+    toast(`${label}不能为空`,'error');
+    return null;
+  }
+  const n=/^[+-]?\d+(?:\.\d+)?$/.test(raw)?Number(raw):NaN;
+  if(!Number.isFinite(n)){
+    toast(`${label}必须是有效数字`,'error');
+    return null;
+  }
+  if(opts.integer!==false&&!Number.isSafeInteger(n)){
+    toast(`${label}必须是整数`,'error');
+    return null;
+  }
+  if(opts.min!==undefined&&n<opts.min){
+    toast(`${label}必须 >= ${opts.min}`,'error');
+    return null;
+  }
+  if(opts.max!==undefined&&n>opts.max){
+    toast(`${label}必须 <= ${opts.max}`,'error');
+    return null;
+  }
+  if(opts.greaterThan!==undefined&&n<=opts.greaterThan){
+    toast(`${label}必须 > ${opts.greaterThan}`,'error');
+    return null;
+  }
+  return n;
 }
 async function saveSettings(){
+  if(!beginExclusiveAction('settingsSave','设置保存正在进行中，请稍候'))return;
+  const requestAuthToken=authToken;
+  const requestInitGeneration=dashboardInitGeneration;
   // --- 客户端预校验重试字段（服务端 validateConfigForSave 严格校验，
   // 不符合的值会导致整次保存失败 + 真实错误被旧 toast 吞掉，表现为
   // 「一改重试，所有 tab 都保存失败」。这里提前拦截，给用户明确提示）。
-  const maxRetries=parseInt(document.getElementById('cfgRetryMax').value,10);
-  const initialDelayMs=parseInt(document.getElementById('cfgRetryDelay').value,10);
-  const maxDelayMs=parseInt(document.getElementById('cfgRetryMaxDelay').value,10);
-  const backoffFactor=parseFloat(document.getElementById('cfgRetryBackoff').value);
+  const port=readSettingsNumberInput('cfgPort','监听端口',{min:1,max:65535});
+  const maxBody=readSettingsNumberInput('cfgMaxBody','最大请求体',{min:0});
+  const maxRetries=readSettingsNumberInput('cfgRetryMax','最大重试次数',{min:0});
+  const initialDelayMs=readSettingsNumberInput('cfgRetryDelay','初始延迟',{min:1,max:60000});
+  const maxDelayMs=readSettingsNumberInput('cfgRetryMaxDelay','最大延迟',{min:1,max:300000});
+  const backoffFactor=readSettingsNumberInput('cfgRetryBackoff','退避因子',{integer:false,greaterThan:0});
+  const credSwitch=readSettingsNumberInput('cfgRetryCredSwitch','凭证切换阈值',{min:0});
+  const emptyStreamSwitch=readSettingsNumberInput('cfgRetryEmptyStreamSwitch','空回切换阈值',{min:0});
+  if(port===null||maxBody===null||maxRetries===null||initialDelayMs===null||maxDelayMs===null||backoffFactor===null||credSwitch===null||emptyStreamSwitch===null){
+    endExclusiveAction('settingsSave');return;
+  }
   const statusesRaw=document.getElementById('cfgRetryStatuses').value;
-  const credSwitch=parseInt(document.getElementById('cfgRetryCredSwitch').value,10);
-  const emptyStreamSwitch=parseInt(document.getElementById('cfgRetryEmptyStreamSwitch').value,10);
-  // 与服务端 validateConfigForSave 一致：100-599
-  const statuses=statusesRaw.split(',').map(s=>s.trim()).filter(Boolean)
-    .map(s=>parseInt(s,10))
-    .filter(n=>Number.isFinite(n)&&n>=100&&n<=599);
-  if(Number.isFinite(maxRetries)&&maxRetries<0){
-    toast('最大重试次数必须 >= 0（无上限）','error');return;
+  // 与服务端 normalizeRetryableStatuses / validateConfigForSave 一致：必须是 100-599 的整数。
+  // 不要静默过滤非法项，否则用户输入 "529,bad" 会被保存成 "529"，看起来像成功但配置并非所填内容。
+  const statusTokens=statusesRaw.split(',').map(s=>s.trim()).filter(Boolean);
+  const statuses=[];
+  let invalidStatusToken='';
+  for(const token of statusTokens){
+    const n=/^\d+$/.test(token)?Number(token):NaN;
+    if(!Number.isInteger(n)||n<100||n>599){invalidStatusToken=token;break}
+    statuses.push(n);
   }
-  if(Number.isFinite(initialDelayMs)&&(initialDelayMs<0||initialDelayMs>60000)){
-    toast('初始延迟必须在 0-60000ms 之间','error');return;
-  }
-  if(Number.isFinite(maxDelayMs)&&(maxDelayMs<0||maxDelayMs>300000)){
-    toast('最大延迟必须在 0-300000ms 之间','error');return;
-  }
-  if(Number.isFinite(backoffFactor)&&backoffFactor<=0){
-    toast('退避因子必须大于 0','error');return;
-  }
-  // 检查用户输入的状态码格式：如果输入了非空但全部解析失败，提示
-  if(statusesRaw.trim()&&statuses.length===0){
-    toast('可重试状态码必须是 100-599 之间的数字（逗号分隔）','error');return;
-  }
-  // 凭证切换阈值：非负整数，0 = 禁用
-  if(Number.isFinite(credSwitch)&&credSwitch<0){
-    toast('凭证切换阈值必须 >= 0（0 = 禁用）','error');return;
-  }
-  // 空回切换阈值：非负整数，0 = 禁用（回退到普通阈值）
-  if(Number.isFinite(emptyStreamSwitch)&&emptyStreamSwitch<0){
-    toast('空回切换阈值必须 >= 0（0 = 禁用，回退到普通凭证切换阈值）','error');return;
+  // 检查用户输入的状态码格式：只要有任意非法项，提示并中止保存
+  if((statusesRaw.trim()&&statusTokens.length===0)||invalidStatusToken){
+    toast('可重试状态码必须是 100-599 之间的数字（逗号分隔）','error');endExclusiveAction('settingsSave');return;
   }
 
   const cfg={
-    server:{port:+document.getElementById('cfgPort').value,host:document.getElementById('cfgHost').value},
+    server:{port,host:document.getElementById('cfgHost').value,maxRequestBodyBytes:maxBody},
     provider:document.getElementById('cfgProvider').value,
     plan:document.getElementById('cfgPlan').value,
     auth:{mode:document.getElementById('cfgAuthMode').value},
     defaultModel:document.getElementById('cfgDefaultModel').value,
     models:document.getElementById('cfgModels').value.split('\n').map(s=>s.trim()).filter(Boolean),
     retry:{
-      // 空值兜底为合理默认，避免 +"" === 0 把字段变成 0；
-      // 服务端 loadConfig 的 resolvePositive* 也有兜底，这里保持一致。
-      maxRetries:Number.isFinite(maxRetries)?maxRetries:3,
-      initialDelayMs:Number.isFinite(initialDelayMs)?initialDelayMs:1000,
-      maxDelayMs:Number.isFinite(maxDelayMs)?maxDelayMs:8000,
-      backoffFactor:Number.isFinite(backoffFactor)&&backoffFactor>0?backoffFactor:2,
+      maxRetries,
+      initialDelayMs,
+      maxDelayMs,
+      backoffFactor,
       retryableStatuses:statuses.length>0?statuses:[529],
-      credentialSwitchThreshold:Number.isFinite(credSwitch)&&credSwitch>=0?credSwitch:5,
-      emptyStreamSwitchThreshold:Number.isFinite(emptyStreamSwitch)&&emptyStreamSwitch>=0?emptyStreamSwitch:3,
+      credentialSwitchThreshold:credSwitch,
+      emptyStreamSwitchThreshold:emptyStreamSwitch,
     },
     identity:{appVersion:document.getElementById('cfgAppVer').value,sourceTitle:document.getElementById('cfgSrcTitle').value,refererOrigin:document.getElementById('cfgReferer').value},
     logging:{level:document.getElementById('cfgLogLevel').value,verbose:document.getElementById('cfgVerboseLog').checked,debug:document.getElementById('cfgDebugLog').checked},
@@ -2741,47 +3144,82 @@ async function saveSettings(){
   if(apiKey&&apiKey!=='***configured***')cfg.auth.apiKey=apiKey;
   if(proxyApiKey&&proxyApiKey!=='***configured***')cfg.auth.proxyApiKey=proxyApiKey;
   try{
-    const r=await fetch(API+'/admin/api/config',{method:'PUT',headers:authHeaders(),body:JSON.stringify(cfg)});
-    if(r.ok){
-      const d=await r.json().catch(()=>({}));
-      if(d.requiresRestart){
-        toast(`设置已保存，但以下字段需重启生效：${(d.restartFields||[]).join(', ')}`,'warn');
-      }else{
-        toast('设置已保存（已热生效）','success');
-      }
+    const d=await fetchJsonMutationWithTimeout(API+'/admin/api/config',{method:'PUT',headers:authHeaders(),body:JSON.stringify(cfg)});
+    if(!dashboardActionCurrent(requestInitGeneration,requestAuthToken))return;
+    invalidateConfigSnapshot();
+    syncConfigModelsForUi(cfg.models);
+    renderModelMappings();
+    if(d.requiresRestart){
+      toast(`设置已保存，但以下字段需重启生效：${(d.restartFields||[]).join(', ')}`,'warn');
+    }else{
+      toast('设置已保存（已热生效）','success');
     }
-    else{
-      const d=await r.json().catch(()=>({}));
-      // 服务端错误结构为 { error: { type, message } }，旧代码误读 d.message，
-      // 导致真实错误被吞掉，用户只看到无意义的「保存失败」。
-      const msg=d?.error?.message||d?.message||'保存失败';
-      toast(msg,'error');
-      console.error('saveSettings failed:',{status:r.status,body:d});
+  }catch(e){
+    if(dashboardActionCurrent(requestInitGeneration,requestAuthToken)){
+      console.error('saveSettings failed:',e);
+      toast(e instanceof Error&&e.message?e.message:'保存失败','error');
     }
-  }catch{toast('保存失败','error')}
+  }
+  finally{endExclusiveAction('settingsSave');}
 }
 
 // --- Accounts ---
-async function loadAccountInfo(){
+async function fetchCredentialSnapshot(){
+  return await fetchJsonWithTimeout(API+'/admin/api/credentials',{headers:authHeaders()},5000);
+}
+let _credentialViewsLoadGeneration=0;
+function renderAccountInfo(d){
+  if(d.credential){
+    const c=d.credential;
+    const displayName=c.name||c.label||'';
+    document.getElementById('currentCred').innerHTML=`
+      <div class="kv-grid">
+        ${displayName?`<span class="kv-key">名称</span><span class="kv-val">${escapeHtml(displayName)}</span>`:''}
+        <span class="kv-key">提供商</span><span class="kv-val">${escapeHtml(c.provider)}</span>
+        <span class="kv-key">API Key</span><span class="kv-val mono">${escapeHtml(c.apiKeyMask)}</span>
+        <span class="kv-key">套餐</span><span class="kv-val">${c.plan==='start-plan'?'<span class="badge badge-warn">Start 套餐</span>':'<span class="badge badge-success">Coding 套餐</span>'}</span>
+        <span class="kv-key">状态</span><span class="kv-val">${c.disabled?'<span class="badge badge-danger">已禁用</span>':'<span class="badge badge-success">可用</span>'}</span>
+        <span class="kv-key">认证模式</span><span class="kv-val"><span class="badge badge-info">${escapeHtml(c.mode||'apikey')}</span></span>
+        <span class="kv-key">含 Secret</span><span class="kv-val">${c.hasSecret?'<span class="badge badge-success">是</span>':'<span class="badge badge-warn">否</span>'}</span>
+        ${c.email?`<span class="kv-key">邮箱</span><span class="kv-val">${escapeHtml(c.email)}</span>`:''}
+        ${c.proxy?`<span class="kv-key">账号代理</span><span class="kv-val mono">${escapeHtml(c.proxy)}</span>`:''}
+        ${c.userId?`<span class="kv-key">用户 ID</span><span class="kv-val mono">${escapeHtml(c.userId)}</span>`:''}
+        ${c.expiresAt?`<span class="kv-key">过期时间</span><span class="kv-val">${escapeHtml(new Date(c.expiresAt).toLocaleString())}</span>`:''}
+      </div>`;
+  }else{
+    document.getElementById('currentCred').innerHTML='<div class="empty-state"><div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></div><div class="empty-text">未配置凭证</div><div class="empty-hint">请使用 OAuth 登录或添加 API Key</div></div>';
+  }
+}
+function renderCredStore(d){
+  document.getElementById('credStoreInfo').innerHTML=d.credential
+    ?`<span class="badge badge-success"><span class="badge-dot"></span>活跃</span> &nbsp; ${escapeHtml(d.credential.provider)} &nbsp; <code class="code-inline">${escapeHtml(d.credential.apiKeyMask)}</code>`
+    :'<div class="empty-state" style="padding:16px"><div class="empty-text"><span class="badge badge-warn">无存储凭证</span></div></div>';
+}
+async function loadCredentialViews(){
+  const generation=++_credentialViewsLoadGeneration;
+  const requestAuthToken=authToken;
+  const requestInitGeneration=dashboardInitGeneration;
   try{
-    const r=await fetch(API+'/admin/api/credentials',{headers:authHeaders()});
-    const d=await r.json();
-    if(d.credential){
-      const c=d.credential;
-      document.getElementById('currentCred').innerHTML=`
-        <div class="kv-grid">
-          <span class="kv-key">提供商</span><span class="kv-val">${escapeHtml(c.provider)}</span>
-          <span class="kv-key">API Key</span><span class="kv-val mono">${escapeHtml(c.apiKeyMask)}</span>
-          <span class="kv-key">套餐</span><span class="kv-val">${c.plan==='start-plan'?'<span class="badge badge-warn">Start 套餐</span>':'<span class="badge badge-success">Coding 套餐</span>'}</span>
-          <span class="kv-key">认证模式</span><span class="kv-val"><span class="badge badge-info">${escapeHtml(c.mode||'apikey')}</span></span>
-          <span class="kv-key">含 Secret</span><span class="kv-val">${c.hasSecret?'<span class="badge badge-success">是</span>':'<span class="badge badge-warn">否</span>'}</span>
-          ${c.userId?`<span class="kv-key">用户 ID</span><span class="kv-val mono">${escapeHtml(c.userId)}</span>`:''}
-          ${c.expiresAt?`<span class="kv-key">过期时间</span><span class="kv-val">${escapeHtml(new Date(c.expiresAt).toLocaleString())}</span>`:''}
-        </div>`;
-    }else{
-      document.getElementById('currentCred').innerHTML='<div class="empty-state"><div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></div><div class="empty-text">未配置凭证</div><div class="empty-hint">请使用 OAuth 登录或添加 API Key</div></div>';
+    const d=await fetchCredentialSnapshot();
+    if(generation!==_credentialViewsLoadGeneration||!dashboardCanUpdate()||!dashboardActionCurrent(requestInitGeneration,requestAuthToken))return;
+    renderAccountInfo(d);
+    renderCredStore(d);
+  }catch(e){
+    if(generation===_credentialViewsLoadGeneration&&dashboardCanUpdate()&&dashboardActionCurrent(requestInitGeneration,requestAuthToken)){
+      console.error('loadCredentialViews failed:',e);
+      document.getElementById('currentCred').innerHTML='<p style="color:var(--danger)">加载失败</p>';
     }
-  }catch(e){console.error('loadAccountInfo failed:',e);document.getElementById('currentCred').innerHTML='<p style="color:var(--danger)">加载失败</p>'}
+  }
+}
+async function loadAccountInfo(){
+  const generation=++_credentialViewsLoadGeneration;
+  const requestAuthToken=authToken;
+  const requestInitGeneration=dashboardInitGeneration;
+  try{
+    const d=await fetchCredentialSnapshot();
+    if(generation!==_credentialViewsLoadGeneration||!dashboardCanUpdate()||!dashboardActionCurrent(requestInitGeneration,requestAuthToken))return;
+    renderAccountInfo(d);
+  }catch(e){if(generation===_credentialViewsLoadGeneration&&dashboardCanUpdate()&&dashboardActionCurrent(requestInitGeneration,requestAuthToken)){console.error('loadAccountInfo failed:',e);document.getElementById('currentCred').innerHTML='<p style="color:var(--danger)">加载失败</p>'}}
 }
 async function addApiKey(){
   const provider=document.getElementById('addKeyProvider').value;
@@ -2789,18 +3227,11 @@ async function addApiKey(){
   const key=document.getElementById('addKeyValue').value.trim();
   if(!key)return toast('请输入 API Key','error');
   try{
-    const r=await fetch(API+'/admin/api/credentials',{method:'POST',headers:authHeaders(),body:JSON.stringify({provider,apiKey:key,plan})});
-    if(r.ok){
-      toast('API Key 已添加（'+plan+'）','success');
-      loadAccountInfo();loadAccountsList();loadCredStore();
-      document.getElementById('addKeyValue').value='';
-    }else{
-      // vceshi0.0.7+: surface the real server error (e.g. "provider must be
-      // 'zai' or 'bigmodel'") instead of the generic "添加失败".
-      const d=await r.json().catch(()=>({}));
-      toast(d.error?.message||d.error||'添加失败','error');
-    }
-  }catch(e){console.error('addApiKey failed:',e);toast('添加失败','error')}
+    await fetchJsonMutationWithTimeout(API+'/admin/api/credentials',{method:'POST',headers:authHeaders(),body:JSON.stringify({provider,apiKey:key,plan})});
+    toast('API Key 已添加（'+plan+'）','success');
+    refreshAccountViews();
+    document.getElementById('addKeyValue').value='';
+  }catch(e){console.error('addApiKey failed:',e);toast(e instanceof Error&&e.message?e.message:'添加失败','error')}
 }
 // Pre-fill the ZCode import dropdowns from the server's auto-detection:
 // activeProvider selects the provider, and provider×plan combos with no
@@ -2835,13 +3266,14 @@ function refreshImportPlanOptions(){
 }
 function onImportProviderChange(){refreshImportPlanOptions();}
 async function initImportCard(){
+  const requestAuthToken=authToken;
+  const requestInitGeneration=dashboardInitGeneration;
   const provSel=document.getElementById('importProvider');
   const planSel=document.getElementById('importPlan');
   if(!provSel||!planSel)return;
   try{
-    const r=await fetch(API+'/admin/api/import/detect',{headers:authHeaders()});
-    if(!r.ok)return;
-    const d=await r.json();
+    const d=await fetchJsonWithTimeout(API+'/admin/api/import/detect',{headers:authHeaders()},5000);
+    if(!dashboardCanUpdate()||!dashboardActionCurrent(requestInitGeneration,requestAuthToken))return;
     // available: [{provider, plan, hasApiKey}] — a combo is pickable only if it has a credential.
     const availMap={};
     (d.available||[]).forEach(a=>{availMap[a.provider+'|'+a.plan]=a.hasApiKey;});
@@ -2859,22 +3291,15 @@ async function importKey(){
   const provider=document.getElementById('importProvider').value;
   const plan=document.getElementById('importPlan').value;
   try{
-    const r=await fetch(API+'/admin/api/import',{method:'POST',headers:authHeaders(),body:JSON.stringify({provider,plan})});
-    const d=await r.json();
-    if(r.ok){
-      // Show email when the import captured it (from credentials.json) — makes
-      // it obvious which account was imported.
-      const namePart=d.name||d.email?(d.email?(' · '+d.email):''):'';
-      toast('凭证已导入：'+d.apiKeyMask+namePart,'success');
-      loadAccountInfo();loadAccountsList();loadCredStore();
-      // Re-run detection so a freshly-available combo stays reflected.
-      initImportCard();
-    }else{
-      // vceshi0.0.7+: surface the real server error (e.g. "ZCode config not
-      // found at ...") instead of the generic "导入失败".
-      toast(d.error?.message||d.error||'导入失败','error');
-    }
-  }catch(e){console.error('importKey failed:',e);toast('导入失败','error')}
+    const d=await fetchJsonMutationWithTimeout(API+'/admin/api/import',{method:'POST',headers:authHeaders(),body:JSON.stringify({provider,plan})});
+    // Show email when the import captured it (from credentials.json) — makes
+    // it obvious which account was imported.
+    const namePart=d.name||d.email?(d.email?(' · '+d.email):''):'';
+    toast('凭证已导入：'+d.apiKeyMask+namePart,'success');
+    refreshAccountViews();
+    // Re-run detection so a freshly-available combo stays reflected.
+    initImportCard();
+  }catch(e){console.error('importKey failed:',e);toast(e instanceof Error&&e.message?e.message:'导入失败','error')}
 }
 
 // --- Multi-account management ---
@@ -2883,14 +3308,61 @@ async function importKey(){
 // re-fetching from the server on every keystroke in the search box.
 let _cachedAccounts=[];
 let _cachedActiveId=null;
+let _accountFilterTimer=null;
+let _accountViewsRefreshTimer=null;
+let _accountViewsRefreshPending=false;
+let _accountViewsRefreshInFlight=null;
+let _accountListLoadGeneration=0;
+
+function clearAccountFilterTimer(){
+  if(_accountFilterTimer){clearTimeout(_accountFilterTimer);_accountFilterTimer=null;}
+}
+
+function clearAccountViewsRefreshTimer(){
+  if(_accountViewsRefreshTimer){clearTimeout(_accountViewsRefreshTimer);_accountViewsRefreshTimer=null;}
+  _accountViewsRefreshPending=false;
+}
+
+function refreshAccountViews(){
+  if(document.hidden||!dashboardActive())return;
+  _accountViewsRefreshPending=true;
+  if(_accountViewsRefreshTimer||_accountViewsRefreshInFlight)return;
+  _accountViewsRefreshTimer=setTimeout(runAccountViewsRefresh,ACCOUNT_REFRESH_DEBOUNCE_MS);
+}
+
+async function runAccountViewsRefresh(){
+  _accountViewsRefreshTimer=null;
+  if(_accountViewsRefreshInFlight)return;
+  _accountViewsRefreshPending=false;
+  _accountViewsRefreshInFlight=Promise.allSettled([
+    loadCredentialViews(),
+    loadAccountsList(),
+  ]).finally(()=>{
+    _accountViewsRefreshInFlight=null;
+    if(_accountViewsRefreshPending&&!document.hidden&&dashboardActive())refreshAccountViews();
+  });
+  await _accountViewsRefreshInFlight;
+}
+
+function scheduleFilterAccounts(){
+  clearAccountFilterTimer();
+  _accountFilterTimer=setTimeout(()=>{
+    _accountFilterTimer=null;
+    filterAccounts();
+  },ACCOUNT_FILTER_DEBOUNCE_MS);
+}
 
 async function loadAccountsList(){
+  const generation=++_accountListLoadGeneration;
+  const requestAuthToken=authToken;
+  const requestInitGeneration=dashboardInitGeneration;
   const tb=document.getElementById('accountsList');
   if(!tb)return;
   try{
-    const r=await fetch(API+'/admin/api/accounts',{headers:authHeaders()});
-    const d=await r.json();
+    const d=await fetchJsonWithTimeout(API+'/admin/api/accounts',{headers:authHeaders()},5000);
+    if(generation!==_accountListLoadGeneration||!dashboardCanUpdate()||!dashboardActionCurrent(requestInitGeneration,requestAuthToken))return;
     const accounts=d.accounts||[];
+    for(const account of accounts)cacheAccountSearchText(account);
     _cachedAccounts=accounts;
     _cachedActiveId=d.activeId;
     // Update the stats bar + account count tag
@@ -2900,9 +3372,26 @@ async function loadAccountsList(){
     // Apply current filter (if any) and render
     filterAccounts();
   }catch(e){
-    console.error('loadAccountsList failed:',e);
-    tb.innerHTML='<tr><td colspan="9"><div class="empty-state" style="color:var(--danger)">加载账号列表失败</div></td></tr>';
+    if(generation===_accountListLoadGeneration&&dashboardCanUpdate()&&dashboardActionCurrent(requestInitGeneration,requestAuthToken)){
+      console.error('loadAccountsList failed:',e);
+      tb.innerHTML='<tr><td colspan="9"><div class="empty-state" style="color:var(--danger)">加载账号列表失败</div></td></tr>';
+    }
   }
+}
+
+function cacheAccountSearchText(account){
+  const searchText=[
+    account.name||'',
+    account.label||'',
+    account.email||'',
+    account.apiKeyMask||''
+  ].join(' ').toLowerCase();
+  Object.defineProperty(account,'_searchText',{
+    value:searchText,
+    writable:true,
+    configurable:true
+  });
+  return account;
 }
 
 /** Update the 4-card stats bar at the top of the accounts page. */
@@ -2911,10 +3400,18 @@ function updateAccountsStats(accounts){
     const el=document.getElementById(id);
     if(el)el.textContent=val;
   };
+  let bigmodel=0;
+  let zai=0;
+  let startPlan=0;
+  for(const account of accounts){
+    if(account.provider==='bigmodel')bigmodel++;
+    if(account.provider==='zai')zai++;
+    if((account.plan||'coding-plan')==='start-plan')startPlan++;
+  }
   setStat('statAccountsTotal',accounts.length);
-  setStat('statBigmodel',accounts.filter(a=>a.provider==='bigmodel').length);
-  setStat('statZai',accounts.filter(a=>a.provider==='zai').length);
-  setStat('statStartPlan',accounts.filter(a=>(a.plan||'coding-plan')==='start-plan').length);
+  setStat('statBigmodel',bigmodel);
+  setStat('statZai',zai);
+  setStat('statStartPlan',startPlan);
 }
 
 /**
@@ -2928,27 +3425,28 @@ function filterAccounts(){
   const search=(document.getElementById('accountSearch')?.value||'').trim().toLowerCase();
   const fProvider=document.getElementById('accountFilterProvider')?.value||'';
   const fPlan=document.getElementById('accountFilterPlan')?.value||'';
-  let accounts=_cachedAccounts;
-  // Apply filters
-  if(fProvider)accounts=accounts.filter(a=>a.provider===fProvider);
-  if(fPlan)accounts=accounts.filter(a=>(a.plan||'coding-plan')===fPlan);
-  if(search){
-    accounts=accounts.filter(a=>{
-      const label=(a.label||'').toLowerCase();
-      const key=(a.apiKeyMask||'').toLowerCase();
-      return label.includes(search)||key.includes(search);
-    });
+  const visibleAccounts=[];
+  let matchedCount=0;
+  for(const account of _cachedAccounts){
+    if(fProvider&&account.provider!==fProvider)continue;
+    if(fPlan&&(account.plan||'coding-plan')!==fPlan)continue;
+    if(search&&!(account._searchText||cacheAccountSearchText(account)._searchText).includes(search))continue;
+    matchedCount++;
+    if(visibleAccounts.length<ACCOUNT_MAX_RENDERED_ROWS)visibleAccounts.push(account);
   }
   const activeId=_cachedActiveId;
   if(!_cachedAccounts.length){
     tb.innerHTML='<tr><td colspan="9"><div class="empty-state"><div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg></div><div class="empty-text">暂无存储的账号</div><div class="empty-hint">请使用 OAuth 或"添加 API Key"创建</div></div></td></tr>';
     return;
   }
-  if(!accounts.length){
+  if(!matchedCount){
     tb.innerHTML='<tr><td colspan="9"><div class="empty-state"><div class="empty-text">没有匹配的账号</div><div class="empty-hint">尝试调整搜索条件或过滤器</div></div></td></tr>';
     return;
   }
-  tb.innerHTML=accounts.map(a=>{
+  const truncatedRow=matchedCount>visibleAccounts.length
+    ? `<tr><td colspan="9"><div class="empty-state" style="padding:12px"><div class="empty-text">仅渲染前 ${visibleAccounts.length} / ${matchedCount} 个账号，搜索和过滤仍基于完整列表</div></div></td></tr>`
+    : '';
+  tb.innerHTML=visibleAccounts.map(a=>{
     const isActive=a.id===activeId;
     const isDisabled=!!a.disabled;
     const created=new Date(a.createdAt).toLocaleString();
@@ -2961,8 +3459,9 @@ function filterAccounts(){
     // editable field is now `name` (via the edit modal).
     const displayName=a.name||a.label;
     const emailCell=a.email?`<span class="td-mute" title="${escapeHtml(a.email)}">${escapeHtml(a.email)}</span>`:'<span class="td-mute">—</span>';
-    // vceshi0.0.6+: usage count from cached byCredential stats (keyed by apiKeyMask)
-    const usage=_cachedByCredential[a.apiKeyMask];
+    // Usage stats are keyed by credentialKey (stable hash). Fall back to the
+    // old apiKeyMask key so stats collected before a hot reload still render.
+    const usage=_cachedByCredential[a.credentialKey]||_cachedByCredential[a.apiKeyMask];
     const usageCell=usage?`<span class="td-mono" title="输入 ${usage.inputTokens||0} / 输出 ${usage.outputTokens||0} tokens">${usage.count}</span>`:'<span class="td-mute">0</span>';
     // vceshi0.0.6+: status column shows both active + disabled badges
     let statusBadge;
@@ -2971,77 +3470,64 @@ function filterAccounts(){
     if(isDisabled) statusBadge+=' <span class="badge badge-danger">已禁用</span>';
     // vceshi0.0.6+: disable/enable toggle button
     const toggleBtn=isDisabled
-      ?`<button class="btn btn-success btn-sm" onclick="toggleDisabled('${escapeJsString(a.id)}',false)" title="启用此凭证">启用</button> `
-      :`<button class="btn btn-warn btn-sm" onclick="toggleDisabled('${escapeJsString(a.id)}',true)" title="禁用此凭证（不会被激活或自动切换到）">禁用</button> `;
+      ?`<button class="btn btn-success btn-sm" onclick="toggleDisabled('${escapeJsAttrString(a.id)}',false)" title="启用此凭证">启用</button> `
+      :`<button class="btn btn-warn btn-sm" onclick="toggleDisabled('${escapeJsAttrString(a.id)}',true)" title="禁用此凭证（不会被激活或自动切换到）">禁用</button> `;
     return `<tr>
-      <td><input value="${escapeHtml(displayName)}" onchange="renameAccount('${escapeJsString(a.id)}',this.value)" title="${a.name?'编辑名称（清空将回退到自动标签）':'编辑自动标签'}" ${isDisabled?'style="opacity:0.5"':''}></td>
+      <td><input value="${escapeHtml(displayName)}" onchange="renameAccount('${escapeJsAttrString(a.id)}',this.value)" title="${a.name?'编辑名称（清空将回退到自动标签）':'编辑自动标签'}" ${isDisabled?'style="opacity:0.5"':''}></td>
       <td><span class="badge badge-info">${escapeHtml(a.provider)}</span></td>
-      <td><select onchange="changePlan('${escapeJsString(a.id)}',this.value)" ${isDisabled?'style="opacity:0.5"':''}><option value="coding-plan"${planVal==='coding-plan'?' selected':''}>Coding</option><option value="start-plan"${planVal==='start-plan'?' selected':''}>Start</option></select></td>
+      <td><select onchange="changePlan('${escapeJsAttrString(a.id)}',this.value)" ${isDisabled?'style="opacity:0.5"':''}><option value="coding-plan"${planVal==='coding-plan'?' selected':''}>Coding</option><option value="start-plan"${planVal==='start-plan'?' selected':''}>Start</option></select></td>
       <td class="td-mono">${proxyBadge}${escapeHtml(a.apiKeyMask)}${a.hasSecret?' <span class="badge badge-success">secret</span>':''}${a.hasJwt?' <span class="badge badge-success">jwt</span>':''}</td>
       <td>${emailCell}</td>
       <td>${usageCell}</td>
       <td class="td-mute">${escapeHtml(created)}</td>
       <td>${statusBadge}</td>
       <td class="td-actions">
-        <button class="btn btn-ghost btn-sm" onclick="openAccountDetail('${escapeJsString(a.id)}')" title="查看完整凭证信息">查看</button>
-        <button class="btn btn-ghost btn-sm" onclick="openEditModal('${escapeJsString(a.id)}')" title="编辑名称和邮箱">编辑</button>
-        <button class="btn btn-ghost btn-sm" onclick="exportSingleAccountJson('${escapeJsString(a.id)}')" title="导出此账号的 JSON 凭证">导出</button>
-        <button class="btn btn-ghost btn-sm" onclick="checkQuota('${escapeJsString(a.id)}')" title="查询上游额度">额度</button>
-        <button class="btn btn-ghost btn-sm" onclick="openProxyModal('${escapeJsString(a.id)}','${escapeJsString(a.proxy||'')}',this.getAttribute('data-provider'))" data-provider="${escapeHtml(a.provider)}" title="配置代理">代理</button>
+        <button class="btn btn-ghost btn-sm" onclick="openAccountDetail('${escapeJsAttrString(a.id)}')" title="查看完整凭证信息">查看</button>
+        <button class="btn btn-ghost btn-sm" onclick="openEditModal('${escapeJsAttrString(a.id)}')" title="编辑名称和邮箱">编辑</button>
+        <button class="btn btn-ghost btn-sm" onclick="exportSingleAccountJson('${escapeJsAttrString(a.id)}')" title="导出此账号的 JSON 凭证">导出</button>
+        <button class="btn btn-ghost btn-sm" onclick="checkQuota('${escapeJsAttrString(a.id)}')" title="查询上游额度">额度</button>
+        <button class="btn btn-ghost btn-sm" onclick="openProxyModal('${escapeJsAttrString(a.id)}','${escapeJsAttrString(a.proxy||'')}',this.getAttribute('data-provider'))" data-provider="${escapeHtml(a.provider)}" title="配置代理">代理</button>
         ${toggleBtn}
-        ${(isActive||isDisabled)?'':`<button class="btn btn-primary btn-sm" onclick="activateAccount('${escapeJsString(a.id)}')">激活</button> `}
-        <button class="btn btn-danger btn-sm" onclick="deleteAccount('${escapeJsString(a.id)}','${escapeJsString(displayName)}')">删除</button>
+        ${(isActive||isDisabled)?'':`<button class="btn btn-primary btn-sm" onclick="activateAccount('${escapeJsAttrString(a.id)}')">激活</button> `}
+        <button class="btn btn-danger btn-sm" onclick="deleteAccount('${escapeJsAttrString(a.id)}','${escapeJsAttrString(displayName)}')">删除</button>
       </td>
     </tr>`;
-  }).join('');
+  }).join('')+truncatedRow;
 }
 async function activateAccount(id){
   try{
-    const r=await fetch(API+'/admin/api/accounts/active',{method:'PUT',headers:authHeaders(),body:JSON.stringify({id})});
-    if(r.ok){toast('账号已激活','success');loadAccountInfo();loadAccountsList();loadCredStore()}
-    else toast('激活失败','error');
-  }catch(e){console.error('activateAccount failed:',e);toast('激活失败','error')}
+    await fetchJsonMutationWithTimeout(API+'/admin/api/accounts/active',{method:'PUT',headers:authHeaders(),body:JSON.stringify({id})});
+    toast('账号已激活','success');
+    refreshAccountViews();
+  }catch(e){console.error('activateAccount failed:',e);toast(e instanceof Error&&e.message?e.message:'激活失败','error')}
 }
 async function renameAccount(id,label){
   try{
-    const r=await fetch(API+'/admin/api/accounts/label',{method:'PUT',headers:authHeaders(),body:JSON.stringify({id,label})});
-    if(r.ok){
-      toast('标签已更新','success');
-      // vceshi0.0.7+: refresh the accounts list so the displayed name
-      // matches the server-side normalized value (e.g. trimmed). Previously
-      // the inline input showed whatever the user typed, which could
-      // diverge from the persisted value.
-      loadAccountsList();
-    }else{
-      const d=await r.json().catch(()=>({}));
-      toast(d.error?.message||d.error||'重命名失败','error');
-      // Refresh on failure too — the input value reverts to the persisted value.
-      loadAccountsList();
-    }
+    await fetchJsonMutationWithTimeout(API+'/admin/api/accounts/label',{method:'PUT',headers:authHeaders(),body:JSON.stringify({id,label})});
+    toast('标签已更新','success');
+    // vceshi0.0.7+: refresh the accounts list so the displayed name
+    // matches the server-side normalized value (e.g. trimmed). Previously
+    // the inline input showed whatever the user typed, which could
+    // diverge from the persisted value.
+    loadAccountsList();
   }catch(e){console.error('renameAccount failed:',e);toast('重命名失败','error');loadAccountsList()}
 }
 async function deleteAccount(id,label){
   if(!confirm(`确认删除账号"${label}"？此操作不可撤销。`))return;
   try{
-    const r=await fetch(API+'/admin/api/accounts/'+id,{method:'DELETE',headers:authHeaders()});
-    if(r.ok){toast('账号已删除','success');loadAccountInfo();loadAccountsList();loadCredStore()}
-    else toast('删除失败','error');
-  }catch(e){console.error('deleteAccount failed:',e);toast('删除失败','error')}
+    await fetchJsonMutationWithTimeout(API+'/admin/api/accounts/'+id,{method:'DELETE',headers:authHeaders()});
+    toast('账号已删除','success');
+    refreshAccountViews();
+  }catch(e){console.error('deleteAccount failed:',e);toast(e instanceof Error&&e.message?e.message:'删除失败','error')}
 }
 async function changePlan(id,plan){
   try{
-    const r=await fetch(API+'/admin/api/accounts/plan',{method:'PUT',headers:authHeaders(),body:JSON.stringify({id,plan})});
-    if(r.ok){
-      toast('套餐已更新为 '+plan,'success');
-      // vceshi0.0.7+: refresh the accounts list so the plan badge updates.
-      // Previously the dropdown showed the new value but the rest of the row
-      // (and any plan-based filtering) was stale until manual refresh.
-      loadAccountInfo();loadCredStore();loadAccountsList();
-    }else{
-      const d=await r.json().catch(()=>({}));
-      toast(d.error?.message||d.error||'套餐更新失败','error');
-      loadAccountsList(); // revert the dropdown to the persisted value
-    }
+    await fetchJsonMutationWithTimeout(API+'/admin/api/accounts/plan',{method:'PUT',headers:authHeaders(),body:JSON.stringify({id,plan})});
+    toast('套餐已更新为 '+plan,'success');
+    // vceshi0.0.7+: refresh the accounts list so the plan badge updates.
+    // Previously the dropdown showed the new value but the rest of the row
+    // (and any plan-based filtering) was stale until manual refresh.
+    refreshAccountViews();
   }catch(e){console.error('changePlan failed:',e);toast('套餐更新失败','error');loadAccountsList()}
 }
 async function changeProxy(id,proxy){
@@ -3054,16 +3540,9 @@ async function changeProxy(id,proxy){
     return;
   }
   try{
-    const r=await fetch(API+'/admin/api/accounts/proxy',{method:'PUT',headers:authHeaders(),body:JSON.stringify({id,proxy:trimmed})});
-    if(r.ok){
-      const d=await r.json();
-      toast(d.proxy?('代理已设置：'+d.proxy):'代理已清除','success');
-      loadAccountInfo();loadCredStore();
-    }else{
-      const d=await r.json().catch(()=>({}));
-      toast(d.error||'代理更新失败','error');
-      loadAccountsList();
-    }
+    const d=await fetchJsonMutationWithTimeout(API+'/admin/api/accounts/proxy',{method:'PUT',headers:authHeaders(),body:JSON.stringify({id,proxy:trimmed})});
+    toast(d.proxy?('代理已设置：'+d.proxy):'代理已清除','success');
+    refreshAccountViews();
   }catch(e){console.error('changeProxy failed:',e);toast('代理更新失败','error');loadAccountsList()}
 }
 
@@ -3074,9 +3553,13 @@ async function changeProxy(id,proxy){
 // when user clicks "show"). Edit modal: change name + email only (the only
 // fields the user is allowed to edit post-creation). JSON export: downloads
 // a single account's full credential JSON as a file.
+let accountDetailModalGeneration=0;
 
 /** Open a read-only detail modal showing all credential info. */
 async function openAccountDetail(id){
+  const generation=++accountDetailModalGeneration;
+  const requestAuthToken=authToken;
+  const requestInitGeneration=dashboardInitGeneration;
   // Render the modal shell immediately with a loading state so the click
   // feels responsive — previously the user clicked and saw nothing for
   // 100-500ms while the fetch was in flight, which read as "lag".
@@ -3099,13 +3582,8 @@ async function openAccountDetail(id){
   </div>`;
   showModal('accountDetailModal',loadingHtml);
   try{
-    const r=await fetch(API+'/admin/api/accounts/export-single?id='+encodeURIComponent(id),{headers:authHeaders()});
-    if(!r.ok){
-      const d=await r.json().catch(()=>({}));
-      closeModal('accountDetailModal');
-      toast(d.error||'查看失败','error');return;
-    }
-    const d=await r.json();
+    const d=await fetchJsonWithTimeout(API+'/admin/api/accounts/export-single?id='+encodeURIComponent(id),{headers:authHeaders()},5000);
+    if(generation!==accountDetailModalGeneration||!dashboardActionCurrent(requestInitGeneration,requestAuthToken))return;
     const acc=d.account;
     if(!acc){closeModal('accountDetailModal');toast('账号不存在','error');return;}
     const cred=acc.credential||{};
@@ -3173,7 +3651,13 @@ async function openAccountDetail(id){
         });
       });
     }
-  }catch(e){console.error('openAccountDetail failed:',e);toast('查看失败','error')}
+  }catch(e){
+    if(generation===accountDetailModalGeneration&&dashboardActionCurrent(requestInitGeneration,requestAuthToken)){
+      console.error('openAccountDetail failed:',e);
+      closeModal('accountDetailModal');
+      toast('查看失败','error');
+    }
+  }
 }
 
 /** Mask a sensitive string for display: show first 8 + last 4 chars. */
@@ -3225,7 +3709,7 @@ async function openEditModal(id){
       </div>
       <div class="modal-footer">
         <button class="btn btn-ghost" onclick="closeModal('editModal')">取消</button>
-        <button class="btn btn-primary" onclick="saveAccountEdit('${escapeJsString(id)}')">保存</button>
+        <button class="btn btn-primary" onclick="saveAccountEdit('${escapeJsAttrString(id)}')">保存</button>
       </div>
     </div>
   </div>`;
@@ -3237,16 +3721,11 @@ async function saveAccountEdit(id){
   const name=document.getElementById('editName').value;
   const email=document.getElementById('editEmail').value;
   try{
-    const r=await fetch(API+'/admin/api/accounts/edit',{method:'PUT',headers:authHeaders(),body:JSON.stringify({id,name,email})});
-    if(r.ok){
-      toast('账号已更新','success');
-      closeModal('editModal');
-      loadAccountInfo();loadAccountsList();loadCredStore();
-    }else{
-      const d=await r.json().catch(()=>({}));
-      toast(d.error?.message||d.error||'保存失败','error');
-    }
-  }catch(e){console.error('saveAccountEdit failed:',e);toast('保存失败','error')}
+    await fetchJsonMutationWithTimeout(API+'/admin/api/accounts/edit',{method:'PUT',headers:authHeaders(),body:JSON.stringify({id,name,email})});
+    toast('账号已更新','success');
+    closeModal('editModal');
+    refreshAccountViews();
+  }catch(e){console.error('saveAccountEdit failed:',e);toast(e instanceof Error&&e.message?e.message:'保存失败','error')}
 }
 
 /** Toggle account disabled state (vceshi0.0.6+). */
@@ -3260,26 +3739,16 @@ async function toggleDisabled(id,disabled){
     }
   }
   try{
-    const r=await fetch(API+'/admin/api/accounts/disabled',{method:'PUT',headers:authHeaders(),body:JSON.stringify({id,disabled})});
-    if(r.ok){
-      toast(`已${action}账号`,'success');
-      loadAccountsList();
-    }else{
-      const d=await r.json().catch(()=>({}));
-      toast(d.error?.message||d.error||`${action}失败`,'error');
-    }
-  }catch(e){console.error('toggleDisabled failed:',e);toast(`${action}失败`,'error')}
+    await fetchJsonMutationWithTimeout(API+'/admin/api/accounts/disabled',{method:'PUT',headers:authHeaders(),body:JSON.stringify({id,disabled})});
+    toast(`已${action}账号`,'success');
+    refreshAccountViews();
+  }catch(e){console.error('toggleDisabled failed:',e);toast(e instanceof Error&&e.message?e.message:`${action}失败`,'error')}
 }
 
 /** Export a single account's full credential JSON as a downloadable file. */
 async function exportSingleAccountJson(id){
   try{
-    const r=await fetch(API+'/admin/api/accounts/export-single?id='+encodeURIComponent(id),{headers:authHeaders()});
-    if(!r.ok){
-      const d=await r.json().catch(()=>({}));
-      toast(d.error||'导出失败','error');return;
-    }
-    const d=await r.json();
+    const d=await fetchJsonWithTimeout(API+'/admin/api/accounts/export-single?id='+encodeURIComponent(id),{headers:authHeaders()},10000);
     const acc=d.account;
     if(!acc){toast('账号不存在','error');return;}
     // Build a clean JSON object: account metadata + full credential
@@ -3305,7 +3774,7 @@ async function exportSingleAccountJson(id){
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
     toast('已导出 JSON 文件','success');
-  }catch(e){console.error('exportSingleAccountJson failed:',e);toast('导出失败','error')}
+  }catch(e){console.error('exportSingleAccountJson failed:',e);toast(e instanceof Error&&e.message?e.message:'导出失败','error')}
 }
 
 /** Show a modal by injecting HTML into a container div. */
@@ -3321,6 +3790,7 @@ function showModal(containerId,html){
 
 /** Close a modal by clearing its container. */
 function closeModal(containerId){
+  if(containerId==='accountDetailModal')accountDetailModalGeneration++;
   const container=document.getElementById(containerId);
   if(container)container.innerHTML='';
 }
@@ -3337,6 +3807,8 @@ function closeModal(containerId){
 /** Currently focused account id in the proxy modal. */
 let proxyModalAccountId=null;
 let proxyModalProvider=null;
+let proxyModalGeneration=0;
+let quotaModalGeneration=0;
 
 /**
  * Build a proxy URL string from individual modal fields.
@@ -3388,6 +3860,7 @@ function parseProxyUrl(url){
 
 /** Open the proxy modal for a given account. */
 function openProxyModal(id,currentProxy,provider){
+  proxyModalGeneration++;
   proxyModalAccountId=id;
   proxyModalProvider=(provider==='bigmodel')?'bigmodel':'zai';
   const parsed=parseProxyUrl(currentProxy);
@@ -3400,6 +3873,8 @@ function openProxyModal(id,currentProxy,provider){
   const result=document.getElementById('proxyTestResult');
   result.innerHTML='';
   result.style.display='none';
+  const testBtn=document.getElementById('proxyTestBtn');
+  if(testBtn&&testBtn.dataset.idleHtml)testBtn.innerHTML=testBtn.dataset.idleHtml;
   // Toggle field enablement based on type
   updateProxyFieldState();
   // Show modal
@@ -3408,6 +3883,7 @@ function openProxyModal(id,currentProxy,provider){
 
 /** Close the proxy modal without saving. */
 function closeProxyModal(){
+  proxyModalGeneration++;
   document.getElementById('proxyModal').style.display='none';
   proxyModalAccountId=null;
   proxyModalProvider=null;
@@ -3415,19 +3891,23 @@ function closeProxyModal(){
 
 /** Query and display the upstream quota/balance for an account. */
 async function checkQuota(id){
+  const generation=++quotaModalGeneration;
+  const requestAuthToken=authToken;
+  const requestInitGeneration=dashboardInitGeneration;
   const modal=document.getElementById('quotaModal');
   const body=document.getElementById('quotaBody');
   // Loading state
   body.innerHTML='<div style="display:flex;align-items:center;justify-content:center;gap:10px;padding:24px;color:var(--text-2);font-size:13px;animation:pulse 1.4s ease-in-out infinite;">正在查询上游额度…</div>';
   modal.style.display='flex';
   try{
-    const r=await fetch(API+'/admin/api/accounts/quota',{method:'POST',headers:authHeaders(),body:JSON.stringify({id})});
-    if(!r.ok){const t=await r.text().catch(()=>'');throw new Error('HTTP '+r.status+(t?' '+t:''))}
-    const d=await r.json();
+    const d=await fetchJsonMutationWithTimeout(API+'/admin/api/accounts/quota',{method:'POST',headers:authHeaders(),body:JSON.stringify({id})},15000);
+    if(generation!==quotaModalGeneration||!dashboardActionCurrent(requestInitGeneration,requestAuthToken))return;
     renderQuota(d);
   }catch(e){
-    console.error('checkQuota failed:',e);
-    body.innerHTML='<div style="padding:20px;color:var(--danger);font-size:13px;line-height:1.6;">查询失败：'+escapeHtml(e instanceof Error?e.message:String(e))+'<br><span style="color:var(--text-3)">请检查网络或上游服务是否可达。</span></div>';
+    if(generation===quotaModalGeneration&&dashboardActionCurrent(requestInitGeneration,requestAuthToken)){
+      console.error('checkQuota failed:',e);
+      body.innerHTML='<div style="padding:20px;color:var(--danger);font-size:13px;line-height:1.6;">查询失败：'+escapeHtml(e instanceof Error?e.message:String(e))+'<br><span style="color:var(--text-3)">请检查网络或上游服务是否可达。</span></div>';
+    }
   }
 }
 
@@ -3502,6 +3982,7 @@ function fmtNum(n){return (n==null||n===undefined)?'-':String(n).replace(/\B(?=(
 
 
 function closeQuotaModal(){
+  quotaModalGeneration++;
   document.getElementById('quotaModal').style.display='none';
 }
 
@@ -3526,6 +4007,10 @@ async function testProxyConnection(){
     toast('未选择账号','error');
     return;
   }
+  const generation=proxyModalGeneration;
+  const requestAccountId=proxyModalAccountId;
+  const requestAuthToken=authToken;
+  const requestInitGeneration=dashboardInitGeneration;
   const proxyUrl=buildProxyUrlFromModal();
   if(!proxyUrl){
     // "none" — can't test "no proxy"; show a friendly message instead
@@ -3548,21 +4033,25 @@ async function testProxyConnection(){
   }
   // Show testing state
   const btn=document.getElementById('proxyTestBtn');
-  const originalText=btn.textContent;
+  if(!btn.dataset.idleHtml)btn.dataset.idleHtml=btn.innerHTML;
+  const originalHtml=btn.dataset.idleHtml;
   btn.disabled=true;
-  btn.textContent='测试中…';
+  btn.innerHTML='测试中…';
   const result=document.getElementById('proxyTestResult');
   result.style.display='block';
   result.style.background='var(--info-soft)';
   result.style.color='var(--info)';
   result.innerHTML='正在通过代理连接上游…';
+  const stillCurrent=()=>generation===proxyModalGeneration
+    && proxyModalAccountId===requestAccountId
+    && dashboardActionCurrent(requestInitGeneration,requestAuthToken);
   try{
-    const r=await fetch(API+'/admin/api/accounts/proxy-test',{
+    const d=await fetchJsonMutationWithTimeout(API+'/admin/api/accounts/proxy-test',{
       method:'POST',
       headers:authHeaders(),
       body:JSON.stringify({proxy:proxyUrl,provider:proxyModalProvider}),
-    });
-    const d=await r.json();
+    },15000);
+    if(!stillCurrent())return;
     if(d.ok){
       result.style.background='var(--success-soft)';
       result.style.color='var(--success)';
@@ -3573,12 +4062,16 @@ async function testProxyConnection(){
       result.innerHTML=`✗ 连接失败：${escapeHtml(d.error||'未知错误')}（${d.latencyMs}ms）`;
     }
   }catch(e){
-    result.style.background='var(--danger-soft)';
-    result.style.color='var(--danger)';
-    result.innerHTML=`✗ 请求失败：${escapeHtml((e&&e.message)||String(e))}`;
+    if(stillCurrent()){
+      result.style.background='var(--danger-soft)';
+      result.style.color='var(--danger)';
+      result.innerHTML=`✗ 请求失败：${escapeHtml((e&&e.message)||String(e))}`;
+    }
   }finally{
-    btn.disabled=false;
-    btn.textContent=originalText;
+    if(stillCurrent()){
+      btn.disabled=false;
+      btn.innerHTML=originalHtml;
+    }
   }
 }
 
@@ -3588,6 +4081,9 @@ async function saveProxyFromModal(){
     toast('未选择账号','error');
     return;
   }
+  const generation=proxyModalGeneration;
+  const requestAuthToken=authToken;
+  const requestInitGeneration=dashboardInitGeneration;
   const proxyUrl=buildProxyUrlFromModal();
   const type=document.getElementById('proxyType').value;
   // Validate: if a non-none type is selected, host is required
@@ -3597,46 +4093,35 @@ async function saveProxyFromModal(){
   }
   const id=proxyModalAccountId;
   try{
-    const r=await fetch(API+'/admin/api/accounts/proxy',{
+    const d=await fetchJsonMutationWithTimeout(API+'/admin/api/accounts/proxy',{
       method:'PUT',
       headers:authHeaders(),
       body:JSON.stringify({id,proxy:proxyUrl}),
     });
-    if(r.ok){
-      const d=await r.json();
-      toast(d.proxy?('代理已设置：'+d.proxy):'代理已清除，恢复直连','success');
-      closeProxyModal();
-      loadAccountInfo();loadAccountsList();loadCredStore();
-    }else{
-      const d=await r.json().catch(()=>({}));
-      toast(d.error?.message||d.error||'代理保存失败','error');
-    }
+    if(generation!==proxyModalGeneration||!dashboardActionCurrent(requestInitGeneration,requestAuthToken))return;
+    toast(d.proxy?('代理已设置：'+d.proxy):'代理已清除，恢复直连','success');
+    closeProxyModal();
+    refreshAccountViews();
   }catch(e){
-    console.error('saveProxyFromModal failed:',e);
-    toast('代理保存失败','error');
+    if(generation===proxyModalGeneration&&dashboardActionCurrent(requestInitGeneration,requestAuthToken)){
+      console.error('saveProxyFromModal failed:',e);
+      toast('代理保存失败','error');
+    }
   }
 }
 async function exportAccounts(){
   try{
-    const r=await fetch(API+'/admin/api/accounts/export',{headers:authHeaders()});
-    if(!r.ok){toast('导出失败','error');return}
-    const d=await r.json();
+    const d=await fetchJsonWithTimeout(API+'/admin/api/accounts/export',{headers:authHeaders()},10000);
     const blob=new Blob([JSON.stringify(d,null,2)],{type:'application/json'});
     const url=URL.createObjectURL(blob);
     const a=document.createElement('a');a.href=url;a.download=`zcode-proxy-accounts-${new Date().toISOString().slice(0,10)}.json`;
     document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(url);
     toast('账号已导出（'+d.accounts.length+' 个账号）','success');
-  }catch(e){console.error('exportAccounts failed:',e);toast('导出失败','error')}
+  }catch(e){console.error('exportAccounts failed:',e);toast(e instanceof Error&&e.message?e.message:'导出失败','error')}
 }
 async function exportRenderCredential(){
   try{
-    const r=await fetch(API+'/admin/api/accounts/render-export',{headers:authHeaders()});
-    if(!r.ok){
-      const d=await r.json().catch(()=>({}));
-      toast(d.message||d.error?.message||'导出失败：请先登录或导入凭证','error');
-      return;
-    }
-    const d=await r.json();
+    const d=await fetchJsonWithTimeout(API+'/admin/api/accounts/render-export',{headers:authHeaders()},10000);
     // Build a modal dialog showing the base64 blob, env vars, and instructions.
     // For multi-account setups, d.multi=true and d.accountCount=N — show a badge
     // so the user knows all their accounts are bundled into the single env var.
@@ -3667,7 +4152,7 @@ async function exportRenderCredential(){
             <pre style="background:var(--bg-1);border-radius:6px;padding:12px;font-family:monospace;font-size:11px;line-height:1.6;overflow:auto;max-height:180px;margin:0;color:var(--text-1);">${escapeHtml(d.json)}</pre>
           </div>
           <div style="display:flex;gap:8px;">
-            <button onclick="navigator.clipboard.writeText('${escapeJsString(d.credential)}').then(()=>toast('已复制 base64 凭证到剪贴板','success')).catch(()=>toast('复制失败，请手动选择','error'))" style="background:var(--primary);color:white;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500;">
+            <button onclick="navigator.clipboard.writeText('${escapeJsAttrString(d.credential)}').then(()=>toast('已复制 base64 凭证到剪贴板','success')).catch(()=>toast('复制失败，请手动选择','error'))" style="background:var(--primary);color:white;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500;">
               📋 复制 ZCODE_OAUTH_CREDENTIAL
             </button>
             <button onclick="this.closest('div[style*=fixed]').remove()" style="background:var(--bg-2);color:var(--text-1);border:1px solid var(--border);padding:8px 16px;border-radius:6px;cursor:pointer;font-size:13px;">
@@ -3682,12 +4167,14 @@ async function exportRenderCredential(){
     `;
     document.body.appendChild(modal);
     modal.addEventListener('click',e=>{if(e.target===modal)modal.remove()});
-  }catch(e){console.error('exportRenderCredential failed:',e);toast('导出失败','error')}
+  }catch(e){console.error('exportRenderCredential failed:',e);toast(e instanceof Error&&e.message?e.message:'导出失败：请先登录或导入凭证','error')}
 }
 async function importAccountsFromFile(input){
   if(!input.files||!input.files[0])return;
+  if(!beginExclusiveAction('accountImport','账号导入正在进行中，请稍候')){input.value='';return;}
   const file=input.files[0];
   try{
+    if(!checkImportFileSize(file,ACCOUNT_IMPORT_MAX_FILE_BYTES,'账号导入'))return;
     const text=await file.text();
     const data=JSON.parse(text);
     // Accept multiple export formats so users can re-import files produced by
@@ -3713,12 +4200,14 @@ async function importAccountsFromFile(input){
       return;
     }
     if(!confirm(`从"${file.name}"导入 ${accounts.length} 个账号？\nID 匹配的现有账号将被更新。`))return;
-    const r=await fetch(API+'/admin/api/accounts/import',{method:'POST',headers:authHeaders(),body:JSON.stringify({accounts})});
-    const d=await r.json().catch(()=>({}));
-    if(r.ok){toast(`导入完成：新增 ${d.added}，更新 ${d.updated}`,'success');loadAccountInfo();loadAccountsList();loadCredStore()}
-    else toast(d.error?.message||d.message||'导入失败','error');
-  }catch(e){console.error('importAccounts failed:',e);toast('导入失败：文件无效','error')}
-  input.value='';
+    const d=await fetchJsonMutationWithTimeout(API+'/admin/api/accounts/import',{method:'POST',headers:authHeaders(),body:JSON.stringify({accounts})},MUTATION_TIMEOUT_MS);
+    toast(`导入完成：新增 ${d.added}，更新 ${d.updated}`,'success');
+    refreshAccountViews();
+  }catch(e){
+    console.error('importAccounts failed:',e);
+    toast(e instanceof Error&&e.message?'导入失败：'+e.message:'导入失败：文件无效','error');
+  }
+  finally{input.value='';endExclusiveAction('accountImport');}
 }
 function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 // Escape a string for safe interpolation inside a JavaScript single-quoted
@@ -3737,6 +4226,7 @@ function escapeJsString(s){
     .replace(/\u2028/g,'\\u2028') // line separator (breaks JS parsers)
     .replace(/\u2029/g,'\\u2029'); // paragraph separator
 }
+function escapeJsAttrString(s){return escapeHtml(escapeJsString(s))}
 
 // --- OAuth ---
 let currentFlowId=sessionStorage.getItem('zcodeOAuthFlowId')||null;
@@ -3746,14 +4236,27 @@ let oauthExpiresAt=0;
 // a new OAuth flow starts (so the previous loop stops) or when the user
 // submits a callback URL (so the loop stops because we have the result).
 let oauthPollCancelled=false;
+let oauthPollGeneration=0;
+function cancelOAuthPoll(){
+  oauthPollCancelled=true;
+  oauthPollGeneration++;
+}
+function isOAuthPollStale(flowId,generation){
+  return oauthPollCancelled||generation!==oauthPollGeneration||flowId!==currentFlowId||!dashboardActive();
+}
+function clearCurrentOAuthFlow(){
+  currentFlowId=null;
+  try{sessionStorage.removeItem('zcodeOAuthFlowId')}catch{}
+}
+function clearOauthExpiryTimer(){
+  if(oauthExpiryTimer){clearInterval(oauthExpiryTimer);oauthExpiryTimer=null}
+}
 async function loadCredStore(){
   try{
-    const r=await fetch(API+'/admin/api/credentials',{headers:authHeaders()});
-    const d=await r.json();
-    document.getElementById('credStoreInfo').innerHTML=d.credential
-      ?`<span class="badge badge-success"><span class="badge-dot"></span>活跃</span> &nbsp; ${d.credential.provider} &nbsp; <code class="code-inline">${d.credential.apiKeyMask}</code>`
-      :'<div class="empty-state" style="padding:16px"><div class="empty-text"><span class="badge badge-warn">无存储凭证</span></div></div>';
-  }catch(e){console.error('loadCredStore failed:',e)}
+    const d=await fetchCredentialSnapshot();
+    if(!dashboardCanUpdate())return;
+    renderCredStore(d);
+  }catch(e){if(dashboardCanUpdate())console.error('loadCredStore failed:',e)}
 }
 async function startOAuth(){
   const provider=document.getElementById('oauthProvider').value;
@@ -3764,16 +4267,12 @@ async function startOAuth(){
   document.getElementById('oauthUrlBox').style.display='none';
   document.getElementById('callbackResult').style.display='none';
   try{
-    const r=await fetch(API+'/admin/api/oauth/init',{method:'POST',headers:authHeaders(),body:JSON.stringify({provider,plan})});
-    const d=await r.json();
-    if(!r.ok)throw new Error(d.error||'Init failed');
+    const d=await fetchJsonMutationWithTimeout(API+'/admin/api/oauth/init',{method:'POST',headers:authHeaders(),body:JSON.stringify({provider,plan})},15000);
     // vceshi0.0.7+: cancel any previous poll loop before starting a new one.
     // Without this, starting a new OAuth flow while the old one was still
     // polling would leave both loops running — the old loop could update
     // the UI with stale "ready" status after the user moved on.
-    if(oauthPollCancelled===false){
-      oauthPollCancelled=true; // signal the previous loop to stop
-    }
+    cancelOAuthPoll();
     currentFlowId=d.flowId;
     sessionStorage.setItem('zcodeOAuthFlowId',d.flowId);
     document.getElementById('oauthDot').className='oauth-dot on';
@@ -3783,18 +4282,20 @@ async function startOAuth(){
     oauthExpiresAt=d.expiresAt||0;
     startOauthCountdown();
     // Reset the cancellation flag for the new poll loop, then start it.
-    // The flag is captured by closure so the loop can check it on each iteration.
+    // The generation token makes older loops stop even if this flag flips
+    // back to false for the new flow before the old loop wakes up.
     oauthPollCancelled=false;
-    pollOAuth(d.flowId);
+    const pollGeneration=++oauthPollGeneration;
+    pollOAuth(d.flowId,pollGeneration);
   }catch(e){toast(e.message,'error');document.getElementById('oauthStatusText').textContent='失败：'+e.message}
 }
 function startOauthCountdown(){
-  if(oauthExpiryTimer)clearInterval(oauthExpiryTimer);
+  clearOauthExpiryTimer();
   const update=()=>{
     const remainingMs=oauthExpiresAt?oauthExpiresAt-Date.now():0;
     if(remainingMs<=0){
       document.getElementById('oauthCountdown').textContent='已过期';
-      clearInterval(oauthExpiryTimer);
+      clearOauthExpiryTimer();
       return;
     }
     const s=Math.floor(remainingMs/1000);
@@ -3804,38 +4305,69 @@ function startOauthCountdown(){
   update();
   oauthExpiryTimer=setInterval(update,1000);
 }
-async function pollOAuth(flowId){
-  // vceshi0.0.7+: capture the cancellation flag at loop start. If a new
-  // flow starts later, it will set oauthPollCancelled=true; we check the
-  // shared flag on each iteration and exit if it's been flipped.
+function waitForDashboardVisibleOrDelay(maxDelayMs=60000){
+  return new Promise(resolve=>{
+    if(!document.hidden){setTimeout(resolve,Math.max(1,maxDelayMs));return}
+    let settled=false;
+    let timer=null;
+    const finish=()=>{
+      if(settled)return;
+      settled=true;
+      if(timer)clearTimeout(timer);
+      document.removeEventListener('visibilitychange',onVisible);
+      resolve();
+    };
+    const onVisible=()=>{if(!document.hidden)finish()};
+    document.addEventListener('visibilitychange',onVisible);
+    timer=setTimeout(finish,Math.max(1000,maxDelayMs));
+  });
+}
+async function pollOAuth(flowId,generation){
+  // vceshi0.0.8+: each loop carries a generation token. A plain shared
+  // boolean is not enough because starting a new flow sets cancel=true and
+  // then immediately false again; an older sleeping loop could wake up and
+  // keep polling. Generation mismatch always means "not my flow anymore".
   for(let i=0;i<120;i++){
     // Bail out if a new OAuth flow was started (or callback submitted).
-    if(oauthPollCancelled){
+    if(isOAuthPollStale(flowId,generation)){
       // Don't update UI — the new flow's pollOAuth will handle it.
       return;
     }
+    if(document.hidden){
+      // Hidden tabs should not wake every 2s forever. Suspend until the tab
+      // becomes visible again, with a coarse 60s max delay to re-check expiry.
+      i--;
+      await waitForDashboardVisibleOrDelay(60000);
+      continue;
+    }
     await new Promise(r=>setTimeout(r,2000));
-    if(oauthPollCancelled)return; // re-check after the 2s sleep
+    if(isOAuthPollStale(flowId,generation))return; // re-check after the 2s sleep
+    if(document.hidden){
+      // Keep the flow alive client-side without hammering the backend while
+      // the dashboard tab is hidden. Retry the same iteration when visible.
+      i--;
+      await waitForDashboardVisibleOrDelay(60000);
+      continue;
+    }
     try{
-      const r=await fetch(API+'/admin/api/oauth/poll?flowId='+flowId,{headers:authHeaders()});
-      const d=await r.json();
+      const d=await fetchJsonWithTimeout(API+'/admin/api/oauth/poll?flowId='+flowId,{headers:authHeaders()},8000);
+      if(isOAuthPollStale(flowId,generation))return;
       if(d.status==='ready'){
         document.getElementById('oauthDot').className='oauth-dot on';
         document.getElementById('oauthStatusText').innerHTML='<span class="badge badge-success"><span class="badge-dot"></span>已授权！</span>';
         document.getElementById('oauthUrlBox').style.display='none';
-        if(oauthExpiryTimer)clearInterval(oauthExpiryTimer);
+        clearOauthExpiryTimer();
         toast('OAuth 登录成功','success');
-        currentFlowId=null;
-        sessionStorage.removeItem('zcodeOAuthFlowId');
+        clearCurrentOAuthFlow();
         // vceshi0.0.7+: refresh the accounts list too — the new account
         // won't appear in the multi-account table without this.
-        loadAccountInfo();loadCredStore();loadAccountsList();
+        refreshAccountViews();
         return;
       }
       if(d.status==='failed'){
         document.getElementById('oauthDot').className='oauth-dot off';
         document.getElementById('oauthStatusText').textContent='授权失败';
-        if(oauthExpiryTimer)clearInterval(oauthExpiryTimer);
+        clearOauthExpiryTimer();
         // vceshi0.0.5+: surface the error message if present (previously
         // the dashboard couldn't tell the user WHY the flow failed).
         if(d.error){
@@ -3843,6 +4375,7 @@ async function pollOAuth(flowId){
         }else{
           toast('OAuth 失败','error');
         }
+        clearCurrentOAuthFlow();
         return;
       }
       // vceshi0.0.7+: handle 'expired' status — backend returns this when
@@ -3851,16 +4384,15 @@ async function pollOAuth(flowId){
       if(d.status==='expired'){
         document.getElementById('oauthDot').className='oauth-dot off';
         document.getElementById('oauthStatusText').textContent='授权已过期，请重新开始登录';
-        if(oauthExpiryTimer)clearInterval(oauthExpiryTimer);
+        clearOauthExpiryTimer();
         toast('OAuth 授权已过期，请重新开始','warn');
-        currentFlowId=null;
-        sessionStorage.removeItem('zcodeOAuthFlowId');
+        clearCurrentOAuthFlow();
         return;
       }
     }catch(e){console.error('pollOAuth fetch failed:',e)}
   }
   document.getElementById('oauthStatusText').textContent='已超时（仍可在下方粘贴回调 URL）';
-  if(oauthExpiryTimer)clearInterval(oauthExpiryTimer);
+  clearOauthExpiryTimer();
 }
 function copyOauthUrl(){
   const input=document.getElementById('oauthUrl');
@@ -3898,29 +4430,23 @@ async function submitCallback(){
   resultBox.style.display='block';
   resultBox.innerHTML='<div class="hint"><span class="hint-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg></span><div>正在用 code 换取凭证...</div></div>';
   try{
-    const r=await fetch(API+'/admin/api/oauth/callback',{
+    const d=await fetchJsonMutationWithTimeout(API+'/admin/api/oauth/callback',{
       method:'POST',
       headers:authHeaders(),
       body:JSON.stringify({flowId:currentFlowId,callbackUrl})
-    });
-    const d=await r.json();
-    if(r.ok){
-      resultBox.innerHTML=`<div class="hint" style="background:var(--success-soft);border-color:var(--success);border-left-color:var(--success)"><span class="hint-icon" style="color:var(--success)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg></span><div><strong>授权成功！</strong><br>提供商：<strong>${escapeHtml(d.provider)}</strong> &nbsp; API Key：<code class="code-inline">${escapeHtml(d.apiKeyMask)}</code>${d.userId?`<br>用户 ID：<code class="code-inline">${escapeHtml(d.userId)}</code>`:''}</div></div>`;
-      toast('凭证保存成功','success');
-      if(oauthExpiryTimer)clearInterval(oauthExpiryTimer);
-      // vceshi0.0.7+: cancel any in-flight poll loop so it doesn't update
-      // the UI with stale "pending" status after we've already shown success.
-      oauthPollCancelled=true;
-      document.getElementById('oauthDot').className='oauth-dot on';
-      document.getElementById('oauthStatusText').innerHTML='<span class="badge badge-success"><span class="badge-dot"></span>已通过回调 URL 授权</span>';
-      currentFlowId=null;
-      // vceshi0.0.7+: refresh the accounts list too — the new account
-      // wouldn't appear in the multi-account table without this.
-      loadAccountInfo();loadCredStore();loadAccountsList();
-    }else{
-      resultBox.innerHTML=`<div class="hint hint-danger"><span class="hint-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg></span><div><strong>失败：</strong>${escapeHtml(d.error||'换取失败')}${d.message?`<br>${escapeHtml(d.message)}`:''}</div></div>`;
-      toast(d.error||'回调换取失败','error');
-    }
+    },15000);
+    resultBox.innerHTML=`<div class="hint" style="background:var(--success-soft);border-color:var(--success);border-left-color:var(--success)"><span class="hint-icon" style="color:var(--success)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg></span><div><strong>授权成功！</strong><br>提供商：<strong>${escapeHtml(d.provider)}</strong> &nbsp; API Key：<code class="code-inline">${escapeHtml(d.apiKeyMask)}</code>${d.userId?`<br>用户 ID：<code class="code-inline">${escapeHtml(d.userId)}</code>`:''}</div></div>`;
+    toast('凭证保存成功','success');
+    clearOauthExpiryTimer();
+    // vceshi0.0.7+: cancel any in-flight poll loop so it doesn't update
+    // the UI with stale "pending" status after we've already shown success.
+    cancelOAuthPoll();
+    document.getElementById('oauthDot').className='oauth-dot on';
+    document.getElementById('oauthStatusText').innerHTML='<span class="badge badge-success"><span class="badge-dot"></span>已通过回调 URL 授权</span>';
+    clearCurrentOAuthFlow();
+    // vceshi0.0.7+: refresh the accounts list too — the new account
+    // wouldn't appear in the multi-account table without this.
+    refreshAccountViews();
   }catch(e){
     resultBox.innerHTML=`<div class="hint hint-danger"><span class="hint-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg></span><div><strong>错误：</strong>${escapeHtml(e.message)}</div></div>`;
     toast('回调提交失败','error');
@@ -3929,34 +4455,53 @@ async function submitCallback(){
 async function clearCredentials(){
   if(!confirm('确认清空所有存储的凭证？将删除所有账号。'))return;
   try{
-    const r=await fetch(API+'/admin/api/credentials',{method:'DELETE',headers:authHeaders()});
-    if(r.ok){toast('凭证已清空','success');loadAccountInfo();loadAccountsList();loadCredStore()}
-    else{const d=await r.json().catch(()=>({}));toast(d.error?.message||'清空失败','error')}
-  }catch(e){console.error('clearCredentials failed:',e);toast('操作失败','error')}
+    await fetchJsonMutationWithTimeout(API+'/admin/api/credentials',{method:'DELETE',headers:authHeaders()});
+    toast('凭证已清空','success');
+    refreshAccountViews();
+  }catch(e){console.error('clearCredentials failed:',e);toast(e instanceof Error&&e.message?e.message:'操作失败','error')}
 }
 
 // --- Logs ---
 let logEventSource=null;
+let logReconnectTimer=null;
+const expandedLogSeqs=new Set();
+function clearLogReconnectTimer(){
+  if(logReconnectTimer){clearTimeout(logReconnectTimer);logReconnectTimer=null}
+}
 function connectLogStream(){
-  if(logEventSource){try{logEventSource.close()}catch{}}
+  clearLogReconnectTimer();
+  if(document.hidden||!dashboardActive())return;
+  if(logEventSource){try{logEventSource.close()}catch{};logEventSource=null}
   const sseUrl=API+'/admin/api/logs/stream?token='+encodeURIComponent(authToken);
   try{
-    logEventSource=new EventSource(sseUrl);
-    logEventSource.onmessage=e=>{
+    const source=new EventSource(sseUrl);
+    logEventSource=source;
+    source.onmessage=e=>{
+      if(logEventSource!==source||document.hidden||!dashboardActive())return;
       try{
         const d=JSON.parse(e.data);
         appendLog(d);
       }catch(err){console.error('log SSE parse failed:',err,e.data)}
     };
-    logEventSource.onerror=()=>{
-      try{logEventSource.close()}catch(err){void err}
-      setTimeout(()=>{if(authToken)connectLogStream()},3000);
+    source.onerror=()=>{
+      try{source.close()}catch(err){void err}
+      if(logEventSource!==source)return;
+      if(logEventSource===source)logEventSource=null;
+      if(document.hidden||!dashboardActive()||logReconnectTimer)return;
+      logReconnectTimer=setTimeout(()=>{
+        logReconnectTimer=null;
+        if(!document.hidden&&dashboardActive())connectLogStream();
+      },3000);
     };
   }catch(err){console.error('connectLogStream failed:',err)}
 }
 function appendLog(entry){
+  entry._searchText=(entry.message||'').toLowerCase();
   logLines.push(entry);
-  if(logLines.length>2000)logLines=logLines.slice(-1000);
+  if(logLines.length>2000){
+    logLines=logLines.slice(-1000);
+    pruneExpandedLogSeqs();
+  }
   scheduleLogRender();
 }
 /**
@@ -3981,20 +4526,45 @@ function appendLog(entry){
  * is throttled (background tabs — though we already pause SSE there too).
  */
 let _logRenderPending=false;
+let _logRenderTimer=null;
+let _logRenderFrame=null;
+let _logFilterTimer=null;
+function clearLogRenderTimer(){
+  if(_logRenderFrame!==null&&typeof cancelAnimationFrame==='function')cancelAnimationFrame(_logRenderFrame);
+  if(_logRenderTimer!==null)clearTimeout(_logRenderTimer);
+  _logRenderFrame=null;
+  _logRenderTimer=null;
+  _logRenderPending=false;
+}
+function clearLogFilterTimer(){
+  if(_logFilterTimer){clearTimeout(_logFilterTimer);_logFilterTimer=null;}
+}
 function scheduleLogRender(){
   if(_logRenderPending)return;
   _logRenderPending=true;
   if(typeof requestAnimationFrame==='function'){
-    requestAnimationFrame(()=>{
+    _logRenderFrame=requestAnimationFrame(()=>{
+      _logRenderFrame=null;
       _logRenderPending=false;
+      if(!dashboardCanUpdate())return;
       renderLogs();
     });
   }else{
-    setTimeout(()=>{
+    _logRenderTimer=setTimeout(()=>{
+      _logRenderTimer=null;
       _logRenderPending=false;
+      if(!dashboardCanUpdate())return;
       renderLogs();
     },0);
   }
+}
+function scheduleLogFilterRender(){
+  clearLogFilterTimer();
+  _logFilterTimer=setTimeout(()=>{
+    _logFilterTimer=null;
+    if(!dashboardCanUpdate())return;
+    renderLogs();
+  },LOG_FILTER_DEBOUNCE_MS);
 }
 /**
  * Determine if a log entry should be renderable as an expandable row.
@@ -4025,38 +4595,37 @@ function logSummary(msg){
   return escapeHtml(msg.slice(0,cut))+' <span style="color:var(--text-3)">…</span>';
 }
 /** A row is "long" enough to warrant the expand affordance in debug mode. */
-const expandedLogSeqs=new Set();
+function pruneExpandedLogSeqs(){
+  if(expandedLogSeqs.size===0)return;
+  const liveSeqs=new Set(logLines.map(l=>l.seq).filter(seq=>seq!==undefined&&seq!==null));
+  for(const seq of expandedLogSeqs){
+    if(!liveSeqs.has(seq))expandedLogSeqs.delete(seq);
+  }
+}
 function renderLogs(){
   const box=document.getElementById('logBox');
   const level=document.getElementById('logLevel').value;
   const search=document.getElementById('logSearch').value.toLowerCase();
   const expandAll=document.getElementById('logExpandAll').checked;
-  const filtered=logLines.filter(l=>{
-    if(level&&l.level!==level)return false;
-    if(search&&!l.message.toLowerCase().includes(search))return false;
-    return true;
-  });
-  /* === PERFORMANCE FIX (运行久了刷新卡顿) ===
-   * Cap the number of DOM nodes we actually render to MAX_RENDERED_LOGS.
-   * Even with the rAF debounce in scheduleLogRender(), building 2000
-   * <div> nodes via innerHTML on every filter keystroke is wasteful and
-   * causes visible jank on slower machines. The in-memory `logLines`
-   * array keeps the full 2000-entry window for search accuracy — we just
-   * only render the most recent MAX_RENDERED_LOGS of the filtered set.
-   * A small "showing N of M" hint is appended when truncation occurs so
-   * the user understands why older rows are missing.
-   *
-   * 500 is chosen as a balance: large enough that the user never notices
-   * the cap during normal browsing, small enough that innerHTML rebuilds
-   * stay under 16ms even on low-end hardware.
+  /* === PERFORMANCE FIX (日志搜索/刷新卡顿) ===
+   * Walk the ring tail backwards and keep at most MAX_RENDERED_LOGS matches.
+   * The old code built a full filtered array (up to 2000 entries), then sliced
+   * the newest 500. That allocated a large temporary array on every search
+   * keystroke and on every render after an SSE burst. This single pass keeps
+   * the exact truncation count but only stores the rows we will actually draw.
    */
   const MAX_RENDERED_LOGS=500;
-  let visible=filtered;
-  let truncatedCount=0;
-  if(filtered.length>MAX_RENDERED_LOGS){
-    truncatedCount=filtered.length-MAX_RENDERED_LOGS;
-    visible=filtered.slice(-MAX_RENDERED_LOGS);
+  const visible=[];
+  let matchedCount=0;
+  for(let i=logLines.length-1;i>=0;i--){
+    const l=logLines[i];
+    if(level&&l.level!==level)continue;
+    if(search&&!(l._searchText||(l.message||'').toLowerCase()).includes(search))continue;
+    matchedCount++;
+    if(visible.length<MAX_RENDERED_LOGS)visible.push(l);
   }
+  visible.reverse();
+  const truncatedCount=Math.max(0,matchedCount-visible.length);
   /* Render with colored levels + expandable rows for debug/verbose/long logs.
    * Each row is a <div class="log-line"> with:
    *   - a toggle icon span (▶/▼/blank)
@@ -4112,37 +4681,43 @@ function toggleLogExpand(seq){
  * more useful (debug rows are long and benefit from expansion).
  */
 async function toggleLogDebugMode(){
-  const checked=document.getElementById('logDebugToggle').checked;
+  const toggle=document.getElementById('logDebugToggle');
+  const checked=toggle.checked;
+  if(!beginExclusiveAction('debugModeToggle','调试开关正在保存中，请稍候')){toggle.checked=!checked;return;}
+  const requestAuthToken=authToken;
+  const requestInitGeneration=dashboardInitGeneration;
   try{
     // Fetch current config, flip logging.debug, PUT it back.
-    const cfgResp=await fetch(API+'/admin/api/config',{headers:authHeaders()});
-    const cfg=await cfgResp.json();
+    const cfg=await fetchConfigSnapshot({force:true});
+    if(!dashboardActionCurrent(requestInitGeneration,requestAuthToken))return;
     cfg.logging={...(cfg.logging||{}),debug:checked};
-    const r=await fetch(API+'/admin/api/config',{method:'PUT',headers:authHeaders(),body:JSON.stringify(cfg)});
-    if(r.ok){
-      toast(checked?'调试响应日志已开启 — 每个请求将显示上游完整响应':'调试响应日志已关闭','success');
-      // When enabling debug, auto-enable "全部展开" so the user immediately
-      // sees the full content without having to click each row.
-      if(checked){
-        document.getElementById('logExpandAll').checked=true;
-      }
-      renderLogs();
-    }else{
-      toast('切换调试模式失败','error');
-      // Revert the checkbox on failure
-      document.getElementById('logDebugToggle').checked=!checked;
+    await fetchJsonMutationWithTimeout(API+'/admin/api/config',{method:'PUT',headers:authHeaders(),body:JSON.stringify(cfg)});
+    if(!dashboardActionCurrent(requestInitGeneration,requestAuthToken))return;
+    invalidateConfigSnapshot();
+    toast(checked?'调试响应日志已开启 — 每个请求将显示上游完整响应':'调试响应日志已关闭','success');
+    // When enabling debug, auto-enable "全部展开" so the user immediately
+    // sees the full content without having to click each row.
+    if(checked){
+      document.getElementById('logExpandAll').checked=true;
     }
+    renderLogs();
   }catch(e){
-    console.error('toggleLogDebugMode failed:',e);
-    toast('切换调试模式失败','error');
-    document.getElementById('logDebugToggle').checked=!checked;
+    if(dashboardActionCurrent(requestInitGeneration,requestAuthToken)){
+      console.error('toggleLogDebugMode failed:',e);
+      toast('切换调试模式失败','error');
+      toggle.checked=!checked;
+    }
+  }finally{
+    endExclusiveAction('debugModeToggle');
   }
 }
 /** Sync the log-page debug toggle with the server's current logging.debug state. */
 async function syncLogDebugToggle(){
+  const requestAuthToken=authToken;
+  const requestInitGeneration=dashboardInitGeneration;
   try{
-    const r=await fetch(API+'/admin/api/config',{headers:authHeaders()});
-    const c=await r.json();
+    const c=await fetchConfigSnapshot();
+    if(!dashboardCanUpdate()||!dashboardActionCurrent(requestInitGeneration,requestAuthToken))return;
     document.getElementById('logDebugToggle').checked=!!c.logging?.debug;
     // v0.2.0.9+: also sync the header-debug toggle (same fetch, free ride).
     document.getElementById('logHeaderDebugToggle').checked=!!c.logging?.headerDebug;
@@ -4157,48 +4732,67 @@ async function syncLogDebugToggle(){
  * when done.
  */
 async function toggleHeaderDebugMode(){
-  const checked=document.getElementById('logHeaderDebugToggle').checked;
+  const toggle=document.getElementById('logHeaderDebugToggle');
+  const checked=toggle.checked;
+  if(!beginExclusiveAction('debugModeToggle','调试开关正在保存中，请稍候')){toggle.checked=!checked;return;}
+  const requestAuthToken=authToken;
+  const requestInitGeneration=dashboardInitGeneration;
   try{
-    const cfgResp=await fetch(API+'/admin/api/config',{headers:authHeaders()});
-    const cfg=await cfgResp.json();
+    const cfg=await fetchConfigSnapshot({force:true});
+    if(!dashboardActionCurrent(requestInitGeneration,requestAuthToken))return;
     cfg.logging={...(cfg.logging||{}),headerDebug:checked};
-    const r=await fetch(API+'/admin/api/config',{method:'PUT',headers:authHeaders(),body:JSON.stringify(cfg)});
-    if(r.ok){
-      toast(checked?'请求头调试已开启 — 每个请求将写入两个文件到 ./header-debug/：_inbound.json (收到的原始请求) + _upstream.json (翻译后发给 z.ai 的请求)':'请求头调试已关闭','success');
-    }else{
-      toast('切换请求头调试失败','error');
-      document.getElementById('logHeaderDebugToggle').checked=!checked;
-    }
+    await fetchJsonMutationWithTimeout(API+'/admin/api/config',{method:'PUT',headers:authHeaders(),body:JSON.stringify(cfg)});
+    if(!dashboardActionCurrent(requestInitGeneration,requestAuthToken))return;
+    invalidateConfigSnapshot();
+    toast(checked?'请求头调试已开启 — 每个请求将写入两个文件到 ./header-debug/：_inbound.json (收到的原始请求) + _upstream.json (翻译后发给 z.ai 的请求)':'请求头调试已关闭','success');
   }catch(e){
-    console.error('toggleHeaderDebugMode failed:',e);
-    toast('切换请求头调试失败','error');
-    document.getElementById('logHeaderDebugToggle').checked=!checked;
+    if(dashboardActionCurrent(requestInitGeneration,requestAuthToken)){
+      console.error('toggleHeaderDebugMode failed:',e);
+      toast('切换请求头调试失败','error');
+      toggle.checked=!checked;
+    }
+  }finally{
+    endExclusiveAction('debugModeToggle');
   }
 }
-function clearLogs(){logLines=[];expandedLogSeqs.clear();document.getElementById('logBox').innerHTML=''}
+function clearLogs(){clearLogRenderTimer();clearLogFilterTimer();logLines=[];expandedLogSeqs.clear();document.getElementById('logBox').innerHTML=''}
 document.getElementById('logLevel').addEventListener('change',renderLogs);
-document.getElementById('logSearch').addEventListener('input',renderLogs);
+document.getElementById('logSearch').addEventListener('input',scheduleLogFilterRender);
 
 // --- Proxy ---
 async function loadProxyEndpoints(){
+  const requestAuthToken=authToken;
+  const requestInitGeneration=dashboardInitGeneration;
   try{
-    const r=await fetch(API+'/admin/api/config',{headers:authHeaders()});
-    const c=await r.json();
+    const c=await fetchConfigSnapshot();
+    if(!dashboardCanUpdate()||!dashboardActionCurrent(requestInitGeneration,requestAuthToken))return;
     document.getElementById('proxyZaiAnthropic').value=c.providers?.zai?.anthropicBase||'';
     document.getElementById('proxyZaiOpenai').value=c.providers?.zai?.openaiBase||'';
     document.getElementById('proxyBmAnthropic').value=c.providers?.bigmodel?.anthropicBase||'';
     document.getElementById('proxyBmOpenai').value=c.providers?.bigmodel?.openaiBase||'';
-  }catch(e){console.error('loadProxyEndpoints failed:',e);toast('加载端点失败','error')}
+  }catch(e){if(dashboardCanUpdate()&&dashboardActionCurrent(requestInitGeneration,requestAuthToken)){console.error('loadProxyEndpoints failed:',e);toast('加载端点失败','error')}}
 }
 async function saveProxyEndpoints(){
+  if(!beginExclusiveAction('proxyEndpointsSave','端点保存正在进行中，请稍候'))return;
+  const requestAuthToken=authToken;
+  const requestInitGeneration=dashboardInitGeneration;
   const endpoints={
     zai:{anthropicBase:document.getElementById('proxyZaiAnthropic').value,openaiBase:document.getElementById('proxyZaiOpenai').value},
     bigmodel:{anthropicBase:document.getElementById('proxyBmAnthropic').value,openaiBase:document.getElementById('proxyBmOpenai').value}
   };
   try{
-    const r=await fetch(API+'/admin/api/endpoints',{method:'PUT',headers:authHeaders(),body:JSON.stringify(endpoints)});
-    if(r.ok)toast('端点已保存','success');else toast('保存失败','error');
-  }catch(e){console.error('saveProxyEndpoints failed:',e);toast('保存失败','error')}
+    await fetchJsonMutationWithTimeout(API+'/admin/api/endpoints',{method:'PUT',headers:authHeaders(),body:JSON.stringify(endpoints)});
+    if(!dashboardActionCurrent(requestInitGeneration,requestAuthToken))return;
+    invalidateConfigSnapshot();
+    toast('端点已保存','success');
+  }catch(e){
+    if(dashboardActionCurrent(requestInitGeneration,requestAuthToken)){
+      console.error('saveProxyEndpoints failed:',e);
+      toast('保存失败','error');
+    }
+  }finally{
+    endExclusiveAction('proxyEndpointsSave');
+  }
 }
 function addRoutingRule(){
   routingRules.push({pattern:'',provider:'zai',endpoint:'',note:''});
@@ -4216,12 +4810,14 @@ function renderRoutingRules(){
   </tr>`).join('');
 }
 async function loadRoutingRules(){
+  const requestAuthToken=authToken;
+  const requestInitGeneration=dashboardInitGeneration;
   try{
-    const r=await fetch(API+'/admin/api/routing-rules',{headers:authHeaders()});
-    const d=await r.json();
+    const d=await fetchJsonWithTimeout(API+'/admin/api/routing-rules',{headers:authHeaders()},5000);
+    if(!dashboardCanUpdate()||!dashboardActionCurrent(requestInitGeneration,requestAuthToken))return;
     routingRules=(d.rules||[]).map(r=>({pattern:r.pattern,provider:r.provider,endpoint:r.endpoint||'',note:r.note||''}));
     renderRoutingRules();
-  }catch(e){console.error('loadRoutingRules failed:',e);toast('加载路由规则失败','error')}
+  }catch(e){if(dashboardCanUpdate()&&dashboardActionCurrent(requestInitGeneration,requestAuthToken)){console.error('loadRoutingRules failed:',e);toast('加载路由规则失败','error')}}
 }
 async function saveRoutingRules(){
   for(let i=0;i<routingRules.length;i++){
@@ -4229,17 +4825,31 @@ async function saveRoutingRules(){
     if(!r.pattern||!r.pattern.trim()){toast(`第 ${i+1} 条规则缺少模型匹配规则`,'error');return}
     if(r.provider!=='zai'&&r.provider!=='bigmodel'){toast(`第 ${i+1} 条规则的提供商无效`,'error');return}
   }
+  if(!beginExclusiveAction('routingRulesSave','路由规则保存正在进行中，请稍候'))return;
+  const rulesForSave=routingRules.map(r=>({pattern:r.pattern,provider:r.provider,endpoint:r.endpoint||'',note:r.note||''}));
+  const requestState=JSON.stringify(rulesForSave);
+  const requestAuthToken=authToken;
+  const requestInitGeneration=dashboardInitGeneration;
   try{
-    const r=await fetch(API+'/admin/api/routing-rules',{method:'PUT',headers:authHeaders(),body:JSON.stringify({rules:routingRules})});
-    const d=await r.json();
-    if(r.ok){
-      routingRules=(d.rules||[]).map(r=>({pattern:r.pattern,provider:r.provider,endpoint:r.endpoint||'',note:r.note||''}));
+    const d=await fetchJsonMutationWithTimeout(API+'/admin/api/routing-rules',{method:'PUT',headers:authHeaders(),body:JSON.stringify({rules:rulesForSave})});
+    if(!dashboardActionCurrent(requestInitGeneration,requestAuthToken))return;
+    const serverRules=(d.rules||[]).map(r=>({pattern:r.pattern,provider:r.provider,endpoint:r.endpoint||'',note:r.note||''}));
+    const currentState=JSON.stringify(routingRules.map(r=>({pattern:r.pattern,provider:r.provider,endpoint:r.endpoint||'',note:r.note||''})));
+    if(currentState===requestState){
+      routingRules=serverRules;
       renderRoutingRules();
       toast(`已保存 ${routingRules.length} 条路由规则`,'success');
     }else{
-      toast(d.error||'保存失败','error');
+      toast('路由规则已保存；页面上还有新的未保存修改','warn');
     }
-  }catch(e){console.error('saveRoutingRules failed:',e);toast('保存失败','error')}
+  }catch(e){
+    if(dashboardActionCurrent(requestInitGeneration,requestAuthToken)){
+      console.error('saveRoutingRules failed:',e);
+      toast('保存失败','error');
+    }
+  }finally{
+    endExclusiveAction('routingRulesSave');
+  }
 }
 
 // --- Model Mappings ---
@@ -4281,12 +4891,14 @@ function renderModelMappings(){
   dl.innerHTML=glmOptions;
 }
 async function loadModelMappings(){
+  const requestAuthToken=authToken;
+  const requestInitGeneration=dashboardInitGeneration;
   try{
-    const r=await fetch(API+'/admin/api/model-mappings',{headers:authHeaders()});
-    const d=await r.json();
+    const d=await fetchJsonWithTimeout(API+'/admin/api/model-mappings',{headers:authHeaders()},5000);
+    if(!dashboardCanUpdate()||!dashboardActionCurrent(requestInitGeneration,requestAuthToken))return;
     modelMappings=(d.mappings||[]).map(m=>({from:m.from,to:m.to,note:m.note||''}));
     renderModelMappings();
-  }catch(e){console.error('loadModelMappings failed:',e);toast('加载模型映射失败','error')}
+  }catch(e){if(dashboardCanUpdate()&&dashboardActionCurrent(requestInitGeneration,requestAuthToken)){console.error('loadModelMappings failed:',e);toast('加载模型映射失败','error')}}
 }
 async function saveModelMappings(){
   for(let i=0;i<modelMappings.length;i++){
@@ -4301,42 +4913,76 @@ async function saveModelMappings(){
     if(seen.has(f)){toast(`第 ${i+1} 条映射的"客户端模型"重复：${modelMappings[i].from}`,'error');return}
     seen.add(f);
   }
+  if(!beginExclusiveAction('modelMappingsSave','模型映射保存正在进行中，请稍候'))return;
+  const mappingsForSave=modelMappings.map(m=>({from:m.from,to:m.to,note:m.note||''}));
+  const requestState=JSON.stringify(mappingsForSave);
+  const requestAuthToken=authToken;
+  const requestInitGeneration=dashboardInitGeneration;
   try{
-    const r=await fetch(API+'/admin/api/model-mappings',{method:'PUT',headers:authHeaders(),body:JSON.stringify({mappings:modelMappings})});
-    const d=await r.json();
-    if(r.ok){
-      modelMappings=(d.mappings||[]).map(m=>({from:m.from,to:m.to,note:m.note||''}));
+    const d=await fetchJsonMutationWithTimeout(API+'/admin/api/model-mappings',{method:'PUT',headers:authHeaders(),body:JSON.stringify({mappings:mappingsForSave})});
+    if(!dashboardActionCurrent(requestInitGeneration,requestAuthToken))return;
+    const serverMappings=(d.mappings||[]).map(m=>({from:m.from,to:m.to,note:m.note||''}));
+    const currentState=JSON.stringify(modelMappings.map(m=>({from:m.from,to:m.to,note:m.note||''})));
+    if(currentState===requestState){
+      modelMappings=serverMappings;
       renderModelMappings();
       toast(`已保存 ${modelMappings.length} 条模型映射`,'success');
     }else{
-      toast(d.error||'保存失败','error');
+      toast('模型映射已保存；页面上还有新的未保存修改','warn');
     }
-  }catch(e){console.error('saveModelMappings failed:',e);toast('保存失败','error')}
+  }catch(e){
+    if(dashboardActionCurrent(requestInitGeneration,requestAuthToken)){
+      console.error('saveModelMappings failed:',e);
+      toast('保存失败','error');
+    }
+  }finally{
+    endExclusiveAction('modelMappingsSave');
+  }
 }
 
 // --- GLM Catalog & Responses Thinking ---
 async function loadGlmCatalog(){
+  const requestAuthToken=authToken;
+  const requestInitGeneration=dashboardInitGeneration;
   try{
-    const r=await fetch(API+'/admin/api/glm-models',{headers:authHeaders()});
-    const d=await r.json();
+    const d=await fetchJsonWithTimeout(API+'/admin/api/glm-models',{headers:authHeaders()},5000);
+    if(!dashboardCanUpdate()||!dashboardActionCurrent(requestInitGeneration,requestAuthToken))return;
     glmCatalog=Array.isArray(d.models)?d.models:[];
     // Refresh dependent UIs that use the catalog as a dropdown source.
     renderModelMappings();
     renderResponsesThinkingChips();
-  }catch(e){console.error('loadGlmCatalog failed:',e);toast('加载 GLM 模型目录失败','error')}
+    syncResponsesThinkingCustomInput();
+  }catch(e){if(dashboardCanUpdate()&&dashboardActionCurrent(requestInitGeneration,requestAuthToken)){console.error('loadGlmCatalog failed:',e);toast('加载 GLM 模型目录失败','error')}}
 }
 async function loadResponsesThinking(){
+  const requestAuthToken=authToken;
+  const requestInitGeneration=dashboardInitGeneration;
   try{
-    const r=await fetch(API+'/admin/api/responses-thinking',{headers:authHeaders()});
-    const d=await r.json();
+    const d=await fetchJsonWithTimeout(API+'/admin/api/responses-thinking',{headers:authHeaders()},5000);
+    if(!dashboardCanUpdate()||!dashboardActionCurrent(requestInitGeneration,requestAuthToken))return;
     responsesThinkingModels=new Set((d.models||[]).map(m=>String(m).toLowerCase()));
     renderResponsesThinkingChips();
-    // Sync the custom-input box with any model ids that aren't in the catalog
-    // (e.g. operator-added custom ids). Catalog ids are rendered as chips;
-    // non-catalog ids appear in the custom input.
-    const custom=(d.models||[]).filter(m=>!glmCatalog.some(c=>c.id.toLowerCase()===String(m).toLowerCase()));
-    document.getElementById('responsesThinkingCustomInput').value=custom.join(', ');
-  }catch(e){console.error('loadResponsesThinking failed:',e);toast('加载 Responses 思考配置失败','error')}
+    syncResponsesThinkingCustomInput(d.models||[]);
+  }catch(e){if(dashboardCanUpdate()&&dashboardActionCurrent(requestInitGeneration,requestAuthToken)){console.error('loadResponsesThinking failed:',e);toast('加载 Responses 思考配置失败','error')}}
+}
+function responsesThinkingCatalogIdSet(){
+  return new Set(glmCatalog.map(c=>String(c.id).toLowerCase()));
+}
+function syncResponsesThinkingCustomInput(models){
+  const input=document.getElementById('responsesThinkingCustomInput');
+  if(!input)return;
+  const catalogIds=responsesThinkingCatalogIdSet();
+  const source=Array.isArray(models)?models:Array.from(responsesThinkingModels);
+  const custom=[];
+  const seen=new Set();
+  for(const model of source){
+    const id=String(model).trim();
+    const key=id.toLowerCase();
+    if(!id||catalogIds.has(key)||seen.has(key))continue;
+    seen.add(key);
+    custom.push(id);
+  }
+  input.value=custom.join(', ');
 }
 function renderResponsesThinkingChips(){
   const wrap=document.getElementById('responsesThinkingChips');
@@ -4350,7 +4996,7 @@ function renderResponsesThinkingChips(){
     const reasoningTag=m.reasoning?'<span class="badge badge-info" style="margin-left:6px;font-size:9px;padding:1px 5px;">reasoning</span>':'';
     const cls=on?'btn btn-success btn-sm':'btn btn-ghost btn-sm';
     const check=on?'<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" style="margin-right:4px;"><polyline points="20 6 9 17 4 12"/></svg>':'';
-    return `<button type="button" class="${cls}" onclick="toggleResponsesThinking('${escapeJsString(m.id)}')" style="font-family:var(--font-mono);font-size:12px;">${check}${escapeHtml(m.id)}${reasoningTag}</button>`;
+    return `<button type="button" class="${cls}" onclick="toggleResponsesThinking('${escapeJsAttrString(m.id)}')" style="font-family:var(--font-mono);font-size:12px;">${check}${escapeHtml(m.id)}${reasoningTag}</button>`;
   }).join('');
 }
 function toggleResponsesThinking(modelId){
@@ -4362,45 +5008,76 @@ function toggleResponsesThinking(modelId){
   }
   renderResponsesThinkingChips();
 }
-async function saveResponsesThinking(){
-  // Collect: chip-selected ids + custom-input ids (comma-separated).
+function collectResponsesThinkingModels(){
   const selected=new Set(responsesThinkingModels);
+  const catalogIds=responsesThinkingCatalogIdSet();
   const customStr=(document.getElementById('responsesThinkingCustomInput').value||'').trim();
   if(customStr){
     for(const part of customStr.split(',')){
       const id=part.trim();
-      if(id)selected.add(id.toLowerCase());
+      const key=id.toLowerCase();
+      if(id&&!catalogIds.has(key))selected.add(key);
     }
   }
-  const models=Array.from(selected);
+  return Array.from(selected);
+}
+function responsesThinkingStateKey(models){
+  return JSON.stringify(Array.from(new Set((models||[]).map(m=>String(m).toLowerCase()))).sort());
+}
+async function saveResponsesThinking(){
+  if(!beginExclusiveAction('responsesThinkingSave','Responses 思考配置保存正在进行中，请稍候'))return;
+  const requestAuthToken=authToken;
+  const requestInitGeneration=dashboardInitGeneration;
+  // Collect: chip-selected ids + custom-input ids (comma-separated).
+  const models=collectResponsesThinkingModels();
+  const requestState=responsesThinkingStateKey(models);
   try{
-    const r=await fetch(API+'/admin/api/responses-thinking',{method:'PUT',headers:authHeaders(),body:JSON.stringify({models})});
-    const d=await r.json();
-    if(r.ok){
-      responsesThinkingModels=new Set((d.models||[]).map(m=>String(m).toLowerCase()));
-      // Re-sync custom input to only show non-catalog ids
-      const custom=(d.models||[]).filter(m=>!glmCatalog.some(c=>c.id.toLowerCase()===String(m).toLowerCase()));
-      document.getElementById('responsesThinkingCustomInput').value=custom.join(', ');
+    const d=await fetchJsonMutationWithTimeout(API+'/admin/api/responses-thinking',{method:'PUT',headers:authHeaders(),body:JSON.stringify({models})});
+    if(!dashboardActionCurrent(requestInitGeneration,requestAuthToken))return;
+    const serverModels=(d.models||[]).map(m=>String(m).toLowerCase());
+    const currentState=responsesThinkingStateKey(collectResponsesThinkingModels());
+    if(currentState===requestState){
+      responsesThinkingModels=new Set(serverModels);
+      syncResponsesThinkingCustomInput(serverModels);
       renderResponsesThinkingChips();
-      toast(`已保存 Responses 思考配置（${(d.models||[]).length} 个模型）`,'success');
+      toast(`已保存 Responses 思考配置（${serverModels.length} 个模型）`,'success');
     }else{
-      toast(d.error||'保存失败','error');
+      toast('Responses 思考配置已保存；页面上还有新的未保存修改','warn');
     }
-  }catch(e){console.error('saveResponsesThinking failed:',e);toast('保存失败','error')}
+  }catch(e){
+    if(dashboardActionCurrent(requestInitGeneration,requestAuthToken)){
+      console.error('saveResponsesThinking failed:',e);
+      toast('保存失败','error');
+    }
+  }finally{
+    endExclusiveAction('responsesThinkingSave');
+  }
 }
 
 // --- Stats ---
+let statsLoadInFlight=false;
+let statsLoadPending=false;
+let statsLoadGeneration=0;
+function invalidateStatsLoads(){
+  statsLoadGeneration++;
+  statsLoadPending=false;
+}
 async function loadStats(){
+  if(statsLoadInFlight){statsLoadPending=true;return;}
+  statsLoadPending=false;
+  const generation=statsLoadGeneration;
+  const requestAuthToken=authToken;
+  const requestInitGeneration=dashboardInitGeneration;
+  statsLoadInFlight=true;
   try{
-    const r=await fetch(API+'/admin/api/stats',{headers:authHeaders()});
-    const d=await r.json();
+    const d=await fetchJsonWithTimeout(API+'/admin/api/stats',{headers:authHeaders()},5000);
+    if(generation!==statsLoadGeneration||document.hidden||!dashboardActionCurrent(requestInitGeneration,requestAuthToken))return;
     statsData=d;
+    applyStatsSnapshot(d);
     document.getElementById('statTotal').textContent=d.total||0;
     document.getElementById('statSuccess').textContent=d.success||0;
     document.getElementById('statFailed').textContent=d.failed||0;
     document.getElementById('statRetried').textContent=d.retried||0;
-    document.getElementById('statRequests').textContent=d.total||0;
-    document.getElementById('statRetries').textContent=d.retried||0;
     /* Update progress bar */
     const total=d.total||0;
     const successPct=total?(d.success/total*100):0;
@@ -4423,32 +5100,34 @@ async function loadStats(){
     const mu=document.getElementById('modelUsage');
     mu.innerHTML=Object.entries(d.models||{}).map(([m,v])=>`<tr><td class="td-mono">${escapeHtml(m)}</td><td>${v.count}</td><td class="td-mono">${v.avgTtfb}ms</td><td class="td-mono">${v.inputTokens||0}</td><td class="td-mono">${v.tokens}</td></tr>`).join('')
       ||'<tr><td colspan="5"><div class="empty-state"><div class="empty-text">暂无数据</div></div></td></tr>';
-    // vceshi0.0.6+: cache byCredential stats + re-render accounts table to
-    // refresh usage counts without a full loadAccountsList fetch.
-    _cachedByCredential=d.byCredential||{};
-    // vceshi0.0.7+: use classList check instead of style.display — pages
-    // toggle visibility via the .active class (added/removed by nav clicks),
-    // not by setting style.display directly. The old check
-    // `style.display!=='none'` was always true (since we never set
-    // display:none on the page element), so filterAccounts() ran on every
-    // poll even when the user was on a different page — wasteful DOM work.
-    const accountsPage=document.getElementById('page-accounts');
-    if(accountsPage&&accountsPage.classList.contains('active')&&_cachedAccounts.length>0){
-      filterAccounts();
+  }catch(e){if(generation===statsLoadGeneration&&!document.hidden&&dashboardActionCurrent(requestInitGeneration,requestAuthToken))console.error('loadStats failed:',e)}
+  finally{
+    statsLoadInFlight=false;
+    if(statsLoadPending&&!document.hidden&&dashboardActionCurrent(requestInitGeneration,requestAuthToken)){
+      statsLoadPending=false;
+      loadStats();
     }
-  }catch(e){console.error('loadStats failed:',e)}
+  }
 }
 
 // --- Debug Dumps ---
+let debugDetailGeneration=0;
+function hideDebugDetail(){
+  debugDetailGeneration++;
+  const card=document.getElementById('debugDetailCard');
+  if(card)card.style.display='none';
+}
 async function loadDebugDumps(){
+  const requestAuthToken=authToken;
+  const requestInitGeneration=dashboardInitGeneration;
   const tb=document.getElementById('debugDumps');
   if(!tb)return;
   try{
-    const r=await fetch(API+'/admin/api/debug-dumps?limit=20',{headers:authHeaders()});
-    if(!r.ok){tb.innerHTML='<tr><td colspan="6"><div class="empty-state" style="color:var(--danger)">加载失败</div></td></tr>';return}
-    const d=await r.json();
+    const d=await fetchJsonWithTimeout(API+'/admin/api/debug-dumps?limit=20',{headers:authHeaders()},5000);
+    if(!dashboardCanUpdate()||!dashboardActionCurrent(requestInitGeneration,requestAuthToken))return;
     const dumps=d.dumps||[];
     if(!dumps.length){
+      hideDebugDetail();
       tb.innerHTML='<tr><td colspan="6"><div class="empty-state"><div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></div><div class="empty-text">暂无调试转储</div><div class="empty-hint">上游 4xx 错误时会自动记录</div></div></td></tr>';
       return;
     }
@@ -4458,15 +5137,23 @@ async function loadDebugDumps(){
       <td><span class="badge badge-danger">${d.status}</span></td>
       <td class="td-mono" style="max-width:300px;overflow:hidden;text-overflow:ellipsis">${escapeHtml((d.upstreamError||'').slice(0,100))}</td>
       <td class="td-mono" style="max-width:200px;overflow:hidden;text-overflow:ellipsis">${escapeHtml(d.anthropicBeta||'(none)')}</td>
-      <td class="td-actions"><button class="btn btn-primary btn-sm" onclick="viewDebugDump('${escapeJsString(d.id)}')">查看详情</button></td>
+      <td class="td-actions"><button class="btn btn-primary btn-sm" onclick="viewDebugDump('${escapeJsAttrString(d.id)}')">查看详情</button></td>
     </tr>`).join('');
-  }catch(e){console.error('loadDebugDumps failed:',e);tb.innerHTML='<tr><td colspan="6"><div class="empty-state" style="color:var(--danger)">加载失败</div></td></tr>'}
+  }catch(e){if(dashboardCanUpdate()&&dashboardActionCurrent(requestInitGeneration,requestAuthToken)){console.error('loadDebugDumps failed:',e);tb.innerHTML='<tr><td colspan="6"><div class="empty-state" style="color:var(--danger)">加载失败</div></td></tr>'}}
 }
 async function viewDebugDump(id){
+  const generation=++debugDetailGeneration;
+  const requestAuthToken=authToken;
+  const requestInitGeneration=dashboardInitGeneration;
+  const card=document.getElementById('debugDetailCard');
+  if(card)card.style.display='block';
+  document.getElementById('debugDetailId').textContent=id;
+  document.getElementById('debugDetailMeta').innerHTML='<span class="kv-key">状态</span><span class="kv-val"><span class="badge badge-info">加载中...</span></span>';
+  document.getElementById('debugDetailSummary').textContent='加载中...';
+  document.getElementById('debugDetailBody').textContent='加载中...';
   try{
-    const r=await fetch(API+'/admin/api/debug-dumps?id='+encodeURIComponent(id)+'&full=1',{headers:authHeaders()});
-    if(!r.ok){toast('加载失败','error');return}
-    const d=await r.json();
+    const d=await fetchJsonWithTimeout(API+'/admin/api/debug-dumps?id='+encodeURIComponent(id)+'&full=1',{headers:authHeaders()},5000);
+    if(generation!==debugDetailGeneration||!dashboardActionCurrent(requestInitGeneration,requestAuthToken))return;
     document.getElementById('debugDetailCard').style.display='block';
     document.getElementById('debugDetailId').textContent=d.id;
     document.getElementById('debugDetailMeta').innerHTML=`
@@ -4479,35 +5166,49 @@ async function viewDebugDump(id){
     let prettyBody=d.body||'';
     try{prettyBody=JSON.stringify(JSON.parse(d.body),null,2)}catch{}
     document.getElementById('debugDetailBody').textContent=prettyBody;
-    document.getElementById('debugDetailCard').scrollIntoView({behavior:'smooth',block:'start'});
-  }catch(e){console.error('viewDebugDump failed:',e);toast('加载失败','error')}
+    if(!document.hidden)document.getElementById('debugDetailCard').scrollIntoView({behavior:'smooth',block:'start'});
+  }catch(e){
+    if(generation===debugDetailGeneration&&dashboardActionCurrent(requestInitGeneration,requestAuthToken)){
+      console.error('viewDebugDump failed:',e);
+      document.getElementById('debugDetailMeta').innerHTML='<span class="kv-key">状态</span><span class="kv-val"><span class="badge badge-danger">加载失败</span></span>';
+      document.getElementById('debugDetailSummary').textContent='加载失败';
+      document.getElementById('debugDetailBody').textContent='';
+      toast('加载失败','error');
+    }
+  }
 }
 async function clearDebugDumps(){
   if(!confirm('确认清空所有调试转储？此操作不可撤销。'))return;
+  debugDetailGeneration++;
+  const requestAuthToken=authToken;
+  const requestInitGeneration=dashboardInitGeneration;
   try{
-    const r=await fetch(API+'/admin/api/debug-dumps',{method:'DELETE',headers:authHeaders()});
-    if(r.ok){toast('已清空','success');loadDebugDumps();document.getElementById('debugDetailCard').style.display='none'}
-    else toast('清空失败','error');
-  }catch(e){console.error('clearDebugDumps failed:',e);toast('清空失败','error')}
+    await fetchJsonMutationWithTimeout(API+'/admin/api/debug-dumps',{method:'DELETE',headers:authHeaders()});
+    if(!dashboardActionCurrent(requestInitGeneration,requestAuthToken))return;
+    toast('已清空','success');loadDebugDumps();hideDebugDetail();
+  }catch(e){
+    if(dashboardActionCurrent(requestInitGeneration,requestAuthToken)){
+      console.error('clearDebugDumps failed:',e);
+      toast('清空失败','error');
+    }
+  }
 }
 // vceshi0.0.6+: cache byCredential stats so filterAccounts can render usage
 // counts without a separate fetch. Updated by loadStats, read by filterAccounts.
 let _cachedByCredential={};
 // vceshi0.0.7+: track the interval handle so doLogout() can clear it.
-// The old code leaked the interval forever (even after logout) — the inner
-// guard `if(authToken)loadStats()` prevented the actual fetch, but the timer
-// itself leaked. Now we clear it on logout.
+// The old code leaked the interval forever (even after logout). Now we clear
+// it on logout and gate refreshes on whether the dashboard is still visible.
 //
 // vceshi0.0.8+: don't start the interval at script load — start it inside
 // initDashboard() after login. The old code started a 10s timer the moment
-// the page loaded, even before the user logged in. The `if(authToken)`
-// guard prevented fetches, but the timer kept firing every 10s for the
-// entire session lifetime of the login page, which is wasteful (especially
-// on mobile where the page may sit open in a background tab).
+// the page loaded, even before the user logged in, which is wasteful
+// (especially on mobile where the page may sit open in a background tab).
 let statsIntervalId=null;
 function startStatsInterval(){
   if(statsIntervalId)clearInterval(statsIntervalId);
-  statsIntervalId=setInterval(()=>{if(authToken)loadStats()},10000);
+  if(document.hidden||!dashboardActive()){statsIntervalId=null;return;}
+  statsIntervalId=setInterval(()=>{if(dashboardCanUpdate())loadStats()},10000);
 }
 
 // === PERFORMANCE FIX (运行久了刷新卡顿) ===
@@ -4528,14 +5229,23 @@ document.addEventListener('visibilitychange', () => {
     // Tab hidden — pause polling
     if (uptimeIntervalId) { clearInterval(uptimeIntervalId); uptimeIntervalId = null; }
     if (statsIntervalId) { clearInterval(statsIntervalId); statsIntervalId = null; }
+    clearLogReconnectTimer();
+    clearProxyPoolPollTimer();
+    clearProxyPoolProgressHideTimer();
+    invalidateCaptchaHelperLoads();
+    clearAccountViewsRefreshTimer();
+    clearAccountFilterTimer();
+    clearLogRenderTimer();
+    clearLogFilterTimer();
+    abortDashboardRequests();
     // Close SSE — server will doCleanup on disconnect, freeing the waiter
     if (logEventSource) { try { logEventSource.close(); } catch {} logEventSource = null; }
   } else {
-    // Tab visible again — resume polling + SSE (only if authenticated)
-    if (authToken) {
+    // Tab visible again — resume polling + SSE if the dashboard is active.
+    if (dashboardActive()) {
       if (!uptimeIntervalId) {
         loadUptimeFromServer();
-        uptimeIntervalId = setInterval(loadUptimeFromServer, 5000);
+        uptimeIntervalId = setInterval(tickUptimeDisplay, 1000);
       }
       if (!statsIntervalId) {
         startStatsInterval();
@@ -4543,17 +5253,35 @@ document.addEventListener('visibilitychange', () => {
       if (!logEventSource) {
         connectLogStream();
       }
+      const accountsPage=document.getElementById('page-accounts');
+      if(accountsPage&&accountsPage.classList.contains('active')){
+        refreshAccountViews();
+      }
+      checkRunningTestJob();
     }
   }
 });
+window.addEventListener('pagehide',abortDashboardRequests);
 
 async function resetStats(){
   if(!confirm('确认重置所有统计数据？此操作不可撤销。'))return;
+  if(!beginExclusiveAction('statsReset','统计重置正在进行中，请稍候'))return;
+  const requestAuthToken=authToken;
+  const requestInitGeneration=dashboardInitGeneration;
   try{
-    const r=await fetch(API+'/admin/api/stats',{method:'DELETE',headers:authHeaders()});
-    if(r.ok){toast('统计已重置','success');loadStats()}
-    else toast('重置失败','error');
-  }catch(e){console.error('resetStats failed:',e);toast('重置失败','error')}
+    await fetchJsonMutationWithTimeout(API+'/admin/api/stats',{method:'DELETE',headers:authHeaders()});
+    if(!dashboardActionCurrent(requestInitGeneration,requestAuthToken))return;
+    toast('统计已重置','success');
+    invalidateStatsLoads();
+    loadStats();
+  }catch(e){
+    if(dashboardActionCurrent(requestInitGeneration,requestAuthToken)){
+      console.error('resetStats failed:',e);
+      toast('重置失败','error');
+    }
+  }finally{
+    endExclusiveAction('statsReset');
+  }
 }
 
 // --- Toast (enhanced) ---
@@ -4563,24 +5291,30 @@ const TOAST_ICONS={
   warn:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>',
   info:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>'
 };
+const TOAST_MAX_VISIBLE=5;
+function dismissToast(el){
+  if(!el||el.dataset.closing==='1')return;
+  el.dataset.closing='1';
+  if(el._toastTimer){clearTimeout(el._toastTimer);el._toastTimer=null;}
+  el.classList.add('leaving');
+  setTimeout(()=>el.remove(),200);
+}
 function toast(msg,type='success'){
   const container=document.getElementById('toastContainer');
   if(!container)return;
+  while(container.children.length>=TOAST_MAX_VISIBLE){
+    const first=container.firstElementChild;
+    if(!first)break;
+    if(first._toastTimer){clearTimeout(first._toastTimer);first._toastTimer=null;}
+    first.remove();
+  }
   const el=document.createElement('div');
   el.className='toast toast-'+type;
   const icon=TOAST_ICONS[type]||TOAST_ICONS.info;
   el.innerHTML=`<span class="toast-icon">${icon}</span><span class="toast-msg">${escapeHtml(msg)}</span>`;
-  el.addEventListener('click',()=>{
-    el.classList.add('leaving');
-    setTimeout(()=>el.remove(),200);
-  });
+  el.addEventListener('click',()=>dismissToast(el));
   container.appendChild(el);
-  setTimeout(()=>{
-    if(el.parentNode){
-      el.classList.add('leaving');
-      setTimeout(()=>el.remove(),200);
-    }
-  },3000);
+  el._toastTimer=setTimeout(()=>dismissToast(el),3000);
 }
 
 // --- Proxy Pool (v0.2.2+) ---
@@ -4591,29 +5325,148 @@ let ppPoolState=null;
 let ppTestResults={};
 let ppTestAllRunning=false;
 let ppTestPollTimer=null;
+let ppProgressHideTimer=null;
+let ppTestJobSeq=0;
+let ppTestPollErrorCount=0;
+let ppPoolLoadInFlight=false;
+let ppPoolLoadPending=false;
+let ppPoolLoadPendingForceConfig=false;
+let ppPoolLoadGeneration=0;
+let ppSingleTestGeneration=0;
+let ppLastPrunedProxiesRef=null;
+let ppConfigLastSyncedKey='';
+let ppConfigDirty=false;
+let ppConfigDirtyTrackingInitialized=false;
+const PP_CONFIG_INPUT_IDS=['ppEnabled','ppRefreshInterval','ppMaxRotations','ppRotateOnGatewayBlock','ppSourceUrls'];
+const PP_MAX_RENDERED_PROXIES=500;
 
-async function loadProxyPool(){
-  try{
-    const r=await fetch(API+'/admin/api/proxy-pool',{headers:authHeaders()});
-    if(!r.ok)throw new Error('HTTP '+r.status);
-    ppPoolState=await r.json();
-    renderProxyPool();
-  }catch(e){
-    console.error('loadProxyPool failed:',e);
-    toast('加载代理池失败','error');
+function clearProxyPoolPollTimer(){
+  if(ppTestPollTimer){clearTimeout(ppTestPollTimer);ppTestPollTimer=null;}
+}
+function clearProxyPoolProgressHideTimer(){
+  if(ppProgressHideTimer){clearTimeout(ppProgressHideTimer);ppProgressHideTimer=null;}
+}
+
+function invalidateProxyPoolLoads(){
+  ppPoolLoadGeneration++;
+  ppPoolLoadPending=false;
+  ppPoolLoadPendingForceConfig=false;
+  ppSingleTestGeneration++;
+  ppLastPrunedProxiesRef=null;
+}
+
+function normalizeProxyPoolConfigForForm(config){
+  const c=config||{};
+  return {
+    enabled:!!c.enabled,
+    refreshIntervalMin:c.refreshIntervalMin ?? 5,
+    maxRotations:c.maxRotations ?? 3,
+    rotateOnGatewayBlock:c.rotateOnGatewayBlock !== false,
+    sourceUrls:Array.isArray(c.sourceUrls)?c.sourceUrls:[],
+  };
+}
+
+function currentProxyPoolConfigFormKey(){
+  const config=collectProxyPoolConfigForm({showErrors:false});
+  return config?proxyPoolConfigStateKey(config):'__invalid__';
+}
+
+function markProxyPoolConfigDirty(){
+  if(!ppConfigLastSyncedKey){
+    ppConfigDirty=true;
+    return;
+  }
+  ppConfigDirty=currentProxyPoolConfigFormKey()!==ppConfigLastSyncedKey;
+}
+
+function initProxyPoolConfigDirtyTracking(){
+  if(ppConfigDirtyTrackingInitialized)return;
+  ppConfigDirtyTrackingInitialized=true;
+  for(const id of PP_CONFIG_INPUT_IDS){
+    const el=document.getElementById(id);
+    if(!el)continue;
+    el.addEventListener('input',markProxyPoolConfigDirty);
+    el.addEventListener('change',markProxyPoolConfigDirty);
   }
 }
 
-function renderProxyPool(){
+function writeProxyPoolConfigForm(config){
+  document.getElementById('ppEnabled').checked=!!config.enabled;
+  document.getElementById('ppRefreshInterval').value=config.refreshIntervalMin;
+  document.getElementById('ppMaxRotations').value=config.maxRotations;
+  document.getElementById('ppRotateOnGatewayBlock').checked=config.rotateOnGatewayBlock !== false;
+  document.getElementById('ppSourceUrls').value=(config.sourceUrls||[]).join('\n');
+}
+
+function syncProxyPoolConfigForm(config,options={}){
+  const normalized=normalizeProxyPoolConfigForForm(config);
+  const serverKey=proxyPoolConfigStateKey(normalized);
+  const currentKey=currentProxyPoolConfigFormKey();
+  const canOverwrite=options.force===true||!ppConfigDirty||currentKey===ppConfigLastSyncedKey||currentKey===serverKey;
+  ppConfigLastSyncedKey=serverKey;
+  if(canOverwrite){
+    writeProxyPoolConfigForm(normalized);
+    ppConfigDirty=false;
+  }else{
+    ppConfigDirty=currentKey!==serverKey;
+  }
+}
+
+function reloadProxyPool(){
+  ppConfigDirty=false;
+  loadProxyPool({forceConfig:true});
+}
+
+async function loadProxyPool(options={}){
+  if(ppPoolLoadInFlight){
+    ppPoolLoadPending=true;
+    if(options.forceConfig===true)ppPoolLoadPendingForceConfig=true;
+    return;
+  }
+  ppPoolLoadPending=false;
+  ppPoolLoadPendingForceConfig=false;
+  const generation=ppPoolLoadGeneration;
+  const requestAuthToken=authToken;
+  const requestInitGeneration=dashboardInitGeneration;
+  const forceConfig=options.forceConfig===true;
+  ppPoolLoadInFlight=true;
+  try{
+    const state=await fetchJsonWithTimeout(API+'/admin/api/proxy-pool',{headers:authHeaders()},5000);
+    if(generation!==ppPoolLoadGeneration||document.hidden||!dashboardActionCurrent(requestInitGeneration,requestAuthToken))return;
+    ppPoolState=state;
+    renderProxyPool({forceConfig});
+  }catch(e){
+    if(generation===ppPoolLoadGeneration&&!document.hidden&&dashboardActionCurrent(requestInitGeneration,requestAuthToken)){
+      console.error('loadProxyPool failed:',e);
+      toast('加载代理池失败','error');
+    }
+  }finally{
+    ppPoolLoadInFlight=false;
+    if(ppPoolLoadPending&&!document.hidden&&dashboardActionCurrent(requestInitGeneration,requestAuthToken)){
+      const pendingForceConfig=ppPoolLoadPendingForceConfig;
+      ppPoolLoadPending=false;
+      ppPoolLoadPendingForceConfig=false;
+      loadProxyPool({forceConfig:pendingForceConfig});
+    }
+  }
+}
+
+function pruneProxyPoolTestResults(proxies){
+  if(ppLastPrunedProxiesRef===proxies)return;
+  ppLastPrunedProxiesRef=proxies;
+  const liveIds=new Set((proxies||[]).map(p=>p.id));
+  for(const id of Object.keys(ppTestResults)){
+    if(!liveIds.has(id))delete ppTestResults[id];
+  }
+}
+
+function renderProxyPool(options={}){
   if(!ppPoolState)return;
   const c=ppPoolState.config||{};
-  document.getElementById('ppEnabled').checked=!!c.enabled;
-  document.getElementById('ppRefreshInterval').value=c.refreshIntervalMin ?? 5;
-  document.getElementById('ppMaxRotations').value=c.maxRotations ?? 3;
-  document.getElementById('ppRotateOnGatewayBlock').checked=c.rotateOnGatewayBlock !== false;
-  document.getElementById('ppSourceUrls').value=(c.sourceUrls||[]).join('\n');
+  syncProxyPoolConfigForm(c,{force:options.forceConfig===true});
 
   const proxies=ppPoolState.proxies||[];
+  pruneProxyPoolTestResults(proxies);
   document.getElementById('ppPoolCount').textContent=String(proxies.length);
 
   // Sticky proxy indicator
@@ -4647,7 +5500,11 @@ function renderProxyPool(){
     tbody.innerHTML=`<tr><td colspan="5"><div class="empty-state"><div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg></div><div class="empty-text">代理池为空 — 在上方导入代理或配置来源 URL</div></div></td></tr>`;
     return;
   }
-  tbody.innerHTML=proxies.map(p=>{
+  const visibleProxies=proxies.length>PP_MAX_RENDERED_PROXIES?proxies.slice(0,PP_MAX_RENDERED_PROXIES):proxies;
+  const truncatedRow=proxies.length>visibleProxies.length
+    ? `<tr><td colspan="5"><div class="empty-state" style="padding:12px"><div class="empty-text">仅渲染前 ${visibleProxies.length} / ${proxies.length} 个代理，完整列表仍保存在服务端</div></div></td></tr>`
+    : '';
+  tbody.innerHTML=visibleProxies.map(p=>{
     const failures=p.failures||0;
     const sourceLabel=formatProxySource(p.source);
     const failBadge=failures>0?`<span class="badge badge-${failures>3?'danger':'warn'}">${failures}</span>`:'0';
@@ -4656,7 +5513,7 @@ function renderProxyPool(){
     // Test status: use cached result if available
     const testResult=ppTestResults[p.id];
     let testCell;
-    if(testResult==='testing'){
+    if(testResult==='testing'||(ppTestAllRunning&&testResult===undefined)){
       testCell='<span style="font-size:11px;color:var(--text-3)">检测中...</span>';
     }else if(testResult&&testResult.ok){
       testCell=`<span class="badge badge-success">${testResult.latencyMs}ms</span>`;
@@ -4672,11 +5529,11 @@ function renderProxyPool(){
       <td style="text-align:center">${testCell}</td>
       <td style="text-align:center">${failBadge}</td>
       <td>
-        <button class="btn btn-ghost btn-sm" onclick="testOneProxy('${escapeHtml(p.id)}')" ${testResult==='testing'?'disabled':''}>检测</button>
-        <button class="btn btn-ghost btn-sm" onclick="removeProxyPoolEntry('${escapeHtml(p.id)}')">删除</button>
+        <button class="btn btn-ghost btn-sm" onclick="testOneProxy('${escapeJsAttrString(p.id)}')" ${testResult==='testing'?'disabled':''}>检测</button>
+        <button class="btn btn-ghost btn-sm" onclick="removeProxyPoolEntry('${escapeJsAttrString(p.id)}')">删除</button>
       </td>
     </tr>`;
-  }).join('');
+  }).join('')+truncatedRow;
 }
 
 function shortenUrl(u){
@@ -4689,70 +5546,130 @@ function formatProxySource(source){
   return source;
 }
 
-async function saveProxyPoolConfig(){
-  const config={
+function readProxyPoolNonNegativeIntInput(id,label,max,showErrors=true){
+  const el=document.getElementById(id);
+  const raw=String(el.value||'').trim();
+  const n=/^\d+$/.test(raw)?Number(raw):NaN;
+  if(!Number.isSafeInteger(n)){
+    if(showErrors){toast(label+'必须是非负整数','error');el.focus()}
+    return null;
+  }
+  if(n>max){
+    if(showErrors){toast(label+'不能超过 '+max,'error');el.focus()}
+    return null;
+  }
+  return n;
+}
+function readProxyPoolBatchSizeInput(){
+  const el=document.getElementById('ppBatchSize');
+  const raw=String(el.value||'').trim();
+  const n=/^\d+$/.test(raw)?Number(raw):NaN;
+  if(!Number.isSafeInteger(n)||n<1||n>50){
+    toast('批量并发数必须是 1-50 的整数','error');
+    el.focus();
+    return null;
+  }
+  return n;
+}
+function collectProxyPoolConfigForm(options={}){
+  const showErrors=options.showErrors!==false;
+  const refreshIntervalMin=readProxyPoolNonNegativeIntInput('ppRefreshInterval','自动更新间隔',1440,showErrors);
+  if(refreshIntervalMin===null)return null;
+  const maxRotations=readProxyPoolNonNegativeIntInput('ppMaxRotations','最大轮询次数',20,showErrors);
+  if(maxRotations===null)return null;
+  return {
     enabled:document.getElementById('ppEnabled').checked,
-    refreshIntervalMin:parseInt(document.getElementById('ppRefreshInterval').value,10)||0,
-    maxRotations:parseInt(document.getElementById('ppMaxRotations').value,10)||0,
+    refreshIntervalMin,
+    maxRotations,
     rotateOnGatewayBlock:document.getElementById('ppRotateOnGatewayBlock').checked,
     sourceUrls:document.getElementById('ppSourceUrls').value
       .split(/\r?\n/).map(s=>s.trim()).filter(s=>s.length>0),
   };
+}
+function proxyPoolConfigStateKey(config){
+  if(!config)return '';
+  return JSON.stringify({
+    enabled:!!config.enabled,
+    refreshIntervalMin:Number.isFinite(config.refreshIntervalMin)?config.refreshIntervalMin:0,
+    maxRotations:Number.isFinite(config.maxRotations)?config.maxRotations:0,
+    rotateOnGatewayBlock:config.rotateOnGatewayBlock!==false,
+    sourceUrls:Array.isArray(config.sourceUrls)?config.sourceUrls:[],
+  });
+}
+async function saveProxyPoolConfig(){
+  const config=collectProxyPoolConfigForm();
+  if(!config)return;
+  if(!beginExclusiveAction('proxyPoolConfigSave','代理池配置保存正在进行中，请稍候'))return;
+  const requestState=proxyPoolConfigStateKey(config);
+  const requestAuthToken=authToken;
+  const requestInitGeneration=dashboardInitGeneration;
   try{
-    const r=await fetch(API+'/admin/api/proxy-pool/config',{
+    const data=await fetchJsonMutationWithTimeout(API+'/admin/api/proxy-pool/config',{
       method:'PUT',headers:authHeaders(),body:JSON.stringify(config),
     });
-    if(!r.ok){
-      const e=await r.json().catch(()=>({}));
-      throw new Error(e.error?.message||'HTTP '+r.status);
+    if(!dashboardActionCurrent(requestInitGeneration,requestAuthToken))return;
+    invalidateProxyPoolLoads();
+    const currentState=proxyPoolConfigStateKey(collectProxyPoolConfigForm({showErrors:false}));
+    if(currentState===requestState){
+      ppPoolState={...ppPoolState,config:data.config};
+      renderProxyPool();
+      toast('代理池配置已保存');
+    }else{
+      ppPoolState={...ppPoolState,config:data.config};
+      syncProxyPoolConfigForm(data.config);
+      toast('代理池配置已保存；页面上还有新的未保存修改','warn');
     }
-    const data=await r.json();
-    ppPoolState={...ppPoolState,config:data.config};
-    renderProxyPool();
-    toast('代理池配置已保存');
   }catch(e){
-    console.error('saveProxyPoolConfig failed:',e);
-    toast('保存配置失败：'+e.message,'error');
+    if(dashboardActionCurrent(requestInitGeneration,requestAuthToken)){
+      console.error('saveProxyPoolConfig failed:',e);
+      toast('保存配置失败：'+e.message,'error');
+    }
+  }finally{
+    endExclusiveAction('proxyPoolConfigSave');
   }
 }
 
 async function importProxyPoolFromUrl(){
   const url=document.getElementById('ppImportUrl').value.trim();
   if(!url){toast('请输入 URL','warn');return}
+  if(!beginExclusiveAction('proxyPoolMutation','代理池操作正在进行中，请稍候'))return;
   try{
-    const r=await fetch(API+'/admin/api/proxy-pool/import-url',{
+    const data=await fetchJsonMutationWithTimeout(API+'/admin/api/proxy-pool/import-url',{
       method:'POST',headers:authHeaders(),body:JSON.stringify({url}),
-    });
-    if(!r.ok)throw new Error('HTTP '+r.status);
-    const data=await r.json();
+    },LONG_MUTATION_TIMEOUT_MS);
     if(data.error){
       toast(`导入失败：${data.error}`,'error');
     }else{
       toast(`导入完成：新增 ${data.added}，删除 ${data.removed}，总计 ${data.total}（拉取 ${data.fetched} 条）`);
       document.getElementById('ppImportUrl').value='';
     }
+    invalidateProxyPoolLoads();
     await loadProxyPool();
   }catch(e){
     console.error('importProxyPoolFromUrl failed:',e);
     toast('导入失败：'+e.message,'error');
+  }finally{
+    endExclusiveAction('proxyPoolMutation');
   }
 }
 
 async function importProxyPoolFromText(replace){
   const text=document.getElementById('ppImportText').value;
   if(!text.trim()){toast('请输入代理内容','warn');return}
+  if(!beginExclusiveAction('proxyPoolMutation','代理池操作正在进行中，请稍候'))return;
   try{
-    const r=await fetch(API+'/admin/api/proxy-pool/import-text',{
+    const data=await fetchJsonMutationWithTimeout(API+'/admin/api/proxy-pool/import-text',{
       method:'POST',headers:authHeaders(),body:JSON.stringify({text,replace}),
     });
-    if(!r.ok)throw new Error('HTTP '+r.status);
-    const data=await r.json();
     toast(`${replace?'替换':'追加'}导入：新增 ${data.added}，删除 ${data.removed}，总计 ${data.total}`);
     document.getElementById('ppImportText').value='';
+    invalidateProxyPoolLoads();
     await loadProxyPool();
   }catch(e){
     console.error('importProxyPoolFromText failed:',e);
     toast('导入失败：'+e.message,'error');
+  }finally{
+    endExclusiveAction('proxyPoolMutation');
   }
 }
 
@@ -4760,22 +5677,23 @@ async function uploadProxyPoolFile(event){
   const file=event.target.files[0];
   if(!file)return;
   try{
+    if(!checkImportFileSize(file,PROXY_IMPORT_MAX_FILE_BYTES,'代理导入'))return;
     const text=await file.text();
     document.getElementById('ppImportText').value=text;
     toast(`已加载文件 ${file.name}（${text.length} 字节），点击"追加导入"或"替换导入"应用`);
   }catch(e){
     toast('读取文件失败：'+e.message,'error');
+  }finally{
+    event.target.value=''; // reset so the same file can be re-selected
   }
-  event.target.value=''; // reset so the same file can be re-selected
 }
 
 async function refreshProxyPool(){
+  if(!beginExclusiveAction('proxyPoolMutation','代理池操作正在进行中，请稍候'))return;
   try{
-    const r=await fetch(API+'/admin/api/proxy-pool/refresh',{
+    const data=await fetchJsonMutationWithTimeout(API+'/admin/api/proxy-pool/refresh',{
       method:'POST',headers:authHeaders(),
-    });
-    if(!r.ok)throw new Error('HTTP '+r.status);
-    const data=await r.json();
+    },LONG_MUTATION_TIMEOUT_MS);
     let msg=`刷新完成：新增 ${data.added}，删除 ${data.removed}，总计 ${data.total}`;
     if(data.errors&&Object.keys(data.errors).length>0){
       msg+='；'+Object.keys(data.errors).length+' 个来源失败';
@@ -4783,60 +5701,73 @@ async function refreshProxyPool(){
     }else{
       toast(msg);
     }
+    invalidateProxyPoolLoads();
     await loadProxyPool();
   }catch(e){
     console.error('refreshProxyPool failed:',e);
     toast('刷新失败：'+e.message,'error');
+  }finally{
+    endExclusiveAction('proxyPoolMutation');
   }
 }
 
 async function removeProxyPoolEntry(id){
+  if(!beginExclusiveAction('proxyPoolMutation','代理池操作正在进行中，请稍候'))return;
   try{
-    const r=await fetch(API+'/admin/api/proxy-pool/proxy',{
+    await fetchJsonMutationWithTimeout(API+'/admin/api/proxy-pool/proxy',{
       method:'DELETE',headers:authHeaders(),body:JSON.stringify({id}),
     });
-    if(!r.ok)throw new Error('HTTP '+r.status);
     toast('已删除');
+    invalidateProxyPoolLoads();
     await loadProxyPool();
   }catch(e){
     console.error('removeProxyPoolEntry failed:',e);
     toast('删除失败：'+e.message,'error');
+  }finally{
+    endExclusiveAction('proxyPoolMutation');
   }
 }
 
 async function clearProxyPool(){
   if(!confirm('确定要清空代理池中的所有代理吗？配置（来源 URL、刷新间隔等）会保留。'))return;
+  if(!beginExclusiveAction('proxyPoolMutation','代理池操作正在进行中，请稍候'))return;
   try{
-    const r=await fetch(API+'/admin/api/proxy-pool/clear',{
+    const data=await fetchJsonMutationWithTimeout(API+'/admin/api/proxy-pool/clear',{
       method:'POST',headers:authHeaders(),
     });
-    if(!r.ok)throw new Error('HTTP '+r.status);
-    const data=await r.json();
     toast(`已清空 ${data.removed} 条代理`);
     ppTestResults={}; // clear test results
+    invalidateProxyPoolLoads();
     await loadProxyPool();
   }catch(e){
     console.error('clearProxyPool failed:',e);
     toast('清空失败：'+e.message,'error');
+  }finally{
+    endExclusiveAction('proxyPoolMutation');
   }
 }
 
 // Test a single proxy by id
 async function testOneProxy(id){
   if(ppTestResults[id]==='testing')return; // already testing
+  const generation=ppSingleTestGeneration;
+  const requestAuthToken=authToken;
   ppTestResults[id]='testing';
   renderProxyPool();
+  let result;
   try{
-    const r=await fetch(API+'/admin/api/proxy-pool/test-one',{
+    result=await fetchJsonMutationWithTimeout(API+'/admin/api/proxy-pool/test-one',{
       method:'POST',headers:authHeaders(),
       body:JSON.stringify({id}),
     });
-    if(!r.ok)throw new Error('HTTP '+r.status);
-    const data=await r.json();
-    ppTestResults[id]=data;
   }catch(e){
-    ppTestResults[id]={ok:false,error:e.message,latencyMs:0};
+    result={ok:false,error:e.message,latencyMs:0};
   }
+  if(generation!==ppSingleTestGeneration||requestAuthToken!==authToken||!dashboardCanUpdate()){
+    if(ppTestResults[id]==='testing')delete ppTestResults[id];
+    return;
+  }
+  ppTestResults[id]=result;
   renderProxyPool();
 }
 
@@ -4851,26 +5782,38 @@ async function testAllProxies(){
     toast('代理池为空，无需检测','warn');
     return;
   }
-  const batchSize=Math.max(1,Math.min(50,parseInt(document.getElementById('ppBatchSize').value,10)||5));
+  const batchSize=readProxyPoolBatchSizeInput();
+  if(batchSize===null)return;
   const autoRemove=document.getElementById('ppAutoRemoveFailed').checked;
+  const requestInitGeneration=dashboardInitGeneration;
+  const requestAuthToken=authToken;
 
   try{
     // Start the background job on the server.
-    const r=await fetch(API+'/admin/api/proxy-pool/test-all',{
+    const state=await fetchJsonMutationWithTimeout(API+'/admin/api/proxy-pool/test-all',{
       method:'POST',headers:authHeaders(),
       body:JSON.stringify({batchSize,autoRemove}),
     });
-    if(!r.ok)throw new Error('HTTP '+r.status);
-    const state=await r.json();
+    if(requestInitGeneration!==dashboardInitGeneration||requestAuthToken!==authToken||!dashboardCanUpdate())return;
     ppTestAllRunning=true;
+    ppJobFinishedNotified=false;
+    ppTestResults={};
+    if(state.results){
+      for(const[id,result]of Object.entries(state.results)){
+        ppTestResults[id]=result;
+      }
+    }
+    ppTestJobSeq=state.resultSeq||0;
     const btn=document.getElementById('ppTestAllBtn');
     if(btn)btn.disabled=true;
     toast(`后台检测已启动：共 ${state.total} 个代理，可关闭页面，任务在服务器继续运行`);
     // Start polling for progress.
     pollTestJob();
   }catch(e){
-    console.error('testAllProxies failed:',e);
-    toast('启动检测失败：'+e.message,'error');
+    if(requestInitGeneration===dashboardInitGeneration&&requestAuthToken===authToken&&dashboardCanUpdate()){
+      console.error('testAllProxies failed:',e);
+      toast('启动检测失败：'+e.message,'error');
+    }
   }
 }
 
@@ -4878,28 +5821,24 @@ async function testAllProxies(){
 // active. Updates the progress display and test results table. When the job
 // finishes, reloads the pool (to reflect auto-removals) and shows a toast.
 function pollTestJob(){
-  if(ppTestPollTimer){clearTimeout(ppTestPollTimer);ppTestPollTimer=null;}
+  clearProxyPoolPollTimer();
+  clearProxyPoolProgressHideTimer();
+  if(document.hidden||!dashboardActive())return;
+  const requestInitGeneration=dashboardInitGeneration;
+  const requestAuthToken=authToken;
   ppTestPollTimer=setTimeout(async()=>{
+    ppTestPollTimer=null;
     try{
-      const r=await fetch(API+'/admin/api/proxy-pool/test-status',{headers:authHeaders()});
-      if(!r.ok)throw new Error('HTTP '+r.status);
-      const state=await r.json();
+      const state=await fetchJsonWithTimeout(API+'/admin/api/proxy-pool/test-status?sinceSeq='+encodeURIComponent(ppTestJobSeq),{headers:authHeaders()},5000);
+      if(requestInitGeneration!==dashboardInitGeneration||requestAuthToken!==authToken||!dashboardCanUpdate())return;
+      ppTestPollErrorCount=0;
       // Merge server results into ppTestResults for the table render.
       if(state.results){
         for(const[id,result]of Object.entries(state.results)){
           ppTestResults[id]=result;
         }
       }
-      // Mark untested proxies (total - tested) as still 'testing' if the job
-      // is running, so the table shows them correctly.
-      if(ppPoolState&&ppPoolState.proxies){
-        const testedIds=new Set(Object.keys(state.results||{}));
-        for(const p of ppPoolState.proxies){
-          if(!testedIds.has(p.id)){
-            ppTestResults[p.id]=state.running?'testing':{ok:false,error:'未检测',latencyMs:0};
-          }
-        }
-      }
+      ppTestJobSeq=Math.max(ppTestJobSeq,state.resultSeq||0);
       // Update progress display.
       const progress=document.getElementById('ppTestProgress');
       const progressText=document.getElementById('ppTestProgressText');
@@ -4917,15 +5856,23 @@ function pollTestJob(){
         ppTestAllRunning=false;
         const btn=document.getElementById('ppTestAllBtn');
         if(btn)btn.disabled=false;
+        ppTestPollErrorCount=0;
         // Reload pool to reflect auto-removals, then stop polling.
+        invalidateProxyPoolLoads();
         await loadProxyPool();
+        if(requestInitGeneration!==dashboardInitGeneration||requestAuthToken!==authToken||!dashboardCanUpdate())return;
         // Show a toast only once when the job transitions to finished.
         if(!ppJobFinishedNotified){
           ppJobFinishedNotified=true;
           toast(txt,state.okCount>0?'success':'warn');
         }
         // Hide progress after 5 seconds.
-        setTimeout(()=>{progress.style.display='none';},5000);
+        ppProgressHideTimer=setTimeout(()=>{
+          ppProgressHideTimer=null;
+          if(requestInitGeneration===dashboardInitGeneration&&requestAuthToken===authToken&&dashboardCanUpdate()){
+            progress.style.display='none';
+          }
+        },5000);
         ppTestPollTimer=null;
         return;
       }else{
@@ -4933,6 +5880,7 @@ function pollTestJob(){
         ppTestAllRunning=false;
         const btn=document.getElementById('ppTestAllBtn');
         if(btn)btn.disabled=false;
+        ppTestPollErrorCount=0;
         ppTestPollTimer=null;
         return;
       }
@@ -4940,8 +5888,15 @@ function pollTestJob(){
       // Continue polling.
       pollTestJob();
     }catch(e){
+      if(requestInitGeneration!==dashboardInitGeneration||requestAuthToken!==authToken||!dashboardCanUpdate())return;
       console.error('pollTestJob failed:',e);
       ppTestPollTimer=null;
+      ppTestPollErrorCount++;
+      if(dashboardCanUpdate()&&ppTestPollErrorCount<3){
+        pollTestJob();
+        return;
+      }
+      ppTestPollErrorCount=0;
       ppTestAllRunning=false;
       const btn=document.getElementById('ppTestAllBtn');
       if(btn)btn.disabled=false;
@@ -4954,13 +5909,15 @@ let ppJobFinishedNotified=false;
 // Check on page load if a background test job is already running (e.g. user
 // closed the page and reopened it). If so, resume polling.
 async function checkRunningTestJob(){
+  const requestAuthToken=authToken;
+  const requestInitGeneration=dashboardInitGeneration;
   try{
-    const r=await fetch(API+'/admin/api/proxy-pool/test-status',{headers:authHeaders()});
-    if(!r.ok)return;
-    const state=await r.json();
+    const state=await fetchJsonWithTimeout(API+'/admin/api/proxy-pool/test-status',{headers:authHeaders()},5000);
+    if(!dashboardCanUpdate()||!dashboardActionCurrent(requestInitGeneration,requestAuthToken))return;
     if(state.running){
       ppTestAllRunning=true;
       ppJobFinishedNotified=false;
+      ppTestJobSeq=0;
       const btn=document.getElementById('ppTestAllBtn');
       if(btn)btn.disabled=true;
       pollTestJob();
@@ -4971,6 +5928,7 @@ async function checkRunningTestJob(){
           ppTestResults[id]=result;
         }
       }
+      ppTestJobSeq=state.resultSeq||0;
       renderProxyPool();
     }
   }catch(e){/* ignore — non-critical */}

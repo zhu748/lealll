@@ -5,6 +5,7 @@
  */
 import type { AnthropicStreamEvent, OpenAIStreamChunk } from "./types.js";
 import { parseSSEChunk, waitForBackpressure, type ParsedSSE } from "../utils/sse.js";
+import { SSE as SSE_CONST } from "../utils/constants.js";
 
 interface TranslationState {
   messageId: string;
@@ -47,6 +48,8 @@ interface TranslationState {
   toolBlocks: Map<number, { openaiIndex: number; id: string; name: string }>;
   /** Counter for assigning OpenAI tool_calls indices. */
   nextToolIndex: number;
+  /** Whether a terminal finish_reason/usage chunk has already been emitted. */
+  finalChunkSent: boolean;
 }
 
 function initState(model: string): TranslationState {
@@ -60,6 +63,7 @@ function initState(model: string): TranslationState {
     thinkingTokens: 0,
     toolBlocks: new Map(),
     nextToolIndex: 0,
+    finalChunkSent: false,
   };
 }
 
@@ -84,6 +88,18 @@ function makeChunk(
   return `data: ${JSON.stringify(chunk)}\n\n`;
 }
 
+function parseStreamContentBlockIndex(value: unknown): number {
+  const n = value ?? 0;
+  if (!Number.isInteger(n) || (n as number) < 0 || (n as number) > SSE_CONST.MAX_TO_BATCH_CONTENT_BLOCK_INDEX) {
+    throw new Error(`Invalid SSE content block index: ${String(value)} (max ${SSE_CONST.MAX_TO_BATCH_CONTENT_BLOCK_INDEX})`);
+  }
+  return n as number;
+}
+
+function utf8ByteLength(encoder: TextEncoder, value: string): number {
+  return encoder.encode(value).byteLength;
+}
+
 /**
  * Transform an Anthropic SSE stream into OpenAI SSE format.
  * Input: ReadableStream<Uint8Array> (Anthropic SSE bytes)
@@ -97,57 +113,105 @@ export function anthropicSseToOpenaiSse(
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   let buffer = "";
+  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  let cancelled = false;
+  let streamClosed = false;
 
   return new ReadableStream({
     async start(controller) {
-      const reader = upstream.getReader();
+      reader = upstream.getReader();
+      const safeClose = (): void => {
+        if (streamClosed) return;
+        streamClosed = true;
+        try { controller.close(); } catch {}
+      };
+      const safeError = (err: unknown): void => {
+        if (streamClosed) return;
+        streamClosed = true;
+        try { controller.error(err); } catch {}
+      };
+      const enqueueEncoded = async (output: string): Promise<boolean> => {
+        if (cancelled || streamClosed) return false;
+        await waitForBackpressure(controller);
+        if (cancelled || streamClosed) return false;
+        try {
+          controller.enqueue(encoder.encode(output));
+          return true;
+        } catch (err) {
+          streamClosed = true;
+          if (!cancelled) throw err;
+          return false;
+        }
+      };
 
       try {
         while (true) {
+          if (cancelled || streamClosed) break;
           const { done, value } = await reader.read();
           if (done) break;
+          if (cancelled || streamClosed) break;
 
           buffer += decoder.decode(value, { stream: true });
-          const blocks = buffer.split("\n\n");
-          buffer = blocks.pop() ?? "";
+          if (buffer.indexOf("\r") >= 0) {
+            buffer = buffer.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+          }
 
-          for (const block of blocks) {
+          let cursor = 0;
+          let eventEnd: number;
+          while ((eventEnd = buffer.indexOf("\n\n", cursor)) !== -1) {
+            const block = buffer.slice(cursor, eventEnd);
+            cursor = eventEnd + 2;
+            if (utf8ByteLength(encoder, block) > SSE_CONST.MAX_TRANSLATED_STREAM_BUFFERED_EVENT_BYTES) {
+              throw new Error(`SSE event exceeded ${SSE_CONST.MAX_TRANSLATED_STREAM_BUFFERED_EVENT_BYTES} byte limit`);
+            }
             const parsed = parseSSEChunk(block);
             for (const p of parsed) {
               const output = translateEvent(state, p);
               if (output) {
-                // Wait for the downstream client to drain before enqueuing
-                // more chunks. Without this, a slow client (e.g. Codex CLI
-                // on a flaky network) can cause the proxy's translated-stream
-                // buffer to grow unbounded — eventually OOMing.
-                await waitForBackpressure(controller);
-                controller.enqueue(encoder.encode(output));
+                if (!(await enqueueEncoded(output))) return;
               }
             }
           }
+          if (cursor > 0) {
+            buffer = buffer.slice(cursor);
+          }
+          if (utf8ByteLength(encoder, buffer) > SSE_CONST.MAX_TRANSLATED_STREAM_BUFFERED_EVENT_BYTES) {
+            throw new Error(`SSE buffered event exceeded ${SSE_CONST.MAX_TRANSLATED_STREAM_BUFFERED_EVENT_BYTES} byte limit`);
+          }
         }
 
+        if (cancelled) return;
         // Flush remaining buffer
         if (buffer.trim()) {
           const parsed = parseSSEChunk(buffer);
           for (const p of parsed) {
             const output = translateEvent(state, p);
             if (output) {
-              await waitForBackpressure(controller);
-              controller.enqueue(encoder.encode(output));
+              if (!(await enqueueEncoded(output))) return;
             }
           }
         }
 
         // Emit [DONE]
-        await waitForBackpressure(controller);
-        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        await enqueueEncoded("data: [DONE]\n\n");
       } catch (err) {
-        controller.error(err);
+        if (!cancelled) {
+          // Parser/translation failures mean this output stream is done; cancel
+          // the upstream body too so a bad SSE event does not leave the fetch
+          // body sitting unread until the server closes it.
+          void reader?.cancel(err).catch(() => {});
+          safeError(err);
+        }
       } finally {
-        try { controller.close(); } catch {}
+        safeClose();
         try { reader.releaseLock(); } catch {}
+        reader = null;
       }
+    },
+    cancel(reason) {
+      cancelled = true;
+      streamClosed = true;
+      void reader?.cancel(reason).catch(() => {});
     },
   });
 }
@@ -182,7 +246,7 @@ function translateEvent(state: TranslationState, sse: ParsedSSE): string | null 
       // initial id + name + empty arguments string; subsequent
       // input_json_delta events append to the arguments string.
       const block = (data as any).content_block;
-      const blockIdx = (data as any).index ?? 0;
+      const blockIdx = parseStreamContentBlockIndex((data as any).index);
       if (block?.type === "tool_use") {
         const openaiIdx = state.nextToolIndex++;
         state.toolBlocks.set(blockIdx, {
@@ -206,6 +270,7 @@ function translateEvent(state: TranslationState, sse: ParsedSSE): string | null 
 
     case "content_block_delta": {
       const delta = (data as any).delta;
+      const blockIdx = parseStreamContentBlockIndex((data as any).index);
       if (delta?.type === "text_delta") {
         return makeChunk(state, { content: delta.text });
       }
@@ -213,7 +278,6 @@ function translateEvent(state: TranslationState, sse: ParsedSSE): string | null 
         // Forward the partial JSON arguments to the matching OpenAI
         // tool_call entry. The Anthropic block index tells us which
         // tool_use block this delta belongs to.
-        const blockIdx = (data as any).index ?? 0;
         const tool = state.toolBlocks.get(blockIdx);
         if (!tool) return null; // orphan delta — drop
         return makeChunk(state, {
@@ -243,7 +307,7 @@ function translateEvent(state: TranslationState, sse: ParsedSSE): string | null 
       // event needs to be emitted — OpenAI's format doesn't have an
       // explicit "tool call ended" marker; the finish_reason carries
       // that information.
-      const blockIdx = (data as any).index ?? 0;
+      const blockIdx = parseStreamContentBlockIndex((data as any).index);
       state.toolBlocks.delete(blockIdx);
       return null;
     }
@@ -266,6 +330,7 @@ function translateEvent(state: TranslationState, sse: ParsedSSE): string | null 
         state.thinkingTokens = dataAny.usage.reasoning_tokens;
       }
       if (delta?.stop_reason) {
+        state.finalChunkSent = true;
         const finishReason = mapStopReason(delta.stop_reason);
         return makeChunk(state, {}, finishReason, {
           prompt_tokens: state.inputTokens,
@@ -285,6 +350,8 @@ function translateEvent(state: TranslationState, sse: ParsedSSE): string | null 
     }
 
     case "message_stop": {
+      if (state.finalChunkSent) return null;
+      state.finalChunkSent = true;
       return makeChunk(state, {}, "stop", {
         prompt_tokens: state.inputTokens,
         completion_tokens: state.outputTokens,

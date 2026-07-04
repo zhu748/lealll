@@ -38,18 +38,29 @@ const CONFIGS_API = "https://zcode.z.ai/api/v1/client/configs";
 // we solve fresh each time so TTL doesn't matter to us.
 // const TOKEN_TTL_MS = 45_000;
 const FAKE_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+const MAX_TIMER_MS = 2_147_483_647;
 
 /** How many times to retry a single captcha solve. Overridable via env. */
-const SOLVE_RETRIES = Number(process.env.ZCODE_CAPTCHA_RETRIES || 3);
+const SOLVE_RETRIES = resolveCaptchaRetryCount();
 /** Per-attempt solve timeout (ms). Overridable via env. */
-const SOLVE_TIMEOUT_MS = Number(process.env.ZCODE_CAPTCHA_TIMEOUT_MS || 40_000);
+const SOLVE_TIMEOUT_MS = resolveCaptchaTimeoutMs(process.env.ZCODE_CAPTCHA_TIMEOUT_MS, 40_000);
 /** Timeout (ms) waiting for the SDK to expose `initAliyunCaptcha`. */
-const SDK_LOAD_TIMEOUT_MS = Number(process.env.ZCODE_CAPTCHA_SDK_LOAD_MS || 20_000);
+const SDK_LOAD_TIMEOUT_MS = resolveCaptchaTimeoutMs(process.env.ZCODE_CAPTCHA_SDK_LOAD_MS, 20_000);
 /** Config-fetch timeout (ms). The configs API is fast; 15s is generous
  *  for slow networks. Overridable via env. */
-const CONFIG_FETCH_TIMEOUT_MS = Number(process.env.ZCODE_CAPTCHA_CONFIG_TIMEOUT_MS || 15_000);
-const CHROME_SOLVE_TIMEOUT_MS = Number(process.env.ZCODE_CAPTCHA_CHROME_TIMEOUT_MS || 70_000);
+const CONFIG_FETCH_TIMEOUT_MS = resolveCaptchaTimeoutMs(process.env.ZCODE_CAPTCHA_CONFIG_TIMEOUT_MS, 15_000);
+const CHROME_SOLVE_TIMEOUT_MS = resolveCaptchaTimeoutMs(process.env.ZCODE_CAPTCHA_CHROME_TIMEOUT_MS, 70_000);
 const CHROME_INTERACTIVE = process.env.ZCODE_CAPTCHA_CHROME_INTERACTIVE === "1";
+const MAX_CAPTCHA_CONFIG_JSON_BYTES = 256 * 1024;
+const MAX_CDP_JSON_BYTES = 512 * 1024;
+const CAPTCHA_CONFIG_CACHE_MS = 60_000;
+const MAX_CAPTCHA_CONFIG_CACHE_ENTRIES = 32;
+const CDP_JSON_ATTEMPT_TIMEOUT_MS = 1000;
+const DEFAULT_CHROME_IDLE_MS = 10 * 60_000;
+const DEFAULT_CHROME_STOP_GRACE_MS = 2_000;
+const DEFAULT_CHROME_DEBUG_PORT_BASE = 9300;
+const DEFAULT_CHROME_DEBUG_PORT_SPAN = 1000;
+const DEFAULT_CHROME_DEBUG_PORT_ATTEMPTS = 8;
 const ALIYUN_SDK_URL = "https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js";
 export type CaptchaSolverStrategy = "auto" | "chrome" | "jsdom";
 type CaptchaLanguage = "cn" | "en";
@@ -68,10 +79,154 @@ interface CaptchaRuntimeOptions {
   solver?: CaptchaSolverStrategy;
 }
 
+export interface ChromeCaptchaHelperStatus {
+  keepAlive: boolean;
+  running: boolean;
+  mode: "persistent" | "per-solve";
+  chromePath: string | null;
+  userDataDir: string;
+  ephemeral: boolean;
+  idleTimeoutMs: number;
+  nextIdleShutdownAt: number | null;
+  port: number | null;
+  pageUrl: string | null;
+  visible: boolean;
+  startedAt: number | null;
+  lastUsedAt: number | null;
+  lastSolveAt: number | null;
+  solveCount: number;
+  interactiveCount: number;
+  busy: boolean;
+  sdkReady: boolean;
+  sdkPreloadError: string | null;
+  lastError: string | null;
+}
+
+function parsePositiveInt(raw: unknown): number | null {
+  if (raw === undefined || raw === null) return null;
+  const trimmed = String(raw).trim();
+  if (!/^\d+$/.test(trimmed)) return null;
+  const n = Number(trimmed);
+  return Number.isSafeInteger(n) && n > 0 ? n : null;
+}
+
+export function resolveCaptchaRetryCount(raw = process.env.ZCODE_CAPTCHA_RETRIES): number {
+  const n = parsePositiveInt(raw);
+  return n === null ? 3 : Math.min(n, 100);
+}
+
+export function resolveCaptchaTimeoutMs(raw: unknown, fallback: number): number {
+  const safeFallback = Number.isSafeInteger(fallback) && fallback > 0
+    ? Math.min(fallback, MAX_TIMER_MS)
+    : 1;
+  const n = parsePositiveInt(raw);
+  return n === null ? safeFallback : Math.min(n, MAX_TIMER_MS);
+}
+
 let cachedConfigs = new Map<string, { value: FetchedCaptchaConfig | null; expiresAt: number }>();
+
+function pruneCaptchaConfigCache(now = Date.now()): void {
+  for (const [key, entry] of cachedConfigs) {
+    if (entry.expiresAt <= now) cachedConfigs.delete(key);
+  }
+  while (cachedConfigs.size > MAX_CAPTCHA_CONFIG_CACHE_ENTRIES) {
+    const oldest = cachedConfigs.keys().next().value;
+    if (oldest === undefined) break;
+    cachedConfigs.delete(oldest);
+  }
+}
+
+export function _clearCaptchaConfigCacheForTesting(): void {
+  cachedConfigs.clear();
+}
+
+export function _captchaConfigCacheSizeForTesting(): number {
+  return cachedConfigs.size;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+function parseContentLength(headers: Headers): number | undefined {
+  const raw = headers.get("content-length");
+  if (!raw) return undefined;
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) return undefined;
+  const n = Number(trimmed);
+  return Number.isSafeInteger(n) ? n : undefined;
+}
+
+async function readChunkWithTimeout(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  timeoutMs: number,
+): ReturnType<ReadableStreamDefaultReader<Uint8Array>["read"]> {
+  const timeout = resolveCaptchaTimeoutMs(timeoutMs, CONFIG_FETCH_TIMEOUT_MS);
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const result = await Promise.race([
+    reader.read(),
+    new Promise<"timeout">(resolve => {
+      timer = setTimeout(() => resolve("timeout"), timeout);
+      timer.unref?.();
+    }),
+  ]).finally(() => {
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  });
+  if (result === "timeout") {
+    const err = new Error(`captcha response read timeout after ${timeout}ms`);
+    void reader.cancel(err).catch(() => {});
+    throw err;
+  }
+  return result;
+}
+
+async function readTextLimited(
+  resp: Response,
+  maxBytes: number,
+  timeoutMs = CONFIG_FETCH_TIMEOUT_MS,
+): Promise<string> {
+  const limit = Math.max(1, Math.floor(maxBytes));
+  const declaredLength = parseContentLength(resp.headers);
+  if (declaredLength !== undefined && declaredLength > limit) {
+    void resp.body?.cancel().catch(() => {});
+    throw new Error(`captcha response exceeds ${limit} byte limit (content-length ${declaredLength})`);
+  }
+  if (!resp.body) return "";
+
+  const reader = resp.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await readChunkWithTimeout(reader, timeoutMs);
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > limit) {
+        try { await reader.cancel(); } catch {}
+        throw new Error(`captcha response exceeds ${limit} byte limit`);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    try { reader.releaseLock(); } catch {}
+  }
+
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(bytes);
+}
+
+async function readJsonLimited(resp: Response, maxBytes: number, timeoutMs = CONFIG_FETCH_TIMEOUT_MS): Promise<any> {
+  const text = await readTextLimited(resp, maxBytes, timeoutMs);
+  return text ? JSON.parse(text) : {};
 }
 
 export function extractAliyunCaptchaVerifyParam(value: unknown): string | undefined {
@@ -112,6 +267,61 @@ export function isAliyunCaptchaDeferredInteractive(value: unknown): boolean {
 export function resolveCaptchaSolverStrategy(raw = process.env.ZCODE_CAPTCHA_SOLVER): CaptchaSolverStrategy {
   const value = (raw || "auto").trim().toLowerCase();
   return value === "chrome" || value === "jsdom" ? value : "auto";
+}
+
+export function resolveChromeKeepAliveEnabled(raw = process.env.ZCODE_CAPTCHA_CHROME_KEEPALIVE): boolean {
+  const value = (raw ?? "1").trim().toLowerCase();
+  return !(value === "0" || value === "false" || value === "off" || value === "never");
+}
+
+export function resolveChromeIdleTimeoutMs(raw = process.env.ZCODE_CAPTCHA_CHROME_IDLE_MS): number {
+  if (raw === undefined || raw.trim() === "") return DEFAULT_CHROME_IDLE_MS;
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) return DEFAULT_CHROME_IDLE_MS;
+  const n = Number(trimmed);
+  return Number.isSafeInteger(n) ? Math.min(n, MAX_TIMER_MS) : DEFAULT_CHROME_IDLE_MS;
+}
+
+export function resolveChromeStopGraceMs(raw = process.env.ZCODE_CAPTCHA_CHROME_STOP_GRACE_MS): number {
+  if (raw === undefined || raw.trim() === "") return DEFAULT_CHROME_STOP_GRACE_MS;
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) return DEFAULT_CHROME_STOP_GRACE_MS;
+  const n = Number(trimmed);
+  return Number.isSafeInteger(n) ? Math.min(n, MAX_TIMER_MS) : DEFAULT_CHROME_STOP_GRACE_MS;
+}
+
+export function buildChromeDebugPortCandidates(
+  opts: {
+    fixedPort?: string;
+    base?: string;
+    span?: string;
+    attempts?: string;
+    randomSeed?: number;
+  } = {},
+): number[] {
+  const fixed = Number((opts.fixedPort ?? process.env.ZCODE_CAPTCHA_CHROME_PORT ?? "").trim());
+  if (Number.isInteger(fixed) && fixed > 0 && fixed < 65536) return [fixed];
+
+  const parsedBase = Number((opts.base ?? process.env.ZCODE_CAPTCHA_CHROME_PORT_BASE ?? "").trim());
+  const base = Number.isInteger(parsedBase) && parsedBase > 0 && parsedBase < 65536
+    ? parsedBase
+    : DEFAULT_CHROME_DEBUG_PORT_BASE;
+  const parsedSpan = Number((opts.span ?? process.env.ZCODE_CAPTCHA_CHROME_PORT_SPAN ?? "").trim());
+  const maxSpan = Math.max(1, 65535 - base + 1);
+  const span = Number.isInteger(parsedSpan) && parsedSpan > 0
+    ? Math.min(parsedSpan, maxSpan)
+    : Math.min(DEFAULT_CHROME_DEBUG_PORT_SPAN, maxSpan);
+  const parsedAttempts = Number((opts.attempts ?? process.env.ZCODE_CAPTCHA_CHROME_PORT_ATTEMPTS ?? "").trim());
+  const attempts = Number.isInteger(parsedAttempts) && parsedAttempts > 0
+    ? Math.min(parsedAttempts, span)
+    : Math.min(DEFAULT_CHROME_DEBUG_PORT_ATTEMPTS, span);
+  const seed = opts.randomSeed ?? Math.random();
+  const start = Math.floor(Math.max(0, Math.min(0.999999, seed)) * span);
+  const out: number[] = [];
+  for (let i = 0; i < attempts; i++) {
+    out.push(base + ((start + i) % span));
+  }
+  return out;
 }
 
 export function resolveClientPlatformKey(): string {
@@ -192,17 +402,25 @@ export function invalidateCaptchaToken(): void {
 
 async function fetchCaptchaConfig(reqId?: string, opts?: CaptchaRuntimeOptions): Promise<FetchedCaptchaConfig | null> {
   const url = buildCaptchaConfigUrl({ appVersion: opts?.appVersion, platform: opts?.platform });
+  pruneCaptchaConfigCache();
   const cached = cachedConfigs.get(url);
   if (cached && cached.expiresAt > Date.now()) return cached.value;
+  if (cached) cachedConfigs.delete(url);
   const tag = reqId ? `${reqId} ` : "";
   try {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), CONFIG_FETCH_TIMEOUT_MS);
+    timer.unref?.();
     try {
       const resp = await fetch(url, { signal: ctrl.signal });
-      const json = (await resp.json()) as { data?: { configs?: { captcha?: FetchedCaptchaConfig } } };
+      if (!resp.ok) {
+        void resp.body?.cancel().catch(() => {});
+        throw new Error(`captcha config HTTP ${resp.status}`);
+      }
+      const json = (await readJsonLimited(resp, MAX_CAPTCHA_CONFIG_JSON_BYTES)) as { data?: { configs?: { captcha?: FetchedCaptchaConfig } } };
       const cfg = json?.data?.configs?.captcha ?? null;
-      cachedConfigs.set(url, { value: cfg, expiresAt: Date.now() + 60000 });
+      cachedConfigs.set(url, { value: cfg, expiresAt: Date.now() + CAPTCHA_CONFIG_CACHE_MS });
+      pruneCaptchaConfigCache();
       return cfg;
     } finally {
       clearTimeout(timer);
@@ -325,15 +543,23 @@ async function solveInJsdomWithRetry(
       // ensures we still reject and the finally block runs to release the
       // JSDOM instance (50-100MB each).
       const HARD_GUARD_MS = SOLVE_TIMEOUT_MS + SDK_LOAD_TIMEOUT_MS + 10_000;
+      let hardGuardTimer: ReturnType<typeof setTimeout> | null = null;
+      const hardGuard = new Promise<never>((_, reject) => {
+        hardGuardTimer = setTimeout(
+          () => reject(new Error(`captcha hard-guard timeout after ${HARD_GUARD_MS}ms (inner timeouts failed to fire — JSDOM may be stuck)`)),
+          HARD_GUARD_MS,
+        );
+        hardGuardTimer.unref?.();
+      });
       const result = await Promise.race([
         solveInJsdom(cfg, language),
-        new Promise<never>((_, reject) => {
-          setTimeout(
-            () => reject(new Error(`captcha hard-guard timeout after ${HARD_GUARD_MS}ms (inner timeouts failed to fire — JSDOM may be stuck)`)),
-            HARD_GUARD_MS,
-          );
-        }),
-      ]);
+        hardGuard,
+      ]).finally(() => {
+        if (hardGuardTimer) {
+          clearTimeout(hardGuardTimer);
+          hardGuardTimer = null;
+        }
+      });
       return result;
     } catch (err) {
       lastErr = err as Error;
@@ -391,10 +617,13 @@ function defaultStoreDir(): string {
   return process.env.ZCODE_PROXY_STORE_DIR?.trim() || join(homedir(), ".zcode-proxy");
 }
 
-function resolveChromeUserDataDir(): { dir: string; ephemeral: boolean } {
+function resolveChromeUserDataDir(opts?: { createEphemeral?: boolean }): { dir: string; ephemeral: boolean } {
   const configured = process.env.ZCODE_CAPTCHA_CHROME_USER_DATA_DIR?.trim();
   if (configured) return { dir: configured, ephemeral: false };
   if (process.env.ZCODE_CAPTCHA_CHROME_EPHEMERAL === "1") {
+    if (opts?.createEphemeral === false) {
+      return { dir: join(tmpdir(), "zcode-captcha-cdp-*"), ephemeral: true };
+    }
     return { dir: mkdtempSync(join(tmpdir(), "zcode-captcha-cdp-")), ephemeral: true };
   }
   return { dir: join(defaultStoreDir(), "captcha-chrome-profile"), ephemeral: false };
@@ -404,39 +633,274 @@ async function waitForCdpJson(port: number, path: string): Promise<any> {
   const deadline = Date.now() + 15_000;
   let last = "";
   while (Date.now() < deadline) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), CDP_JSON_ATTEMPT_TIMEOUT_MS);
+    timer.unref?.();
     try {
-      const resp = await fetch(`http://127.0.0.1:${port}${path}`);
-      if (resp.ok) return await resp.json();
-      last = await resp.text();
+      const resp = await fetch(`http://127.0.0.1:${port}${path}`, { signal: ctrl.signal });
+      if (resp.ok) return await readJsonLimited(resp, MAX_CDP_JSON_BYTES, CDP_JSON_ATTEMPT_TIMEOUT_MS);
+      last = await readTextLimited(resp, MAX_CDP_JSON_BYTES, CDP_JSON_ATTEMPT_TIMEOUT_MS);
     } catch (err) {
       last = (err as Error).message;
+    } finally {
+      clearTimeout(timer);
     }
     await new Promise(r => setTimeout(r, 200));
   }
   throw new Error(`Chrome CDP did not become ready: ${last}`);
 }
 
-async function solveInChromeCdp(cfg: FetchedCaptchaConfig, language: CaptchaLanguage): Promise<string> {
+interface ChromeCdpSession {
+  chrome: string;
+  port: number;
+  userDataDir: string;
+  ephemeral: boolean;
+  pageUrl: string;
+  hostServer: ReturnType<typeof Bun.serve> | null;
+  proc: ReturnType<typeof Bun.spawn> | null;
+  ws: WebSocket | null;
+  targetId: string | null;
+  startedAt: number;
+  lastUsedAt: number;
+  lastSolveAt: number | null;
+  solveCount: number;
+  interactiveCount: number;
+  busy: boolean;
+  activeSolve: Promise<void> | null;
+  solveQueue: Promise<void>;
+  sdkReady: boolean;
+  sdkPreloadError: string | null;
+  visible: boolean;
+  closed: boolean;
+  closing: boolean;
+  closePromise: Promise<void> | null;
+  idleTimer: ReturnType<typeof setTimeout> | null;
+  idleDeadline: number | null;
+  lastError: string | null;
+  rejectPendingCommands: ((err: Error) => void) | null;
+  send: (method: string, params?: Record<string, unknown>) => Promise<any>;
+}
+
+let chromeSession: ChromeCdpSession | null = null;
+let chromeSessionPromise: Promise<ChromeCdpSession> | null = null;
+let chromeLastError: string | null = null;
+
+function shouldUsePersistentChromeSession(userData: { ephemeral: boolean }): boolean {
+  return resolveChromeKeepAliveEnabled() && !userData.ephemeral;
+}
+
+function buildChromeStatus(session = chromeSession): ChromeCaptchaHelperStatus {
+  const userData = session
+    ? { dir: session.userDataDir, ephemeral: session.ephemeral }
+    : resolveChromeUserDataDir({ createEphemeral: false });
+  const keepAlive = shouldUsePersistentChromeSession(userData);
+  return {
+    keepAlive,
+    running: !!session && !session.closed && !session.closing,
+    mode: keepAlive ? "persistent" : "per-solve",
+    chromePath: session?.chrome ?? findChromeExecutable(),
+    userDataDir: userData.dir,
+    ephemeral: userData.ephemeral,
+    idleTimeoutMs: resolveChromeIdleTimeoutMs(),
+    nextIdleShutdownAt: session?.idleDeadline ?? null,
+    port: session?.port ?? null,
+    pageUrl: session?.pageUrl ?? null,
+    visible: session?.visible ?? false,
+    startedAt: session?.startedAt ?? null,
+    lastUsedAt: session?.lastUsedAt ?? null,
+    lastSolveAt: session?.lastSolveAt ?? null,
+    solveCount: session?.solveCount ?? 0,
+    interactiveCount: session?.interactiveCount ?? 0,
+    busy: session?.busy ?? false,
+    sdkReady: session?.sdkReady ?? false,
+    sdkPreloadError: session?.sdkPreloadError ?? null,
+    lastError: session?.lastError ?? chromeLastError,
+  };
+}
+
+function cleanupChromeSessionAfterUnexpectedClose(
+  session: ChromeCdpSession,
+  reason: string,
+  opts: { killProcess?: boolean } = {},
+): void {
+  const wasClosing = session.closing;
+  const alreadyCleaned = session.closed
+    && session.ws === null
+    && session.hostServer === null
+    && session.idleTimer === null;
+  if (alreadyCleaned) return;
+
+  session.closed = true;
+  if (chromeSession === session) chromeSession = null;
+  clearChromeIdleTimer(session);
+  session.rejectPendingCommands?.(new Error(reason));
+
+  if (wasClosing) return;
+
+  session.lastError = reason;
+  chromeLastError = reason;
+  try { session.ws?.close(); } catch {}
+  session.ws = null;
+  if (opts.killProcess) {
+    try { session.proc?.kill(); } catch {}
+  }
+  session.proc = null;
+  try { session.hostServer?.stop(true); } catch {}
+  session.hostServer = null;
+  if (session.ephemeral) {
+    try { rmSync(session.userDataDir, { recursive: true, force: true }); } catch {}
+  }
+}
+
+async function failChromeSessionStartup(session: ChromeCdpSession, err: unknown): Promise<never> {
+  session.lastError = (err as Error).message;
+  chromeLastError = session.lastError;
+  await closeChromeSession(session, "startup failed");
+  throw err;
+}
+
+export function getChromeCaptchaHelperStatus(): ChromeCaptchaHelperStatus {
+  return buildChromeStatus();
+}
+
+export async function warmupChromeCaptchaHelper(): Promise<ChromeCaptchaHelperStatus> {
+  const userData = resolveChromeUserDataDir();
+  if (!shouldUsePersistentChromeSession(userData)) {
+    return buildChromeStatus();
+  }
+  const session = await getOrCreateChromeSession(userData);
+  await preloadChromeCaptchaSdk(session).catch(err => {
+    const msg = (err as Error).message;
+    session.sdkPreloadError = msg;
+    session.lastError = `sdk_preload_failed: ${msg}`;
+    chromeLastError = session.lastError;
+  });
+  if (!session.closed && !session.closing) scheduleChromeIdleShutdown(session);
+  return buildChromeStatus(session);
+}
+
+export async function shutdownChromeCaptchaHelper(reason = "manual"): Promise<ChromeCaptchaHelperStatus> {
+  const activeSolveTimeoutMs = resolveChromeStopGraceMs();
+  const pending = chromeSessionPromise;
+  if (pending) {
+    await pending.then(session => closeChromeSession(session, reason, activeSolveTimeoutMs)).catch(() => {});
+  }
+  if (chromeSession) {
+    await closeChromeSession(chromeSession, reason, activeSolveTimeoutMs);
+  }
+  return buildChromeStatus(null);
+}
+
+async function getOrCreateChromeSession(userData: { dir: string; ephemeral: boolean }): Promise<ChromeCdpSession> {
+  if (chromeSession?.closing) {
+    await chromeSession.closePromise?.catch(() => {});
+  }
+  if (chromeSession && !chromeSession.closed && !chromeSession.closing) {
+    chromeSession.lastUsedAt = Date.now();
+    clearChromeIdleTimer(chromeSession);
+    return chromeSession;
+  }
+  if (chromeSessionPromise) return chromeSessionPromise;
+  chromeSessionPromise = openChromeCdpSession(userData)
+    .then(session => {
+      chromeSession = session;
+      chromeLastError = null;
+      return session;
+    })
+    .catch(err => {
+      chromeLastError = (err as Error).message;
+      throw err;
+    })
+    .finally(() => {
+      chromeSessionPromise = null;
+    });
+  return chromeSessionPromise;
+}
+
+async function openChromeCdpSession(userData: { dir: string; ephemeral: boolean }): Promise<ChromeCdpSession> {
   const chrome = findChromeExecutable();
   if (!chrome) throw new Error("Chrome/Edge executable not found; set ZCODE_CAPTCHA_CHROME_PATH");
 
-  const port = 9300 + Math.floor(Math.random() * 1000);
-  const { dir: userDataDir, ephemeral } = resolveChromeUserDataDir();
+  const ports = buildChromeDebugPortCandidates();
+  let lastErr: Error | null = null;
+  for (let i = 0; i < ports.length; i++) {
+    try {
+      return await openChromeCdpSessionOnPort(chrome, userData, ports[i]);
+    } catch (err) {
+      lastErr = err as Error;
+      chromeLastError = lastErr.message;
+      if (i < ports.length - 1) {
+        console.warn(`[captcha] Chrome CDP startup failed on port ${ports[i]}, retrying on ${ports[i + 1]}: ${lastErr.message}`);
+      }
+    }
+  }
+  throw lastErr ?? new Error("Chrome CDP startup failed");
+}
+
+async function openChromeCdpSessionOnPort(
+  chrome: string,
+  userData: { dir: string; ephemeral: boolean },
+  port: number,
+): Promise<ChromeCdpSession> {
+  const { dir: userDataDir, ephemeral } = userData;
   mkdirSync(userDataDir, { recursive: true });
-  let hostServer: ReturnType<typeof Bun.serve> | null = null;
+  const session: ChromeCdpSession = {
+    chrome,
+    port,
+    userDataDir,
+    ephemeral,
+    pageUrl: "",
+    hostServer: null,
+    proc: null,
+    ws: null,
+    targetId: null,
+    startedAt: Date.now(),
+    lastUsedAt: Date.now(),
+    lastSolveAt: null,
+    solveCount: 0,
+    interactiveCount: 0,
+    busy: false,
+    activeSolve: null,
+    solveQueue: Promise.resolve(),
+    sdkReady: false,
+    sdkPreloadError: null,
+    visible: CHROME_INTERACTIVE,
+    closed: false,
+    closing: false,
+    closePromise: null,
+    idleTimer: null,
+    idleDeadline: null,
+    lastError: null,
+    rejectPendingCommands: null,
+    send: async () => {
+      throw new Error("Chrome CDP session is not ready");
+    },
+  };
   let chromePageUrl = process.env.ZCODE_CAPTCHA_CHROME_URL?.trim();
   if (!chromePageUrl) {
-    hostServer = Bun.serve({
-      hostname: "127.0.0.1",
-      port: 0,
-      fetch() {
-        return new Response("<!doctype html><html><head><meta charset='utf-8'></head><body></body></html>", {
-          headers: { "content-type": "text/html; charset=utf-8" },
-        });
-      },
-    });
-    chromePageUrl = `http://127.0.0.1:${hostServer.port}/captcha-host`;
+    try {
+      const hostServer = Bun.serve({
+        hostname: "127.0.0.1",
+        port: 0,
+        fetch(req) {
+          const url = new URL(req.url);
+          if (url.pathname === "/captcha-interactive") {
+            session.interactiveCount++;
+            void showChromeWindow(session, "interactive captcha requested");
+            return new Response("ok", { headers: { "content-type": "text/plain; charset=utf-8" } });
+          }
+          return new Response("<!doctype html><html><head><meta charset='utf-8'></head><body></body></html>", {
+            headers: { "content-type": "text/html; charset=utf-8" },
+          });
+        },
+      });
+      session.hostServer = hostServer;
+      chromePageUrl = `http://127.0.0.1:${hostServer.port}/captcha-host`;
+    } catch (err) {
+      return await failChromeSessionStartup(session, err);
+    }
   }
+  session.pageUrl = chromePageUrl;
   const chromeArgs = [
     chrome,
     `--remote-debugging-port=${port}`,
@@ -454,9 +918,20 @@ async function solveInChromeCdp(cfg: FetchedCaptchaConfig, language: CaptchaLang
       chromeArgs.splice(1, 0, "--headless=new");
     }
   }
-  const proc = Bun.spawn(chromeArgs, { stdout: "ignore", stderr: "ignore" });
+  let proc: ReturnType<typeof Bun.spawn>;
+  try {
+    proc = Bun.spawn(chromeArgs, { stdout: "ignore", stderr: "ignore" });
+    session.proc = proc;
+  } catch (err) {
+    return await failChromeSessionStartup(session, err);
+  }
+  const markChromeProcessExited = (): void => {
+    cleanupChromeSessionAfterUnexpectedClose(session, "Chrome process exited");
+  };
+  proc.exited
+    .then(markChromeProcessExited)
+    .catch(markChromeProcessExited);
 
-  let ws: WebSocket | null = null;
   try {
     const tabs = await waitForCdpJson(port, "/json/list");
     const tab = tabs.find((t: any) =>
@@ -471,34 +946,214 @@ async function solveInChromeCdp(cfg: FetchedCaptchaConfig, language: CaptchaLang
       && !t.url.startsWith("chrome://"),
     ) ?? tabs.find((t: any) => t.webSocketDebuggerUrl) ?? tabs[0];
     if (!tab?.webSocketDebuggerUrl) throw new Error("Chrome CDP target not found");
+    session.targetId = typeof tab.id === "string" ? tab.id : null;
 
-    ws = new WebSocket(tab.webSocketDebuggerUrl);
+    const ws = new WebSocket(tab.webSocketDebuggerUrl);
+    session.ws = ws;
     let id = 0;
     const pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>();
+    const rejectPendingCommands = (err: Error): void => {
+      for (const p of pending.values()) p.reject(err);
+      pending.clear();
+    };
+    session.rejectPendingCommands = rejectPendingCommands;
     ws.onmessage = ev => {
-      const msg = JSON.parse(String(ev.data));
+      let msg: any;
+      try {
+        msg = JSON.parse(String(ev.data));
+      } catch (err) {
+        session.lastError = `Chrome CDP malformed websocket message: ${(err as Error).message}`;
+        return;
+      }
       if (!msg.id || !pending.has(msg.id)) return;
       const p = pending.get(msg.id)!;
       pending.delete(msg.id);
       msg.error ? p.reject(new Error(JSON.stringify(msg.error))) : p.resolve(msg.result);
     };
+    ws.onclose = () => {
+      cleanupChromeSessionAfterUnexpectedClose(session, "Chrome CDP websocket closed", { killProcess: true });
+    };
+    let opened = false;
     await new Promise<void>((resolve, reject) => {
-      if (!ws) return reject(new Error("WebSocket not initialized"));
-      ws.onopen = () => resolve();
-      ws.onerror = () => reject(new Error("Chrome CDP websocket error"));
+      ws.onopen = () => {
+        opened = true;
+        resolve();
+      };
+      ws.onerror = () => {
+        const err = new Error("Chrome CDP websocket error");
+        session.lastError = err.message;
+        if (!opened) reject(err);
+        else rejectPendingCommands(err);
+      };
     });
-    const send = (method: string, params: Record<string, unknown> = {}) => new Promise<any>((resolve, reject) => {
-      if (!ws) return reject(new Error("Chrome CDP websocket closed"));
+    ws.onerror = () => {
+      const err = new Error("Chrome CDP websocket error");
+      session.lastError = err.message;
+      rejectPendingCommands(err);
+    };
+    session.send = (method: string, params: Record<string, unknown> = {}) => new Promise<any>((resolve, reject) => {
+      if (session.closed || !session.ws || session.ws.readyState !== WebSocket.OPEN) {
+        return reject(new Error("Chrome CDP websocket closed"));
+      }
       const msgId = ++id;
-      pending.set(msgId, { resolve, reject });
-      ws.send(JSON.stringify({ id: msgId, method, params }));
+      const timer = setTimeout(() => {
+        pending.delete(msgId);
+        reject(new Error(`Chrome CDP command timeout: ${method}`));
+      }, CHROME_SOLVE_TIMEOUT_MS + 15_000);
+      timer.unref?.();
+      pending.set(msgId, {
+        resolve: (v) => { clearTimeout(timer); resolve(v); },
+        reject: (e) => { clearTimeout(timer); reject(e); },
+      });
+      try {
+        session.ws.send(JSON.stringify({ id: msgId, method, params }));
+      } catch (err) {
+        pending.delete(msgId);
+        clearTimeout(timer);
+        reject(err as Error);
+      }
     });
 
-    await send("Runtime.enable");
-    await send("Page.enable").catch(() => {});
-    await send("Page.setBypassCSP", { enabled: true }).catch(() => {});
+    await session.send("Runtime.enable");
+    await session.send("Page.enable").catch(() => {});
+    await session.send("Page.setBypassCSP", { enabled: true }).catch(() => {});
     await new Promise(r => setTimeout(r, 2500));
+    return session;
+  } catch (err) {
+    return await failChromeSessionStartup(session, err);
+  }
+}
 
+async function preloadChromeCaptchaSdk(session: ChromeCdpSession): Promise<void> {
+  if (session.closed) throw new Error("Chrome CDP session is closed");
+  if (session.sdkReady) return;
+  session.lastUsedAt = Date.now();
+  clearChromeIdleTimer(session);
+  const expression = `(() => new Promise((resolve, reject) => {
+      let settled = false;
+      let poll = null;
+      const cleanup = () => { if (poll) clearInterval(poll); clearTimeout(timer); };
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(value);
+      };
+      const fail = (err) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(err instanceof Error ? err : new Error(String(err)));
+      };
+      const ready = () => typeof window.initAliyunCaptcha === "function";
+      const timer = setTimeout(() => fail(new Error("Aliyun SDK preload timeout")), ${SDK_LOAD_TIMEOUT_MS});
+      if (ready()) {
+        finish({ ready: true, source: "already" });
+        return;
+      }
+      const src = ${JSON.stringify(ALIYUN_SDK_URL)};
+      let script = document.querySelector('script[src="' + src + '"]');
+      poll = setInterval(() => {
+        if (ready()) finish({ ready: true, source: "poll" });
+      }, 100);
+      const onLoad = () => setTimeout(() => {
+        if (ready()) finish({ ready: true, source: "load" });
+        else fail(new Error("Aliyun SDK loaded but initAliyunCaptcha is missing"));
+      }, 0);
+      const onError = () => fail(new Error("Aliyun SDK preload failed"));
+      if (!script) {
+        script = document.createElement("script");
+        script.src = src;
+        script.async = true;
+        script.addEventListener("load", onLoad, { once: true });
+        script.addEventListener("error", onError, { once: true });
+        document.head.appendChild(script);
+      } else {
+        script.addEventListener("load", onLoad, { once: true });
+        script.addEventListener("error", onError, { once: true });
+      }
+    }))()`;
+  const result = await session.send("Runtime.evaluate", {
+    expression,
+    awaitPromise: true,
+    returnByValue: true,
+    timeout: SDK_LOAD_TIMEOUT_MS + 5_000,
+  });
+  if (result.exceptionDetails) {
+    throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text ?? "Chrome SDK preload exception");
+  }
+  if (!result.result?.value?.ready) {
+    throw new Error(`Chrome SDK preload did not become ready: ${JSON.stringify(result.result?.value)}`);
+  }
+  session.sdkReady = true;
+  session.sdkPreloadError = null;
+}
+
+async function solveInChromeCdp(cfg: FetchedCaptchaConfig, language: CaptchaLanguage): Promise<string> {
+  const userData = resolveChromeUserDataDir();
+  const persistent = shouldUsePersistentChromeSession(userData);
+  const session = persistent ? await getOrCreateChromeSession(userData) : await openChromeCdpSession(userData);
+  try {
+    return await enqueueChromeSessionSolve(session, async () => {
+      await preloadChromeCaptchaSdk(session).catch(err => {
+        session.sdkPreloadError = (err as Error).message;
+        session.lastError = `sdk_preload_failed: ${session.sdkPreloadError}`;
+        chromeLastError = session.lastError;
+      });
+      return await solveInChromeCdpSession(session, cfg, language);
+    });
+  } catch (err) {
+    session.lastError = (err as Error).message;
+    chromeLastError = session.lastError;
+    if (persistent) {
+      await closeChromeSession(session, "solve failed");
+    }
+    throw err;
+  } finally {
+    if (persistent && !session.closed && !session.closing) {
+      if (!CHROME_INTERACTIVE) await hideChromeWindow(session).catch(() => {});
+      scheduleChromeIdleShutdown(session);
+    } else if (!persistent) {
+      await closeChromeSession(session, "per-solve complete");
+    }
+  }
+}
+
+async function enqueueChromeSessionSolve<T>(
+  session: ChromeCdpSession,
+  task: () => Promise<T>,
+): Promise<T> {
+  const previous = session.solveQueue.catch(() => {});
+  let release!: () => void;
+  const current = new Promise<void>(resolve => { release = resolve; });
+  session.solveQueue = previous.then(() => current);
+  await previous;
+  if (session.closed || session.closing) {
+    release();
+    throw new Error("Chrome CDP session is closed");
+  }
+  try {
+    return await task();
+  } finally {
+    release();
+  }
+}
+
+async function solveInChromeCdpSession(
+  session: ChromeCdpSession,
+  cfg: FetchedCaptchaConfig,
+  language: CaptchaLanguage,
+): Promise<string> {
+  session.lastUsedAt = Date.now();
+  clearChromeIdleTimer(session);
+  session.busy = true;
+  let resolveActiveSolve!: () => void;
+  const activeSolve = new Promise<void>(resolve => { resolveActiveSolve = resolve; });
+  session.activeSolve = activeSolve;
+  try {
+    const notifyUrl = session.hostServer
+      ? `http://127.0.0.1:${session.hostServer.port}/captcha-interactive`
+      : "";
     const expression = `(() => new Promise((resolve, reject) => {
       const timeout = setTimeout(() => reject(new Error("Chrome captcha solve timeout")), ${CHROME_SOLVE_TIMEOUT_MS});
       let settled = false;
@@ -587,9 +1242,15 @@ async function solveInChromeCdp(cfg: FetchedCaptchaConfig, language: CaptchaLang
         const delay = Math.max(0, 2000 - elapsed);
         setTimeout(resolveWait, delay);
       });
+      const notifyInteractive = () => {
+        const url = ${JSON.stringify(notifyUrl)};
+        if (!url) return;
+        try { fetch(url, { method: "POST", keepalive: true }).catch(() => {}); } catch {}
+      };
       const tryInteractive = () => {
         if (deferredInteractiveStarted) return;
         deferredInteractiveStarted = true;
+        notifyInteractive();
         try {
           if (instance && typeof instance.show === "function") {
             instance.show();
@@ -671,7 +1332,7 @@ async function solveInChromeCdp(cfg: FetchedCaptchaConfig, language: CaptchaLang
         });
       })().catch(fail);
     }))()`;
-    const result = await send("Runtime.evaluate", {
+    const result = await session.send("Runtime.evaluate", {
       expression,
       awaitPromise: true,
       returnByValue: true,
@@ -685,15 +1346,150 @@ async function solveInChromeCdp(cfg: FetchedCaptchaConfig, language: CaptchaLang
     if (!parsed?.ok || typeof parsed.param !== "string" || parsed.param.length === 0) {
       throw new Error(`Chrome captcha solve failed: ${JSON.stringify(parsed)}`);
     }
+    session.solveCount++;
+    session.lastSolveAt = Date.now();
+    session.lastUsedAt = session.lastSolveAt;
+    session.lastError = null;
+    chromeLastError = null;
     return parsed.param;
   } finally {
-    try { ws?.close(); } catch {}
-    try { proc.kill(); } catch {}
-    try { hostServer?.stop(true); } catch {}
-    if (ephemeral) {
-      try { rmSync(userDataDir, { recursive: true, force: true }); } catch {}
-    }
+    session.busy = false;
+    resolveActiveSolve();
+    if (session.activeSolve === activeSolve) session.activeSolve = null;
   }
+}
+
+function clearChromeIdleTimer(session: ChromeCdpSession): void {
+  if (session.idleTimer) {
+    clearTimeout(session.idleTimer);
+    session.idleTimer = null;
+  }
+  session.idleDeadline = null;
+}
+
+function scheduleChromeIdleShutdown(session: ChromeCdpSession): void {
+  clearChromeIdleTimer(session);
+  const idleMs = resolveChromeIdleTimeoutMs();
+  if (idleMs <= 0 || session.closed || session.closing) return;
+  session.idleDeadline = Date.now() + idleMs;
+  session.idleTimer = setTimeout(() => {
+    void closeChromeSession(session, "idle timeout");
+  }, idleMs);
+  session.idleTimer.unref?.();
+}
+
+async function showChromeWindow(session: ChromeCdpSession, reason: string): Promise<void> {
+  if (session.closed || !session.targetId || CHROME_INTERACTIVE) {
+    session.visible = CHROME_INTERACTIVE || session.visible;
+    return;
+  }
+  try {
+    const r = await session.send("Browser.getWindowForTarget", { targetId: session.targetId });
+    const windowId = r?.windowId;
+    if (typeof windowId !== "number") return;
+    await session.send("Browser.setWindowBounds", {
+      windowId,
+      bounds: { left: 120, top: 80, width: 1280, height: 720, windowState: "normal" },
+    });
+    session.visible = true;
+    console.warn(`[captcha] interactive challenge requested; showing Chrome window (${reason})`);
+  } catch (err) {
+    session.lastError = `show_window_failed: ${(err as Error).message}`;
+  }
+}
+
+async function hideChromeWindow(session: ChromeCdpSession): Promise<void> {
+  if (session.closed || !session.targetId || CHROME_INTERACTIVE) return;
+  try {
+    const r = await session.send("Browser.getWindowForTarget", { targetId: session.targetId });
+    const windowId = r?.windowId;
+    if (typeof windowId !== "number") return;
+    await session.send("Browser.setWindowBounds", {
+      windowId,
+      bounds: { left: -32000, top: -32000, width: 1280, height: 720, windowState: "normal" },
+    });
+    session.visible = false;
+  } catch (err) {
+    session.lastError = `hide_window_failed: ${(err as Error).message}`;
+  }
+}
+
+async function waitForChromeSessionIdleBeforeClose(
+  session: ChromeCdpSession,
+  timeoutMs = CHROME_SOLVE_TIMEOUT_MS + 20_000,
+): Promise<void> {
+  const active = session.activeSolve;
+  if (!active) return;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  await Promise.race([
+    active.catch(() => {}),
+    new Promise<void>(resolve => {
+      timer = setTimeout(resolve, timeoutMs);
+    }),
+  ]).finally(() => {
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  });
+}
+
+async function closeChromeSession(
+  session: ChromeCdpSession,
+  reason: string,
+  activeSolveTimeoutMs?: number,
+): Promise<void> {
+  if (session.closing) {
+    await session.closePromise?.catch(() => {});
+    return;
+  }
+  session.closing = true;
+  clearChromeIdleTimer(session);
+  session.closePromise = (async () => {
+    await waitForChromeSessionIdleBeforeClose(session, activeSolveTimeoutMs);
+    if (chromeSession === session) chromeSession = null;
+    session.closed = true;
+    session.rejectPendingCommands?.(new Error(`Chrome CDP session closed: ${reason}`));
+    session.rejectPendingCommands = null;
+    try { session.ws?.close(); } catch {}
+    session.ws = null;
+    try { session.proc?.kill(); } catch {}
+    session.proc = null;
+    try { session.hostServer?.stop(true); } catch {}
+    session.hostServer = null;
+    if (session.ephemeral) {
+      try { rmSync(session.userDataDir, { recursive: true, force: true }); } catch {}
+    }
+    if (reason !== "idle timeout" && reason !== "per-solve complete") {
+      console.log(`[captcha] Chrome helper stopped: ${reason}`);
+    }
+  })().finally(() => {
+    session.closePromise = null;
+  });
+  await session.closePromise;
+}
+
+export async function _closeChromeSessionForTesting(
+  session: ChromeCdpSession,
+  reason = "test",
+  activeSolveTimeoutMs = 1000,
+): Promise<void> {
+  await closeChromeSession(session, reason, activeSolveTimeoutMs);
+}
+
+export function _cleanupChromeSessionAfterUnexpectedCloseForTesting(
+  session: ChromeCdpSession,
+  reason = "Chrome process exited",
+  opts: { killProcess?: boolean } = {},
+): void {
+  cleanupChromeSessionAfterUnexpectedClose(session, reason, opts);
+}
+
+export async function _enqueueChromeSessionSolveForTesting<T>(
+  session: ChromeCdpSession,
+  task: () => Promise<T>,
+): Promise<T> {
+  return enqueueChromeSessionSolve(session, task);
 }
 
 /**

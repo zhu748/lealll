@@ -41,7 +41,7 @@ export interface ServerOptions {
 export function createFetchHandler(opts: ServerOptions): (req: Request) => Promise<Response> {
   const { config, auth } = opts;
   const proxyOpts = { config, auth, fetchImpl: opts.fetchImpl, resolveClientIp: opts.resolveClientIp };
-  const corsAllow = config.corsAllowList;
+  const currentCorsAllow = () => config.corsAllowList;
 
   const adminOpts: AdminOptions = opts.adminOpts ?? {
     config,
@@ -70,56 +70,62 @@ export function createFetchHandler(opts: ServerOptions): (req: Request) => Promi
   // a parameter to each handler, so no mutation is needed.
   type RouteHandler = (req: Request) => Promise<Response> | Response;
   const routes = new Map<string, RouteHandler>([
-    ["GET:/health", (req) => addCorsHeaders(healthResponse(), req, corsAllow)],
-    ["GET:/healthz", (req) => addCorsHeaders(healthResponse(), req, corsAllow)],
-    ["GET:/", (req) => addCorsHeaders(healthResponse(), req, corsAllow)],
-    ["GET:/v1/models", (req) => addCorsHeaders(handleListModels(), req, corsAllow)],
-    ["POST:/v1/chat/completions", async (req) => addCorsHeaders(await handleChatCompletions(req, proxyOpts), req, corsAllow)],
-    ["POST:/v1/messages", async (req) => addCorsHeaders(await handleMessages(req, proxyOpts), req, corsAllow)],
-    ["POST:/v1/responses", async (req) => addCorsHeaders(await handleResponses(req, proxyOpts), req, corsAllow)],
+    ["GET:/health", (req) => addCorsHeaders(healthResponse(), req, currentCorsAllow())],
+    ["GET:/healthz", (req) => addCorsHeaders(healthResponse(), req, currentCorsAllow())],
+    ["GET:/", (req) => addCorsHeaders(healthResponse(), req, currentCorsAllow())],
+    ["GET:/v1/models", (req) => addCorsHeaders(handleListModels(), req, currentCorsAllow())],
+    ["POST:/v1/chat/completions", async (req) => addCorsHeaders(await handleChatCompletions(req, proxyOpts), req, currentCorsAllow())],
+    ["POST:/v1/messages", async (req) => addCorsHeaders(await handleMessages(req, proxyOpts), req, currentCorsAllow())],
+    ["POST:/v1/responses", async (req) => addCorsHeaders(await handleResponses(req, proxyOpts), req, currentCorsAllow())],
   ]);
 
   return async (req: Request): Promise<Response> => {
-    const url = new URL(req.url);
-    const path = url.pathname;
-    const method = req.method;
+    try {
+      const url = new URL(req.url);
+      const path = url.pathname;
+      const method = req.method;
 
-    // CORS preflight — short-circuit before auth
-    if (method === "OPTIONS") {
-      return corsResponse(req, corsAllow);
-    }
-
-    // Admin dashboard routes (handled before proxy API key auth).
-    // Admin page itself is open; API routes use proxyApiKey.
-    if (path === "/admin" || path === "/admin/" || path.startsWith("/admin/api/")) {
-      const adminResp = await handleAdminRoute(req, adminOpts);
-      if (adminResp) return addCorsHeaders(adminResp, req, corsAllow);
-    }
-
-    // Health checks are ALWAYS open — Render/Fly/Cloud Run/K8s probes don't
-    // send Authorization headers, and returning 401 here causes the platform
-    // to mark the service as unhealthy and restart it in a loop. The health
-    // response leaks no sensitive info (just `{status:"ok", provider}`).
-    // Both `/health` (legacy) and `/healthz` (K8s convention) work.
-    if (path === "/health" || path === "/healthz" || path === "/") {
-      return addCorsHeaders(healthResponse(), req, corsAllow);
-    }
-
-    // Proxy API key auth (if configured) — applies to all non-admin, non-health routes
-    if (config.auth.proxyApiKey) {
-      const authHeader = req.headers.get("authorization") ?? req.headers.get("x-api-key");
-      if (!authHeader || !checkProxyKey(authHeader, config.auth.proxyApiKey)) {
-        return addCorsHeaders(errorResponse(401, "authentication_error", "Invalid or missing proxy API key"), req, corsAllow);
+      // CORS preflight — short-circuit before auth
+      if (method === "OPTIONS") {
+        return corsResponse(req, currentCorsAllow());
       }
-    }
 
-    // --- Static route lookup (O(1)) ---
-    const handler = routes.get(`${method}:${path}`);
-    if (handler) {
-      return await handler(req);
-    }
+      // Admin dashboard routes (handled before proxy API key auth).
+      // Admin page itself is open; API routes use proxyApiKey.
+      if (path === "/admin" || path === "/admin/" || path.startsWith("/admin/api/")) {
+        const adminResp = await handleAdminRoute(req, adminOpts);
+        if (adminResp) return addCorsHeaders(adminResp, req, currentCorsAllow());
+      }
 
-    return addCorsHeaders(errorResponse(404, "not_found_error", `No route for ${method} ${path}`), req, corsAllow);
+      // Health checks are ALWAYS open — Render/Fly/Cloud Run/K8s probes don't
+      // send Authorization headers, and returning 401 here causes the platform
+      // to mark the service as unhealthy and restart it in a loop. The health
+      // response leaks no sensitive info (just `{status:"ok", provider}`).
+      // Both `/health` (legacy) and `/healthz` (K8s convention) work.
+      if (path === "/health" || path === "/healthz" || path === "/") {
+        return addCorsHeaders(healthResponse(), req, currentCorsAllow());
+      }
+
+      // Proxy API key auth (if configured) — applies to all non-admin, non-health routes
+      if (config.auth.proxyApiKey) {
+        const authHeader = req.headers.get("authorization") ?? req.headers.get("x-api-key");
+        if (!authHeader || !checkProxyKey(authHeader, config.auth.proxyApiKey)) {
+          return addCorsHeaders(errorResponse(401, "authentication_error", "Invalid or missing proxy API key"), req, currentCorsAllow());
+        }
+      }
+
+      // --- Static route lookup (O(1)) ---
+      const handler = routes.get(`${method}:${path}`);
+      if (handler) {
+        return await handler(req);
+      }
+
+      return addCorsHeaders(errorResponse(404, "not_found_error", `No route for ${method} ${path}`), req, currentCorsAllow());
+    } catch (err) {
+      const message = (err as Error).message || "Unhandled server error";
+      console.error(`[server] unhandled request error: ${message}`);
+      return addCorsHeaders(errorResponse(500, "internal_server_error", message), req, currentCorsAllow());
+    }
   };
 }
 

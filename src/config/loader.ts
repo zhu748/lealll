@@ -28,12 +28,15 @@ const ENV = {
   UPSTREAM_TIMEOUT_MS: "ZCODE_UPSTREAM_TIMEOUT_MS",
   TRUST_PROXY: "ZCODE_PROXY_TRUST_PROXY",
   SSE_HEARTBEAT_MS: "ZCODE_PROXY_SSE_HEARTBEAT_MS",
+  MAX_REQUEST_BODY_BYTES: "ZCODE_PROXY_MAX_REQUEST_BODY_BYTES",
 } as const;
 
 const DEFAULTS = {
   PORT: 8080,
   HOST: "0.0.0.0",
-  UPSTREAM_TIMEOUT_MS: 300_000,
+  // 0 means "use handler defaults": 10 min for streams, 5 min for batch.
+  // A non-zero value overrides both paths.
+  UPSTREAM_TIMEOUT_MS: 0,
   PROVIDER: "zai" as const,
   PLAN: "coding-plan" as const,
   DEFAULT_MODEL: "glm-4.6",
@@ -69,10 +72,12 @@ const DEFAULTS = {
   // SSE heartbeat default — well under Cloudflare's 100s Proxy Read Timeout.
   // See src/utils/constants.ts SSE_HEARTBEAT for rationale.
   SSE_HEARTBEAT_MS: 15_000,
+  MAX_REQUEST_BODY_BYTES: 64 * 1024 * 1024,
 };
 
 /** Printable-ASCII gate copied from the ZCode bundle's `rYn` helper. */
 const ASCII_PRINTABLE = /^[\x20-\x7e]+$/;
+const MAX_TIMER_MS = 2_147_483_647;
 
 /**
  * Load and validate proxy configuration from a YAML file, applying env overrides.
@@ -92,6 +97,7 @@ export function loadConfig(path: string): ProxyConfig {
   const upstreamTimeoutMs = resolveNonNegativeInt(
     process.env[ENV.UPSTREAM_TIMEOUT_MS] ?? parsed?.server?.upstreamTimeoutMs,
     DEFAULTS.UPSTREAM_TIMEOUT_MS,
+    MAX_TIMER_MS,
   );
   // trustProxy: explicit env or YAML flag. Default false — client IP comes
   // from the TCP socket (Bun's server.requestIP), which cannot be spoofed.
@@ -105,6 +111,11 @@ export function loadConfig(path: string): ProxyConfig {
   const sseHeartbeatMs = resolveNonNegativeInt(
     process.env[ENV.SSE_HEARTBEAT_MS] ?? parsed?.server?.sseHeartbeatMs,
     DEFAULTS.SSE_HEARTBEAT_MS,
+    MAX_TIMER_MS,
+  );
+  const maxRequestBodyBytes = resolveNonNegativeInt(
+    process.env[ENV.MAX_REQUEST_BODY_BYTES] ?? parsed?.server?.maxRequestBodyBytes,
+    DEFAULTS.MAX_REQUEST_BODY_BYTES,
   );
 
   // --- auth ---
@@ -138,7 +149,7 @@ export function loadConfig(path: string): ProxyConfig {
 
   // --- models ---
   const defaultModel = typeof parsed?.defaultModel === "string" ? parsed.defaultModel : DEFAULTS.DEFAULT_MODEL;
-  const models = Array.isArray(parsed?.models) ? parsed.models : [defaultModel];
+  const models = resolveModels(parsed?.models, defaultModel);
 
   // --- logging ---
   const logLevel = resolveLogLevel(parsed?.logging?.level);
@@ -197,7 +208,11 @@ export function loadConfig(path: string): ProxyConfig {
     || (typeof (parsed as any)?.logging === "object" && (parsed as any).logging?.headerDebug === true);
 
   // --- CORS allowlist ---
-  const corsAllowList = resolveCorsAllowList(process.env.ZCODE_PROXY_CORS_ALLOWLIST);
+  const corsAllowList = resolveCorsAllowList(
+    process.env.ZCODE_PROXY_CORS_ALLOWLIST !== undefined
+      ? process.env.ZCODE_PROXY_CORS_ALLOWLIST
+      : parsed?.corsAllowList,
+  );
 
   // v0.2.0.4: `forceStreamAnthropic` config option removed.
   // `stream: true` is now forced unconditionally inside alignZCodeRequestFormat
@@ -219,7 +234,7 @@ export function loadConfig(path: string): ProxyConfig {
     : "max";
 
   const config: ProxyConfig = {
-    server: { port, host, upstreamTimeoutMs: upstreamTimeoutMs || undefined, trustProxy, sseHeartbeatMs },
+    server: { port, host, upstreamTimeoutMs, trustProxy, sseHeartbeatMs, maxRequestBodyBytes },
     auth: { proxyApiKey, mode, apiKey, oauthCredentialsPath },
     provider,
     plan,
@@ -243,8 +258,8 @@ export function loadConfig(path: string): ProxyConfig {
 /** Resolve port from raw value (YAML or env), defaulting to 8080. */
 function resolvePort(raw: unknown): number {
   if (raw === undefined || raw === null) return DEFAULTS.PORT;
-  const n = typeof raw === "number" ? raw : parseInt(String(raw), 10);
-  if (!Number.isFinite(n)) {
+  const n = parseStrictNumber(raw);
+  if (n === null || !Number.isInteger(n)) {
     throw new Error("server.port must be a valid number");
   }
   return n;
@@ -260,8 +275,10 @@ function resolveProvider(raw: unknown): "zai" | "bigmodel" {
 }
 
 function resolvePlan(raw: unknown): "coding-plan" | "start-plan" {
+  if (raw === undefined || raw === null) return DEFAULTS.PLAN;
+  if (raw === "coding-plan") return "coding-plan";
   if (raw === "start-plan") return "start-plan";
-  return DEFAULTS.PLAN;
+  throw new Error(`Invalid plan "${String(raw)}": must be "coding-plan" or "start-plan"`);
 }
 
 /** Resolve log level with fallback. */
@@ -317,10 +334,12 @@ function resolveRetry(raw?: unknown): RetryConfig {
   const initialDelayMs = resolvePositiveInt(
     process.env[ENV.RETRY_INITIAL_DELAY_MS] ?? r.initialDelayMs,
     DEFAULTS.RETRY_INITIAL_DELAY_MS,
+    MAX_TIMER_MS,
   );
   const maxDelayMs = resolvePositiveInt(
     process.env[ENV.RETRY_MAX_DELAY_MS] ?? r.maxDelayMs,
     DEFAULTS.RETRY_MAX_DELAY_MS,
+    MAX_TIMER_MS,
   );
   const backoffFactor = resolvePositiveFloat(
     process.env[ENV.RETRY_BACKOFF_FACTOR] ?? r.backoffFactor,
@@ -328,15 +347,18 @@ function resolveRetry(raw?: unknown): RetryConfig {
   );
 
   // retryableStatuses: env var is comma-separated (e.g. "529,429,503"), YAML is array
-  let retryableStatuses = DEFAULTS.RETRY_STATUSES;
+  let retryableStatuses = [...DEFAULTS.RETRY_STATUSES];
   const envStatuses = process.env[ENV.RETRY_STATUSES];
   if (typeof envStatuses === "string" && envStatuses.trim().length > 0) {
-    retryableStatuses = envStatuses.split(",").map(s => parseInt(s.trim(), 10)).filter(n => Number.isFinite(n) && n > 0);
+    retryableStatuses = normalizeRetryableStatuses(
+      envStatuses.split(","),
+      DEFAULTS.RETRY_STATUSES,
+    );
   } else if (Array.isArray(r.retryableStatuses) && r.retryableStatuses.length > 0) {
-    retryableStatuses = r.retryableStatuses.map((s: unknown) => {
-      const n = typeof s === "number" ? s : parseInt(String(s), 10);
-      return Number.isFinite(n) && n > 0 ? n : null;
-    }).filter((n: number | null): n is number => n !== null);
+    retryableStatuses = normalizeRetryableStatuses(
+      r.retryableStatuses,
+      DEFAULTS.RETRY_STATUSES,
+    );
   }
 
   const credentialSwitchThreshold = resolveNonNegativeInt(
@@ -355,25 +377,58 @@ function resolveRetry(raw?: unknown): RetryConfig {
   return { maxRetries, initialDelayMs, maxDelayMs, backoffFactor, retryableStatuses, credentialSwitchThreshold, emptyStreamSwitchThreshold };
 }
 
+/** Resolve the configured model list while keeping the returned array isolated
+ * from YAML parser internals and default constants. */
+function resolveModels(raw: unknown, defaultModel: string): string[] {
+  const source = Array.isArray(raw) ? raw : [defaultModel];
+  const models = source
+    .filter((m): m is string => typeof m === "string")
+    .map(m => m.trim())
+    .filter(Boolean);
+  return models.length > 0 ? models : [defaultModel];
+}
+
 /** Resolve a non-negative integer from a raw value, falling back to default. */
-function resolveNonNegativeInt(raw: unknown, fallback: number): number {
+function resolveNonNegativeInt(raw: unknown, fallback: number, max = Number.MAX_SAFE_INTEGER): number {
   if (raw === undefined || raw === null) return fallback;
-  const n = typeof raw === "number" ? raw : parseInt(String(raw), 10);
-  return Number.isFinite(n) && n >= 0 ? Math.round(n) : fallback;
+  const n = parseStrictNumber(raw);
+  return n !== null && Number.isInteger(n) && n >= 0 ? Math.min(n, max) : fallback;
 }
 
 /** Resolve a positive integer (> 0) from a raw value, falling back to default. */
-function resolvePositiveInt(raw: unknown, fallback: number): number {
+function resolvePositiveInt(raw: unknown, fallback: number, max = Number.MAX_SAFE_INTEGER): number {
   if (raw === undefined || raw === null) return fallback;
-  const n = typeof raw === "number" ? raw : parseInt(String(raw), 10);
-  return Number.isFinite(n) && n > 0 ? Math.round(n) : fallback;
+  const n = parseStrictNumber(raw);
+  return n !== null && Number.isInteger(n) && n > 0 ? Math.min(n, max) : fallback;
 }
 
 /** Resolve a positive float from a raw value, falling back to default. */
 function resolvePositiveFloat(raw: unknown, fallback: number): number {
   if (raw === undefined || raw === null) return fallback;
-  const n = typeof raw === "number" ? raw : parseFloat(String(raw));
-  return Number.isFinite(n) && n > 0 ? n : fallback;
+  const n = parseStrictNumber(raw);
+  return n !== null && n > 0 ? n : fallback;
+}
+
+function parseStrictNumber(raw: unknown): number | null {
+  if (typeof raw === "number") return Number.isFinite(raw) ? raw : null;
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  if (!/^[+-]?\d+(?:\.\d+)?$/.test(trimmed)) return null;
+  const n = Number(trimmed);
+  return Number.isFinite(n) ? n : null;
+}
+
+function normalizeRetryableStatuses(raw: unknown[], fallback: number[]): number[] {
+  const out: number[] = [];
+  const seen = new Set<number>();
+  for (const value of raw) {
+    const n = parseStrictNumber(value);
+    if (n === null || !Number.isInteger(n) || n < 100 || n > 599) continue;
+    if (seen.has(n)) continue;
+    seen.add(n);
+    out.push(n);
+  }
+  return out.length > 0 ? out : [...fallback];
 }
 
 /** Resolve routing rules from YAML, validating each rule's shape. */
@@ -482,9 +537,22 @@ function validate(config: ProxyConfig): void {
   }
 }
 
-/** Parse a comma-separated CORS allowlist from the env var. */
-function resolveCorsAllowList(raw: string | undefined): string[] | undefined {
-  if (!raw || raw.trim().length === 0) return undefined;
-  const list = raw.split(",").map(s => s.trim()).filter(Boolean);
+/** Parse CORS allowlist from env (`a,b`) or YAML (`[a, b]`). */
+function resolveCorsAllowList(raw: unknown): string[] | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw === "string") {
+    if (raw.trim().length === 0) return undefined;
+    const list = raw.split(",").map(s => s.trim()).filter(Boolean);
+    return list.length > 0 ? list : undefined;
+  }
+  if (!Array.isArray(raw)) {
+    throw new Error("corsAllowList must be a comma-separated string or an array of strings");
+  }
+  const list = raw.map((entry) => {
+    if (typeof entry !== "string") {
+      throw new Error("corsAllowList must contain only strings");
+    }
+    return entry.trim();
+  }).filter(Boolean);
   return list.length > 0 ? list : undefined;
 }

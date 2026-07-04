@@ -30,6 +30,7 @@ import type {
   ResponsesOutputItem,
 } from "./types.js";
 import { parseSSEChunk, waitForBackpressure } from "../utils/sse.js";
+import { SSE as SSE_CONST } from "../utils/constants.js";
 
 /** Default model name when upstream doesn't echo one back. */
 const DEFAULT_MODEL = "glm-4.6";
@@ -151,6 +152,8 @@ interface StreamState {
   nextOutputIndex: number;
   /** Track open content block indices for the current Anthropic block. */
   currentBlockIndex: number | null;
+  /** Anthropic content block index backing the currently open output item. */
+  currentAnthropicBlockIndex: number | null;
   /** For text blocks: have we emitted the message item + content_part.added? */
   textItemOpened: boolean;
   /** For tool_use blocks: have we emitted the function_call item.added? */
@@ -161,6 +164,8 @@ interface StreamState {
   currentToolArgsAccum: string;
   /** Items we've emitted (for the final response.completed payload). */
   emittedItems: ResponsesOutputItem[];
+  /** Whether response.completed has already been emitted. */
+  completedSent: boolean;
 }
 
 function initState(model: string): StreamState {
@@ -177,16 +182,30 @@ function initState(model: string): StreamState {
     headerSent: false,
     nextOutputIndex: 0,
     currentBlockIndex: null,
+    currentAnthropicBlockIndex: null,
     textItemOpened: false,
     toolItemOpened: false,
     currentTextAccum: "",
     currentToolArgsAccum: "",
     emittedItems: [],
+    completedSent: false,
   };
 }
 
 function formatSSE(eventType: string, payload: unknown): string {
   return `event: ${eventType}\n${SSE_DATA_PREFIX}${JSON.stringify(payload)}\n\n`;
+}
+
+function parseStreamContentBlockIndex(value: unknown): number {
+  const n = value ?? 0;
+  if (!Number.isInteger(n) || (n as number) < 0 || (n as number) > SSE_CONST.MAX_TO_BATCH_CONTENT_BLOCK_INDEX) {
+    throw new Error(`Invalid SSE content block index: ${String(value)} (max ${SSE_CONST.MAX_TO_BATCH_CONTENT_BLOCK_INDEX})`);
+  }
+  return n as number;
+}
+
+function utf8ByteLength(encoder: TextEncoder, value: string): number {
+  return encoder.encode(value).byteLength;
 }
 
 function buildResponseSnapshot(state: StreamState, status: OpenAIResponse["status"]): OpenAIResponse {
@@ -228,7 +247,7 @@ function emitHeaderIfNeeded(state: StreamState): string[] {
   return out;
 }
 
-function openTextItem(state: StreamState): string[] {
+function openTextItem(state: StreamState, anthropicBlockIndex: number = 0): string[] {
   const out: string[] = [];
   const outputIndex = state.nextOutputIndex;
   const msgId = genId("msg");
@@ -253,6 +272,7 @@ function openTextItem(state: StreamState): string[] {
   // Track this item so we can close it later. We'll mutate its content when closing.
   state.emittedItems.push(item);
   state.currentBlockIndex = outputIndex;
+  state.currentAnthropicBlockIndex = anthropicBlockIndex;
   state.textItemOpened = true;
   state.currentTextAccum = "";
   return out;
@@ -288,10 +308,11 @@ function closeTextItem(state: StreamState): string[] {
   state.textItemOpened = false;
   state.currentTextAccum = "";
   state.currentBlockIndex = null;
+  state.currentAnthropicBlockIndex = null;
   return out;
 }
 
-function openToolItem(state: StreamState, block: { id: string; name: string }): string[] {
+function openToolItem(state: StreamState, block: { id: string; name: string }, anthropicBlockIndex: number = 0): string[] {
   const out: string[] = [];
   const outputIndex = state.nextOutputIndex;
   const fcId = genId("fc");
@@ -310,6 +331,7 @@ function openToolItem(state: StreamState, block: { id: string; name: string }): 
   }));
   state.emittedItems.push(item);
   state.currentBlockIndex = outputIndex;
+  state.currentAnthropicBlockIndex = anthropicBlockIndex;
   state.toolItemOpened = true;
   state.currentToolArgsAccum = "";
   return out;
@@ -337,6 +359,30 @@ function closeToolItem(state: StreamState): string[] {
   state.toolItemOpened = false;
   state.currentToolArgsAccum = "";
   state.currentBlockIndex = null;
+  state.currentAnthropicBlockIndex = null;
+  return out;
+}
+
+function hasPartialResponse(state: StreamState): boolean {
+  return state.headerSent
+    || state.emittedItems.length > 0
+    || state.textItemOpened
+    || state.toolItemOpened
+    || state.stopReason !== null;
+}
+
+function emitResponseCompleted(state: StreamState): string[] {
+  if (state.completedSent) return [];
+  const out: string[] = [];
+  if (state.textItemOpened) out.push(...closeTextItem(state));
+  if (state.toolItemOpened) out.push(...closeToolItem(state));
+  if (!state.headerSent) out.push(...emitHeaderIfNeeded(state));
+  const status = mapStopReasonToStatus(state.stopReason);
+  out.push(formatSSE("response.completed", {
+    type: "response.completed",
+    response: buildResponseSnapshot(state, status),
+  }));
+  state.completedSent = true;
   return out;
 }
 
@@ -361,30 +407,35 @@ function translateStreamEvent(state: StreamState, sse: ParsedSSE): string[] {
 
     case "content_block_start": {
       const block = (data as any).content_block;
-      const idx = (data as any).index;
-      // Close any previously open block of the other kind.
+      const idx = parseStreamContentBlockIndex((data as any).index);
+      // Close any previously open output item before opening another. Normal
+      // Anthropic streams send content_block_stop first; this is defensive for
+      // malformed/interleaved streams.
       if (block?.type === "text") {
-        if (state.toolItemOpened) out.push(...closeToolItem(state));
-        out.push(...openTextItem(state));
-      } else if (block?.type === "tool_use") {
         if (state.textItemOpened) out.push(...closeTextItem(state));
-        out.push(...openToolItem(state, { id: block.id, name: block.name }));
+        if (state.toolItemOpened) out.push(...closeToolItem(state));
+        out.push(...openTextItem(state, idx));
+      } else if (block?.type === "tool_use") {
+        if (state.toolItemOpened) out.push(...closeToolItem(state));
+        if (state.textItemOpened) out.push(...closeTextItem(state));
+        out.push(...openToolItem(state, { id: block.id, name: block.name }, idx));
       } else {
-        // thinking blocks etc. — skip but track index parity
-        state.currentBlockIndex = idx;
+        // thinking blocks etc. do not have a Responses output item, so they
+        // must not mutate currentBlockIndex (that field is an output index).
       }
       return out;
     }
 
     case "content_block_delta": {
       const delta = (data as any).delta;
+      const idx = parseStreamContentBlockIndex((data as any).index);
       if (delta?.type === "text_delta") {
         // Be tolerant of upstreams that omit content_block_start (some GLM
         // streams jump straight to deltas). Open a text item lazily here.
         if (!state.textItemOpened && !state.toolItemOpened) {
-          out.push(...openTextItem(state));
+          out.push(...openTextItem(state, idx));
         }
-        if (state.textItemOpened) {
+        if (state.textItemOpened && state.currentAnthropicBlockIndex === idx) {
           state.currentTextAccum += delta.text ?? "";
           out.push(formatSSE("response.output_text.delta", {
             type: "response.output_text.delta",
@@ -397,7 +448,7 @@ function translateStreamEvent(state: StreamState, sse: ParsedSSE): string[] {
         // Tool argument delta — content_block_start should have arrived first
         // with the tool_use block; if it didn't, we can't recover the tool
         // name/id, so silently drop.
-        if (state.toolItemOpened) {
+        if (state.toolItemOpened && state.currentAnthropicBlockIndex === idx) {
           state.currentToolArgsAccum += delta.partial_json ?? "";
           out.push(formatSSE("response.function_call_arguments.delta", {
             type: "response.function_call_arguments.delta",
@@ -420,6 +471,8 @@ function translateStreamEvent(state: StreamState, sse: ParsedSSE): string[] {
     }
 
     case "content_block_stop": {
+      const idx = parseStreamContentBlockIndex((data as any).index);
+      if (state.currentAnthropicBlockIndex !== idx) return out;
       if (state.textItemOpened) out.push(...closeTextItem(state));
       else if (state.toolItemOpened) out.push(...closeToolItem(state));
       return out;
@@ -447,15 +500,7 @@ function translateStreamEvent(state: StreamState, sse: ParsedSSE): string[] {
     }
 
     case "message_stop": {
-      // Close any stray open block, then emit response.completed.
-      if (state.textItemOpened) out.push(...closeTextItem(state));
-      if (state.toolItemOpened) out.push(...closeToolItem(state));
-      if (!state.headerSent) out.push(...emitHeaderIfNeeded(state));
-      const status = mapStopReasonToStatus(state.stopReason);
-      out.push(formatSSE("response.completed", {
-        type: "response.completed",
-        response: buildResponseSnapshot(state, status),
-      }));
+      out.push(...emitResponseCompleted(state));
       return out;
     }
 
@@ -478,58 +523,111 @@ export function anthropicSseToResponsesSse(
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   let buffer = "";
+  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  let cancelled = false;
+  let streamClosed = false;
 
   return new ReadableStream({
     async start(controller) {
-      const reader = upstream.getReader();
+      reader = upstream.getReader();
+      const safeClose = (): void => {
+        if (streamClosed) return;
+        streamClosed = true;
+        try { controller.close(); } catch {}
+      };
+      const safeError = (err: unknown): void => {
+        if (streamClosed) return;
+        streamClosed = true;
+        try { controller.error(err); } catch {}
+      };
+      const enqueueEncoded = async (line: string): Promise<boolean> => {
+        if (cancelled || streamClosed) return false;
+        await waitForBackpressure(controller);
+        if (cancelled || streamClosed) return false;
+        try {
+          controller.enqueue(encoder.encode(line));
+          return true;
+        } catch (err) {
+          streamClosed = true;
+          if (!cancelled) throw err;
+          return false;
+        }
+      };
 
       try {
         while (true) {
+          if (cancelled || streamClosed) break;
           const { done, value } = await reader.read();
           if (done) break;
+          if (cancelled || streamClosed) break;
 
           buffer += decoder.decode(value, { stream: true });
-          const blocks = buffer.split("\n\n");
-          buffer = blocks.pop() ?? "";
+          if (buffer.indexOf("\r") >= 0) {
+            buffer = buffer.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+          }
 
-          for (const block of blocks) {
+          let cursor = 0;
+          let eventEnd: number;
+          while ((eventEnd = buffer.indexOf("\n\n", cursor)) !== -1) {
+            const block = buffer.slice(cursor, eventEnd);
+            cursor = eventEnd + 2;
+            if (utf8ByteLength(encoder, block) > SSE_CONST.MAX_TRANSLATED_STREAM_BUFFERED_EVENT_BYTES) {
+              throw new Error(`SSE event exceeded ${SSE_CONST.MAX_TRANSLATED_STREAM_BUFFERED_EVENT_BYTES} byte limit`);
+            }
             const parsed = parseSSEChunk(block);
             for (const p of parsed) {
               const output = translateStreamEvent(state, p);
               for (const line of output) {
-                // Apply backpressure before each enqueue to prevent unbounded
-                // memory growth when the downstream client is slow.
-                await waitForBackpressure(controller);
-                controller.enqueue(encoder.encode(line));
+                if (!(await enqueueEncoded(line))) return;
               }
             }
           }
+          if (cursor > 0) {
+            buffer = buffer.slice(cursor);
+          }
+          if (utf8ByteLength(encoder, buffer) > SSE_CONST.MAX_TRANSLATED_STREAM_BUFFERED_EVENT_BYTES) {
+            throw new Error(`SSE buffered event exceeded ${SSE_CONST.MAX_TRANSLATED_STREAM_BUFFERED_EVENT_BYTES} byte limit`);
+          }
         }
 
+        if (cancelled) return;
         // Flush remaining buffer
         if (buffer.trim()) {
           const parsed = parseSSEChunk(buffer);
           for (const p of parsed) {
             const output = translateStreamEvent(state, p);
             for (const line of output) {
-              await waitForBackpressure(controller);
-              controller.enqueue(encoder.encode(line));
+              if (!(await enqueueEncoded(line))) return;
             }
           }
         }
 
-        // If upstream ended without message_stop (rare), still emit response.completed
-        if (!state.emittedItems.some((i) => i === undefined)) {
-          // Check if we've already emitted response.completed by looking at the last emission
-          // The translateStreamEvent for message_stop already emits it; if we never got
-          // message_stop, fall through to emit a synthetic one.
+        // If upstream ended without message_stop (rare), still emit a terminal
+        // response.completed for clients that wait for the Responses stream's
+        // lifecycle event instead of only relying on EOF.
+        if (!state.completedSent && hasPartialResponse(state)) {
+          for (const line of emitResponseCompleted(state)) {
+            if (!(await enqueueEncoded(line))) return;
+          }
         }
       } catch (err) {
-        controller.error(err);
+        if (!cancelled) {
+          // Parser/translation failures mean this output stream is done; cancel
+          // the upstream body too so a bad SSE event does not leave the fetch
+          // body sitting unread until the server closes it.
+          void reader?.cancel(err).catch(() => {});
+          safeError(err);
+        }
       } finally {
-        controller.close();
-        reader.releaseLock();
+        safeClose();
+        try { reader.releaseLock(); } catch {}
+        reader = null;
       }
+    },
+    cancel(reason) {
+      cancelled = true;
+      streamClosed = true;
+      void reader?.cancel(reason).catch(() => {});
     },
   });
 }

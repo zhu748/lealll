@@ -47,37 +47,119 @@ interface StoredTurn {
 
 const MAX_ENTRIES = 256;
 /** Max serialized size per entry. Entries larger than this are stored with
- *  their input truncated to fit — preserves the latest output for chaining
- *  while bounding total memory. */
+ *  older history removed first. Recent output is preferred, but single
+ *  oversized input/output items are replaced with compact markers so the
+ *  memory cap is enforced. */
 const MAX_ENTRY_BYTES = 256 * 1024;
+const EMPTY_ARRAY_BYTES = 2;
 /** v0.2.2+: TTL — entries older than this are treated as misses and deleted
  *  on next access. 24h matches Codex CLI's typical session lifetime. */
 const ENTRY_TTL_MS = 24 * 60 * 60 * 1000;
 
 const store = new Map<string, StoredTurn>();
+const utf8Encoder = new TextEncoder();
 
-/** Approximate byte length of a value when JSON-serialized. Returns 0 on
- *  circular / un-stringifiable values so they're stored without truncation. */
-function approxBytes(v: unknown): number {
-  try { return JSON.stringify(v).length; } catch { return 0; }
+function utf8Bytes(json: string): number {
+  return utf8Encoder.encode(json).byteLength;
 }
 
-/** Truncate `input` (the part the client can replay later) so the entry fits
- *  within MAX_ENTRY_BYTES. We truncate by dropping the oldest input items
- *  first — the most recent ones (which the model just generated from) are
- *  the most useful for context. Output is never truncated. */
-function fitToBytes(input: unknown[], output: unknown[]): unknown[] {
-  let inBytes = approxBytes(input);
-  const outBytes = approxBytes(output);
-  const budget = MAX_ENTRY_BYTES - outBytes;
-  if (budget <= 0 || inBytes <= budget) return input;
-  // Drop oldest input items until we fit. If a single item is larger than
-  // budget, keep just that one item truncated.
-  const trimmed = [...input];
-  while (trimmed.length > 1 && approxBytes(trimmed) > budget) {
-    trimmed.shift();
+/** Approximate byte length of a value when JSON-serialized. Treat circular /
+ *  un-stringifiable values as oversized so they are replaced by a marker
+ *  instead of being kept indefinitely. */
+function approxBytes(v: unknown): number {
+  try {
+    const json = JSON.stringify(v);
+    return typeof json === "string" ? utf8Bytes(json) : MAX_ENTRY_BYTES + 1;
+  } catch {
+    return MAX_ENTRY_BYTES + 1;
   }
-  return trimmed;
+}
+
+function truncationMarker(kind: "input" | "output", originalBytes: number): unknown {
+  return {
+    type: "message",
+    role: kind === "output" ? "assistant" : "user",
+    content: `[zcode-proxy truncated oversized previous_response_id ${kind} history (${originalBytes} bytes)]`,
+  };
+}
+
+function cloneStoredValue(value: unknown, kind: "input" | "output"): unknown {
+  try {
+    return structuredClone(value);
+  } catch {
+    try {
+      return JSON.parse(JSON.stringify(value));
+    } catch {
+      return truncationMarker(kind, approxBytes(value));
+    }
+  }
+}
+
+function cloneItems(items: unknown[], kind: "input" | "output"): unknown[] {
+  return items.map(item => cloneStoredValue(item, kind));
+}
+
+function jsonArrayElementBytes(item: unknown): number | null {
+  try {
+    const json = JSON.stringify([item]);
+    return typeof json === "string" ? utf8Bytes(json) - 2 : null;
+  } catch {
+    return null;
+  }
+}
+
+function fitItemsToBudgetSlowPath(items: unknown[], budget: number, kind: "input" | "output"): unknown[] {
+  for (let start = 0; start < items.length; start++) {
+    const suffix = start === 0 ? items : items.slice(start);
+    if (approxBytes(suffix) <= budget) return suffix;
+    if (items.length - start === 1) {
+      const marker = truncationMarker(kind, approxBytes(items[start]));
+      return approxBytes([marker]) <= budget ? [marker] : [];
+    }
+  }
+  return [];
+}
+
+function fitItemsToBudget(items: unknown[], budget: number, kind: "input" | "output"): unknown[] {
+  if (budget <= 2) return [];
+  if (items.length === 0) return [];
+
+  let totalBytes = 2; // JSON array brackets: []
+  const elementBytes: number[] = [];
+  for (let i = 0; i < items.length; i++) {
+    const bytes = jsonArrayElementBytes(items[i]);
+    if (bytes === null) return fitItemsToBudgetSlowPath(items, budget, kind);
+    elementBytes.push(bytes);
+    totalBytes += bytes + (i === 0 ? 0 : 1); // comma between array elements
+  }
+
+  let start = 0;
+  let remaining = items.length;
+  while (remaining > 1 && totalBytes > budget) {
+    totalBytes -= elementBytes[start] + 1; // remove the element and its comma
+    start++;
+    remaining--;
+  }
+
+  if (totalBytes <= budget) return start === 0 ? items : items.slice(start);
+
+  const marker = truncationMarker(kind, approxBytes(items[start]));
+  return approxBytes([marker]) <= budget ? [marker] : [];
+}
+
+/** Fit the stored history within MAX_ENTRY_BYTES. We prefer preserving recent
+ *  output (what the model just said), then keep as much recent input as fits.
+ *  Both sides have a hard fallback marker for single oversized items so the
+ *  advertised per-entry cap is real, not best-effort. */
+function fitToBytes(input: unknown[], output: unknown[]): { input: unknown[]; output: unknown[]; bytes: number } {
+  const fittedOutput = fitItemsToBudget(output, MAX_ENTRY_BYTES - EMPTY_ARRAY_BYTES, "output");
+  const outputBytes = approxBytes(fittedOutput);
+  const fittedInput = fitItemsToBudget(input, MAX_ENTRY_BYTES - outputBytes, "input");
+  return {
+    input: fittedInput,
+    output: fittedOutput,
+    bytes: approxBytes(fittedInput) + outputBytes,
+  };
 }
 
 /**
@@ -99,23 +181,34 @@ function evictLRU(): void {
   if (oldestKey) store.delete(oldestKey);
 }
 
+function pruneExpired(now: number): void {
+  for (const [key, turn] of store) {
+    if (now - turn.at > ENTRY_TTL_MS) {
+      store.delete(key);
+    }
+  }
+}
+
 /** Save a turn keyed by the response id (must be unique). */
 export function saveTurn(responseId: string, input: unknown[], output: unknown[]): void {
   if (!responseId) return;
+  const now = Date.now();
+  pruneExpired(now);
   // v0.2.2+ LRU: if the store is at capacity AND this is a NEW key (not an
   // overwrite of an existing one), evict the least-recently-used entry first.
   // Overwriting an existing key doesn't grow the store, so we skip eviction.
-  if (store.size >= MAX_ENTRIES && !store.has(responseId)) {
+  while (store.size >= MAX_ENTRIES && !store.has(responseId)) {
+    const before = store.size;
     evictLRU();
+    if (store.size === before) break;
   }
-  const now = Date.now();
-  const fittedInput = fitToBytes(input, output);
+  const fitted = fitToBytes(input, output);
   store.set(responseId, {
-    input: fittedInput,
-    output,
+    input: cloneItems(fitted.input, "input"),
+    output: cloneItems(fitted.output, "output"),
     at: now,
     lastAccessAt: now,
-    bytes: approxBytes(fittedInput) + approxBytes(output),
+    bytes: fitted.bytes,
   });
 }
 
@@ -137,7 +230,11 @@ export function getTurn(responseId: string): StoredTurn | undefined {
   // uses lastAccessAt (not insertion order) so this update is what actually
   // keeps the entry from being evicted.
   turn.lastAccessAt = now;
-  return turn;
+  return {
+    ...turn,
+    input: cloneItems(turn.input, "input"),
+    output: cloneItems(turn.output, "output"),
+  };
 }
 
 /** Total bytes currently held by the store. Exposed for diagnostics. */

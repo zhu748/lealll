@@ -2,7 +2,7 @@
  * Auth manager — picks the right credential source based on mode.
  * @see .omo/plans/zcode-proxy.md Task 4
  */
-import type { AuthMode, Credential } from "./types.js";
+import type { AuthMode, Credential, PlanId } from "./types.js";
 import { createApiKeyCredential } from "./apikey.js";
 import type { ProviderId } from "../provider/types.js";
 
@@ -18,6 +18,10 @@ export interface AuthManagerOptions {
    * switching is effectively disabled (switchToNextCredential always returns null).
    */
   listAllCredentials?: () => Promise<Credential[]>;
+}
+
+function cloneCredential(cred: Credential): Credential {
+  return { ...cred };
 }
 
 /**
@@ -45,7 +49,7 @@ export class AuthManager {
   /** Returns the current credential, refreshing if necessary. */
   async getCredential(): Promise<Credential> {
     if (this.mode === "apikey") {
-      if (this.cachedApiKeyCred) return this.cachedApiKeyCred;
+      if (this.cachedApiKeyCred) return cloneCredential(this.cachedApiKeyCred);
       throw new Error("apikey mode configured but no credential was set");
     }
 
@@ -55,14 +59,14 @@ export class AuthManager {
         this.oauthCred = null;
         throw new Error("OAuth credential expired; re-authentication required (T9/T10 not yet implemented)");
       }
-      return this.oauthCred;
+      return cloneCredential(this.oauthCred);
     }
     throw new Error("OAuth credential not available — run login flow first (T9/T10 not yet implemented)");
   }
 
   /** Set the OAuth credential (used by T9/T10 OAuth flow). */
   setOAuthCredential(cred: Credential): void {
-    this.oauthCred = cred;
+    this.oauthCred = cloneCredential(cred);
   }
 
   /**
@@ -75,6 +79,27 @@ export class AuthManager {
    */
   clearOAuthCredential(): void {
     this.oauthCred = null;
+  }
+
+  /**
+   * Hot-apply auth-related config after the admin dashboard saves config.
+   *
+   * The live `ProxyConfig` object is mutated in-place by the admin API, but
+   * AuthManager keeps its own private mode/provider/static API-key cache.
+   * Without syncing this object too, the dashboard can report "auth saved"
+   * while requests keep using the old credential until process restart.
+   */
+  updateConfig(opts: { mode: AuthMode; provider: ProviderId; apiKey?: string; plan?: PlanId }): void {
+    this.mode = opts.mode;
+    this.provider = opts.provider;
+    if (opts.mode === "apikey") {
+      this.oauthCred = null;
+      this.cachedApiKeyCred = opts.apiKey
+        ? createApiKeyCredential(opts.provider, opts.apiKey, opts.plan)
+        : null;
+      return;
+    }
+    this.cachedApiKeyCred = null;
   }
 
   /**
@@ -111,14 +136,14 @@ export class AuthManager {
 
     // Pick the first candidate. A round-robin based on a stored index could be
     // added later, but for now first-available is deterministic and simple.
-    const next = candidates[0];
+    const next = cloneCredential(candidates[0]);
 
     if (this.mode === "oauth") {
-      this.oauthCred = next;
+      this.oauthCred = cloneCredential(next);
     } else {
-      this.cachedApiKeyCred = next;
+      this.cachedApiKeyCred = cloneCredential(next);
     }
-    return next;
+    return cloneCredential(next);
   }
 
   /** Current auth mode. */

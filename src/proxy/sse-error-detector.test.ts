@@ -50,6 +50,30 @@ test("detects standard Anthropic error event: event: error + data with error wra
   expect(body.error.message).toContain("1305");
 });
 
+test("releases the SSE reader when an embedded error is converted", async () => {
+  let canceled = false;
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(
+        `event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"busy"}}\n\n`,
+      ));
+    },
+    cancel() {
+      canceled = true;
+    },
+  });
+  const resp = new Response(stream, {
+    status: 200,
+    headers: { "content-type": "text/event-stream" },
+  });
+
+  const converted = await detectSseErrorAndConvert(resp);
+
+  expect(converted.status).toBe(529);
+  expect(canceled).toBe(true);
+  expect(stream.locked).toBe(false);
+});
+
 test("detects direct error type: data with overloaded_error as top-level type", async () => {
   // This is the format GLM's gateway actually sends (matching user's screenshot)
   const sseBody = [
@@ -63,6 +87,21 @@ test("detects direct error type: data with overloaded_error as top-level type", 
   const body = JSON.parse(await readBody(converted));
   expect(body.error.type).toBe("overloaded_error");
   expect(body.error.message).toContain("1305");
+});
+
+test("detects SSE error events whose JSON is split across multiple data lines", async () => {
+  const resp = sseResponse([
+    `event: error\n`,
+    `data: {"type":"error",\n`,
+    `data: "error":{"type":"overloaded_error","message":"busy split data"}}\n\n`,
+  ]);
+
+  const converted = await detectSseErrorAndConvert(resp);
+
+  expect(converted.status).toBe(529);
+  const body = JSON.parse(await readBody(converted));
+  expect(body.error.type).toBe("overloaded_error");
+  expect(body.error.message).toBe("busy split data");
 });
 
 test("detects raw JSON error without SSE framing", async () => {
@@ -89,6 +128,21 @@ test("detects rate_limit_error and maps to 429", async () => {
   expect(converted.status).toBe(429);
   const body = JSON.parse(await readBody(converted));
   expect(body.error.type).toBe("rate_limit_error");
+});
+
+test("detects SSE error events that use CRLF line endings", async () => {
+  const sseBody = [
+    `event: error\r\n`,
+    `data: {"type":"error","error":{"type":"overloaded_error","message":"busy with CRLF"}}\r\n\r\n`,
+  ];
+  const resp = sseResponse(sseBody);
+
+  const converted = await detectSseErrorAndConvert(resp);
+
+  expect(converted.status).toBe(529);
+  const body = JSON.parse(await readBody(converted));
+  expect(body.error.type).toBe("overloaded_error");
+  expect(body.error.message).toContain("CRLF");
 });
 
 test("detects error split across multiple chunks", async () => {
@@ -127,6 +181,64 @@ test("passes through legitimate stream with message_start event", async () => {
   expect(body).toContain("message_stop");
 });
 
+test("passes through OpenAI chat completion SSE chunks without false empty-stream conversion", async () => {
+  const sseBody = [
+    `data: {"id":"chatcmpl_1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}\n\n`,
+    `data: {"id":"chatcmpl_1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}\n\n`,
+    `data: {"id":"chatcmpl_1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n`,
+    `data: [DONE]\n\n`,
+  ];
+  const resp = sseResponse(sseBody);
+
+  const converted = await detectSseErrorAndConvert(resp);
+
+  expect(converted.status).toBe(200);
+  expect(converted.headers.get("x-zcode-empty-stream")).toBe(null);
+  expect(await readBody(converted)).toBe(sseBody.join(""));
+});
+
+test("passes through OpenAI Responses API SSE events without false empty-stream conversion", async () => {
+  const sseBody = [
+    `event: response.created\ndata: {"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}\n\n`,
+    `event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"Hi"}\n\n`,
+    `event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}\n\n`,
+  ];
+  const resp = sseResponse(sseBody);
+
+  const converted = await detectSseErrorAndConvert(resp);
+
+  expect(converted.status).toBe(200);
+  expect(converted.headers.get("x-zcode-empty-stream")).toBe(null);
+  expect(await readBody(converted)).toBe(sseBody.join(""));
+});
+
+test("passes through OpenAI DONE-only SSE terminal frame as non-empty stream", async () => {
+  const sseBody = [`data: [DONE]\n\n`];
+  const resp = sseResponse(sseBody);
+
+  const converted = await detectSseErrorAndConvert(resp);
+
+  expect(converted.status).toBe(200);
+  expect(converted.headers.get("x-zcode-empty-stream")).toBe(null);
+  expect(await readBody(converted)).toBe(sseBody.join(""));
+});
+
+test("passes through legitimate SSE events whose JSON is split across multiple data lines", async () => {
+  const sseBody = [
+    `event: message_start\n`,
+    `data: {"type":\n`,
+    `data: "message_start","message":{"id":"msg_split","model":"glm-5.2"}}\n\n`,
+    `event: content_block_delta\n`,
+    `data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hi"}}\n\n`,
+  ];
+  const resp = sseResponse(sseBody);
+
+  const converted = await detectSseErrorAndConvert(resp);
+
+  expect(converted.status).toBe(200);
+  expect(await readBody(converted)).toBe(sseBody.join(""));
+});
+
 test("passes through stream when ping comes before content", async () => {
   const sseBody = [
     `event: ping\ndata: {"type":"ping"}\n\n`,
@@ -141,6 +253,73 @@ test("passes through stream when ping comes before content", async () => {
   const body = await readBody(converted);
   expect(body).toContain("ping");
   expect(body).toContain("Hi");
+});
+
+test("continues peeking when ping comes before an error event", async () => {
+  const sseBody = [
+    `event: ping\ndata: {"type":"ping"}\n\n`,
+    `event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"busy after ping"}}\n\n`,
+  ];
+  const resp = sseResponse(sseBody);
+
+  const converted = await detectSseErrorAndConvert(resp);
+
+  expect(converted.status).toBe(529);
+  const body = JSON.parse(await readBody(converted));
+  expect(body.error.type).toBe("overloaded_error");
+  expect(body.error.message).toBe("busy after ping");
+});
+
+test("continues peeking across many ping events before an error event", async () => {
+  const pings = Array.from({ length: 40 }, (_, i) =>
+    `event: ping\ndata: {"type":"ping","seq":${i}}\n\n`
+  );
+  const resp = sseResponse([
+    ...pings,
+    `event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"busy after many pings"}}\n\n`,
+  ]);
+
+  const converted = await detectSseErrorAndConvert(resp);
+
+  expect(converted.status).toBe(529);
+  const body = JSON.parse(await readBody(converted));
+  expect(body.error.type).toBe("overloaded_error");
+  expect(body.error.message).toBe("busy after many pings");
+});
+
+test("does not treat a ping-only stream as a valid model response", async () => {
+  const resp = sseResponse([
+    `event: ping\ndata: {"type":"ping"}\n\n`,
+  ]);
+
+  const converted = await detectSseErrorAndConvert(resp);
+
+  expect(converted.status).toBe(529);
+  expect(converted.headers.get("x-zcode-empty-stream")).toBe("1");
+});
+
+test("passes through legitimate CRLF SSE streams without rewriting bytes", async () => {
+  const originalChunks = [
+    `event: message_start\r\ndata: {"type":"message_start","message":{"id":"msg_crlf"}}\r\n\r\n`,
+    `event: content_block_delta\r\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hi"}}\r\n\r\n`,
+  ];
+  const resp = sseResponse(originalChunks);
+
+  const converted = await detectSseErrorAndConvert(resp);
+
+  expect(converted.status).toBe(200);
+  expect(await readBody(converted)).toBe(originalChunks.join(""));
+});
+
+test("passes through a legitimate first SSE event larger than the peek window", async () => {
+  const hugeText = "x".repeat(64 * 1024);
+  const originalBody = `event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"${hugeText}"}}\n\n`;
+  const resp = sseResponse([originalBody]);
+
+  const converted = await detectSseErrorAndConvert(resp);
+
+  expect(converted.status).toBe(200);
+  expect(await readBody(converted)).toBe(originalBody);
 });
 
 test("converts empty stream to synthetic 529 with x-zcode-empty-stream marker", async () => {
@@ -189,6 +368,20 @@ test("skips detection for compressed SSE (content-encoding: gzip)", async () => 
   // Should pass through unchanged (can't decode gzip as UTF-8)
   expect(converted.status).toBe(200);
   expect(converted.headers.get("content-encoding")).toBe("gzip");
+});
+
+test("does not treat identity content-encoding as compressed", async () => {
+  const resp = sseResponse(
+    [`event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"identity still plain"}}\n\n`],
+    200,
+    { "content-encoding": "Identity" },
+  );
+
+  const converted = await detectSseErrorAndConvert(resp);
+
+  expect(converted.status).toBe(529);
+  const body = JSON.parse(await readBody(converted));
+  expect(body.error.message).toContain("identity still plain");
 });
 
 test("skips detection when response has no body", async () => {
@@ -275,8 +468,8 @@ test("converts SSE stream with only partial event fragment to synthetic 529", as
 test("still passes through stream that starts with ping then has real content", async () => {
   // Make sure the loosened check doesn't false-positive on legitimate
   // streams that begin with a ping event before the actual content.
-  // `ping` is a non-error event, so hasNonErrorEvent() returns true and
-  // sawAnyCompleteEvent becomes true → no false conversion.
+  // `ping` alone is not considered progress; the later message_start/content
+  // event is what proves this is a real response.
   const sseBody = [
     `event: ping\ndata: {"type":"ping"}\n\n`,
     `event: message_start\ndata: {"type":"message_start","message":{"id":"msg_4"}}\n\n`,
@@ -305,10 +498,10 @@ test("still passes through stream that starts with ping then has real content", 
 //   | #063 | ... | glm-5.2 | batch | 200 | 1019ms | in:- out:- |
 
 /** Build an application/json response. */
-function jsonResponse(body: string, status: number = 200): Response {
+function jsonResponse(body: string, status: number = 200, headers: Record<string, string> = {}): Response {
   return new Response(body, {
     status,
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...headers },
   });
 }
 
@@ -331,6 +524,24 @@ test("converts application/json 200 with whitespace-only body to 529", async () 
 
   expect(converted.status).toBe(529);
   expect(converted.headers.get("x-zcode-empty-stream")).toBe("1");
+});
+
+test("releases the JSON reader when an empty JSON response is converted", async () => {
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode("{}"));
+      controller.close();
+    },
+  });
+  const resp = new Response(stream, {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+
+  const converted = await detectSseErrorAndConvert(resp);
+
+  expect(converted.status).toBe(529);
+  expect(stream.locked).toBe(false);
 });
 
 test("converts application/json 200 with `{}` to synthetic 529", async () => {
@@ -465,6 +676,34 @@ test("passes through application/json 200 with embedded error field", async () =
   expect(converted.headers.get("x-zcode-empty-stream")).toBe(null);
   const body = await readBody(converted);
   expect(body).toBe(errBody);
+});
+
+test("passes through large application/json responses without full empty-response inspection", async () => {
+  const largeText = "x".repeat(2 * 1024 * 1024 + 1024);
+  const realBody = JSON.stringify({
+    id: "msg_large",
+    content: [{ type: "text", text: largeText }],
+    usage: { input_tokens: 10, output_tokens: 1000 },
+  });
+  const resp = jsonResponse(realBody);
+
+  const converted = await detectSseErrorAndConvert(resp);
+
+  expect(converted.status).toBe(200);
+  expect(converted.headers.get("x-zcode-empty-stream")).toBe(null);
+  expect(await readBody(converted)).toBe(realBody);
+});
+
+test("skips application/json inspection when Content-Length is over the preview cap", async () => {
+  const resp = jsonResponse("{}", 200, {
+    "content-length": String(2 * 1024 * 1024 + 1),
+  });
+
+  const converted = await detectSseErrorAndConvert(resp);
+
+  expect(converted.status).toBe(200);
+  expect(converted.headers.get("x-zcode-empty-stream")).toBe(null);
+  expect(await readBody(converted)).toBe("{}");
 });
 
 test("still skips detection for other content-types (text/plain, etc.)", async () => {

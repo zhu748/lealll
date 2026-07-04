@@ -29,9 +29,9 @@ FROM oven/bun:1.2-slim AS runtime
 # tini: minimal init for proper SIGTERM forwarding + zombie reaping.
 # Render sends SIGTERM on scale-down; without tini, Bun might exit uncleanly
 # and lose in-flight SSE responses.
-# Chromium + Xvfb: start-plan captcha preflight needs a real browser runtime.
-# Xvfb lets Chromium run non-headless inside Render's container, which is
-# closer to ZCode Electron than the JSDOM fallback and avoids default 3007s.
+# Chromium + Xvfb: on-demand start-plan captcha challenges need a real browser
+# runtime. Xvfb lets Chromium run non-headless inside Render's container, which
+# is closer to ZCode Electron than the JSDOM fallback.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \

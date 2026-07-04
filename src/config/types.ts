@@ -186,9 +186,9 @@ export interface ProxyConfig {
     host: string;
     /**
      * Upstream request timeout in milliseconds. If an upstream request takes
-     * longer than this, it is aborted and a 504 Gateway Timeout is returned.
-     * Set to 0 to disable (not recommended — a hung upstream connection would
-     * leak resources indefinitely). Default: 300000 (5 minutes).
+     * longer than this, it is aborted and reported as an upstream timeout.
+     * Leave unset or set to 0 to use the built-in defaults:
+     * stream requests 10 minutes, batch requests 5 minutes.
      */
     upstreamTimeoutMs?: number;
     /**
@@ -225,6 +225,14 @@ export interface ProxyConfig {
      * is wasteful; above 60s defeats the purpose if upstream is behind CF.
      */
     sseHeartbeatMs?: number;
+    /**
+     * Maximum client request body size in bytes for proxy endpoints.
+     *
+     * The proxy has to materialize JSON request bodies before translating /
+     * aligning them, so an unbounded body can pin memory and stall the event
+     * loop. Default: 64 MiB. Set to 0 to disable the guard.
+     */
+    maxRequestBodyBytes?: number;
   };
   auth: AuthConfig;
   /** Active upstream provider. */
@@ -253,10 +261,12 @@ export interface ProxyConfig {
    */
   /**
    * CORS origin allowlist. When set, only origins in this list receive
-   * `Access-Control-Allow-Origin` headers. When empty/unset, any origin
-   * is allowed (legacy permissive behavior for backwards compatibility).
+   * `Access-Control-Allow-Origin` headers. When empty/unset, browser requests
+   * with an Origin header receive `null`; server-to-server requests without
+   * Origin receive `*`.
    *
-   * Set via env var `ZCODE_PROXY_CORS_ALLOWLIST` (comma-separated).
+   * Set via YAML (`corsAllowList: [...]`) or env var
+   * `ZCODE_PROXY_CORS_ALLOWLIST` (comma-separated).
    */
   corsAllowList?: string[];
   /**

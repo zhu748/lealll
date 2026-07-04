@@ -15,7 +15,12 @@
  */
 
 import { test, expect, describe, beforeAll, afterAll } from "bun:test";
-import { getSocksBridge, isSocksProxy, _shutdownAllBridgesForTesting } from "./socks-bridge.js";
+import {
+  getSocksBridge,
+  isSocksProxy,
+  _bridgeRefCountForTesting,
+  _shutdownAllBridgesForTesting,
+} from "./socks-bridge.js";
 import { proxiedFetch } from "./proxied-fetch.js";
 
 // Real HTTPS target — picked because it's stable and CORS-friendly.
@@ -350,6 +355,131 @@ describe("SOCKS bridge end-to-end", () => {
     expect(h1.httpProxyUrl).toBe(h2.httpProxyUrl);
     h1.release();
     h2.release();
+  });
+
+  test("bridge release handle is idempotent", () => {
+    const url = "socks5://1.2.3.4:1080";
+    const h1 = getSocksBridge(url);
+    const h2 = getSocksBridge(url);
+    expect(_bridgeRefCountForTesting(url)).toBe(2);
+
+    h1.release();
+    h1.release();
+    expect(_bridgeRefCountForTesting(url)).toBe(1);
+
+    h2.release();
+    expect(_bridgeRefCountForTesting(url)).toBe(0);
+  });
+
+  test("rejects SOCKS proxy URLs with port 0 before starting a bridge", () => {
+    expect(() => getSocksBridge("socks5://127.0.0.1:0")).toThrow(/Invalid SOCKS proxy port/);
+  });
+
+  test("bridge idle eviction timer does not keep the process alive", () => {
+    const originalSetTimeout = globalThis.setTimeout;
+    let unrefCalled = false;
+    (globalThis as any).setTimeout = (handler: any, timeout?: number, ...args: unknown[]) => {
+      const timer = originalSetTimeout(handler as any, timeout as any, ...args as any) as any;
+      if (timeout === 60_000 && typeof timer.unref === "function") {
+        const originalUnref = timer.unref.bind(timer);
+        timer.unref = () => {
+          unrefCalled = true;
+          return originalUnref();
+        };
+      }
+      return timer;
+    };
+
+    try {
+      const url = "socks5://1.2.3.4:1081";
+      const h = getSocksBridge(url);
+      h.release();
+      expect(_bridgeRefCountForTesting(url)).toBe(0);
+      expect(unrefCalled).toBe(true);
+    } finally {
+      globalThis.setTimeout = originalSetTimeout;
+      _shutdownAllBridgesForTesting();
+    }
+  });
+
+  test("per-connection handshake timeout does not keep the process alive", async () => {
+    const originalSetTimeout = globalThis.setTimeout;
+    let unrefCalled = false;
+    (globalThis as any).setTimeout = (handler: any, timeout?: number, ...args: unknown[]) => {
+      const timer = originalSetTimeout(handler as any, timeout as any, ...args as any) as any;
+      if (timeout === 15_000 && typeof timer.unref === "function") {
+        const originalUnref = timer.unref.bind(timer);
+        timer.unref = () => {
+          unrefCalled = true;
+          return originalUnref();
+        };
+      }
+      return timer;
+    };
+
+    let socket: any = null;
+    try {
+      const h = getSocksBridge("socks5://127.0.0.1:9");
+      const bridgePort = Number(new URL(h.httpProxyUrl).port);
+      socket = await Bun.connect({
+        hostname: "127.0.0.1",
+        port: bridgePort,
+        socket: {
+          data() {},
+          close() {},
+          error() {},
+        },
+      });
+      await new Promise(resolve => setTimeout(resolve, 0));
+      expect(unrefCalled).toBe(true);
+      h.release();
+    } finally {
+      globalThis.setTimeout = originalSetTimeout;
+      try { socket?.end(); } catch { /* ignore */ }
+      _shutdownAllBridgesForTesting();
+    }
+  });
+
+  test("rejects malformed CONNECT target ports without opening a SOCKS tunnel", async () => {
+    let socket: any = null;
+    let responseText = "";
+    let resolveClosed!: () => void;
+    const closed = new Promise<void>(resolve => { resolveClosed = resolve; });
+    try {
+      const h = getSocksBridge("socks5://127.0.0.1:9");
+      const bridgePort = Number(new URL(h.httpProxyUrl).port);
+      socket = await Bun.connect({
+        hostname: "127.0.0.1",
+        port: bridgePort,
+        socket: {
+          data(_socket, data) {
+            responseText += new TextDecoder().decode(data);
+          },
+          close() {
+            resolveClosed();
+          },
+          error() {
+            resolveClosed();
+          },
+        },
+      });
+
+      socket.write(new TextEncoder().encode(
+        "CONNECT example.com:443abc HTTP/1.1\r\nHost: example.com:443abc\r\n\r\n",
+      ));
+
+      await Promise.race([
+        closed,
+        new Promise((_, reject) => setTimeout(() => reject(new Error("CONNECT rejection timed out")), 1000)),
+      ]);
+
+      expect(responseText).toContain("502 Bad Gateway");
+      expect(responseText).toContain("bad target port");
+      h.release();
+    } finally {
+      try { socket?.end(); } catch { /* ignore */ }
+      _shutdownAllBridgesForTesting();
+    }
   });
 
   test("regression: write failure during tunneling does NOT inject 502 into TLS stream", async () => {

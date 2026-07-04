@@ -286,6 +286,18 @@ describe("translateRequestResponsesToAnthropic", () => {
     expect(translateRequestResponsesToAnthropic(req3).tool_choice).toEqual({ type: "tool", name: "f" });
   });
 
+  it("drops tools and tool_choice when tool_choice is none", () => {
+    const req: OpenAIResponseRequest = {
+      model: "glm-4.6",
+      input: "Hi",
+      tools: [{ type: "function", name: "f", parameters: {} }],
+      tool_choice: "none",
+    };
+    const result = translateRequestResponsesToAnthropic(req);
+    expect(result.tools).toBeUndefined();
+    expect(result.tool_choice).toBeUndefined();
+  });
+
   it("forwards stream / temperature / top_p / stop fields", () => {
     const req: OpenAIResponseRequest = {
       model: "glm-4.6",

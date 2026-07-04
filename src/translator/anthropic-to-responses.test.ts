@@ -8,6 +8,7 @@ import {
   buildResponsesOutput,
 } from "./anthropic-to-responses.js";
 import type { AnthropicMessagesResponse } from "./types.js";
+import { SSE as SSE_CONST } from "../utils/constants.js";
 
 function makeAnthropicResp(overrides: Partial<AnthropicMessagesResponse> = {}): AnthropicMessagesResponse {
   return {
@@ -165,6 +166,80 @@ describe("anthropicSseToResponsesSse", () => {
     expect(out).toContain("event: response.completed");
   });
 
+  it("emits a terminal response.completed when upstream ends without message_stop", async () => {
+    const anthropicSse = [
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_short","model":"glm-4.6","usage":{"input_tokens":3}}}\n\n',
+      'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial answer"}}\n\n',
+    ].join("");
+
+    const stream = anthropicSseToResponsesSse(new Response(anthropicSse).body!, "glm-4.6");
+    const out = await readStream(stream);
+
+    expect(out).toContain("event: response.output_text.done");
+    expect(out).toContain('"text":"partial answer"');
+    expect(out).toContain("event: response.completed");
+    expect(out.match(/event: response\.completed/g)).toHaveLength(1);
+  });
+
+  it("handles CRLF SSE line endings", async () => {
+    const anthropicSse = [
+      'event: message_start\r\ndata: {"type":"message_start","message":{"id":"msg_crlf","model":"glm-4.6","usage":{"input_tokens":1,"output_tokens":0}}}\r\n\r\n',
+      'event: content_block_start\r\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\r\n\r\n',
+      'event: content_block_delta\r\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"CRLF ok"}}\r\n\r\n',
+      'event: message_stop\r\ndata: {"type":"message_stop"}\r\n\r\n',
+    ].join("");
+
+    const stream = anthropicSseToResponsesSse(new Response(anthropicSse).body!, "glm-4.6");
+    const out = await readStream(stream);
+
+    expect(out).toContain("event: response.output_text.delta");
+    expect(out).toContain('"delta":"CRLF ok"');
+    expect(out).toContain("event: response.completed");
+  });
+
+  it("translates many complete events from one merged upstream chunk", async () => {
+    const deltas = Array.from({ length: 300 }, (_, i) =>
+      `event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"part-${i}"}}\n\n`
+    ).join("");
+    const anthropicSse = [
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_merged","model":"glm-4.6","usage":{"input_tokens":1,"output_tokens":0}}}\n\n',
+      'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+      deltas,
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":300}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ].join("");
+
+    const stream = anthropicSseToResponsesSse(new Response(anthropicSse).body!, "glm-4.6");
+    const out = await readStream(stream);
+
+    expect(out.match(/event: response\.output_text\.delta/g)?.length).toBe(300);
+    expect(out).toContain('"delta":"part-0"');
+    expect(out).toContain('"delta":"part-299"');
+    expect(out).toContain("event: response.completed");
+  });
+
+  it("ignores non-output blocks without corrupting the open text output index", async () => {
+    const anthropicSse = [
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_x","model":"glm-4.6","usage":{"input_tokens":10}}}\n\n',
+      'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}\n\n',
+      'event: content_block_start\ndata: {"type":"content_block_start","index":1,"content_block":{"type":"thinking","thinking":""}}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":"hidden"}}\n\n',
+      'event: content_block_stop\ndata: {"type":"content_block_stop","index":1}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" world"}}\n\n',
+      'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ].join("");
+
+    const stream = anthropicSseToResponsesSse(new Response(anthropicSse).body!, "glm-4.6");
+    const out = await readStream(stream);
+
+    expect(out).toContain('"text":"Hello world"');
+    expect(out.match(/event: response\.output_item\.added/g)?.length).toBe(1);
+    expect(out).toContain('"output_index":0');
+  });
+
   it("emits function_call events for tool_use blocks", async () => {
     const anthropicSse = [
       'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_x","model":"glm-4.6","usage":{"input_tokens":10}}}\n\n',
@@ -263,5 +338,103 @@ describe("anthropicSseToResponsesSse", () => {
     const out = await readStream(stream);
     expect(out).toContain('"reasoning_tokens":1234');
     expect(out).not.toMatch(/"reasoning_tokens":1[},]/);
+  });
+
+  it("errors when an unfinished SSE event exceeds the stream buffer limit", async () => {
+    const stream = anthropicSseToResponsesSse(
+      new Response("data: " + "x".repeat(SSE_CONST.MAX_TRANSLATED_STREAM_BUFFERED_EVENT_BYTES + 1)).body!,
+      "glm-4.6",
+    );
+    let err: unknown;
+    try {
+      await readStream(stream);
+    } catch (e) {
+      err = e;
+    }
+    expect((err as Error)?.message).toContain("SSE buffered event exceeded");
+  });
+
+  it("counts unfinished SSE event limits by UTF-8 bytes", async () => {
+    const stream = anthropicSseToResponsesSse(
+      new Response("data: " + "汉".repeat(Math.floor(SSE_CONST.MAX_TRANSLATED_STREAM_BUFFERED_EVENT_BYTES / 3) + 1)).body!,
+      "glm-4.6",
+    );
+    let err: unknown;
+    try {
+      await readStream(stream);
+    } catch (e) {
+      err = e;
+    }
+    expect((err as Error)?.message).toContain("SSE buffered event exceeded");
+  });
+
+  it("rejects out-of-range content block indices in Responses streams", async () => {
+    const anthropicSse = [
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_idx","model":"glm-4.6"}}\n\n',
+      `event: content_block_start\ndata: {"type":"content_block_start","index":${SSE_CONST.MAX_TO_BATCH_CONTENT_BLOCK_INDEX + 1},"content_block":{"type":"text","text":""}}\n\n`,
+    ].join("");
+    const stream = anthropicSseToResponsesSse(new Response(anthropicSse).body!, "glm-4.6");
+    let err: unknown;
+    try {
+      await readStream(stream);
+    } catch (e) {
+      err = e;
+    }
+    expect((err as Error)?.message).toContain("Invalid SSE content block index");
+  });
+
+  it("cancels the upstream reader when translation errors", async () => {
+    const encoder = new TextEncoder();
+    let upstreamCancelled = false;
+    const input = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode([
+          'event: message_start',
+          'data: {"type":"message_start","message":{"id":"msg_error","model":"glm-4.6"}}',
+          '',
+          'event: content_block_start',
+          `data: {"type":"content_block_start","index":${SSE_CONST.MAX_TO_BATCH_CONTENT_BLOCK_INDEX + 1},"content_block":{"type":"text","text":""}}`,
+          '',
+          '',
+        ].join("\n")));
+      },
+      cancel() {
+        upstreamCancelled = true;
+      },
+    });
+
+    let err: unknown;
+    try {
+      await readStream(anthropicSseToResponsesSse(input, "glm-4.6"));
+    } catch (e) {
+      err = e;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect((err as Error)?.message).toContain("Invalid SSE content block index");
+    expect(upstreamCancelled).toBe(true);
+  });
+
+  it("cancels the upstream reader when downstream cancels", async () => {
+    const encoder = new TextEncoder();
+    let upstreamCancelled = false;
+    const input = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(
+          'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_cancel","model":"glm-4.6"}}\n\n',
+        ));
+      },
+      cancel() {
+        upstreamCancelled = true;
+      },
+    });
+
+    const reader = anthropicSseToResponsesSse(input, "glm-4.6").getReader();
+    const first = await reader.read();
+    expect(first.done).toBe(false);
+    await reader.cancel("client disconnected");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(upstreamCancelled).toBe(true);
   });
 });

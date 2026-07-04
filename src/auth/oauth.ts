@@ -22,6 +22,7 @@
 import type { ProviderId } from "../provider/types.js";
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
 // IncomingMessage and ServerResponse are used by the CallbackServer class below.
+import type { Socket } from "node:net";
 import { randomBytes } from "node:crypto";
 
 // ---------------------------------------------------------------------------
@@ -41,6 +42,12 @@ const ZAI_CALLBACK_PATH = "/oauth/callback/zai";
 const BIGMODEL_HOST = "https://bigmodel.cn";
 const BIGMODEL_APP_ID = "zcode";
 const BIGMODEL_CALLBACK_PATH = "/oauth/callback/bigmodel";
+const DEFAULT_OAUTH_TOKEN_TIMEOUT_MS = 30_000;
+const MAX_OAUTH_JSON_BYTES = 2 * 1024 * 1024;
+const CALLBACK_CLOSE_TIMEOUT_MS = 250;
+const DEFAULT_CALLBACK_WAIT_TIMEOUT_MS = 300_000;
+const MIN_CALLBACK_WAIT_TIMEOUT_MS = 1;
+const MAX_TIMER_MS = 2_147_483_647;
 
 // ---------------------------------------------------------------------------
 // Shared types
@@ -79,7 +86,129 @@ export interface OAuthResult {
   email?: string;
 }
 
+export function normalizeCallbackWaitTimeoutMs(timeoutMs: number = DEFAULT_CALLBACK_WAIT_TIMEOUT_MS): number {
+  if (!Number.isFinite(timeoutMs)) return DEFAULT_CALLBACK_WAIT_TIMEOUT_MS;
+  const n = Math.floor(timeoutMs);
+  if (n < MIN_CALLBACK_WAIT_TIMEOUT_MS) return MIN_CALLBACK_WAIT_TIMEOUT_MS;
+  return Math.min(n, DEFAULT_CALLBACK_WAIT_TIMEOUT_MS);
+}
+
 export type FetchFn = typeof fetch;
+
+function parseContentLength(headers: Headers): number | undefined {
+  const raw = headers.get("content-length");
+  if (!raw) return undefined;
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) return undefined;
+  const n = Number(trimmed);
+  return Number.isSafeInteger(n) ? n : undefined;
+}
+
+async function readChunkWithTimeout(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  timeoutMs: number,
+): ReturnType<ReadableStreamDefaultReader<Uint8Array>["read"]> {
+  const timeout = normalizeTokenRequestTimeoutMs(timeoutMs);
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const result = await Promise.race([
+    reader.read(),
+    new Promise<"timeout">(resolve => {
+      timer = setTimeout(() => resolve("timeout"), timeout);
+      timer.unref?.();
+    }),
+  ]).finally(() => {
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  });
+  if (result === "timeout") {
+    const err = new Error(`OAuth token response read timeout after ${timeout}ms`);
+    void reader.cancel(err).catch(() => {});
+    throw err;
+  }
+  return result;
+}
+
+async function readTextLimited(
+  resp: Response,
+  maxBytes = MAX_OAUTH_JSON_BYTES,
+  timeoutMs = DEFAULT_OAUTH_TOKEN_TIMEOUT_MS,
+): Promise<string> {
+  const limit = Math.max(1, Math.floor(maxBytes));
+  const declaredLength = parseContentLength(resp.headers);
+  if (declaredLength !== undefined && declaredLength > limit) {
+    void resp.body?.cancel().catch(() => {});
+    throw new Error(`OAuth token response exceeds ${limit} byte limit (content-length ${declaredLength})`);
+  }
+  if (!resp.body) return "";
+
+  const reader = resp.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await readChunkWithTimeout(reader, timeoutMs);
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > limit) {
+        try { await reader.cancel(); } catch {}
+        throw new Error(`OAuth token response exceeds ${limit} byte limit`);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    try { reader.releaseLock(); } catch {}
+  }
+
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(bytes);
+}
+
+async function fetchWithTimeout(
+  fetchImpl: FetchFn,
+  input: RequestInfo | URL,
+  init: RequestInit | undefined,
+  timeoutMs: number,
+): Promise<Response> {
+  const timeout = normalizeTokenRequestTimeoutMs(timeoutMs);
+  const ctrl = new AbortController();
+  const upstreamSignal = init?.signal;
+  let upstreamAborted = false;
+  const onUpstreamAbort = () => {
+    upstreamAborted = true;
+    ctrl.abort();
+  };
+  if (upstreamSignal) {
+    if (upstreamSignal.aborted) onUpstreamAbort();
+    else upstreamSignal.addEventListener("abort", onUpstreamAbort, { once: true });
+  }
+  const timer = setTimeout(() => ctrl.abort(), timeout);
+  timer.unref?.();
+  try {
+    return await fetchImpl(input, { ...init, signal: ctrl.signal });
+  } catch (err) {
+    if (ctrl.signal.aborted && !upstreamAborted) {
+      throw new Error(`OAuth token request timeout after ${timeout}ms`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+    if (upstreamSignal) upstreamSignal.removeEventListener("abort", onUpstreamAbort);
+  }
+}
+
+function normalizeTokenRequestTimeoutMs(raw: number, fallback = DEFAULT_OAUTH_TOKEN_TIMEOUT_MS): number {
+  const candidate = Number.isFinite(raw) && raw > 0 ? raw : fallback;
+  const safe = Number.isFinite(candidate) && candidate > 0 ? candidate : DEFAULT_OAUTH_TOKEN_TIMEOUT_MS;
+  return Math.min(MAX_TIMER_MS, Math.max(1, Math.floor(safe)));
+}
 
 // ---------------------------------------------------------------------------
 // Shared types
@@ -107,6 +236,9 @@ class CallbackServer {
   /** Localhost callback URL; finalized in listen() once the ephemeral port is bound. */
   callbackUrl: string;
   private server: Server;
+  private sockets = new Set<Socket>();
+  private closePromise: Promise<void> | null = null;
+  private closing = false;
   private callbackResult: { code: string; error: string | null } | null = null;
   private callbackWaiters: Array<(result: { code: string; error: string | null }) => void> = [];
 
@@ -146,12 +278,18 @@ class CallbackServer {
       res.end(onSuccessHtml);
       this.resolveOnce({ code, error: null });
     });
+    this.server.on("connection", (socket: Socket) => {
+      this.sockets.add(socket);
+      socket.on("close", () => this.sockets.delete(socket));
+      if (this.closing) socket.destroy();
+    });
   }
 
   private resolveOnce(result: { code: string; error: string | null }): void {
     if (this.callbackResult) return;
     this.callbackResult = result;
-    this.callbackWaiters.forEach((fn) => fn(result));
+    const waiters = this.callbackWaiters.splice(0);
+    waiters.forEach((fn) => fn(result));
   }
 
   /** Listen on an ephemeral port and resolve with the chosen callback URL. */
@@ -178,24 +316,82 @@ class CallbackServer {
     });
   }
 
-  async waitForCallback(timeoutMs: number = 300_000): Promise<string> {
+  async waitForCallback(timeoutMs: number = DEFAULT_CALLBACK_WAIT_TIMEOUT_MS): Promise<string> {
     if (this.callbackResult?.code) return this.callbackResult.code;
     if (this.callbackResult?.error) throw new Error(this.callbackResult.error);
 
     return new Promise<string>((resolve, reject) => {
+      let settled = false;
+      let waiter: ((result: { code: string; error: string | null }) => void) | null = null;
+      const cleanup = () => {
+        if (waiter) {
+          const idx = this.callbackWaiters.indexOf(waiter);
+          if (idx >= 0) this.callbackWaiters.splice(idx, 1);
+          waiter = null;
+        }
+      };
+      const timeout = normalizeCallbackWaitTimeoutMs(timeoutMs);
       const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        cleanup();
         reject(new Error("Authorization timed out. Please retry login."));
-      }, timeoutMs);
-      this.callbackWaiters.push((result) => {
+      }, timeout);
+      timer.unref?.();
+      waiter = (result) => {
+        if (settled) return;
+        settled = true;
         clearTimeout(timer);
+        cleanup();
         if (result.error) reject(new Error(result.error));
         else resolve(result.code);
-      });
+      };
+      this.callbackWaiters.push(waiter);
     });
   }
 
   async close(): Promise<void> {
-    await new Promise<void>((resolve) => this.server.close(() => resolve()));
+    if (this.closePromise) return this.closePromise;
+    this.closing = true;
+    this.resolveOnce({ code: "", error: "OAuth callback server closed." });
+    this.closePromise = new Promise<void>((resolve, reject) => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const finish = (err?: Error & { code?: string }) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        timer = null;
+        if (err && err.code !== "ERR_SERVER_NOT_RUNNING") {
+          forceClose();
+          reject(err);
+        } else {
+          forceClose();
+          resolve();
+        }
+      };
+      const forceClose = () => {
+        for (const socket of this.sockets) {
+          try { socket.destroy(); } catch {}
+        }
+        try { (this.server as Server & { closeAllConnections?: () => void }).closeAllConnections?.(); } catch {}
+        try { (this.server as Server & { closeIdleConnections?: () => void }).closeIdleConnections?.(); } catch {}
+      };
+      timer = setTimeout(() => {
+        forceClose();
+        finish();
+      }, CALLBACK_CLOSE_TIMEOUT_MS);
+      timer.unref?.();
+      try {
+        forceClose();
+        this.server.close((err?: Error) => finish(err as Error & { code?: string } | undefined));
+      } catch (err) {
+        finish(err as Error & { code?: string });
+      }
+    }).finally(() => {
+      this.closePromise = null;
+    });
+    return this.closePromise;
   }
 }
 
@@ -229,6 +425,7 @@ export class ZaiOAuthClient {
     private fetchImpl: FetchFn = fetch,
     private authorizeUrl: string = ZAI_AUTHORIZE_URL,
     private clientId: string = ZAI_CLIENT_ID,
+    private requestTimeoutMs: number = DEFAULT_OAUTH_TOKEN_TIMEOUT_MS,
   ) {}
 
   /**
@@ -280,7 +477,7 @@ export class ZaiOAuthClient {
     redirectUri: string,
     state: string,
   ): Promise<{ accessToken: string; userId?: string; jwt?: string; email?: string }> {
-    const resp = await this.fetchImpl(`${ZCODE_OAUTH_BASE}/oauth/token`, {
+    const resp = await fetchWithTimeout(this.fetchImpl, `${ZCODE_OAUTH_BASE}/oauth/token`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
@@ -289,9 +486,9 @@ export class ZaiOAuthClient {
         redirect_uri: redirectUri,
         state,
       }),
-    });
+    }, this.requestTimeoutMs);
 
-    const raw = safeJsonParse(await resp.text()) as ZaiEnvelope & {
+    const raw = safeJsonParse(await readTextLimited(resp, MAX_OAUTH_JSON_BYTES, this.requestTimeoutMs)) as ZaiEnvelope & {
       data?: {
         token?: string;
         user?: { user_id?: string; email?: string };
@@ -375,6 +572,7 @@ export class BigmodelOAuthClient {
     private fetchImpl: FetchFn = fetch,
     private host: string = BIGMODEL_HOST,
     private appId: string = BIGMODEL_APP_ID,
+    private requestTimeoutMs: number = DEFAULT_OAUTH_TOKEN_TIMEOUT_MS,
   ) {}
 
   /**
@@ -418,7 +616,7 @@ export class BigmodelOAuthClient {
     redirectUri: string,
     state: string,
   ): Promise<{ accessToken: string; userId?: string; jwt?: string; email?: string }> {
-    const resp = await this.fetchImpl(ZCODE_TOKEN_ENDPOINT, {
+    const resp = await fetchWithTimeout(this.fetchImpl, ZCODE_TOKEN_ENDPOINT, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
@@ -427,9 +625,9 @@ export class BigmodelOAuthClient {
         redirect_uri: redirectUri,
         state,
       }),
-    });
+    }, this.requestTimeoutMs);
 
-    const raw = safeJsonParse(await resp.text()) as {
+    const raw = safeJsonParse(await readTextLimited(resp, MAX_OAUTH_JSON_BYTES, this.requestTimeoutMs)) as {
       code?: number;
       data?: {
         token?: string;

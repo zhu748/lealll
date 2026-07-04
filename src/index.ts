@@ -11,12 +11,15 @@ import { loadCredential, saveCredential, clearCredentialAsync, getStorePath, exp
 import { ZaiOAuthClient, BigmodelOAuthClient } from "./auth/oauth.js";
 import { KeyResolver } from "./auth/resolver.js";
 import { readZCodeImport } from "./auth/zcode-config.js";
+import { atomicWriteFile } from "./utils/fs.js";
 import type { Credential, PlanId } from "./auth/types.js";
 import type { ProviderId } from "./provider/types.js";
 import { spawn } from "node:child_process";
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
+import { dirname } from "node:path";
 
-const VERSION = "0.2.1.9";
+const VERSION = "0.2.2.0";
+const LOG_LEVEL_ORDER: Record<string, number> = { debug: 0, info: 1, warn: 2, error: 3 };
 
 // ---------------------------------------------------------------------------
 // Process-level error handlers — installed ONCE before main() so they cover
@@ -53,7 +56,9 @@ process.on("unhandledRejection", (reason) => {
   }
 });
 
-main();
+if (import.meta.main) {
+  main();
+}
 
 function main(): void {
   const args = process.argv.slice(2);
@@ -85,7 +90,7 @@ function main(): void {
  *   zcode-proxy serve --config config.yaml
  *   zcode-proxy serve --config=config.yaml
  */
-function parseServeConfigArg(rest: string[]): string | undefined {
+export function parseServeConfigArg(rest: string[]): string | undefined {
   for (let i = 0; i < rest.length; i++) {
     const a = rest[i];
     if (a === "--config" && i + 1 < rest.length) return rest[i + 1];
@@ -93,6 +98,42 @@ function parseServeConfigArg(rest: string[]): string | undefined {
     if (!a.startsWith("-")) return a; // first positional non-flag arg
   }
   return undefined;
+}
+
+export async function ensureConfigFile(path: string): Promise<boolean> {
+  if (existsSync(path)) return false;
+  mkdirSync(dirname(path), { recursive: true });
+  await atomicWriteFile(path, EXAMPLE_CONFIG_YAML);
+  return true;
+}
+
+export function shouldAppendConsoleLog(configuredLevel: unknown, candidateRank: number): boolean {
+  const minLevel = typeof configuredLevel === "string"
+    ? LOG_LEVEL_ORDER[configuredLevel] ?? LOG_LEVEL_ORDER.info
+    : LOG_LEVEL_ORDER.info;
+  return candidateRank >= minLevel;
+}
+
+export interface ShutdownCleanupTasks {
+  stopServer: () => Promise<unknown> | unknown;
+  shutdownCaptchaHelper: () => Promise<unknown> | unknown;
+  flushLogs: () => Promise<unknown> | unknown;
+}
+
+export async function runShutdownCleanup(
+  tasks: ShutdownCleanupTasks,
+  logError: (message: string, err: unknown) => void = (message, err) => console.error(message, err),
+): Promise<void> {
+  const runStep = async (message: string, task: () => Promise<unknown> | unknown): Promise<void> => {
+    try {
+      await task();
+    } catch (err) {
+      logError(message, err);
+    }
+  };
+  await runStep("[shutdown] server.stop() rejected:", tasks.stopServer);
+  await runStep("[shutdown] captcha helper shutdown failed:", tasks.shutdownCaptchaHelper);
+  await runStep("[shutdown] log file flush failed:", tasks.flushLogs);
 }
 
 /**
@@ -142,8 +183,7 @@ Examples:
 
 async function serve(configPath?: string): Promise<void> {
   const path = configPath ?? process.env.ZCODE_PROXY_CONFIG ?? "config.yaml";
-  if (!existsSync(path)) {
-    writeFileSync(path, EXAMPLE_CONFIG_YAML, "utf-8");
+  if (await ensureConfigFile(path)) {
     console.log(`Created ${path} from bundled template.`);
     console.log(`Edit auth.apiKey, or run: zcode-proxy auth login <zai|bigmodel>\n`);
   }
@@ -232,7 +272,7 @@ async function serve(configPath?: string): Promise<void> {
   const origLog = console.log;
   const origError = console.error;
   const origWarn = console.warn;
-  const { appendLog, setLogFilePath } = await import("./admin/api.js");
+  const { appendLog, setLogFilePath, flushLogFileForShutdown } = await import("./admin/api.js");
 
   /**
    * Serialize a single console argument to a single string.
@@ -280,11 +320,8 @@ async function serve(configPath?: string): Promise<void> {
   // everything (origLog/origError/origWarn are called unconditionally) —
   // this only controls what the admin dashboard exposes. Previously the
   // YAML field was parsed but never enforced, silently ignoring user config.
-  const LEVEL_ORDER: Record<string, number> = { debug: 0, info: 1, warn: 2, error: 3 };
-  const minLevel = LEVEL_ORDER[config.logging.level] ?? 1; // default info
-
   const safeAppend = (level: string, levelRank: number, args: unknown[]) => {
-    if (levelRank < minLevel) return; // below configured minimum — skip
+    if (!shouldAppendConsoleLog(config.logging?.level, levelRank)) return; // below configured minimum — skip
     try { appendLog(level, args.map(serialize).join(" ")); }
     catch (e) { /* appendLog itself may throw if log buffer is full; never let it kill the request */ void e; }
   };
@@ -297,9 +334,9 @@ async function serve(configPath?: string): Promise<void> {
   const logFile = config.logging?.file || process.env.ZCODE_PROXY_LOG_FILE;
   if (logFile) setLogFilePath(logFile);
 
-  // CORS allowlist is now loaded via config.corsAllowList (resolved from
-  // ZCODE_PROXY_CORS_ALLOWLIST env var in loadConfig) and passed through
-  // dependency injection — no more globalThis hack.
+  // CORS allowlist is loaded via config.corsAllowList (resolved from YAML or
+  // ZCODE_PROXY_CORS_ALLOWLIST in loadConfig) and passed through dependency
+  // injection — no more globalThis hack.
 
   const server = startServer({ config, auth, configPath: path });
   const url = `http://${server.hostname}:${server.port}`;
@@ -374,10 +411,18 @@ async function serve(configPath?: string): Promise<void> {
     // .finally (not .then) ensures we exit EVEN IF server.stop() rejects —
     // previously a rejection here left the process in a hung state with no
     // log trail, requiring Task Manager to kill on Windows.
+    const stopAndFlushLogs = async () => {
+      await runShutdownCleanup({
+        stopServer: () => server.stop(),
+        shutdownCaptchaHelper: async () => {
+          const { shutdownChromeCaptchaHelper } = await import("./proxy/captcha.js");
+          await shutdownChromeCaptchaHelper("process shutdown");
+        },
+        flushLogs: flushLogFileForShutdown,
+      });
+    };
     Promise.race([
-      server.stop().catch((err) => {
-        console.error("[shutdown] server.stop() rejected:", err);
-      }),
+      stopAndFlushLogs(),
       new Promise<void>(r => setTimeout(r, 30_000)),
     ]).finally(() => process.exit(0));
   };
@@ -406,7 +451,17 @@ async function authLogin(args: string[]): Promise<void> {
   const provider = args[0] as ProviderId | undefined;
   const importMode = args.includes("--import");
   const planFlag = args.find(a => a.startsWith("--plan="));
-  const plan: PlanId = planFlag === "--plan=start-plan" ? "start-plan" : "coding-plan";
+  let plan: PlanId = "coding-plan";
+  if (planFlag) {
+    const rawPlan = planFlag.slice("--plan=".length);
+    if (rawPlan === "coding-plan" || rawPlan === "start-plan") {
+      plan = rawPlan;
+    } else {
+      console.error(`Invalid --plan value: ${rawPlan || "(empty)"}`);
+      console.error("Expected: --plan=coding-plan or --plan=start-plan");
+      process.exit(1);
+    }
+  }
 
   if (!provider || (provider !== "zai" && provider !== "bigmodel")) {
     console.error("Usage: zcode-proxy auth login <zai|bigmodel> [--import] [--plan=coding-plan|start-plan]");

@@ -37,6 +37,8 @@ const ZCODE_PLAN_BASE = "https://zcode.z.ai/api/v1/zcode-plan";
 // version only matters on the first successful query.
 const DEFAULT_APP_VERSION = "3.1.8";
 const REQUEST_TIMEOUT_MS = 15_000;
+const MAX_QUOTA_JSON_BYTES = 2 * 1024 * 1024;
+const MAX_TIMER_MS = 2_147_483_647;
 
 /** Normalized, UI-ready quota snapshot for one credential. */
 export interface QuotaResult {
@@ -84,13 +86,111 @@ function isNoPlanMessage(msg: unknown): boolean {
 }
 
 function withTimeout(fetchImpl: FetchFn): FetchFn {
-  return ((input: RequestInfo | URL, init?: RequestInit) => {
+  return (async (input: RequestInfo | URL, init?: RequestInit) => {
     const ctrl = new AbortController();
+    const upstreamSignal = init?.signal;
+    let upstreamAborted = false;
+    const onUpstreamAbort = () => {
+      upstreamAborted = true;
+      ctrl.abort();
+    };
+    if (upstreamSignal) {
+      if (upstreamSignal.aborted) onUpstreamAbort();
+      else upstreamSignal.addEventListener("abort", onUpstreamAbort, { once: true });
+    }
     const timer = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
-    return fetchImpl(input, { ...init, signal: ctrl.signal }).finally(() =>
-      clearTimeout(timer),
-    );
+    timer.unref?.();
+    try {
+      return await fetchImpl(input, { ...init, signal: ctrl.signal });
+    } catch (err) {
+      if (ctrl.signal.aborted && !upstreamAborted) {
+        throw new Error(`quota request timeout after ${REQUEST_TIMEOUT_MS}ms`);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+      if (upstreamSignal) upstreamSignal.removeEventListener("abort", onUpstreamAbort);
+    }
   }) as FetchFn;
+}
+
+function parseContentLength(headers: Headers): number | undefined {
+  const raw = headers.get("content-length");
+  if (!raw) return undefined;
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) return undefined;
+  const n = Number(trimmed);
+  return Number.isSafeInteger(n) ? n : undefined;
+}
+
+function normalizeTimerMs(raw: number, fallback = REQUEST_TIMEOUT_MS): number {
+  const candidate = Number.isFinite(raw) && raw > 0 ? raw : fallback;
+  const safe = Number.isFinite(candidate) && candidate > 0 ? candidate : REQUEST_TIMEOUT_MS;
+  return Math.min(MAX_TIMER_MS, Math.max(1, Math.floor(safe)));
+}
+
+async function readChunkWithTimeout(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  timeoutMs: number,
+): ReturnType<ReadableStreamDefaultReader<Uint8Array>["read"]> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const result = await Promise.race([
+    reader.read(),
+    new Promise<"timeout">(resolve => {
+      timer = setTimeout(() => resolve("timeout"), timeoutMs);
+      timer.unref?.();
+    }),
+  ]).finally(() => {
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  });
+  if (result === "timeout") {
+    const err = new Error(`quota JSON response read timeout after ${timeoutMs}ms`);
+    void reader.cancel(err).catch(() => {});
+    throw err;
+  }
+  return result;
+}
+
+async function readJsonLimited(resp: Response, maxBytes = MAX_QUOTA_JSON_BYTES, timeoutMs = REQUEST_TIMEOUT_MS): Promise<any> {
+  const limit = Math.max(1, Math.floor(maxBytes));
+  const readTimeoutMs = normalizeTimerMs(timeoutMs);
+  const declaredLength = parseContentLength(resp.headers);
+  if (declaredLength !== undefined && declaredLength > limit) {
+    void resp.body?.cancel().catch(() => {});
+    throw new Error(`quota JSON response exceeds ${limit} byte limit (content-length ${declaredLength})`);
+  }
+  if (!resp.body) return {};
+
+  const reader = resp.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await readChunkWithTimeout(reader, readTimeoutMs);
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > limit) {
+        try { await reader.cancel(); } catch {}
+        throw new Error(`quota JSON response exceeds ${limit} byte limit`);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    try { reader.releaseLock(); } catch {}
+  }
+
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  const text = new TextDecoder().decode(bytes);
+  return text ? JSON.parse(text) : {};
 }
 
 /**
@@ -114,7 +214,7 @@ export async function queryQuota(
   const fetchWithTimeout = withTimeout(fetchImpl);
   const plan = cred.plan ?? "coding-plan";
 
-  if (plan === "start-plan" && cred.jwt) {
+  if (plan === "start-plan" && cred.jwt?.trim()) {
     return queryStartPlan(cred, fetchWithTimeout, appVersion);
   }
   return queryCodingPlan(cred, fetchWithTimeout);
@@ -245,9 +345,10 @@ async function fetchJson(
 ): Promise<any> {
   const resp = await fetchImpl(url, { method: "GET", headers });
   if (!resp.ok) {
+    void resp.body?.cancel().catch(() => {});
     throw new Error(`quota request ${url} failed: ${resp.status}`);
   }
-  return resp.json();
+  return readJsonLimited(resp);
 }
 
 function normalizeBearerHeader(token: string): string {

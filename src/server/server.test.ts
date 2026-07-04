@@ -130,6 +130,34 @@ describe("server routing", () => {
     const resp = await handler(new Request("http://localhost/unknown", { method: "GET" }));
     expect(resp.status).toBe(404);
   });
+
+  it("returns structured 500 when an unexpected route error escapes", async () => {
+    const config = makeConfig();
+    const auth = {
+      getCredential: async () => ({ apiKey: "testkey", secret: "testsecret", provider: "zai" }),
+      getMode: () => { throw new Error("mode exploded"); },
+    } as unknown as AuthManager;
+    const handler = createFetchHandler({ config, auth, fetchImpl: mockUpstream() });
+    const originalError = console.error;
+    console.error = () => {};
+    try {
+      const resp = await handler(
+        new Request("http://localhost/v1/messages", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ model: "glm-4.6", max_tokens: 100, messages: [{ role: "user", content: "Hi" }] }),
+        }),
+      );
+      expect(resp.status).toBe(500);
+      expect(resp.headers.get("content-type")).toContain("application/json");
+      expect(resp.headers.get("access-control-allow-origin")).toBe("*");
+      const body = await resp.json();
+      expect(body.error.type).toBe("internal_server_error");
+      expect(body.error.message).toContain("mode exploded");
+    } finally {
+      console.error = originalError;
+    }
+  });
 });
 
 describe("proxy API key auth", () => {
@@ -283,6 +311,27 @@ describe("CORS", () => {
     );
     expect(resp.status).toBe(204);
     expect(resp.headers.get("access-control-allow-origin")).toBe("https://my-dashboard.local");
+  });
+
+  it("uses the current CORS allowlist after config hot-swap", async () => {
+    const config = makeConfig();
+    const auth = new AuthManager({ mode: "apikey", provider: "zai", apiKey: "test" });
+    const handler = createFetchHandler({ config, auth });
+
+    const before = await handler(
+      new Request("http://localhost/health", {
+        headers: { origin: "https://hot.example.com" },
+      }),
+    );
+    expect(before.headers.get("access-control-allow-origin")).toBe("null");
+
+    (config as any).corsAllowList = ["https://hot.example.com"];
+    const after = await handler(
+      new Request("http://localhost/health", {
+        headers: { origin: "https://hot.example.com" },
+      }),
+    );
+    expect(after.headers.get("access-control-allow-origin")).toBe("https://hot.example.com");
   });
 });
 

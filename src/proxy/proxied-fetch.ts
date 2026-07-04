@@ -14,8 +14,9 @@
  *   - socks4://, socks4a://, socks5://, socks5h://
  *                            → acquire a bridge handle, fetch with the
  *                              bridge's `http://127.0.0.1:<port>` URL as
- *                              `proxy`, release the handle when the fetch
- *                              settles (success or error)
+ *                              `proxy`, release the handle when the response
+ *                              body is consumed/cancelled (or immediately on
+ *                              fetch error)
  *
  * Two entry points
  * ----------------
@@ -37,6 +38,74 @@
 
 import { isSocksProxy, getSocksBridge } from "./socks-bridge.js";
 
+function releaseAfterResponseBody(resp: Response, release: () => void): Response {
+  if (!resp.body) {
+    release();
+    return resp;
+  }
+
+  const reader = resp.body.getReader();
+  let released = false;
+  let streamClosed = false;
+  const finish = (): void => {
+    if (released) return;
+    released = true;
+    try { reader.releaseLock(); } catch {}
+    release();
+  };
+  const safeClose = (controller: ReadableStreamDefaultController<Uint8Array>): void => {
+    if (streamClosed) return;
+    streamClosed = true;
+    try { controller.close(); } catch {}
+  };
+  const safeError = (controller: ReadableStreamDefaultController<Uint8Array>, err: unknown): void => {
+    if (streamClosed) return;
+    streamClosed = true;
+    try { controller.error(err); } catch {}
+  };
+  const safeEnqueue = (controller: ReadableStreamDefaultController<Uint8Array>, value: Uint8Array): boolean => {
+    if (streamClosed) return false;
+    try {
+      controller.enqueue(value);
+      return true;
+    } catch (err) {
+      safeError(controller, err);
+      return false;
+    }
+  };
+
+  const body = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read();
+        if (streamClosed) return;
+        if (done) {
+          finish();
+          safeClose(controller);
+          return;
+        }
+        if (value && !safeEnqueue(controller, value)) {
+          finish();
+        }
+      } catch (err) {
+        finish();
+        safeError(controller, err);
+      }
+    },
+    async cancel(reason) {
+      streamClosed = true;
+      try { await reader.cancel(reason); } catch {}
+      finish();
+    },
+  });
+
+  return new Response(body, {
+    status: resp.status,
+    statusText: resp.statusText,
+    headers: resp.headers,
+  });
+}
+
 /**
  * Fetch through a proxy of any supported scheme (http/https/socks4/4a/5/5h).
  *
@@ -44,8 +113,8 @@ import { isSocksProxy, getSocksBridge } from "./socks-bridge.js";
  * schemes listed above. The returned promise resolves/rejects exactly like a
  * native `fetch` call with the same semantics.
  *
- * The bridge handle (if any) is released automatically when the fetch
- * settles, so callers never need to think about lifecycle.
+ * The bridge handle (if any) is released automatically when the response body
+ * finishes or is cancelled, so streaming responses keep the bridge alive.
  *
  * `baseFetch` defaults to the global `fetch`. Tests pass a mock here.
  */
@@ -66,12 +135,14 @@ export async function proxiedFetch(
   const { proxy: _drop, ...rest } = init as RequestInit & { proxy?: string };
   void _drop;
   try {
-    return await baseFetch(input as RequestInfo | URL, {
+    const resp = await baseFetch(input as RequestInfo | URL, {
       ...rest,
       proxy: httpProxyUrl,
     } as RequestInit & { proxy: string });
-  } finally {
+    return releaseAfterResponseBody(resp, release);
+  } catch (err) {
     release();
+    throw err;
   }
 }
 
@@ -93,12 +164,14 @@ export function wrapFetchWithSocksBridge(baseFetch: typeof fetch = fetch): typeo
     const { proxy: _drop, ...rest } = init as RequestInit & { proxy?: string };
     void _drop;
     try {
-      return await baseFetch(input as RequestInfo | URL, {
+      const resp = await baseFetch(input as RequestInfo | URL, {
         ...rest,
         proxy: httpProxyUrl,
       } as RequestInit & { proxy: string });
-    } finally {
+      return releaseAfterResponseBody(resp, release);
+    } catch (err) {
       release();
+      throw err;
     }
   }) as typeof fetch;
 }

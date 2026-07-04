@@ -12,7 +12,10 @@ import {
   wrapFetchWithSocksBridge,
   makeProxiedFetcher,
 } from "./proxied-fetch.js";
-import { isSocksProxy, getSocksBridge, _shutdownAllBridgesForTesting } from "./socks-bridge.js";
+import { isSocksProxy, getSocksBridge, _bridgeRefCountForTesting, _shutdownAllBridgesForTesting } from "./socks-bridge.js";
+
+beforeEach(() => { _shutdownAllBridgesForTesting(); });
+afterEach(() => { _shutdownAllBridgesForTesting(); });
 
 // ---------------------------------------------------------------------------
 // isSocksProxy
@@ -154,7 +157,8 @@ describe("proxiedFetch", () => {
     expect(p1).toBe(p2); // same cached bridge → same port
   });
 
-  it("releases the bridge handle after the fetch settles (even on error)", async () => {
+  it("releases the bridge handle immediately when the fetch rejects", async () => {
+    const socksUrl = "socks5://1.2.3.4:1080";
     const mock = (async () => {
       throw new Error("network down");
     }) as unknown as typeof fetch;
@@ -162,13 +166,83 @@ describe("proxiedFetch", () => {
     await expect(
       proxiedFetch(
         "https://example.com/",
-        { method: "GET", proxy: "socks5://1.2.3.4:1080" } as RequestInit & { proxy?: string },
+        { method: "GET", proxy: socksUrl } as RequestInit & { proxy?: string },
         mock,
       ),
     ).rejects.toThrow("network down");
-    // The handle was released — no exception is thrown, the test passes simply
-    // by reaching this line. The bridge is still cached (idle) but its
-    // refcount is back to 0.
+    expect(_bridgeRefCountForTesting(socksUrl)).toBe(0);
+  });
+
+  it("keeps the SOCKS bridge alive until the response body is consumed", async () => {
+    const socksUrl = "socks5://1.2.3.4:1080";
+    const mock = (async () => new Response("stream body")) as unknown as typeof fetch;
+
+    const resp = await proxiedFetch(
+      "https://example.com/",
+      { method: "GET", proxy: socksUrl } as RequestInit & { proxy?: string },
+      mock,
+    );
+
+    expect(_bridgeRefCountForTesting(socksUrl)).toBe(1);
+    await expect(resp.text()).resolves.toBe("stream body");
+    expect(_bridgeRefCountForTesting(socksUrl)).toBe(0);
+  });
+
+  it("releases the SOCKS bridge when the response body is cancelled", async () => {
+    const socksUrl = "socks5://1.2.3.4:1080";
+    const mock = (async () => new Response("unused body")) as unknown as typeof fetch;
+
+    const resp = await proxiedFetch(
+      "https://example.com/",
+      { method: "GET", proxy: socksUrl } as RequestInit & { proxy?: string },
+      mock,
+    );
+
+    expect(_bridgeRefCountForTesting(socksUrl)).toBe(1);
+    await resp.body?.cancel("client closed");
+    expect(_bridgeRefCountForTesting(socksUrl)).toBe(0);
+  });
+
+  it("releases the SOCKS bridge when downstream cancels during a pending body read", async () => {
+    const socksUrl = "socks5://1.2.3.4:1080";
+    const encoder = new TextEncoder();
+    let upstreamCancelled = false;
+    const upstream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode("a"));
+      },
+      cancel() {
+        upstreamCancelled = true;
+      },
+    });
+    const mock = (async () => new Response(upstream)) as unknown as typeof fetch;
+
+    const resp = await proxiedFetch(
+      "https://example.com/",
+      { method: "GET", proxy: socksUrl } as RequestInit & { proxy?: string },
+      mock,
+    );
+
+    expect(_bridgeRefCountForTesting(socksUrl)).toBe(1);
+    const reader = resp.body!.getReader();
+    const first = await reader.read();
+    expect(new TextDecoder().decode(first.value)).toBe("a");
+
+    const pendingRead = reader.read();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const cancelResult = await Promise.race([
+      reader.cancel("client disconnected").then(() => "cancelled"),
+      new Promise((resolve) => setTimeout(() => resolve("timeout"), 100)),
+    ]);
+    expect(cancelResult).toBe("cancelled");
+
+    const pendingResult = await Promise.race([
+      pendingRead.then((r) => r.done ? "done" : "value").catch(() => "error"),
+      new Promise((resolve) => setTimeout(() => resolve("timeout"), 100)),
+    ]);
+    expect(pendingResult).not.toBe("timeout");
+    expect(upstreamCancelled).toBe(true);
+    expect(_bridgeRefCountForTesting(socksUrl)).toBe(0);
   });
 });
 
@@ -291,9 +365,6 @@ describe("makeProxiedFetcher", () => {
 // ---------------------------------------------------------------------------
 
 describe("getSocksBridge", () => {
-  beforeEach(() => { _shutdownAllBridgesForTesting(); });
-  afterEach(() => { _shutdownAllBridgesForTesting(); });
-
   it("returns a stable http://127.0.0.1:<port> URL for the same SOCKS URL", () => {
     const h1 = getSocksBridge("socks5://1.2.3.4:1080");
     const h2 = getSocksBridge("socks5://1.2.3.4:1080");

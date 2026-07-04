@@ -207,12 +207,12 @@ fi
 
 # --- 5. Browser runtime for start-plan captcha -------------------------------
 # Render containers do not provide a desktop display. The Docker image includes
-# Chromium + Xvfb so the default start-plan captcha preflight can use the same
+# Chromium + Xvfb so on-demand start-plan captcha challenges can use the same
 # Chrome CDP path as local runs instead of falling back to JSDOM.
 if [ -z "${DISPLAY:-}" ] && [ "${ZCODE_CAPTCHA_SOLVER:-auto}" != "jsdom" ] && command -v Xvfb >/dev/null 2>&1; then
   export DISPLAY="${ZCODE_XVFB_DISPLAY:-:99}"
   XVFB_WHD="${ZCODE_XVFB_WHD:-1280x720x24}"
-  echo "[render-start] Starting Xvfb on DISPLAY=$DISPLAY ($XVFB_WHD) for Chromium captcha preflight."
+  echo "[render-start] Starting Xvfb on DISPLAY=$DISPLAY ($XVFB_WHD) for Chromium captcha challenges."
   Xvfb "$DISPLAY" -screen 0 "$XVFB_WHD" -nolisten tcp >/tmp/zcode-xvfb.log 2>&1 &
   sleep 1
 fi

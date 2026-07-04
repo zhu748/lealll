@@ -29,7 +29,9 @@ export const LOG = {
   FILE_FLUSH_INTERVAL_MS: 500,
   /** Maximum pending entries in the file log buffer before drop. */
   FILE_BUFFER_MAX: 1000,
-  /** Verbose log char limit (debug + [verbose] lines). */
+  /** Debug diagnostic log char limit (`[debug]` response previews). */
+  DEBUG_MAX_CHARS: 9000,
+  /** Verbose log char limit (`[verbose]` request headers/bodies). */
   VERBOSE_MAX_CHARS: 3000,
   /** Regular log char limit. */
   REGULAR_MAX_CHARS: 500,
@@ -47,6 +49,8 @@ export const RETRY = {
 
 /** Proxy pool tunables. */
 export const PROXY_POOL = {
+  /** Timeout for downloading a remote proxy-list source URL (ms). */
+  SOURCE_FETCH_TIMEOUT_MS: 30_000,
   /** TTL for `triedPoolProxies` entries within a single request (ms).
    *  After this cooldown, a previously-tried proxy becomes eligible again. */
   TRIED_TTL_MS: 60_000,
@@ -56,6 +60,9 @@ export const PROXY_POOL = {
    *  again. Prevents immediately re-picking a just-failed proxy on the next
    *  request, while still allowing recovery after the cooldown expires. */
   FAILURE_COOLDOWN_MS: 60_000,
+  /** How long to keep a completed proxy test-all job in memory for dashboard
+   *  reopen/review before dropping its per-proxy result map. */
+  TEST_JOB_RESULT_TTL_MS: 30 * 60_000,
 } as const;
 
 /** Captcha solver tunables. */
@@ -80,6 +87,16 @@ export const WAF = {
 
 /** SSE batch reassembler tunables. */
 export const SSE = {
+  /** Maximum raw SSE bytes consumed when reassembling stream:true upstream into a batch response. */
+  MAX_TO_BATCH_BYTES: 32 * 1024 * 1024,
+  /** Maximum unfinished SSE event bytes/chars retained during batch reassembly. */
+  MAX_TO_BATCH_BUFFERED_EVENT_BYTES: 1 * 1024 * 1024,
+  /** Maximum content block index accepted during batch reassembly. */
+  MAX_TO_BATCH_CONTENT_BLOCK_INDEX: 4096,
+  /** Maximum unfinished SSE event bytes/chars retained by streaming translators. */
+  MAX_TRANSLATED_STREAM_BUFFERED_EVENT_BYTES: 1 * 1024 * 1024,
+  /** Maximum unfinished SSE line bytes/chars retained by the inline stats observer. */
+  MAX_STATS_BUFFERED_EVENT_BYTES: 1 * 1024 * 1024,
   /** Substring markers used to short-circuit JSON.parse in stats observer. */
   STATS_INTERESTING_MARKERS: [
     '"message_start"',

@@ -3,8 +3,12 @@
  * @see .omo/plans/zcode-proxy.md Task 6
  */
 import { describe, it, expect, mock } from "bun:test";
-import { buildUpstreamRequest, buildUpstreamURL, buildAuthHeaders, buildUpstreamHeaders } from "./upstream.js";
-import { proxyRequest, errorResponse, startPlanCaptchaPreflightEnabled } from "./handler.js";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { buildUpstreamRequest, buildUpstreamURL, buildAuthHeaders, buildUpstreamHeaders, _clearStartPlanAttributionContextsForTesting, _startPlanAttributionContextCountForTesting } from "./upstream.js";
+import { proxyRequest, errorResponse, startPlanCaptchaPreflightEnabled, _readResponseTextPreviewForTesting, _setRequestBodyIdleTimeoutForTesting } from "./handler.js";
+import { importFromText, updatePoolConfig, _resetForTesting as resetProxyPoolForTesting } from "./proxy-pool.js";
 import { ZAI_PROVIDER, BIGMODEL_PROVIDER } from "../provider/providers.js";
 import type { Credential } from "../auth/types.js";
 import type { ProxyConfig, ProxyIdentity } from "../config/types.js";
@@ -20,11 +24,11 @@ const IDENTITY: ProxyIdentity = {
 };
 
 describe("start-plan captcha preflight switch", () => {
-  it("defaults to the official ZCode pre-send runtime header refresh behavior", () => {
+  it("defaults to on-demand captcha solving and only preflights when explicitly enabled", () => {
     const original = process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
     try {
       delete process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
-      expect(startPlanCaptchaPreflightEnabled()).toBe(true);
+      expect(startPlanCaptchaPreflightEnabled()).toBe(false);
 
       process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = "0";
       expect(startPlanCaptchaPreflightEnabled()).toBe(false);
@@ -37,12 +41,39 @@ describe("start-plan captcha preflight switch", () => {
 
       process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = "1";
       expect(startPlanCaptchaPreflightEnabled()).toBe(true);
+      process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = "true";
+      expect(startPlanCaptchaPreflightEnabled()).toBe(true);
+      process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = "on";
+      expect(startPlanCaptchaPreflightEnabled()).toBe(true);
+      process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = "yes";
+      expect(startPlanCaptchaPreflightEnabled()).toBe(true);
       process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = "always";
       expect(startPlanCaptchaPreflightEnabled()).toBe(true);
+      process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = "unexpected";
+      expect(startPlanCaptchaPreflightEnabled()).toBe(false);
     } finally {
       if (original === undefined) delete process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
       else process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = original;
     }
+  });
+});
+
+describe("response body preview guard", () => {
+  it("does not consume the original response when Content-Length exceeds the preview cap", async () => {
+    const resp = new Response("abcdef", {
+      status: 400,
+      headers: {
+        "content-type": "text/plain",
+        "content-length": "100",
+      },
+    });
+
+    const preview = await _readResponseTextPreviewForTesting(resp, { maxBytes: 8, timeoutMs: 1000 });
+
+    expect(preview.truncated).toBe(true);
+    expect(preview.complete).toBe(false);
+    expect(preview.text).toBe("");
+    expect(await resp.text()).toBe("abcdef");
   });
 });
 
@@ -620,6 +651,54 @@ describe("buildUpstreamRequest", () => {
     expect(h1["x-request-id"]).not.toBe(h2["x-request-id"]);
   });
 
+  it("bounds start-plan attribution contexts with LRU eviction", () => {
+    _clearStartPlanAttributionContextsForTesting();
+    try {
+      let h0: Record<string, string> | null = null;
+      let h1: Record<string, string> | null = null;
+      for (let i = 0; i < 512; i++) {
+        const h = buildUpstreamHeaders(
+          "anthropic",
+          { apiKey: `k-${i}`, secret: "s", jwt: `jwt-${i}`, provider: "zai", userId: `user-${i}` },
+          IDENTITY,
+          "start-plan",
+        );
+        if (i === 0) h0 = h;
+        if (i === 1) h1 = h;
+      }
+
+      expect(_startPlanAttributionContextCountForTesting()).toBe(512);
+
+      const h0Recent = buildUpstreamHeaders(
+        "anthropic",
+        { apiKey: "k-0", secret: "s", jwt: "jwt-0", provider: "zai", userId: "user-0" },
+        IDENTITY,
+        "start-plan",
+      );
+      expect(h0Recent["x-session-id"]).toBe(h0!["x-session-id"]);
+      expect(h0Recent["x-zcode-trace-id"]).toBe(h0!["x-zcode-trace-id"]);
+
+      buildUpstreamHeaders(
+        "anthropic",
+        { apiKey: "k-512", secret: "s", jwt: "jwt-512", provider: "zai", userId: "user-512" },
+        IDENTITY,
+        "start-plan",
+      );
+      expect(_startPlanAttributionContextCountForTesting()).toBe(512);
+
+      const h1AfterEviction = buildUpstreamHeaders(
+        "anthropic",
+        { apiKey: "k-1", secret: "s", jwt: "jwt-1", provider: "zai", userId: "user-1" },
+        IDENTITY,
+        "start-plan",
+      );
+      expect(h1AfterEviction["x-session-id"]).not.toBe(h1!["x-session-id"]);
+      expect(_startPlanAttributionContextCountForTesting()).toBe(512);
+    } finally {
+      _clearStartPlanAttributionContextsForTesting();
+    }
+  });
+
   it("uses start-plan apiKey as Bearer auth when jwt field is absent", () => {
     // The real ZCode provider stores zcodejwttoken in provider.apiKey and then
     // normalizes that value into Authorization: Bearer <jwt>. Support the same
@@ -731,6 +810,83 @@ describe("proxyRequest", () => {
     expect(body.content[0].text).toBe("Hello");
   });
 
+  it("times out and cancels stalled client request bodies before upstream fetch", async () => {
+    _setRequestBodyIdleTimeoutForTesting(20);
+    try {
+      let canceled = false;
+      const stream = new ReadableStream<Uint8Array>({
+        pull() {
+          return new Promise<void>(() => {});
+        },
+        cancel() {
+          canceled = true;
+        },
+      });
+      const fetchMock = mock(async (): Promise<Response> => {
+        throw new Error("fetch should not be called");
+      });
+      const auth = new AuthManager({ mode: "apikey", provider: "zai", apiKey: "testkey.testsecret" });
+      const clientReq = new Request("http://localhost:8080/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: stream,
+      });
+
+      const result = await Promise.race([
+        proxyRequest(clientReq, "anthropic", { config: testConfig, auth, fetchImpl: fetchMock as any }),
+        new Promise<"hung">(resolve => setTimeout(() => resolve("hung"), 500)),
+      ]);
+
+      expect(result).not.toBe("hung");
+      const resp = result as Response;
+      expect(resp.status).toBe(408);
+      const body = await resp.json();
+      expect(body.error.type).toBe("request_timeout");
+      expect(fetchMock).not.toHaveBeenCalled();
+      await new Promise(resolve => setTimeout(resolve, 0));
+      expect(canceled).toBe(true);
+    } finally {
+      _setRequestBodyIdleTimeoutForTesting();
+    }
+  });
+
+  it("unrefs the upstream request timeout timer", async () => {
+    const originalSetTimeout = globalThis.setTimeout as any;
+    const unrefDelays: number[] = [];
+    (globalThis as any).setTimeout = (handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
+      const timer = originalSetTimeout(handler, timeout, ...args) as any;
+      const originalUnref = timer.unref?.bind(timer);
+      timer.unref = () => {
+        unrefDelays.push(Number(timeout));
+        return originalUnref?.();
+      };
+      return timer;
+    };
+
+    try {
+      const config: ProxyConfig = {
+        ...testConfig,
+        server: { ...testConfig.server, upstreamTimeoutMs: 1234 },
+      };
+      const fetchMock = mock(async (): Promise<Response> => {
+        return new Response(
+          '{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"Hello"}],"model":"glm-4.6","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":5}}',
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      });
+      const auth = new AuthManager({ mode: "apikey", provider: "zai", apiKey: "testkey.testsecret" });
+      const clientReq = makeClientReq('{"model":"glm-4.6","messages":[{"role":"user","content":"Hi"}]}');
+
+      const resp = await proxyRequest(clientReq, "anthropic", { config, auth, fetchImpl: fetchMock as any });
+
+      expect(resp.status).toBe(200);
+      await resp.text();
+      expect(unrefDelays).toContain(1234);
+    } finally {
+      (globalThis as any).setTimeout = originalSetTimeout;
+    }
+  });
+
   it("streams response body through unchanged", async () => {
     const sseBody = [
       'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1"}}\n\n',
@@ -811,6 +967,160 @@ describe("proxyRequest", () => {
     expect(body.error.type).toBe("credential_unavailable");
   });
 
+  it("rejects oversized request bodies from Content-Length before upstream fetch", async () => {
+    const fetchMock = mock(async (): Promise<Response> => new Response("unexpected"));
+    const auth = new AuthManager({ mode: "apikey", provider: "zai", apiKey: "testkey.testsecret" });
+    const config: ProxyConfig = {
+      ...testConfig,
+      server: { ...testConfig.server, maxRequestBodyBytes: 8 },
+    };
+    const clientReq = makeClientReq("{}", { "content-length": "128" });
+
+    const resp = await proxyRequest(clientReq, "anthropic", { config, auth, fetchImpl: fetchMock as any });
+
+    expect(resp.status).toBe(413);
+    expect(fetchMock).not.toHaveBeenCalled();
+    const body = await resp.json();
+    expect(body.error.type).toBe("request_body_too_large");
+  });
+
+  it("cancels declared oversized request bodies without reading them", async () => {
+    const fetchMock = mock(async (): Promise<Response> => new Response("unexpected"));
+    const auth = new AuthManager({ mode: "apikey", provider: "zai", apiKey: "testkey.testsecret" });
+    const config: ProxyConfig = {
+      ...testConfig,
+      server: { ...testConfig.server, maxRequestBodyBytes: 8 },
+    };
+    let bodyCancelled = false;
+    let pullCount = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pullCount++;
+        controller.enqueue(new TextEncoder().encode("{}"));
+      },
+      cancel() {
+        bodyCancelled = true;
+      },
+    });
+    const clientReq = new Request("http://localhost:8080/v1/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json", "content-length": "128" },
+      body: stream,
+    } as RequestInit);
+
+    const resp = await proxyRequest(clientReq, "anthropic", { config, auth, fetchImpl: fetchMock as any });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(resp.status).toBe(413);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(bodyCancelled).toBe(true);
+    expect(pullCount).toBe(0);
+  });
+
+  it("rejects oversized streamed request bodies while reading", async () => {
+    const fetchMock = mock(async (): Promise<Response> => new Response("unexpected"));
+    const auth = new AuthManager({ mode: "apikey", provider: "zai", apiKey: "testkey.testsecret" });
+    const config: ProxyConfig = {
+      ...testConfig,
+      server: { ...testConfig.server, maxRequestBodyBytes: 10 },
+    };
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode("12345"));
+        controller.enqueue(encoder.encode("678901"));
+        controller.close();
+      },
+    });
+    const clientReq = new Request("http://localhost:8080/v1/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: stream,
+    } as RequestInit);
+
+    const resp = await proxyRequest(clientReq, "anthropic", { config, auth, fetchImpl: fetchMock as any });
+
+    expect(resp.status).toBe(413);
+    expect(fetchMock).not.toHaveBeenCalled();
+    const body = await resp.json();
+    expect(body.error.message).toContain("limit 10 bytes");
+  });
+
+  it("logs request body size using UTF-8 bytes", async () => {
+    const originalLog = console.log;
+    const logs: string[] = [];
+    console.log = (...args: unknown[]) => { logs.push(args.map(String).join(" ")); };
+
+    try {
+      const upstreamBody = JSON.stringify({
+        id: "msg_utf8",
+        type: "message",
+        role: "assistant",
+        model: "glm-4.6",
+        content: [{ type: "text", text: "ok" }],
+        usage: { input_tokens: 1, output_tokens: 1 },
+      });
+      const fetchMock = mock(async (): Promise<Response> =>
+        new Response(upstreamBody, { status: 200, headers: { "content-type": "application/json" } }),
+      );
+      const auth = new AuthManager({ mode: "apikey", provider: "zai", apiKey: "testkey.testsecret" });
+      const requestBody = JSON.stringify({
+        model: "glm-4.6",
+        messages: [{ role: "user", content: [{ type: "text", text: "汉" }] }],
+      });
+
+      const resp = await proxyRequest(makeClientReq(requestBody), "anthropic", {
+        config: testConfig,
+        auth,
+        fetchImpl: fetchMock as any,
+      });
+
+      expect(resp.status).toBe(200);
+      const expectedBytes = new TextEncoder().encode(requestBody).byteLength;
+      expect(logs.some(line => line.includes(`(${expectedBytes} bytes)`))).toBe(true);
+    } finally {
+      console.log = originalLog;
+    }
+  });
+
+  it("debug body preview truncates by UTF-8 bytes", async () => {
+    const originalLog = console.log;
+    const logs: string[] = [];
+    console.log = (...args: unknown[]) => { logs.push(args.map(String).join(" ")); };
+
+    try {
+      const upstreamError = "汉".repeat(600);
+      const expectedBytes = new TextEncoder().encode(upstreamError).byteLength;
+      const fetchMock = mock(async (): Promise<Response> =>
+        new Response(upstreamError, { status: 400, headers: { "content-type": "text/plain" } }),
+      );
+      const auth = new AuthManager({ mode: "apikey", provider: "zai", apiKey: "testkey.testsecret" });
+      const config: ProxyConfig = {
+        ...testConfig,
+        logging: { ...testConfig.logging, debug: true },
+      };
+
+      const resp = await proxyRequest(makeClientReq('{"model":"glm-4.6","messages":[]}'), "anthropic", {
+        config,
+        auth,
+        fetchImpl: fetchMock as any,
+      });
+      await resp.text();
+
+      for (let i = 0; i < 20 && !logs.some(line => line.includes("[debug] body preview")); i++) {
+        await new Promise(resolve => setTimeout(resolve, 0));
+      }
+
+      const line = logs.find(item => item.includes("[debug] body preview")) ?? "";
+      expect(line).toContain(`${expectedBytes} bytes`);
+      expect(line).toContain(`truncated, total ${expectedBytes} bytes`);
+      expect(line).not.toContain("chars");
+      expect(line).not.toContain("\uFFFD");
+    } finally {
+      console.log = originalLog;
+    }
+  });
+
   it("forwards upstream error status codes", async () => {
     const fetchMock = mock(async (): Promise<Response> => {
       return new Response('{"error":{"type":"invalid_request_error","message":"bad model"}}', {
@@ -827,6 +1137,33 @@ describe("proxyRequest", () => {
     expect(resp.status).toBe(400);
     const body = await resp.json();
     expect(body.error.type).toBe("invalid_request_error");
+  });
+
+  it("passes through large JSON bodies without consuming them for usage stats", async () => {
+    const bigText = "x".repeat(2 * 1024 * 1024 + 64 * 1024);
+    const upstreamBody = JSON.stringify({
+      usage: { input_tokens: 10, output_tokens: 5 },
+      payload: bigText,
+    });
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(upstreamBody.slice(0, 1024 * 1024)));
+        controller.enqueue(encoder.encode(upstreamBody.slice(1024 * 1024)));
+        controller.close();
+      },
+    });
+    const fetchMock = mock(async (): Promise<Response> => new Response(stream, {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }));
+    const auth = new AuthManager({ mode: "apikey", provider: "zai", apiKey: "testkey.testsecret" });
+    const clientReq = makeClientReq('{"model":"glm-4.6","messages":[]}');
+
+    const resp = await proxyRequest(clientReq, "anthropic", { config: testConfig, auth, fetchImpl: fetchMock as any });
+
+    expect(resp.status).toBe(200);
+    expect(await resp.text()).toBe(upstreamBody);
   });
 });
 
@@ -929,6 +1266,82 @@ describe("proxyRequest — OpenAI translation mode (coding-plan)", () => {
     expect(body.usage.total_tokens).toBe(13);
   });
 
+  it("rejects translated batch responses whose Content-Length exceeds the body limit without reading them", async () => {
+    const originalLimit = process.env.ZCODE_TRANSLATED_RESPONSE_MAX_BYTES;
+    process.env.ZCODE_TRANSLATED_RESPONSE_MAX_BYTES = String(1024 * 1024);
+    let canceled = false;
+
+    try {
+      const upstreamBody = new ReadableStream<Uint8Array>({
+        cancel() {
+          canceled = true;
+        },
+      });
+      const fetchMock = mock(async (): Promise<Response> => {
+        return new Response(upstreamBody, {
+          status: 200,
+          headers: {
+            "content-type": "application/json",
+            "content-length": String(2 * 1024 * 1024 + 1),
+          },
+        });
+      });
+
+      const auth = new AuthManager({ mode: "apikey", provider: "zai", apiKey: "testkey.testsecret" });
+      const clientReq = makeOpenAIReq('{"model":"glm-4.6","messages":[{"role":"user","content":"Hi"}]}');
+
+      const resp = await proxyRequest(clientReq, "openai", { config: testConfig, auth, fetchImpl: fetchMock as any });
+      expect(resp.status).toBe(502);
+      const body = await resp.json();
+      expect(body.error.type).toBe("translation_failed");
+      expect(body.error.message).toContain("Translated upstream response is too large");
+      await new Promise(resolve => setTimeout(resolve, 0));
+      expect(canceled).toBe(true);
+    } finally {
+      if (originalLimit === undefined) delete process.env.ZCODE_TRANSLATED_RESPONSE_MAX_BYTES;
+      else process.env.ZCODE_TRANSLATED_RESPONSE_MAX_BYTES = originalLimit;
+    }
+  });
+
+  it("rejects chunked translated batch responses once the body grows past the limit", async () => {
+    const originalLimit = process.env.ZCODE_TRANSLATED_RESPONSE_MAX_BYTES;
+    process.env.ZCODE_TRANSLATED_RESPONSE_MAX_BYTES = String(1024 * 1024);
+
+    try {
+      const chunk = new Uint8Array(512 * 1024);
+      chunk.fill(65);
+      let sent = 0;
+      const upstreamBody = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          sent += 1;
+          if (sent <= 6) {
+            controller.enqueue(chunk);
+            return;
+          }
+          controller.close();
+        },
+      });
+      const fetchMock = mock(async (): Promise<Response> => {
+        return new Response(upstreamBody, {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      });
+
+      const auth = new AuthManager({ mode: "apikey", provider: "zai", apiKey: "testkey.testsecret" });
+      const clientReq = makeOpenAIReq('{"model":"glm-4.6","messages":[{"role":"user","content":"Hi"}]}');
+
+      const resp = await proxyRequest(clientReq, "openai", { config: testConfig, auth, fetchImpl: fetchMock as any });
+      expect(resp.status).toBe(502);
+      const body = await resp.json();
+      expect(body.error.type).toBe("translation_failed");
+      expect(body.error.message).toContain("Translated upstream response is too large");
+    } finally {
+      if (originalLimit === undefined) delete process.env.ZCODE_TRANSLATED_RESPONSE_MAX_BYTES;
+      else process.env.ZCODE_TRANSLATED_RESPONSE_MAX_BYTES = originalLimit;
+    }
+  });
+
   it("returns gzip-encoded response when client sends accept-encoding: gzip", async () => {
     const fetchMock = mock(async (): Promise<Response> => {
       return new Response(ANTHROPIC_RESPONSE, { status: 200, headers: { "content-type": "application/json" } });
@@ -973,6 +1386,65 @@ describe("proxyRequest — OpenAI translation mode (coding-plan)", () => {
     expect(text).toContain('"prompt_tokens":10');
     expect(text).toContain('"completion_tokens":5');
     expect(text).toContain('"total_tokens":15');
+  });
+
+  it("returns 502 when SSE-to-batch reassembly exceeds the configured byte limit", async () => {
+    const originalLimit = process.env.ZCODE_SSE_TO_BATCH_MAX_BYTES;
+    process.env.ZCODE_SSE_TO_BATCH_MAX_BYTES = "512";
+    try {
+      const sseBody = [
+        'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_big","model":"glm-4.6","usage":{"input_tokens":1,"output_tokens":0}}}\n\n',
+        'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"',
+        "x".repeat(2048),
+        '"}}\n\n',
+      ].join("");
+      const fetchMock = mock(async (): Promise<Response> => {
+        return new Response(sseBody, { status: 200, headers: { "content-type": "text/event-stream" } });
+      });
+
+      const auth = new AuthManager({ mode: "apikey", provider: "zai", apiKey: "testkey.testsecret" });
+      const clientReq = makeOpenAIReq('{"model":"glm-4.6","messages":[{"role":"user","content":"Hi"}],"stream":false}');
+
+      const resp = await proxyRequest(clientReq, "openai", { config: testConfig, auth, fetchImpl: fetchMock as any });
+      expect(resp.status).toBe(502);
+      const body = await resp.json();
+      expect(body.error.type).toBe("upstream_stream_error");
+      expect(body.error.message).toContain("SSE->batch response exceeded 512 byte limit");
+    } finally {
+      if (originalLimit === undefined) delete process.env.ZCODE_SSE_TO_BATCH_MAX_BYTES;
+      else process.env.ZCODE_SSE_TO_BATCH_MAX_BYTES = originalLimit;
+    }
+  });
+
+  it("ignores malformed SSE-to-batch byte limit env values instead of flooring them", async () => {
+    const originalLimit = process.env.ZCODE_SSE_TO_BATCH_MAX_BYTES;
+    process.env.ZCODE_SSE_TO_BATCH_MAX_BYTES = "512.9";
+    try {
+      const sseBody = [
+        'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_ok","model":"glm-4.6","usage":{"input_tokens":1,"output_tokens":0}}}\n\n',
+        'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+        'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"',
+        "x".repeat(2048),
+        '"}}\n\n',
+        'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+        'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}\n\n',
+        'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+      ].join("");
+      const fetchMock = mock(async (): Promise<Response> => {
+        return new Response(sseBody, { status: 200, headers: { "content-type": "text/event-stream" } });
+      });
+
+      const auth = new AuthManager({ mode: "apikey", provider: "zai", apiKey: "testkey.testsecret" });
+      const clientReq = makeOpenAIReq('{"model":"glm-4.6","messages":[{"role":"user","content":"Hi"}],"stream":false}');
+
+      const resp = await proxyRequest(clientReq, "openai", { config: testConfig, auth, fetchImpl: fetchMock as any });
+      expect(resp.status).toBe(200);
+      const body = await resp.json();
+      expect(body.choices[0].message.content).toContain("x".repeat(128));
+    } finally {
+      if (originalLimit === undefined) delete process.env.ZCODE_SSE_TO_BATCH_MAX_BYTES;
+      else process.env.ZCODE_SSE_TO_BATCH_MAX_BYTES = originalLimit;
+    }
   });
 
   it("forwards x-request-id + anthropic ratelimit headers in translated batch response", async () => {
@@ -1058,6 +1530,31 @@ describe("proxyRequest — OpenAI translation mode (coding-plan)", () => {
     const body = await resp.json();
     expect(body.error.type).toBe("upstream_error");
   });
+
+  it("cancels non-2xx upstream bodies after previewing them in translation mode", async () => {
+    let canceled = false;
+    const fetchMock = mock(async (): Promise<Response> => {
+      return new Response(new ReadableStream<Uint8Array>({
+        cancel() {
+          canceled = true;
+        },
+      }), {
+        status: 400,
+        headers: {
+          "content-type": "application/json",
+          "content-length": String(128 * 1024),
+        },
+      });
+    });
+    const auth = new AuthManager({ mode: "apikey", provider: "zai", apiKey: "testkey.testsecret" });
+    const clientReq = makeOpenAIReq('{"model":"glm-4.6","messages":[]}');
+
+    const resp = await proxyRequest(clientReq, "openai", { config: testConfig, auth, fetchImpl: fetchMock as any });
+    expect(resp.status).toBe(400);
+    const body = await resp.json();
+    expect(body.error.type).toBe("upstream_error");
+    expect(canceled).toBe(true);
+  });
 });
 
 describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
@@ -1101,7 +1598,7 @@ describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
     };
     const originalFetch = globalThis.fetch;
     const originalPreflight = process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
-    process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = "0";
+    delete process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
     const globalFetchMock = mock(async (req: Request | string): Promise<Response> => {
       const url = typeof req === "string" ? req : req.url;
       throw new Error(`unexpected global fetch in test: ${url}`);
@@ -1146,7 +1643,7 @@ describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
 
       const resp = await proxyRequest(clientReq, "openai", { config: startPlanConfig, auth, fetchImpl: fetchMock as any });
       expect(fetchMock).toHaveBeenCalledTimes(1);
-      // Explicit opt-out mode sends the first request without captcha headers.
+      // Default on-demand mode sends the first request without captcha headers.
       expect(globalFetchMock).toHaveBeenCalledTimes(0);
       expect(resp.status).toBe(200);
       expect(resp.headers.get("content-type")).toBe("application/json");
@@ -1157,6 +1654,273 @@ describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
       globalThis.fetch = originalFetch;
       if (originalPreflight === undefined) delete process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
       else process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = originalPreflight;
+    }
+  });
+
+  it("cancels captcha-failed 403 response bodies before solving and retrying", async () => {
+    const startPlanConfig: ProxyConfig = {
+      ...testConfig,
+      plan: "start-plan",
+    };
+    const originalFetch = globalThis.fetch;
+    const originalPreflight = process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
+    process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = "0";
+    const captchaConfigFetchMock = mock(async (): Promise<Response> => {
+      return new Response("config unavailable", { status: 500 });
+    });
+    globalThis.fetch = captchaConfigFetchMock as unknown as typeof fetch;
+    let canceled = false;
+    const captchaFailurePayload = JSON.stringify({ code: 3007, msg: "captcha verify failed" })
+      + "x".repeat(70 * 1024);
+
+    try {
+      const fetchMock = mock(async (): Promise<Response> => {
+        return new Response(new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(captchaFailurePayload));
+          },
+          cancel() {
+            canceled = true;
+          },
+        }), { status: 403, headers: { "content-type": "application/json" } });
+      });
+
+      const auth = new AuthManager({ mode: "oauth", provider: "zai" });
+      auth.setOAuthCredential({ apiKey: "dummy", provider: "zai", plan: "start-plan", jwt: "jwt-mock" });
+      const clientReq = new Request("http://localhost:8080/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: '{"model":"glm-4.6","messages":[{"role":"user","content":"hi"}]}',
+      });
+
+      const resp = await proxyRequest(clientReq, "openai", { config: startPlanConfig, auth, fetchImpl: fetchMock as any });
+      expect(resp.status).toBe(503);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(captchaConfigFetchMock).toHaveBeenCalledTimes(1);
+      expect(canceled).toBe(true);
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (originalPreflight === undefined) delete process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
+      else process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = originalPreflight;
+    }
+  });
+
+  it("checks start-plan captcha after WAF proxy rotation instead of returning 3007", async () => {
+    const startPlanConfig: ProxyConfig = {
+      ...testConfig,
+      plan: "start-plan",
+    };
+    const originalFetch = globalThis.fetch;
+    const originalPreflight = process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
+    const originalStoreDir = process.env.ZCODE_PROXY_STORE_DIR;
+    const tempStoreDir = mkdtempSync(join(tmpdir(), "zcode-proxy-upstream-pool-"));
+    const captchaConfigFetchMock = mock(async (): Promise<Response> => {
+      return new Response("config unavailable", { status: 500 });
+    });
+    const wafHtml = '<html><body><img src="https://errors.aliyun.com/error.png">blocked</body></html>';
+    const captchaFailurePayload = JSON.stringify({ code: 3007, msg: "captcha verify failed" });
+    const seenProxies: Array<string | undefined> = [];
+
+    try {
+      process.env.ZCODE_PROXY_STORE_DIR = tempStoreDir;
+      process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = "0";
+      resetProxyPoolForTesting();
+      await importFromText("1.1.1.1:8080\n2.2.2.2:8080", true);
+      await updatePoolConfig({ enabled: true, maxRotations: 2, rotateOnGatewayBlock: true });
+      globalThis.fetch = captchaConfigFetchMock as unknown as typeof fetch;
+
+      const fetchMock = mock(async (_req: Request, init?: RequestInit & { proxy?: string }): Promise<Response> => {
+        seenProxies.push(init?.proxy);
+        if (seenProxies.length === 1) {
+          return new Response(wafHtml, {
+            status: 405,
+            headers: { "content-type": "text/html", server: "Tengine" },
+          });
+        }
+        return new Response(captchaFailurePayload, {
+          status: 403,
+          headers: { "content-type": "application/json" },
+        });
+      });
+
+      const auth = new AuthManager({ mode: "oauth", provider: "zai" });
+      auth.setOAuthCredential({ apiKey: "dummy", provider: "zai", plan: "start-plan", jwt: "jwt-mock" });
+      const clientReq = new Request("http://localhost:8080/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: '{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}',
+      });
+
+      const resp = await proxyRequest(clientReq, "openai", { config: startPlanConfig, auth, fetchImpl: fetchMock as any });
+
+      expect(resp.status).toBe(503);
+      const body = await resp.json();
+      expect(body.error.type).toBe("captcha_failed");
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(captchaConfigFetchMock).toHaveBeenCalledTimes(1);
+      expect(seenProxies).toEqual(["http://1.1.1.1:8080", "http://2.2.2.2:8080"]);
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (originalPreflight === undefined) delete process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
+      else process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = originalPreflight;
+      if (originalStoreDir === undefined) delete process.env.ZCODE_PROXY_STORE_DIR;
+      else process.env.ZCODE_PROXY_STORE_DIR = originalStoreDir;
+      resetProxyPoolForTesting();
+      rmSync(tempStoreDir, { recursive: true, force: true });
+    }
+  });
+
+  it("returns captcha_failed when captcha retry is rejected with another 3007", async () => {
+    const startPlanConfig: ProxyConfig = {
+      ...testConfig,
+      plan: "start-plan",
+    };
+    const originalPreflight = process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
+    const originalStoreDir = process.env.ZCODE_PROXY_STORE_DIR;
+    const tempStoreDir = mkdtempSync(join(tmpdir(), "zcode-proxy-upstream-pool-"));
+    const captchaFailurePayload = JSON.stringify({ code: 3007, msg: "captcha verify failed" });
+    const seenCaptchaHeaders: Array<string | null> = [];
+
+    try {
+      process.env.ZCODE_PROXY_STORE_DIR = tempStoreDir;
+      process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = "0";
+      resetProxyPoolForTesting();
+
+      const fetchMock = mock(async (req: Request): Promise<Response> => {
+        seenCaptchaHeaders.push(req.headers.get("x-aliyun-captcha-verify-param"));
+        return new Response(captchaFailurePayload, {
+          status: 403,
+          headers: { "content-type": "application/json" },
+        });
+      });
+      const captchaTokenProvider = mock(async (_reqId: string | undefined, opts?: { solver?: string }) => {
+        expect(opts?.solver).toBe("chrome");
+        return { verifyParam: "fake-captcha-param", region: "cn-shanghai", solveMs: 7 };
+      });
+
+      const auth = new AuthManager({ mode: "oauth", provider: "zai" });
+      auth.setOAuthCredential({ apiKey: "dummy", provider: "zai", plan: "start-plan", jwt: "jwt-mock" });
+      const clientReq = new Request("http://localhost:8080/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: '{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}',
+      });
+
+      const resp = await proxyRequest(clientReq, "openai", {
+        config: startPlanConfig,
+        auth,
+        fetchImpl: fetchMock as any,
+        captchaTokenProvider,
+      });
+
+      expect(resp.status).toBe(503);
+      const body = await resp.json();
+      expect(body.error.type).toBe("captcha_failed");
+      expect(body.error.message).toContain("after solving once");
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(captchaTokenProvider).toHaveBeenCalledTimes(1);
+      expect(seenCaptchaHeaders).toEqual([null, "fake-captcha-param"]);
+    } finally {
+      if (originalPreflight === undefined) delete process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
+      else process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = originalPreflight;
+      if (originalStoreDir === undefined) delete process.env.ZCODE_PROXY_STORE_DIR;
+      else process.env.ZCODE_PROXY_STORE_DIR = originalStoreDir;
+      resetProxyPoolForTesting();
+      rmSync(tempStoreDir, { recursive: true, force: true });
+    }
+  });
+
+  it("continues WAF rotation when captcha retry after rotation is WAF-blocked", async () => {
+    const startPlanConfig: ProxyConfig = {
+      ...testConfig,
+      plan: "start-plan",
+    };
+    const originalPreflight = process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
+    const originalStoreDir = process.env.ZCODE_PROXY_STORE_DIR;
+    const tempStoreDir = mkdtempSync(join(tmpdir(), "zcode-proxy-upstream-pool-"));
+    const wafHtml = '<html><body><img src="https://errors.aliyun.com/error.png">blocked</body></html>';
+    const captchaFailurePayload = JSON.stringify({ code: 3007, msg: "captcha verify failed" });
+    const successBody = JSON.stringify({
+      id: "msg_rotated",
+      type: "message",
+      role: "assistant",
+      content: [{ type: "text", text: "ok after third proxy" }],
+      model: "glm-5.2",
+      stop_reason: "end_turn",
+      stop_sequence: null,
+      usage: { input_tokens: 5, output_tokens: 4 },
+    });
+    const seenProxies: Array<string | undefined> = [];
+    const seenCaptchaHeaders: Array<string | null> = [];
+
+    try {
+      process.env.ZCODE_PROXY_STORE_DIR = tempStoreDir;
+      process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = "0";
+      resetProxyPoolForTesting();
+      await importFromText("1.1.1.1:8080\n2.2.2.2:8080\n3.3.3.3:8080", true);
+      await updatePoolConfig({ enabled: true, maxRotations: 3, rotateOnGatewayBlock: true });
+
+      const fetchMock = mock(async (req: Request, init?: RequestInit & { proxy?: string }): Promise<Response> => {
+        seenProxies.push(init?.proxy);
+        seenCaptchaHeaders.push(req.headers.get("x-aliyun-captcha-verify-param"));
+        if (seenProxies.length === 1) {
+          return new Response(wafHtml, {
+            status: 405,
+            headers: { "content-type": "text/html", server: "Tengine" },
+          });
+        }
+        if (seenProxies.length === 2) {
+          return new Response(captchaFailurePayload, {
+            status: 403,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        if (seenProxies.length === 3) {
+          return new Response(wafHtml, {
+            status: 405,
+            headers: { "content-type": "text/html", server: "Tengine" },
+          });
+        }
+        return new Response(successBody, { status: 200, headers: { "content-type": "application/json" } });
+      });
+      const captchaTokenProvider = mock(async () => {
+        return { verifyParam: "fake-captcha-param", region: "cn-shanghai", solveMs: 7 };
+      });
+
+      const auth = new AuthManager({ mode: "oauth", provider: "zai" });
+      auth.setOAuthCredential({ apiKey: "dummy", provider: "zai", plan: "start-plan", jwt: "jwt-mock" });
+      const clientReq = new Request("http://localhost:8080/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: '{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}',
+      });
+
+      const resp = await proxyRequest(clientReq, "openai", {
+        config: startPlanConfig,
+        auth,
+        fetchImpl: fetchMock as any,
+        captchaTokenProvider,
+      });
+
+      expect(resp.status).toBe(200);
+      const body = await resp.json();
+      expect(body.choices[0].message.content).toBe("ok after third proxy");
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+      expect(captchaTokenProvider).toHaveBeenCalledTimes(1);
+      expect(seenProxies).toEqual([
+        "http://1.1.1.1:8080",
+        "http://2.2.2.2:8080",
+        "http://2.2.2.2:8080",
+        "http://3.3.3.3:8080",
+      ]);
+      expect(seenCaptchaHeaders).toEqual([null, null, "fake-captcha-param", null]);
+    } finally {
+      if (originalPreflight === undefined) delete process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
+      else process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = originalPreflight;
+      if (originalStoreDir === undefined) delete process.env.ZCODE_PROXY_STORE_DIR;
+      else process.env.ZCODE_PROXY_STORE_DIR = originalStoreDir;
+      resetProxyPoolForTesting();
+      rmSync(tempStoreDir, { recursive: true, force: true });
     }
   });
 

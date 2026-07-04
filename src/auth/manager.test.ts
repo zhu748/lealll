@@ -100,6 +100,31 @@ describe("AuthManager", () => {
     expect(cred.secret).toBe("sc");
   });
 
+  it("defensively copies OAuth credentials on set and get", async () => {
+    const mgr = new AuthManager({ mode: "oauth", provider: "zai" });
+    const original = { apiKey: "oa", secret: "sc", provider: "zai" as const };
+    mgr.setOAuthCredential(original);
+    original.apiKey = "mutated-after-set";
+
+    const first = await mgr.getCredential();
+    expect(first.apiKey).toBe("oa");
+    first.apiKey = "mutated-after-get";
+
+    const second = await mgr.getCredential();
+    expect(second.apiKey).toBe("oa");
+  });
+
+  it("returns defensive copies for static apikey credentials", async () => {
+    const mgr = new AuthManager({ mode: "apikey", provider: "zai", apiKey: "test.secret" });
+    const first = await mgr.getCredential();
+    first.apiKey = "mutated";
+    first.secret = "changed";
+
+    const second = await mgr.getCredential();
+    expect(second.apiKey).toBe("test");
+    expect(second.secret).toBe("secret");
+  });
+
   it("throws when apikey mode but no key set", async () => {
     const mgr = new AuthManager({ mode: "apikey", provider: "zai" });
     expect(mgr.getCredential()).rejects.toThrow(/no credential/);
@@ -110,5 +135,45 @@ describe("AuthManager", () => {
     expect(m1.getMode()).toBe("apikey");
     const m2 = new AuthManager({ mode: "oauth", provider: "zai" });
     expect(m2.getMode()).toBe("oauth");
+  });
+
+  it("hot-applies apikey auth config", async () => {
+    const mgr = new AuthManager({ mode: "apikey", provider: "zai", apiKey: "old.secret" });
+    mgr.updateConfig({ mode: "apikey", provider: "bigmodel", apiKey: "new-key", plan: "start-plan" });
+    const cred = await mgr.getCredential();
+    expect(mgr.getMode()).toBe("apikey");
+    expect(cred.provider).toBe("bigmodel");
+    expect(cred.apiKey).toBe("new-key");
+    expect(cred.plan).toBe("start-plan");
+  });
+
+  it("hot-switches from apikey to oauth without keeping the old static key", async () => {
+    const mgr = new AuthManager({ mode: "apikey", provider: "zai", apiKey: "old.secret" });
+    mgr.updateConfig({ mode: "oauth", provider: "zai" });
+    expect(mgr.getMode()).toBe("oauth");
+    expect(mgr.getCredential()).rejects.toThrow(/not available/);
+    mgr.setOAuthCredential({ apiKey: "oauth-key", provider: "zai" });
+    expect((await mgr.getCredential()).apiKey).toBe("oauth-key");
+  });
+
+  it("switchToNextCredential does not retain caller-owned credential objects", async () => {
+    const next = { apiKey: "next-key", provider: "zai" as const };
+    const mgr = new AuthManager({
+      mode: "oauth",
+      provider: "zai",
+      listAllCredentials: async () => [
+        { apiKey: "current-key", provider: "zai" },
+        next,
+      ],
+    });
+    mgr.setOAuthCredential({ apiKey: "current-key", provider: "zai" });
+
+    const switched = await mgr.switchToNextCredential();
+    expect(switched?.apiKey).toBe("next-key");
+    next.apiKey = "mutated-source";
+    if (switched) switched.apiKey = "mutated-return";
+
+    const current = await mgr.getCredential();
+    expect(current.apiKey).toBe("next-key");
   });
 });

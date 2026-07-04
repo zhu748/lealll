@@ -15,13 +15,17 @@ import {
   setAccountName,
   setAccountEmail,
   setAccountDisabled,
+  validateProxyUrl,
+  importAccounts,
   exportSingleAccount,
+  exportAccounts,
   maskApiKey,
+  credentialStatsKey,
   invalidateStoreCache,
   getStorePath,
   _resetKeyCacheForTesting,
 } from "./store.js";
-import { existsSync, writeFileSync, mkdirSync, readFileSync, readdirSync, unlinkSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, writeFileSync, mkdirSync, readFileSync, readdirSync, unlinkSync, mkdtempSync, rmSync, statSync, utimesSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import type { Credential } from "./types.js";
@@ -109,6 +113,16 @@ describe("credential store", () => {
     expect(loaded!.apiKey).toBe("testApiKey123");
     expect(loaded!.secret).toBe("testSecret456");
     expect(loaded!.provider).toBe("zai");
+  });
+
+  it("loadCredential returns a defensive copy", async () => {
+    await saveCredential({ apiKey: "copy-test-key", provider: "zai" });
+    const loaded = await loadCredential();
+    expect(loaded).not.toBeNull();
+    loaded!.apiKey = "mutated-in-caller";
+
+    const after = await loadCredential();
+    expect(after!.apiKey).toBe("copy-test-key");
   });
 
   it("roundtrips bigmodel credential (no secret)", async () => {
@@ -234,6 +248,25 @@ describe("multi-account store", () => {
     expect(loaded!.apiKey).toBe("key1");
   });
 
+  it("removeAccount deleting the final account does not emit the empty-store bug warning", async () => {
+    await saveCredential({ apiKey: "only-key", provider: "zai" });
+    const list = await listAccounts();
+    const originalWarn = console.warn;
+    const warnings: string[] = [];
+    console.warn = (...args: unknown[]) => {
+      warnings.push(args.map(String).join(" "));
+    };
+
+    try {
+      const ok = await removeAccount(list.accounts[0].id);
+      expect(ok).toBe(true);
+      expect((await listAccounts()).accounts).toHaveLength(0);
+      expect(warnings.some(w => w.includes("writeStore: writing EMPTY store"))).toBe(false);
+    } finally {
+      console.warn = originalWarn;
+    }
+  });
+
   it("setAccountLabel updates the label", async () => {
     await saveCredential({ apiKey: "k", provider: "zai" });
     const list = await listAccounts();
@@ -249,6 +282,21 @@ describe("multi-account store", () => {
     expect(maskApiKey("abcdefgh12345678wxyz")).toBe("abcdefgh...wxyz");
     expect(maskApiKey("short")).toBe("short");
     expect(maskApiKey("")).toBe("");
+  });
+
+  it("credentialStatsKey distinguishes API keys with the same display mask", async () => {
+    const first = { apiKey: "abcdefgh11111111wxyz", provider: "zai" as const };
+    const second = { apiKey: "abcdefgh22222222wxyz", provider: "zai" as const };
+    expect(maskApiKey(first.apiKey)).toBe(maskApiKey(second.apiKey));
+    expect(credentialStatsKey(first)).not.toBe(credentialStatsKey(second));
+
+    await saveCredential(first);
+    await saveCredential(second);
+    const list = await listAccounts();
+    expect(list.accounts).toHaveLength(2);
+    expect(list.accounts[0].apiKeyMask).toBe(list.accounts[1].apiKeyMask);
+    expect(list.accounts[0].credentialKey).not.toBe(list.accounts[1].credentialKey);
+    expect(list.accounts[0].credentialKey.startsWith("sha256:")).toBe(true);
   });
 
   // --- v2.1.4.1test5: per-account proxy ---
@@ -284,6 +332,23 @@ describe("multi-account store", () => {
 
     const cred = await loadCredential();
     expect(cred!.proxy).toBeUndefined();
+  });
+
+  it("setAccountProxy rejects port 0 instead of deferring to request-time failures", async () => {
+    await saveCredential({ apiKey: "k", provider: "zai" });
+    const list = await listAccounts();
+    const id = list.accounts[0].id;
+
+    expect(validateProxyUrl("socks5://10.0.0.1:0").ok).toBe(false);
+    await expect(setAccountProxy(id, "socks5://10.0.0.1:0")).rejects.toThrow(/port must be between 1 and 65535/);
+    const cred = await loadCredential();
+    expect(cred!.proxy).toBeUndefined();
+  });
+
+  it("validateProxyUrl rejects IPv6 unspecified and link-local literals", () => {
+    expect(validateProxyUrl("http://[::]:8080").ok).toBe(false);
+    expect(validateProxyUrl("http://[fe80::1]:8080").ok).toBe(false);
+    expect(validateProxyUrl("http://[::1]:8080").ok).toBe(true);
   });
 
   it("setAccountProxy returns false for unknown account id", async () => {
@@ -384,6 +449,94 @@ describe("multi-account store", () => {
     // Both keys are <= 12 chars so maskApiKey returns them as-is
     const keys = list2.accounts.map(a => a.apiKeyMask).sort();
     expect(keys).toEqual(["first-key", "second-key"]);
+  });
+
+  it("detects external store rewrites when mtime is unchanged but size differs", async () => {
+    await saveCredential({ apiKey: "first-key", provider: "zai" });
+
+    const storePath = getStorePath();
+    const fixedTime = new Date("2026-01-01T00:00:00.000Z");
+    utimesSync(storePath, fixedTime, fixedTime);
+    invalidateStoreCache();
+
+    const cached = await listAccounts();
+    expect(cached.accounts).toHaveLength(1);
+    const cachedStat = statSync(storePath);
+
+    await writeFixedKeyEncryptedStore({
+      version: 2,
+      activeId: "external-2",
+      accounts: [
+        {
+          id: "external-1",
+          label: "external one",
+          createdAt: 1,
+          credential: { apiKey: "first-key", provider: "zai" },
+        },
+        {
+          id: "external-2",
+          label: "external two",
+          createdAt: 2,
+          credential: { apiKey: "second-key", provider: "bigmodel" },
+        },
+      ],
+    });
+    utimesSync(storePath, fixedTime, fixedTime);
+
+    const rewrittenStat = statSync(storePath);
+    expect(rewrittenStat.mtimeMs).toBe(cachedStat.mtimeMs);
+    expect(rewrittenStat.size).not.toBe(cachedStat.size);
+
+    const refreshed = await listAccounts();
+    expect(refreshed.accounts).toHaveLength(2);
+    expect(refreshed.activeId).toBe("external-2");
+    const keys = refreshed.accounts.map(a => a.apiKeyMask).sort();
+    expect(keys).toEqual(["first-key", "second-key"]);
+  });
+
+  it("detects same-size external store rewrites when mtime is unchanged", async () => {
+    const storePath = getStorePath();
+    const fixedTime = new Date("2026-01-01T00:00:00.000Z");
+
+    await writeFixedKeyEncryptedStore({
+      version: 2,
+      activeId: "acct-a",
+      accounts: [{
+        id: "acct-a",
+        label: "account one",
+        createdAt: 1,
+        credential: { apiKey: "key-aaaa", provider: "zai" },
+      }],
+    });
+    utimesSync(storePath, fixedTime, fixedTime);
+    invalidateStoreCache();
+
+    const cached = await listAccounts();
+    expect(cached.accounts).toHaveLength(1);
+    expect(cached.accounts[0].apiKeyMask).toBe("key-aaaa");
+    const cachedStat = statSync(storePath);
+
+    await new Promise(r => setTimeout(r, 20));
+    await writeFixedKeyEncryptedStore({
+      version: 2,
+      activeId: "acct-b",
+      accounts: [{
+        id: "acct-b",
+        label: "account two",
+        createdAt: 1,
+        credential: { apiKey: "key-bbbb", provider: "zai" },
+      }],
+    });
+    utimesSync(storePath, fixedTime, fixedTime);
+
+    const rewrittenStat = statSync(storePath);
+    expect(rewrittenStat.mtimeMs).toBe(cachedStat.mtimeMs);
+    expect(rewrittenStat.size).toBe(cachedStat.size);
+
+    const refreshed = await listAccounts();
+    expect(refreshed.accounts).toHaveLength(1);
+    expect(refreshed.activeId).toBe("acct-b");
+    expect(refreshed.accounts[0].apiKeyMask).toBe("key-bbbb");
   });
 
   it("detects credentials.json created after an earlier missing-store read", async () => {
@@ -787,6 +940,27 @@ describe("multi-account store", () => {
     expect(exported).toBeNull();
   });
 
+  it("exportAccounts returns defensive copies of cached accounts", async () => {
+    await saveCredential({ apiKey: "export-key", provider: "zai", name: "original-name" });
+
+    const exported = await exportAccounts();
+    expect(exported).toHaveLength(1);
+    exported[0].label = "mutated-label";
+    exported[0].credential.apiKey = "mutated-key";
+    exported.push({
+      id: "fake",
+      label: "fake",
+      createdAt: Date.now(),
+      credential: { apiKey: "fake-key", provider: "zai" },
+    });
+
+    const after = await exportAccounts();
+    expect(after).toHaveLength(1);
+    expect(after[0].label).not.toBe("mutated-label");
+    expect(after[0].credential.apiKey).toBe("export-key");
+    expect((await loadCredential())?.apiKey).toBe("export-key");
+  });
+
   // --- vceshi0.0.6: disabled flag ---
 
   it("setAccountDisabled toggles the disabled flag", async () => {
@@ -806,6 +980,237 @@ describe("multi-account store", () => {
     expect(ok).toBe(true);
     list2 = await listAccounts();
     expect(list2.accounts[0].disabled).toBe(false);
+  });
+
+  it("setAccountDisabled moves activeId away from a disabled active account", async () => {
+    await saveCredential({ apiKey: "k1", provider: "zai" });
+    await saveCredential({ apiKey: "k2", provider: "bigmodel" });
+    const list = await listAccounts();
+    const id1 = list.accounts[0].id;
+    const id2 = list.accounts[1].id;
+    expect(list.activeId).toBe(id2);
+
+    expect(await setAccountDisabled(id2, true)).toBe(true);
+    const after = await listAccounts();
+    expect(after.activeId).toBe(id1);
+    expect((await loadCredential())?.apiKey).toBe("k1");
+
+    expect(await setAccountDisabled(id1, true)).toBe(true);
+    expect((await listAccounts()).activeId).toBeNull();
+    expect(await loadCredential()).toBeNull();
+  });
+
+  it("normalizes a stored disabled activeId to the first enabled account", async () => {
+    const now = Date.now();
+    await writeFixedKeyEncryptedStore({
+      version: 2,
+      activeId: "disabled-active",
+      accounts: [
+        {
+          id: "disabled-active",
+          label: "disabled",
+          createdAt: now,
+          credential: { apiKey: "disabled-key", provider: "zai", disabled: true },
+        },
+        {
+          id: "enabled-fallback",
+          label: "enabled",
+          createdAt: now + 1,
+          credential: { apiKey: "enabled-key", provider: "bigmodel" },
+        },
+      ],
+    });
+    invalidateStoreCache();
+
+    const list = await listAccounts();
+    expect(list.activeId).toBe("enabled-fallback");
+    expect((await loadCredential())?.apiKey).toBe("enabled-key");
+  });
+
+  it("normalizes dirty stored accounts from disk before listing/loading", async () => {
+    const now = Date.now();
+    await writeFixedKeyEncryptedStore({
+      version: 2,
+      activeId: "missing-active",
+      accounts: [
+        null,
+        { id: "missing-credential", label: "bad", createdAt: now },
+        {
+          id: "bad-provider",
+          label: "bad provider",
+          createdAt: now + 1,
+          credential: { apiKey: "bad-key", provider: "unknown" },
+        },
+        {
+          id: "duplicate-id",
+          label: "   ",
+          createdAt: "not-a-number",
+          credential: {
+            apiKey: "  clean-key  ",
+            provider: "zai",
+            plan: " start-plan ",
+            secret: "  secret-value  ",
+            userId: "  user-1  ",
+            jwt: "  jwt-token  ",
+            proxy: "ftp://not-allowed.example",
+            name: "  Display Name  ",
+            email: "  user@example.com  ",
+            disabled: false,
+          },
+        },
+        {
+          id: "duplicate-id",
+          label: "disabled duplicate",
+          createdAt: now + 2,
+          credential: {
+            apiKey: "disabled-key",
+            provider: "bigmodel",
+            disabled: true,
+            expiresAt: "12345",
+            proxy: "http://proxy.example:8080",
+          },
+        },
+      ],
+    });
+    invalidateStoreCache();
+
+    const list = await listAccounts();
+    expect(list.accounts).toHaveLength(2);
+    const active = list.accounts.find(a => a.apiKeyMask === "clean-key");
+    const disabled = list.accounts.find(a => a.apiKeyMask === "disabled-key");
+    expect(active).toBeDefined();
+    expect(disabled).toBeDefined();
+    expect(list.activeId).toBe(active!.id);
+    expect(active!.id).toBe("duplicate-id");
+    expect(active!.label.startsWith("zai · ")).toBe(true);
+    expect(active!.plan).toBe("start-plan");
+    expect(active!.proxy).toBe("");
+    expect(active!.name).toBe("Display Name");
+    expect(active!.email).toBe("user@example.com");
+    expect(disabled!.id).not.toBe("duplicate-id");
+    expect(disabled!.disabled).toBe(true);
+    expect(disabled!.expiresAt).toBe(12345);
+    expect(disabled!.proxy).toBe("http://proxy.example:8080");
+
+    const loaded = await loadCredential();
+    expect(loaded?.apiKey).toBe("clean-key");
+    expect(loaded?.secret).toBe("secret-value");
+    expect(loaded?.userId).toBe("user-1");
+    expect(loaded?.jwt).toBe("jwt-token");
+    expect(loaded?.proxy).toBeUndefined();
+  });
+
+  it("importAccounts skips disabled accounts when choosing a fresh activeId", async () => {
+    const result = await importAccounts([
+      {
+        id: "disabled-import",
+        label: "disabled import",
+        createdAt: Date.now(),
+        credential: { apiKey: "disabled-import-key", provider: "zai", disabled: true },
+      },
+      {
+        id: "enabled-import",
+        label: "enabled import",
+        createdAt: Date.now() + 1,
+        credential: { apiKey: "enabled-import-key", provider: "bigmodel" },
+      },
+    ]);
+
+    expect(result).toEqual({ added: 2, updated: 0 });
+    const list = await listAccounts();
+    expect(list.activeId).toBe("enabled-import");
+    expect((await loadCredential())?.apiKey).toBe("enabled-import-key");
+  });
+
+  it("importAccounts skips invalid incoming accounts and normalizes valid ones", async () => {
+    const result = await importAccounts([
+      null,
+      {
+        id: "missing-provider",
+        label: "missing provider",
+        createdAt: Date.now(),
+        credential: { apiKey: "bad-key" },
+      },
+      {
+        id: "valid-import",
+        label: "  Imported Account  ",
+        createdAt: "1234",
+        credential: {
+          apiKey: "  import-key  ",
+          provider: "zai",
+          plan: " start-plan ",
+          secret: "  import-secret  ",
+          proxy: "ftp://not-allowed.example",
+          disabled: "yes",
+        },
+      },
+    ] as any);
+
+    expect(result).toEqual({ added: 1, updated: 0 });
+    let exported = await exportAccounts();
+    expect(exported).toHaveLength(1);
+    expect(exported[0].id).toBe("valid-import");
+    expect(exported[0].label).toBe("Imported Account");
+    expect(exported[0].createdAt).toBe(1234);
+    expect(exported[0].credential.apiKey).toBe("import-key");
+    expect(exported[0].credential.plan).toBe("start-plan");
+    expect(exported[0].credential.secret).toBe("import-secret");
+    expect(exported[0].credential.proxy).toBeUndefined();
+    expect(exported[0].credential.disabled).toBeUndefined();
+
+    const update = await importAccounts([
+      {
+        id: "valid-import",
+        label: "Updated Account",
+        createdAt: 5678,
+        credential: { apiKey: "updated-key", provider: "bigmodel", disabled: true },
+      },
+    ]);
+    expect(update).toEqual({ added: 0, updated: 1 });
+    exported = await exportAccounts();
+    expect(exported).toHaveLength(1);
+    expect(exported[0].label).toBe("Updated Account");
+    expect(exported[0].createdAt).toBe(5678);
+    expect(exported[0].credential.apiKey).toBe("updated-key");
+    expect(exported[0].credential.disabled).toBe(true);
+    expect((await listAccounts()).activeId).toBeNull();
+  });
+
+  it("importAccounts clones incoming account objects before caching them", async () => {
+    const incoming = [{
+      id: "import-clone-id",
+      label: "Original imported account",
+      createdAt: Date.now(),
+      credential: { apiKey: "import-clone-key", provider: "zai" as const, name: "original" },
+    }];
+
+    await importAccounts(incoming);
+    incoming[0].label = "Mutated after import";
+    incoming[0].credential.apiKey = "mutated-after-import";
+    incoming[0].credential.name = "mutated";
+
+    const exported = await exportAccounts();
+    expect(exported).toHaveLength(1);
+    expect(exported[0].label).toBe("Original imported account");
+    expect(exported[0].credential.apiKey).toBe("import-clone-key");
+    expect(exported[0].credential.name).toBe("original");
+    expect((await loadCredential())?.apiKey).toBe("import-clone-key");
+  });
+
+  it("importAccounts clears activeId when every imported account is disabled", async () => {
+    const result = await importAccounts([
+      {
+        id: "disabled-only",
+        label: "disabled only",
+        createdAt: Date.now(),
+        credential: { apiKey: "disabled-only-key", provider: "zai", disabled: true },
+      },
+    ]);
+
+    expect(result).toEqual({ added: 1, updated: 0 });
+    const list = await listAccounts();
+    expect(list.activeId).toBeNull();
+    expect(await loadCredential()).toBeNull();
   });
 
   it("switchAccount refuses to activate a disabled credential", async () => {
@@ -936,6 +1341,22 @@ describe("multi-account store", () => {
     // credentials.json exists and is valid JSON (not truncated)
     const content = readFileSync(getStorePath(), "utf-8");
     expect(() => JSON.parse(content)).not.toThrow();
+  });
+
+  it("saveCredential fails loudly instead of caching credentials that were not persisted", async () => {
+    if (!testStoreDir) throw new Error("test store dir not initialized");
+    const blockedStoreDir = join(testStoreDir, "blocked-store-dir");
+    writeFileSync(blockedStoreDir, "not a directory", "utf-8");
+    process.env.ZCODE_PROXY_STORE_DIR = blockedStoreDir;
+    invalidateStoreCache();
+
+    await expect(
+      saveCredential({ apiKey: "not-written", provider: "zai" }),
+    ).rejects.toThrow(/Could not persist credentials/);
+
+    invalidateStoreCache();
+    const loaded = await loadCredential();
+    expect(loaded).toBeNull();
   });
 
   // --- This version: empty-file defense + .broken-* cleanup ---

@@ -71,18 +71,18 @@
  *
 * `extraHeaders` is the ONLY way for trusted internal subsystems
 * to inject headers upstream. It is reserved for proxy-internal use — never
-* for passthrough of client headers. The start-plan captcha preflight uses
-* this hook to mirror ZCode's provider-runtime-headers refresh, where the
-* host responds with freshly solved runtime headers before each model attempt.
+* for passthrough of client headers. The start-plan captcha challenge path uses
+* this hook only after upstream returns an explicit Aliyun 3007 response, unless
+* the operator opts into preflight with ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT=1.
  *
  * CONFIRMED NOT SENT (real client wire capture, 2026-06-28):
  *   - anthropic-beta            ❌ (never; SDK/CC-CLI artifact)
  *   - x-session-id              ✅ start-plan only, dynamic attribution
  *   - x-query-id                ✅ start-plan only, dynamic attribution
  *   - x-zcode-trace-id          ✅ start-plan only, dynamic attribution
- *   - x-aliyun-captcha-*        ❌ from downstream clients; ✅ only when
- *                                  injected by our start-plan runtime-header
- *                                  refresh path with a freshly solved token
+  *   - x-aliyun-captcha-*        ❌ from downstream clients; ✅ only after
+  *                                  an explicit start-plan 3007 challenge, or
+  *                                  when preflight is explicitly enabled
  *   - X-ZCode-Agent             ✅ start-plan only (official GLM agent provider)
  *   - accept                    ❌ (not on /v1/messages; was a v0.2.2 bug)
  *   - any x-stainless-*         ❌ (Anthropic SDK fingerprint)
@@ -115,6 +115,7 @@ interface StartPlanAttributionContext {
   traceId: string;
 }
 
+const MAX_STARTPLAN_ATTRIBUTION_CONTEXTS = 512;
 const startPlanAttributionByCredential = new Map<string, StartPlanAttributionContext>();
 
 function startPlanCredentialKey(cred: Credential): string {
@@ -124,14 +125,32 @@ function startPlanCredentialKey(cred: Credential): string {
 function getStartPlanAttributionContext(cred: Credential): StartPlanAttributionContext {
   const key = startPlanCredentialKey(cred);
   let cached = startPlanAttributionByCredential.get(key);
-  if (!cached) {
-    cached = {
-      sessionId: crypto.randomUUID(),
-      traceId: crypto.randomUUID(),
-    };
+  if (cached) {
+    startPlanAttributionByCredential.delete(key);
     startPlanAttributionByCredential.set(key, cached);
+    return cached;
   }
+
+  while (startPlanAttributionByCredential.size >= MAX_STARTPLAN_ATTRIBUTION_CONTEXTS) {
+    const oldest = startPlanAttributionByCredential.keys().next().value;
+    if (oldest === undefined) break;
+    startPlanAttributionByCredential.delete(oldest);
+  }
+
+  cached = {
+    sessionId: crypto.randomUUID(),
+    traceId: crypto.randomUUID(),
+  };
+  startPlanAttributionByCredential.set(key, cached);
   return cached;
+}
+
+export function _clearStartPlanAttributionContextsForTesting(): void {
+  startPlanAttributionByCredential.clear();
+}
+
+export function _startPlanAttributionContextCountForTesting(): number {
+  return startPlanAttributionByCredential.size;
 }
 
 function buildStartPlanAttributionHeaders(cred: Credential): Record<string, string> {
@@ -312,9 +331,9 @@ export function buildUpstreamHeaders(
       const lower = k.toLowerCase();
       // Aliyun captcha headers are never passed through from the downstream
       // client. For start-plan only, handler.ts may inject freshly solved
-      // runtime headers during preflight or after a 3007 challenge, matching
-      // the official provider-runtime-headers refresh path. The verify param
-      // is one-shot, so callers must pass a fresh value for every attempt.
+      // runtime headers after a 3007 challenge, or during explicit preflight.
+      // The verify param is one-shot, so callers must pass a fresh value for
+      // every attempt that includes these headers.
       if (ALIYUN_CAPTCHA_HEADERS.has(lower) && plan !== "start-plan") continue;
       headers[lower] = v;
     }

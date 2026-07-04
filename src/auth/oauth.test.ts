@@ -8,7 +8,9 @@
  * zcode.z.ai token exchange.
  */
 import { describe, it, expect } from "bun:test";
-import { ZaiOAuthClient } from "./oauth.js";
+import { ZaiOAuthClient, normalizeCallbackWaitTimeoutMs } from "./oauth.js";
+import { once } from "node:events";
+import { connect } from "node:net";
 
 /**
  * Wrap response data in the Z.AI / zcode.z.ai {code, data, msg} envelope.
@@ -38,6 +40,16 @@ function tokenExchangeMock(
 }
 
 describe("ZaiOAuthClient", () => {
+  it("normalizes callback wait timeouts to safe timer values", () => {
+    expect(normalizeCallbackWaitTimeoutMs()).toBe(300_000);
+    expect(normalizeCallbackWaitTimeoutMs(Number.POSITIVE_INFINITY)).toBe(300_000);
+    expect(normalizeCallbackWaitTimeoutMs(Number.NaN)).toBe(300_000);
+    expect(normalizeCallbackWaitTimeoutMs(0)).toBe(1);
+    expect(normalizeCallbackWaitTimeoutMs(-500)).toBe(1);
+    expect(normalizeCallbackWaitTimeoutMs(1.9)).toBe(1);
+    expect(normalizeCallbackWaitTimeoutMs(999_999_999)).toBe(300_000);
+  });
+
   it("start() builds the authorize URL with the documented query params and binds a localhost callback", async () => {
     const client = new ZaiOAuthClient(tokenExchangeMock(() => new Response("{}", { status: 200 })));
     const init = await client.start();
@@ -56,6 +68,28 @@ describe("ZaiOAuthClient", () => {
       expect(init.pollToken).toBe(init.state);
     } finally {
       await client.close();
+    }
+  });
+
+  it("close() force-closes stalled localhost callback sockets", async () => {
+    const client = new ZaiOAuthClient(tokenExchangeMock(() => new Response("{}", { status: 200 })));
+    const init = await client.start();
+    const port = Number(new URL(init.callbackUrl).port);
+    const socket = connect({ host: "127.0.0.1", port });
+    let socketClosed = false;
+    socket.once("close", () => { socketClosed = true; });
+    try {
+      await once(socket, "connect");
+      const result = await Promise.race([
+        client.close().then(() => "closed"),
+        new Promise<string>(resolve => setTimeout(() => resolve("timeout"), 1500)),
+      ]);
+      expect(result).toBe("closed");
+      await new Promise(resolve => setTimeout(resolve, 20));
+      expect(socketClosed || socket.destroyed).toBe(true);
+    } finally {
+      socket.destroy();
+      await client.close().catch(() => {});
     }
   });
 
@@ -81,6 +115,94 @@ describe("ZaiOAuthClient", () => {
     expect(result.userId).toBe("u1");
   });
 
+  it("exchangeCode() unrefs the token request timeout timer", async () => {
+    const originalSetTimeout = globalThis.setTimeout as any;
+    const unrefDelays: number[] = [];
+    (globalThis as any).setTimeout = (handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
+      const timer = originalSetTimeout(handler, timeout, ...args) as any;
+      const originalUnref = timer.unref?.bind(timer);
+      timer.unref = () => {
+        unrefDelays.push(Number(timeout));
+        return originalUnref?.();
+      };
+      return timer;
+    };
+
+    try {
+      const mock = tokenExchangeMock(() =>
+        new Response(zaiEnvelope({ zai: { access_token: "zai_access_123" } }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+      const client = new ZaiOAuthClient(mock);
+      await client.exchangeCode("auth_code_abc", "http://127.0.0.1:1/oauth/callback/zai", "state_hex");
+      expect(unrefDelays).toContain(30_000);
+    } finally {
+      (globalThis as any).setTimeout = originalSetTimeout;
+    }
+  });
+
+  it("exchangeCode() normalizes pathological token request timeout values before scheduling timers", async () => {
+    const originalSetTimeout = globalThis.setTimeout as any;
+    const scheduledDelays: number[] = [];
+    (globalThis as any).setTimeout = (handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
+      scheduledDelays.push(Number(timeout));
+      return originalSetTimeout(handler, timeout, ...args);
+    };
+
+    try {
+      const mock = tokenExchangeMock(() =>
+        new Response(zaiEnvelope({ zai: { access_token: "zai_access_123" } }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+      const client = new ZaiOAuthClient(
+        mock,
+        "https://chat.z.ai/api/oauth/authorize",
+        "client_P8X5CMWmlaRO9gyO-KSqtg",
+        Number.POSITIVE_INFINITY,
+      );
+      await client.exchangeCode("auth_code_abc", "http://127.0.0.1:1/oauth/callback/zai", "state_hex");
+      expect(scheduledDelays.every((delay) => Number.isFinite(delay) && delay >= 1)).toBe(true);
+      expect(scheduledDelays).toContain(30_000);
+    } finally {
+      (globalThis as any).setTimeout = originalSetTimeout;
+    }
+  });
+
+  it("exchangeCode() times out when the token response body stalls after headers", async () => {
+    let canceled = false;
+    const mock = tokenExchangeMock(() =>
+      new Response(new ReadableStream<Uint8Array>({
+        pull() {
+          return new Promise<void>(() => {});
+        },
+        cancel() {
+          canceled = true;
+        },
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    const client = new ZaiOAuthClient(
+      mock,
+      "https://chat.z.ai/api/oauth/authorize",
+      "client_P8X5CMWmlaRO9gyO-KSqtg",
+      5,
+    );
+    const keepAlive = setInterval(() => {}, 1);
+    try {
+      await expect(client.exchangeCode("auth_code_abc", "http://127.0.0.1:1/oauth/callback/zai", "state_hex"))
+        .rejects.toThrow(/OAuth token response read timeout after 5ms/);
+      expect(canceled).toBe(true);
+    } finally {
+      clearInterval(keepAlive);
+    }
+  });
+
   it("exchangeCode() throws when the envelope reports a non-zero business code", async () => {
     const mock = tokenExchangeMock(() =>
       new Response(JSON.stringify({ code: 3004, msg: "redirect_uri_mismatch" }), {
@@ -103,6 +225,56 @@ describe("ZaiOAuthClient", () => {
     const client = new ZaiOAuthClient(mock);
     expect(client.exchangeCode("c", "http://127.0.0.1:1/oauth/callback/zai", "s"))
       .rejects.toThrow(/zai\.access_token/);
+  });
+
+  it("exchangeCode() rejects oversized token responses before reading the body", async () => {
+    let canceled = false;
+    const mock = tokenExchangeMock(() =>
+      new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode("{}"));
+        },
+        cancel() {
+          canceled = true;
+        },
+      }), {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+          "content-length": String(2 * 1024 * 1024 + 1),
+        },
+      }),
+    );
+
+    const client = new ZaiOAuthClient(mock);
+    await expect(client.exchangeCode("c", "http://127.0.0.1:1/oauth/callback/zai", "s"))
+      .rejects.toThrow(/OAuth token response exceeds/);
+    expect(canceled).toBe(true);
+  });
+
+  it("exchangeCode() releases the response reader when a chunked token response is oversized", async () => {
+    let canceled = false;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(1024 * 1024));
+        controller.enqueue(new Uint8Array(1024 * 1024 + 1));
+      },
+      cancel() {
+        canceled = true;
+      },
+    });
+    const mock = tokenExchangeMock(() =>
+      new Response(stream, {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+
+    const client = new ZaiOAuthClient(mock);
+    await expect(client.exchangeCode("c", "http://127.0.0.1:1/oauth/callback/zai", "s"))
+      .rejects.toThrow(/OAuth token response exceeds/);
+    expect(canceled).toBe(true);
+    expect(stream.locked).toBe(false);
   });
 
   it("authorize() drives the full loop: authorize URL -> callback redirect -> token exchange", async () => {
@@ -163,6 +335,56 @@ describe("ZaiOAuthClient", () => {
       expect(client.waitForCallback(1)).rejects.toThrow(/timed out/);
       // let the rejection settle so it doesn't surface as an unhandled error
       await new Promise((r) => setTimeout(r, 30));
+    } finally {
+      await client.close();
+    }
+  });
+
+  it("waitForCallback() clamps invalid timeout values before scheduling timers", async () => {
+    const originalSetTimeout = globalThis.setTimeout as any;
+    const delays: number[] = [];
+    (globalThis as any).setTimeout = (handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
+      delays.push(Number(timeout));
+      return originalSetTimeout(handler, timeout, ...args);
+    };
+
+    const client = new ZaiOAuthClient(tokenExchangeMock(() => new Response("{}", { status: 200 })));
+    const init = await client.start();
+    try {
+      const callbackPromise = client.waitForCallback(Number.POSITIVE_INFINITY);
+      const callback = new URL(init.callbackUrl);
+      callback.searchParams.set("code", "valid_code_after_invalid_timeout");
+      callback.searchParams.set("state", init.state!);
+      await fetch(callback.toString());
+      await expect(callbackPromise).resolves.toBe("valid_code_after_invalid_timeout");
+      expect(delays).toContain(300_000);
+      expect(delays).not.toContain(Number.POSITIVE_INFINITY);
+    } finally {
+      await client.close();
+      (globalThis as any).setTimeout = originalSetTimeout;
+    }
+  });
+
+  it("close() rejects a pending waitForCallback immediately", async () => {
+    const client = new ZaiOAuthClient(tokenExchangeMock(() => new Response("{}", { status: 200 })));
+    await client.start();
+    const waitPromise = client.waitForCallback(300_000);
+    await client.close();
+    await expect(waitPromise).rejects.toThrow(/callback server closed/);
+  });
+
+  it("waitForCallback() cleans up timed-out waiters and still accepts a later valid callback", async () => {
+    const client = new ZaiOAuthClient(tokenExchangeMock(() => new Response("{}", { status: 200 })));
+    const init = await client.start();
+    try {
+      await expect(client.waitForCallback(1)).rejects.toThrow(/timed out/);
+
+      const callback = new URL(init.callbackUrl);
+      callback.searchParams.set("code", "late_valid_code");
+      callback.searchParams.set("state", init.state!);
+      await fetch(callback.toString());
+
+      await expect(client.waitForCallback(100)).resolves.toBe("late_valid_code");
     } finally {
       await client.close();
     }
