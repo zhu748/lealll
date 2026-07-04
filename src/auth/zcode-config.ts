@@ -1,14 +1,15 @@
 /**
  * Read & merge credentials from the ZCode desktop client's storage.
  *
- * The ZCode 3.1.x client stores login state in TWO files under `~/.zcode/v2/`:
+ * The ZCode 3.2.x client stores login state in TWO files under `~/.zcode/v2/`:
  *
  * - `config.json` (plaintext) — provider entries with `options.apiKey` and an
  *   `enabled` flag. The `apiKey` here is directly usable (zai = `id.secret`,
  *   bigmodel = plain key). This is what the old import read exclusively.
  * - `credentials.json` (encrypted) — the OAuth-captured tokens, keyed:
- *     `oauth:{provider}:access_token` — coding-plan access JWT (needs biz-API
- *       exchange to become a usable apiKey.secret; NOT directly usable)
+ *     `oauth:{provider}:access_token` — ZAI OAuth/business bearer. ZCode 3.2.5
+ *       stores the post-`/api/auth/z/login` token; older exports may still need
+ *       that exchange before resolving a usable apiKey.secret.
  *     `zcodejwttoken`                 — start-plan JWT (same as config.json's)
  *     `oauth:{provider}:user_info`    — JSON `{user_id, email, avatar}`
  *     `oauth:active_provider`         — plaintext provider name (zai/bigmodel)
@@ -48,7 +49,7 @@ export function zcodeV2Dir(): string {
 
 /** One decrypted ZCode credentials.json field set, per provider. */
 interface DecryptedZCodeCreds {
-  /** `oauth:{provider}:access_token` — raw OAuth JWT, NOT directly usable as apiKey. */
+  /** `oauth:{provider}:access_token` — ZAI OAuth/business bearer, depending on ZCode version. */
   accessToken?: string;
   /** `zcodejwttoken` — start-plan JWT. */
   jwt?: string;
@@ -66,14 +67,15 @@ export interface ZCodeImportSource {
   /**
    * The credential to use. Preference order:
    *   1. config.json plaintext apiKey (directly usable)
-   *   2. credentials.json access_token (raw JWT — caller must resolve via
-   *      KeyResolver before storing; `isRawAccessToken` flags this case)
+   *   2. credentials.json access_token (OAuth/business bearer — caller must
+   *      pass it through KeyResolver before storing; `isRawAccessToken` flags
+   *      this case)
    */
   apiKey: string;
   jwt?: string;
   email?: string;
   userId?: string;
-  /** True when `apiKey` is a raw OAuth access_token JWT needing biz-API exchange. */
+  /** True when `apiKey` came from OAuth storage and should go through KeyResolver. */
   isRawAccessToken: boolean;
 }
 

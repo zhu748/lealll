@@ -1,5 +1,21 @@
 # zcode-proxy 使用说明
 
+> **v0.2.2.1 — 对齐 ZCode 3.2.5 start-plan 领取与导入逻辑**
+>
+> 本版本对齐 ZCode 桌面客户端 3.2.5 的 start-plan 授权后可用性检测路径,解决旧版本授权后 start-plan 不刷新/刷不出的问题。
+>
+> **本次改动**
+>
+> - **默认客户端版本更新到 3.2.5**:`ZCODE_APP_VERSION`、验证码配置查询和 quota 默认 `app_version` 全部对齐当前 ZCode 3.2.5,避免服务端按旧客户端路径处理。
+> - **start-plan 领取探测对齐 3.2.5**:登录后激活/额度查询优先请求 `billing/balance?app_version=3.2.5`,从新版返回里的 `plans + balances` 判断 active start-plan;旧格式没有 `plans` 时才回退 `billing/current`。
+> - **新版 ZCode 导入兼容**:ZCode 3.2.5 存储的 `oauth:zai:access_token` 可能已经是 `/api/auth/z/login` 后的 business token,导入时可直接用于业务 API,不再因二次 `z/login` 失败导致无法解析 coding/start-plan 补充凭证。
+> - **文档与配置同步**:`config.example.yaml`、README、captcha client config 默认版本均更新到 3.2.5。
+> - **测试覆盖**:新增/更新 ZCode 3.2.5 `billing/balance` envelope、旧 balance 回退 current、已交换 business token 导入等用例。全量 `bun test` 1093 个测试通过,`bun x tsc --noEmit` 零错误。
+>
+> **升级建议**:所有使用 ZCode start-plan、从 ZCode 3.2.5 导入凭证,或遇到 OAuth 后 start-plan 不自动领取/不显示的用户建议升级到 v0.2.2.1。
+
+---
+
 > **v0.2.2.0 — 收工稳定性优化:start-plan 按需验证、面板卡顿收敛、后台探测可中止**
 >
 > 本版本收敛近期 start-plan、管理面板、代理池和凭证存储的边界问题,重点减少不必要的验证码浏览器唤起、长期运行后的 UI 卡顿,以及后台任务在弱网下的资源占用。

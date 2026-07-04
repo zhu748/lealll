@@ -256,7 +256,15 @@ export class KeyResolver {
     email?: string,
   ): Promise<Credential> {
     if (provider === "zai") {
-      const bizToken = await this.resolveZaiBizToken(accessToken);
+      let bizToken = accessToken;
+      try {
+        // OAuth responses from zcode.z.ai still carry a raw ZAI access token,
+        // but ZCode 3.2.5 stores oauth:zai:access_token after it has already
+        // been exchanged through /api/auth/z/login. Tolerate both shapes.
+        bizToken = await this.resolveZaiBizToken(accessToken);
+      } catch {
+        bizToken = accessToken;
+      }
       const host = "https://api.z.ai";
       const authorization = `Bearer ${bizToken}`;
 

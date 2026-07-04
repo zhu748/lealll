@@ -509,7 +509,8 @@ describe("ZCode captcha client config alignment", () => {
 
   it("defaults client config platform to process.platform-process.arch", () => {
     expect(resolveClientPlatformKey()).toBe(`${process.platform}-${process.arch}`);
-    const url = new URL(buildCaptchaConfigUrl({ appVersion: "3.1.8" }));
+    const url = new URL(buildCaptchaConfigUrl());
+    expect(url.searchParams.get("app_version")).toBe("3.2.5");
     expect(url.searchParams.get("platform")).toBe(resolveClientPlatformKey());
   });
 

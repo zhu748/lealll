@@ -11,7 +11,7 @@ import { buildIdentityHeaders } from "./identity.js";
 import type { ProxyIdentity } from "../config/types.js";
 
 const BASE: ProxyIdentity = {
-  appVersion: "3.1.8",
+  appVersion: "3.2.5",
   sourceTitle: "Z Code@electron",
   refererOrigin: "https://zcode.z.ai",
 };
@@ -20,7 +20,7 @@ describe("buildIdentityHeaders", () => {
   it("emits User-Agent as ZCode/{appVersion} (matches real ZCode client)", () => {
     const h = buildIdentityHeaders(BASE);
     // Real ZCode client UA, captured from app.asar buildZCodeSourceHeaders().
-    expect(h["User-Agent"]).toBe("ZCode/3.1.8");
+    expect(h["User-Agent"]).toBe("ZCode/3.2.5");
   });
 
   it("emits X-ZCode-App-Version (real ZCode client sends it)", () => {

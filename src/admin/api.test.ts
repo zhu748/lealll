@@ -1181,7 +1181,7 @@ describe("POST /admin/api/accounts/quota — per-account rate limit (vceshi0.0.7
           provider: "zai",
           plan: "start-plan",
           jwt: `activation-probe-jwt-${i}`,
-        } as Credential, hangingFetch, "3.1.8");
+        } as Credential, hangingFetch, "3.2.5");
       }
 
       const state = _quotaCacheStateForTesting();
@@ -1214,7 +1214,7 @@ describe("POST /admin/api/accounts/quota — per-account rate limit (vceshi0.0.7
           provider: "zai",
           plan: "start-plan",
           jwt: `activation-probe-evict-jwt-${i}`,
-        } as Credential, hangingFetch, "3.1.8");
+        } as Credential, hangingFetch, "3.2.5");
       }
 
       expect(_quotaCacheStateForTesting().activationProbes).toBeLessThanOrEqual(50);
@@ -1252,7 +1252,7 @@ describe("POST /admin/api/accounts/quota — per-account rate limit (vceshi0.0.7
         provider: "zai",
         plan: "start-plan",
         jwt: "activation-probe-fast-jwt",
-      } as Credential, fetchImpl, "3.1.8");
+      } as Credential, fetchImpl, "3.2.5");
       for (let i = 0; i < 20 && _quotaCacheStateForTesting().activationProbes > 0; i++) {
         await new Promise(resolve => setTimeout(resolve, 0));
       }
@@ -1453,20 +1453,14 @@ describe("POST /admin/api/accounts/quota — per-account rate limit (vceshi0.0.7
     const fetchImpl = (async (input: RequestInfo | URL) => {
       const url = String(input);
       urls.push(url);
-      if (url.includes("billing/current")) {
-        return new Response(
-          JSON.stringify({
-            code: 0,
-            data: { plans: [{ name: "Start Plan", status: "active", ends_at: "2026-12-31" }] },
-          }),
-          { status: 200, headers: { "content-type": "application/json" } },
-        );
-      }
       if (url.includes("billing/balance")) {
         return new Response(
           JSON.stringify({
             code: 0,
-            data: { balances: [{ entitlement_id: "start", total_units: 100, used_units: 10, remaining_units: 90 }] },
+            data: {
+              plans: [{ name: "Start Plan", plan_id: "start-plan", status: "active", ends_at: "2026-12-31" }],
+              balances: [{ entitlement_id: "start", total_units: 100, used_units: 10, remaining_units: 90 }],
+            },
           }),
           { status: 200, headers: { "content-type": "application/json" } },
         );
@@ -1494,7 +1488,8 @@ describe("POST /admin/api/accounts/quota — per-account rate limit (vceshi0.0.7
     expect(body.cached).toBe(false);
     expect(body.plan).toBe("start-plan");
     expect(body.planName).toBe("Start Plan");
-    expect(urls.some((url) => url.includes("billing/current"))).toBe(true);
+    expect(urls.some((url) => url.includes("billing/balance"))).toBe(true);
+    expect(urls.some((url) => url.includes("billing/current"))).toBe(false);
   });
 
   it("clears cached quota when the account proxy changes", async () => {

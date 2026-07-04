@@ -6,12 +6,11 @@
  * going through the LLM gateway. Two distinct upstreams:
  *
  * - **start-plan** (zcode.z.ai, authenticates with the plan JWT):
- *     GET /api/v1/zcode-plan/billing/current  -> active plan + ends_at
- *     GET /api/v1/zcode-plan/billing/balance  -> total/used/remaining units
+ *     GET /api/v1/zcode-plan/billing/balance  -> active plan + balance units
+ *     GET /api/v1/zcode-plan/billing/current  -> legacy fallback for active plan
  *   Both require an `app_version` query param and `Authorization: Bearer <jwt>`.
- *   This matches the current ZCode desktop host process, which resolves the
- *   saved `zcodejwttoken` into a Bearer authorization object before calling
- *   billing/current and billing/balance.
+ *   ZCode 3.2.5 checks entitlement through billing/balance first; older
+ *   bundles queried billing/current before balance.
  *
  * - **coding-plan** (api.z.ai for zai / open.bigmodel.cn for bigmodel,
  *   authenticates with the api key):
@@ -27,15 +26,16 @@ import { credentialString } from "./types.js";
 import { getProvider } from "../provider/providers.js";
 
 const ZCODE_PLAN_BASE = "https://zcode.z.ai/api/v1/zcode-plan";
-// MUST match a real ZCode desktop-client version. The billing/current endpoint
-// uses app_version as a gate for first-time start-plan trial activation: a low
-// version (e.g. the old "2.0.0") does NOT activate the trial, while a current
-// client version (3.1.x) does. Using "2.0.0" here meant lealll's quota query
+// MUST match a real ZCode desktop-client version. The billing endpoints use
+// app_version as a gate for first-time start-plan trial activation: a low
+// version (e.g. the old "2.0.0") does NOT activate the trial, while the current
+// client version (3.2.x) does. Using "2.0.0" here meant lealll's quota query
 // never activated a fresh account's start-plan — it returned {plans:[]} forever.
 // Verified end-to-end 2026-06-25: same jwt, app_version=2.0.0 -> empty;
-// app_version=3.1.x -> instant activation. Activation is irreversible, so the
-// version only matters on the first successful query.
-const DEFAULT_APP_VERSION = "3.1.8";
+// app_version=3.1.x/3.2.x -> instant activation. Re-checked against ZCode 3.2.5 on
+// 2026-07-04: entitlement is now probed via billing/balance first. Activation
+// is irreversible, so the version only matters on the first successful query.
+const DEFAULT_APP_VERSION = "3.2.5";
 const REQUEST_TIMEOUT_MS = 15_000;
 const MAX_QUOTA_JSON_BYTES = 2 * 1024 * 1024;
 const MAX_TIMER_MS = 2_147_483_647;
@@ -204,7 +204,7 @@ async function readJsonLimited(resp: Response, maxBytes = MAX_QUOTA_JSON_BYTES, 
  *                   server as the start-plan activation gate — see
  *                   DEFAULT_APP_VERSION). Callers should pass the resolved
  *                   identity.appVersion from config so it matches the real
- *                   client. Defaults to DEFAULT_APP_VERSION ("3.1.8").
+ *                   client. Defaults to DEFAULT_APP_VERSION ("3.2.5").
  */
 export async function queryQuota(
   cred: Credential,
@@ -220,7 +220,7 @@ export async function queryQuota(
   return queryCodingPlan(cred, fetchWithTimeout);
 }
 
-/** start-plan path: billing/current + billing/balance against zcode.z.ai. */
+/** start-plan path: billing/balance first, then billing/current as legacy fallback. */
 async function queryStartPlan(
   cred: Credential,
   fetchImpl: FetchFn,
@@ -237,28 +237,47 @@ async function queryStartPlan(
 
   const headers = { Authorization: normalizeBearerHeader(cred.jwt!) };
 
-  // billing/current — active plan + expiry
-  const currentUrl = `${ZCODE_PLAN_BASE}/billing/current?app_version=${encodeURIComponent(appVersion)}`;
-  let current: any;
-  try {
-    current = await fetchJson(fetchImpl, currentUrl, headers);
-  } catch {
-    return { ...base, unavailableReason: "unavailable" };
-  }
-  if (current?.code !== 0) {
-    return { ...base, unavailableReason: "unavailable", raw: current };
-  }
-  const activePlan = pickActiveStartPlan(current?.data?.plans);
-  if (!activePlan) {
-    return { ...base, unavailableReason: "no_plan", raw: current };
-  }
-
-  // billing/balance — total/used/remaining units
+  // ZCode 3.2.5 probes start-plan entitlement through billing/balance.
   const balanceUrl = `${ZCODE_PLAN_BASE}/billing/balance?app_version=${encodeURIComponent(appVersion)}`;
   let balance: any;
+  let balanceOk = false;
   try {
     balance = await fetchJson(fetchImpl, balanceUrl, headers);
+    balanceOk = balance?.code === 0;
   } catch {
+    balanceOk = false;
+  }
+
+  if (balance && !balanceOk) {
+    return { ...base, unavailableReason: "unavailable", raw: balance };
+  }
+
+  // New response shape: billing/balance includes plans + balances.
+  // Old response shape: billing/balance only includes balances, so fall back to
+  // billing/current for the active plan metadata.
+  let current: any;
+  const balanceHasPlans = Array.isArray(balance?.data?.plans);
+  let activePlan = pickActiveStartPlan(balance?.data?.plans);
+  if (!activePlan && balanceHasPlans) {
+    return { ...base, unavailableReason: "no_plan", raw: balance };
+  }
+  if (!activePlan) {
+    const currentUrl = `${ZCODE_PLAN_BASE}/billing/current?app_version=${encodeURIComponent(appVersion)}`;
+    try {
+      current = await fetchJson(fetchImpl, currentUrl, headers);
+    } catch {
+      return { ...base, unavailableReason: "unavailable", raw: balance };
+    }
+    if (current?.code !== 0) {
+      return { ...base, unavailableReason: "unavailable", raw: { balance, current } };
+    }
+    activePlan = pickActiveStartPlan(current?.data?.plans);
+    if (!activePlan) {
+      return { ...base, unavailableReason: "no_plan", raw: { balance, current } };
+    }
+  }
+
+  if (!balanceOk) {
     // current worked but balance failed — still report the plan, no remaining.
     return {
       ...base,
@@ -268,16 +287,6 @@ async function queryStartPlan(
       raw: current,
     };
   }
-  if (balance?.code !== 0) {
-    return {
-      ...base,
-      planName: activePlan.name ?? null,
-      expireTime: activePlan.ends_at ?? null,
-      unavailableReason: "unavailable",
-      raw: { current, balance },
-    };
-  }
-
   const limits = mapStartPlanBalances(balance?.data?.balances);
   const remaining = aggregateRemaining(limits);
 
@@ -287,7 +296,7 @@ async function queryStartPlan(
     planName: activePlan.name ?? null,
     expireTime: activePlan.ends_at ?? null,
     limits,
-    raw: { current, balance },
+    raw: current ? { balance, current } : { balance },
   };
 }
 
@@ -361,11 +370,13 @@ function pickActiveStartPlan(plans: any[]): any | null {
   if (!Array.isArray(plans)) return null;
   const isActive = (p: any) => String(p?.status ?? "").toLowerCase() === "active";
   const isStart = (p: any) => {
-    const name = String(p?.name ?? "").toLowerCase();
-    const id = String(p?.plan_id ?? p?.user_plan_id ?? "").toLowerCase();
-    return name.includes("start") || id.includes("start");
+    const name = String(p?.name ?? p?.plan_name ?? "").toLowerCase();
+    const id = String(p?.plan_id ?? p?.user_plan_id ?? p?.id ?? "").toLowerCase();
+    if (!name && !id) return true;
+    const text = `${id} ${name}`.replace(/_/g, "-");
+    return text.includes("start-plan") || text.includes("start plan");
   };
-  return plans.find((p) => isActive(p) && isStart(p)) ?? plans.find(isActive) ?? null;
+  return plans.find((p) => isActive(p) && isStart(p)) ?? null;
 }
 
 /** Map start-plan balance entries to normalized limits. */

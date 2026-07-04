@@ -48,7 +48,7 @@ export interface ProxyIdentity {
    * Reverse-engineered from app.asar Mf() (offset 886853), 2026-06-28:
    * the real client emits this header ONLY when the channel value is
    * non-empty (the outer code is `r ? { "X-Release-Channel": r } : {}`).
-   * ZCode 3.1.8 production builds send "production"; test builds send
+   * ZCode 3.2.5 production builds send "production"; test builds send
    * "test". When unset / empty, the header is omitted entirely (NOT sent
    * with an empty value).
    *

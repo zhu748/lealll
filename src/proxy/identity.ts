@@ -7,7 +7,7 @@
  * The real ZCode desktop client sends the identity headers in this exact
  * order (after content-type / auth / anthropic-version, before x-request-id):
  *
- *   4.  User-Agent              : ZCode/{appVersion}        (e.g. ZCode/3.1.8)
+ *   4.  User-Agent              : ZCode/{appVersion}        (e.g. ZCode/3.2.5)
  *   5.  HTTP-Referer            : https://zcode.z.ai
  *   6.  X-Title                 : Z Code@electron
  *   7.  X-ZCode-App-Version     : {appVersion}
@@ -29,7 +29,7 @@
  *   2. X-RELEASE-CHANNEL: the previous revision did NOT emit this header.
  *      The real client emits it conditionally — present when the channel
  *      value is non-empty (outer code: `r ? { "X-Release-Channel": r } : {}`),
- *      absent otherwise. The 3.1.8 production bundle sets this to
+ *      absent otherwise. The 3.2.5 production bundle sets this to
  *      "production". We now mirror that.
  *
  *   3. X-OS-VERSION FUNCTION: the previous revision used `os.release()`,

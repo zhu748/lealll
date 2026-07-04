@@ -267,6 +267,35 @@ describe("KeyResolver", () => {
     expect(cred.secret).toBe("mySecret");
     expect(cred.provider).toBe("zai");
   });
+
+  it("resolveCodingPlanCredential accepts an already-exchanged ZAI business token from ZCode 3.2.5 storage", async () => {
+    const seenAuth: string[] = [];
+    const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/auth/z/login")) {
+        return new Response(JSON.stringify({ code: 401, msg: "already business token" }), {
+          status: 401,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      const auth = (init?.headers as Record<string, string> | undefined)?.Authorization;
+      if (auth) seenAuth.push(auth);
+      if (url.includes("getCustomerInfo")) {
+        return bizResponse({
+          organizations: [{ organizationId: "o1", organizationName: "默认机构", projects: [{ projectId: "p1", projectName: "默认项目" }] }],
+        });
+      }
+      if (url.includes("api_keys/copy")) return bizResponse({ secretKey: "mySecret" });
+      if (url.includes("api_keys")) return init?.body ? bizResponse({ apiKey: "myApiKey" }) : bizResponse([]);
+      return new Response("not found", { status: 404 });
+    }) as typeof fetch;
+
+    const resolver = new KeyResolver(fetchImpl);
+    const cred = await resolver.resolveCodingPlanCredential("business-token-from-zcode", "zai");
+    expect(cred.apiKey).toBe("myApiKey");
+    expect(cred.secret).toBe("mySecret");
+    expect(seenAuth.every((h) => h === "Bearer business-token-from-zcode")).toBe(true);
+  });
 });
 
 describe("KeyResolver.resolveCredential — start-plan graceful fallback", () => {

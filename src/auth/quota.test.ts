@@ -51,19 +51,16 @@ const BIGMODEL_CODING_CRED: Credential = {
 };
 
 describe("queryQuota — start-plan", () => {
-  it("aggregates remaining + plan name + expiry when both billing calls succeed", async () => {
+  it("aggregates remaining + plan name + expiry from the ZCode 3.2.5 billing/balance envelope", async () => {
     const captured: { headers: Record<string, string>; url: string }[] = [];
     const fetchImpl = mockFetch(
       {
-        "billing/current": () =>
+        "billing/balance": () =>
           jsonResp({
             plans: [
               { name: "Coding Pro", plan_id: "pro", status: "active" },
-              { name: "Start Plan", plan_id: "start", status: "active", ends_at: 1799000000 },
+              { name: "Start Plan", plan_id: "start-plan", status: "active", ends_at: 1799000000 },
             ],
-          }),
-        "billing/balance": () =>
-          jsonResp({
             balances: [
               { entitlement_id: "ent1", show_name: "时长", total_units: 100, used_units: 30, remaining_units: 70 },
               { entitlement_id: "ent2", show_name: "请求", total_units: 200, used_units: 50, remaining_units: 150 },
@@ -82,6 +79,36 @@ describe("queryQuota — start-plan", () => {
     // start-plan billing auth mirrors current ZCode desktop: Bearer JWT.
     expect(captured.every((c) => c.headers["Authorization"] === "Bearer theJwtToken")).toBe(true);
     expect(captured.every((c) => c.url.includes("app_version=2.1.0"))).toBe(true);
+    expect(captured.some((c) => c.url.includes("billing/current"))).toBe(false);
+  });
+
+  it("falls back to billing/current when an old billing/balance response has no plans", async () => {
+    const captured: { headers: Record<string, string>; url: string }[] = [];
+    const fetchImpl = mockFetch(
+      {
+        "billing/balance": () =>
+          jsonResp({
+            balances: [
+              { entitlement_id: "ent1", show_name: "时长", total_units: 100, used_units: 30, remaining_units: 70 },
+            ],
+          }),
+        "billing/current": () =>
+          jsonResp({
+            plans: [
+              { name: "Start Plan", plan_id: "start-plan", status: "active", ends_at: 1799000000 },
+            ],
+          }),
+      },
+      captured,
+    );
+
+    const result = await queryQuota(START_PLAN_CRED, fetchImpl, "2.1.0");
+    expect(result.planName).toBe("Start Plan");
+    expect(result.remaining).toEqual({ count: 70, total: 100, percentage: 70 });
+    expect(captured.map((c) => new URL(c.url).pathname)).toEqual([
+      "/api/v1/zcode-plan/billing/balance",
+      "/api/v1/zcode-plan/billing/current",
+    ]);
   });
 
   it("returns no_plan when no active start plan is present", async () => {
@@ -96,14 +123,11 @@ describe("queryQuota — start-plan", () => {
 
   it("returns unavailable when balance call returns non-zero code", async () => {
     const fetchImpl = mockFetch({
-      "billing/current": () => jsonResp({ plans: [{ name: "Start Plan", status: "active", ends_at: "2026-07-01" }] }),
       "billing/balance": () => jsonResp({ unused: true }, 5000),
     });
     const result = await queryQuota(START_PLAN_CRED, fetchImpl);
     expect(result.unavailableReason).toBe("unavailable");
-    // current still resolved, so plan name/expiry are surfaced
-    expect(result.planName).toBe("Start Plan");
-    expect(result.expireTime).toBe("2026-07-01");
+    expect(result.planName).toBeNull();
   });
 
   it("returns unavailable when current call throws (network)", async () => {

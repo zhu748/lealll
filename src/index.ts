@@ -18,7 +18,7 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
-const VERSION = "0.2.2.0";
+const VERSION = "0.2.2.1";
 const LOG_LEVEL_ORDER: Record<string, number> = { debug: 0, info: 1, warn: 2, error: 3 };
 
 // ---------------------------------------------------------------------------

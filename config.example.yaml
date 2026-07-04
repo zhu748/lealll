@@ -114,9 +114,9 @@ models:
 identity:
   # Mirrors process.env.ZCODE_APP_VERSION in the ZCode bundle.
   # Must be printable ASCII; non-conforming values fall back to the default.
-  # Default: "3.1.8" (current ZCode release). Override to match your real client.
-  appVersion: "3.1.8"
-  # Release channel header. ZCode 3.1.8 production builds send "production".
+  # Default: "3.2.5" (current ZCode release). Override to match your real client.
+  appVersion: "3.2.5"
+  # Release channel header. ZCode 3.2.5 production builds send "production".
   # Env var: ZCODE_RELEASE_CHANNEL.
   releaseChannel: "production"
   # X-Title header value. Default "Z Code@electron" (what the real client sends).

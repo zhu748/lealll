@@ -174,7 +174,7 @@ docker run --rm -p 8080:8080 \
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ZCODE_APP_VERSION` | `3.1.8` | `User-Agent: ZCode/{version}` sent to upstream. The start-plan captcha config request also sends this as `app_version`, matching the official client. Must be printable ASCII. |
+| `ZCODE_APP_VERSION` | `3.2.5` | `User-Agent: ZCode/{version}` sent to upstream. The start-plan captcha config request also sends this as `app_version`, matching the official client. Must be printable ASCII. |
 | `ZCODE_SOURCE_TITLE` | `Z Code@electron` | `X-Title` sent to upstream. |
 | `ZCODE_REFERER_ORIGIN` | `https://zcode.z.ai` | `HTTP-Referer` URL sent to upstream. |
 | `ZCODE_AGENT` | `glm` | `X-ZCode-Agent` sent on start-plan requests to mirror the official GLM agent provider. |
@@ -594,7 +594,7 @@ curl http://localhost:8080/v1/models \
 | `auth.apiKey` | `ZCODE_API_KEY` | — | Upstream API key |
 | `auth.proxyApiKey` | `ZCODE_PROXY_API_KEY` | — | Client auth key |
 | `provider` | `ZCODE_PROVIDER` | `zai` | Upstream provider |
-| `identity.appVersion` | `ZCODE_APP_VERSION` | `3.1.8` | `User-Agent: ZCode/{version}` |
+| `identity.appVersion` | `ZCODE_APP_VERSION` | `3.2.5` | `User-Agent: ZCode/{version}` |
 | `identity.sourceTitle` | `ZCODE_SOURCE_TITLE` | `Z Code@electron` | `X-Title` |
 | `identity.refererOrigin` | `ZCODE_REFERER_ORIGIN` | `https://zcode.z.ai` | `HTTP-Referer` URL |
 | `identity.zcodeAgent` | `ZCODE_AGENT` | `glm` | `X-ZCode-Agent` for start-plan requests |

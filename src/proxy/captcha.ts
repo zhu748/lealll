@@ -330,7 +330,7 @@ export function resolveClientPlatformKey(): string {
 
 export function buildCaptchaConfigUrl(options?: { appVersion?: string; platform?: string }): string {
   const url = new URL(CONFIGS_API);
-  url.searchParams.set("app_version", options?.appVersion?.trim() || "3.1.8");
+  url.searchParams.set("app_version", options?.appVersion?.trim() || "3.2.5");
   url.searchParams.set("platform", options?.platform?.trim() || resolveClientPlatformKey());
   return url.toString();
 }

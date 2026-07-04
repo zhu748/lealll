@@ -644,14 +644,14 @@ function withLinkedAbortSignal(baseFetch: typeof fetch, signal: AbortSignal): ty
 /**
  * Fire-and-forget a start-plan quota probe right after a credential is saved.
  *
- * The GET billing/current call inside queryQuota is gated by `app_version` — a
- * real client version (3.1.x) activates the start-plan trial on a fresh
+ * The GET billing/balance call inside queryQuota is gated by `app_version` — a
+ * real client version (3.2.x) activates the start-plan trial on a fresh
  * account on the very first successful query, while a low version (2.0.0)
  * never does (see quota.ts DEFAULT_APP_VERSION + the activation memory).
  *
  * OAuth token exchange itself does NOT activate the plan (verified), so a
  * freshly-OAuth'd account is still in `plans:[]` until something queries
- * billing/current with a real version. Firing this probe once at login means a
+ * billing/balance with a real version. Firing this probe once at login means a
  * new account is "OAuth done = ready to use" — the user no longer has to click
  * the quota button manually just to flip the account on.
  *
