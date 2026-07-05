@@ -1,5 +1,22 @@
 # zcode-proxy 使用说明
 
+> **v0.2.2.5 — ZCode GLM agent 模型请求头对齐**
+>
+> 本版本继续对齐真实 ZCode 客户端模型请求路径，重点修正 /v1/messages 使用的 GLM agent provider header 集，减少 start-plan/coding-plan 上游指纹差异。
+>
+> **本次改动**
+>
+> - **模型请求 identity 分流**:新增模型请求专用的 GLM agent identity 构造，避免误用桌面 host/source API 的完整 source headers。
+> - **User-Agent 对齐**:模型请求现在发送 `ZCode/{version} ai-sdk/provider-utils/4.0.27 runtime/node.js/24`，贴近 ZCode 客户端 provider runtime。
+> - **agent header 覆盖所有模型请求**:`X-ZCode-Agent: glm` 现在随上游模型请求统一发送，不再只用于 start-plan。
+> - **host-only 头清理**:模型请求不再发送 `X-Client-Language`、`X-Client-Timezone`、`X-Release-Channel`、`X-Device-Mid`；这些仍保留在验证码 client/configs 等 source/config 路径。
+> - **OS 版本字段修正**:模型 provider 路径的 `X-Os-Version` 改为 `os.release()`，与 ZCode `WOr()` 行为一致；source/config 路径仍使用桌面 host 的 `os.version()`。
+> - **文档与测试同步**:更新 identity 配置说明，并补充 agent header 顺序、host-only 头过滤和上游请求白名单回归测试。
+>
+> **升级建议**:建议使用 ZCode start-plan/coding-plan、Codex Responses API 或 Claude Code 代理的用户升级到 v0.2.2.5，以获得更接近 ZCode 真实客户端的模型请求指纹。
+
+---
+
 > **v0.2.2.4 — Codex/Claude Code 到 ZCode 协议对齐增强**
 >
 > 本版本继续对齐 ZCode 客户端真实请求/响应格式，重点修复 Codex Responses 自定义工具回包、Claude Code cache_control 边界和 ZCode Anthropic beta 指纹。

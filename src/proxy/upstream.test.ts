@@ -153,53 +153,43 @@ describe("buildAuthHeaders", () => {
     expect(h["authorization"]).toBe("Bearer bmkey");
   });
 
-  it("injects the ZCode identity header set (matches real ZCode client)", () => {
-    // Real ZCode client sends `ZCode/{appVersion}` UA plus the full identity
-    // set (verified 2026-06-28 against app.asar Mf() offset 886853).
-    // v0.2.3+: headers are emitted in the EXACT wire order the real client
-    // uses — content-type FIRST, then auth, then anthropic-version, THEN
-    // the identity block, then x-request-id LAST.
-    //
-    // (buildAuthHeaders strips content-type and x-request-id, so we only
-    // see auth + anthropic-version + identity block here. Within that
-    // subset, the order is: auth → anthropic-version → identity block.)
+  it("injects the ZCode GLM agent model-provider identity header set", () => {
+    // Model requests use the GLM agent provider headers from zcode.cjs
+    // ($yo + WOr), not the desktop host's full source-header set.
     const h = buildAuthHeaders("anthropic", ZAI_CRED, IDENTITY);
-    expect(h["user-agent"]).toBe("ZCode/test-1.0.0");
+    expect(h["user-agent"]).toBe("ZCode/test-1.0.0 ai-sdk/provider-utils/4.0.27 runtime/node.js/24");
     expect(h["x-zcode-app-version"]).toBe("test-1.0.0");
-    expect(h["x-title"]).toBe("cli");
+    expect(h["x-title"]).toBe("Z Code@cli");
+    expect(h["x-zcode-agent"]).toBe("glm");
     expect(h["http-referer"]).toBe("https://zcode.z.ai");
     expect(h["x-platform"]).toMatch(/^[a-z0-9]+-[a-z0-9]+$/i);
+    expect(h["x-client-language"]).toBeUndefined();
+    expect(h["x-client-timezone"]).toBeUndefined();
+    expect(h["x-release-channel"]).toBeUndefined();
+    expect(h["x-device-mid"]).toBeUndefined();
 
     // Verify wire order: auth FIRST, then anthropic-version, THEN identity
-    // block (user-agent is the FIRST identity header).
-    // This matches the real ZCode desktop client's wire shape (2026-06-28
-    // unpacking of Mf() at offset 886853).
+    // block.
     const keys = Object.keys(h);
     const authIdx = keys.indexOf("x-api-key");
     const versionIdx = keys.indexOf("anthropic-version");
-    const uaIdx = keys.indexOf("user-agent");
-    expect(authIdx).toBeLessThan(versionIdx);
-    expect(versionIdx).toBeLessThan(uaIdx);
-
-    // Identity block internal order (verified 2026-06-28):
-    //   user-agent → http-referer → x-title → x-zcode-app-version →
-    //   x-platform → [x-release-channel] → x-client-language →
-    //   x-client-timezone → x-os-category → [x-os-version]
-    const uaIdxInBlock = keys.indexOf("user-agent");
     const refererIdx = keys.indexOf("http-referer");
-    const titleIdx = keys.indexOf("x-title");
+    expect(authIdx).toBeLessThan(versionIdx);
+    expect(versionIdx).toBeLessThan(refererIdx);
+
+    // Agent identity block internal order mirrors zcode.cjs $yo + WOr.
+    const uaIdx = keys.indexOf("user-agent");
     const appVerIdx = keys.indexOf("x-zcode-app-version");
+    const titleIdx = keys.indexOf("x-title");
+    const agentIdx = keys.indexOf("x-zcode-agent");
     const platformIdx = keys.indexOf("x-platform");
-    const langIdx = keys.indexOf("x-client-language");
-    const tzIdx = keys.indexOf("x-client-timezone");
     const osCatIdx = keys.indexOf("x-os-category");
-    expect(uaIdxInBlock).toBeLessThan(refererIdx);
-    expect(refererIdx).toBeLessThan(titleIdx);
-    expect(titleIdx).toBeLessThan(appVerIdx);
-    expect(appVerIdx).toBeLessThan(platformIdx);
-    expect(platformIdx).toBeLessThan(langIdx);
-    expect(langIdx).toBeLessThan(tzIdx);
-    expect(tzIdx).toBeLessThan(osCatIdx);
+    expect(refererIdx).toBeLessThan(uaIdx);
+    expect(uaIdx).toBeLessThan(appVerIdx);
+    expect(appVerIdx).toBeLessThan(titleIdx);
+    expect(titleIdx).toBeLessThan(agentIdx);
+    expect(agentIdx).toBeLessThan(platformIdx);
+    expect(platformIdx).toBeLessThan(osCatIdx);
   });
 
   it("does NOT include dynamic attribution headers in the legacy auth-only helper", () => {
@@ -240,9 +230,10 @@ describe("buildUpstreamRequest", () => {
     expect(upstream.headers.get("x-api-key")).toBe("testkey.testsecret");
     expect(upstream.headers.get("anthropic-version")).toBe("2023-06-01");
     expect(upstream.headers.get("content-type")).toBe("application/json");
-    expect(upstream.headers.get("user-agent")).toBe("ZCode/test-1.0.0");
+    expect(upstream.headers.get("user-agent")).toBe("ZCode/test-1.0.0 ai-sdk/provider-utils/4.0.27 runtime/node.js/24");
     expect(upstream.headers.get("x-zcode-app-version")).toBe("test-1.0.0");
-    expect(upstream.headers.get("x-title")).toBe("cli");
+    expect(upstream.headers.get("x-title")).toBe("Z Code@cli");
+    expect(upstream.headers.get("x-zcode-agent")).toBe("glm");
     expect(upstream.headers.get("http-referer")).toBe("https://zcode.z.ai");
     // v0.2.3+: real ZCode client does NOT send `accept` on /v1/messages.
     expect(upstream.headers.get("accept")).toBeNull();
@@ -324,7 +315,7 @@ describe("buildUpstreamRequest", () => {
     expect(upstream.headers.get("x-query-id")).toBeNull();
     expect(upstream.headers.get("x-zcode-trace-id")).toBeNull();
     // Identity headers still present.
-    expect(upstream.headers.get("user-agent")).toBe("ZCode/test-1.0.0");
+    expect(upstream.headers.get("user-agent")).toBe("ZCode/test-1.0.0 ai-sdk/provider-utils/4.0.27 runtime/node.js/24");
   });
 
   // v0.2.1+: Claude Code CLI / Anthropic TypeScript SDK fingerprint headers
@@ -364,7 +355,7 @@ describe("buildUpstreamRequest", () => {
 
     // Identity headers still win — we replaced the SDK fingerprint with the
     // real ZCode client's identity set.
-    expect(upstream.headers.get("user-agent")).toBe("ZCode/test-1.0.0");
+    expect(upstream.headers.get("user-agent")).toBe("ZCode/test-1.0.0 ai-sdk/provider-utils/4.0.27 runtime/node.js/24");
     expect(upstream.headers.get("x-zcode-app-version")).toBe("test-1.0.0");
   });
 
@@ -432,10 +423,9 @@ describe("buildUpstreamRequest", () => {
     const upstream = buildUpstreamRequest(clientReq, "anthropic", ZAI_PROVIDER, ZAI_CRED, "{}", IDENTITY);
 
     // === The whitelist (matches real ZCode client wire capture): ===
-    //   content-type, x-api-key/auth, anthropic-beta, anthropic-version, user-agent,
-    //   http-referer, x-title, x-zcode-app-version, x-platform,
-    //   [x-release-channel], x-client-language, x-client-timezone,
-    //   x-os-category, [x-os-version], [x-zcode-agent start-plan only],
+    //   content-type, x-api-key/auth, anthropic-beta, anthropic-version,
+    //   http-referer, user-agent, x-zcode-app-version, x-title,
+    //   x-zcode-agent, x-platform, x-os-category, [x-os-version],
     //   x-request-id
     // Plus transport-level (auto-added by fetch/HTTP):
     //   host, content-length, accept-encoding
@@ -447,11 +437,10 @@ describe("buildUpstreamRequest", () => {
       "anthropic-version",
       "user-agent",
       "http-referer",
-      "x-title",
       "x-zcode-app-version",
+      "x-title",
+      "x-zcode-agent",
       "x-platform",
-      "x-client-language",
-      "x-client-timezone",
       "x-os-category",
       "x-os-version",
       "x-request-id",
@@ -475,7 +464,7 @@ describe("buildUpstreamRequest", () => {
     expect(leaked).toEqual([]);
 
     // === Verify whitelist values are correct (not the client's) ===
-    expect(upstream.headers.get("user-agent")).toBe("ZCode/test-1.0.0");    // not FakeClient/9.9
+    expect(upstream.headers.get("user-agent")).toBe("ZCode/test-1.0.0 ai-sdk/provider-utils/4.0.27 runtime/node.js/24");    // not FakeClient/9.9
     expect(upstream.headers.get("accept")).toBeNull();                      // not explicitly set
     expect(upstream.headers.get("content-type")).toBe("application/json");  // not text/plain
     expect(upstream.headers.get("x-api-key")).toBe("testkey.testsecret");   // not client-key
@@ -549,82 +538,45 @@ describe("buildUpstreamRequest", () => {
   // of app.asar Mf() at offset 886853 + SDK literal at 1085109 + yU at 887429).
   //
   // Real client wire order:
-  //   1. content-type
-  //   2. x-api-key | authorization
-  //   3. anthropic-beta
-  //   4. anthropic-version
-  //   5. user-agent
-  //   6. http-referer
-  //   7. x-title
-  //   8. x-zcode-app-version
-  //   9. x-platform
-  //   10. [x-release-channel]   (only when set)
-  //   11. x-client-language
-  //   12. x-client-timezone
-  //   13. x-os-category
-  //   14. [x-os-version]       (only when non-empty)
-  //   15. [x-device-mid]       (only when telemetry deviceMid is present)
-  //   16. [x-zcode-agent]      (start-plan only)
-  //   17. x-request-id
-  it("emits headers in the EXACT real ZCode client wire order (v0.2.3+, coding-plan)", () => {
-    // Use an identity WITH releaseChannel set to verify its position in the
-    // wire order. Without it, the test would still pass even if
-    // X-Release-Channel ended up at the wrong position when set.
-    const identityWithChannel: ProxyIdentity = {
-      ...IDENTITY,
-      releaseChannel: "stable",
-    };
-    const h = buildUpstreamHeaders("anthropic", ZAI_CRED, identityWithChannel);
+  it("emits GLM agent model-provider headers in stable construction order (coding-plan)", () => {
+    const h = buildUpstreamHeaders("anthropic", ZAI_CRED, IDENTITY);
 
-    // Expected wire order (just the headers we emit — fetch adds
-    // host/content-length/accept-encoding later, which we don't control).
     const expectedOrder = [
       "content-type",
       "x-api-key",
       "anthropic-beta",
       "anthropic-version",
-      "user-agent",
       "http-referer",
-      "x-title",
-      "x-zcode-app-version",
-      "x-platform",
-      "x-release-channel",   // present because releaseChannel: "stable"
-      "x-client-language",
-      "x-client-timezone",
-      "x-os-category",
-      "x-os-version",        // present because os.version() returns non-empty
-      "x-request-id",
-    ];
-
-    const actualOrder = Object.keys(h);
-    expect(actualOrder).toEqual(expectedOrder);
-  });
-
-  it("places x-device-mid after x-os-version when configured", () => {
-    const h = buildUpstreamHeaders("anthropic", ZAI_CRED, { ...IDENTITY, deviceMid: "device-mid-test" });
-    const expectedOrder = [
-      "content-type",
-      "x-api-key",
-      "anthropic-beta",
-      "anthropic-version",
       "user-agent",
-      "http-referer",
-      "x-title",
       "x-zcode-app-version",
+      "x-title",
+      "x-zcode-agent",
       "x-platform",
-      "x-client-language",
-      "x-client-timezone",
       "x-os-category",
       "x-os-version",
-      "x-device-mid",
       "x-request-id",
     ];
 
     expect(Object.keys(h)).toEqual(expectedOrder);
-    expect(h["x-device-mid"]).toBe("device-mid-test");
+    expect(h["user-agent"]).toBe("ZCode/test-1.0.0 ai-sdk/provider-utils/4.0.27 runtime/node.js/24");
+    expect(h["x-title"]).toBe("Z Code@cli");
+    expect(h["x-zcode-agent"]).toBe("glm");
   });
 
-  it("emits headers in the EXACT real ZCode client wire order (v0.2.3+, start-plan with JWT)", () => {
+  it("does not send host-only source headers on model requests", () => {
+    const h = buildUpstreamHeaders("anthropic", ZAI_CRED, {
+      ...IDENTITY,
+      releaseChannel: "stable",
+      deviceMid: "device-mid-test",
+    });
+
+    expect(h["x-release-channel"]).toBeUndefined();
+    expect(h["x-client-language"]).toBeUndefined();
+    expect(h["x-client-timezone"]).toBeUndefined();
+    expect(h["x-device-mid"]).toBeUndefined();
+  });
+
+  it("emits GLM agent model-provider headers in stable construction order (start-plan with JWT)", () => {
     // Start-plan uses authorization: Bearer <jwt> instead of x-api-key.
     // Verify the wire order is the same except slot 2 swaps to authorization.
     const jwtCred: Credential = { apiKey: "k", secret: "s", jwt: "jwt-token-xyz", provider: "zai" };
@@ -635,17 +587,14 @@ describe("buildUpstreamRequest", () => {
       "authorization",       // start-plan with jwt uses Bearer
       "anthropic-beta",
       "anthropic-version",
-      "user-agent",
       "http-referer",
-      "x-title",
+      "user-agent",
       "x-zcode-app-version",
+      "x-title",
+      "x-zcode-agent",
       "x-platform",
-      // x-release-channel absent (IDENTITY has no releaseChannel set)
-      "x-client-language",
-      "x-client-timezone",
       "x-os-category",
       "x-os-version",
-      "x-zcode-agent",
       "x-request-id",
       "x-zcode-trace-id",
       "x-query-id",
@@ -785,7 +734,7 @@ describe("buildUpstreamRequest", () => {
     expect(h["x-api-key"]).toBeUndefined();
   });
 
-  it("emits headers in the EXACT real ZCode client wire order (v0.2.3+, OpenAI format)", () => {
+  it("emits GLM agent model-provider headers in stable construction order (OpenAI format)", () => {
     // OpenAI upstream: auth via Bearer, NO anthropic-version.
     const h = buildUpstreamHeaders("openai", ZAI_CRED, IDENTITY);
 
@@ -793,13 +742,12 @@ describe("buildUpstreamRequest", () => {
       "content-type",
       "authorization",       // OpenAI uses Bearer
       // NO anthropic-version for OpenAI upstream
-      "user-agent",
       "http-referer",
-      "x-title",
+      "user-agent",
       "x-zcode-app-version",
+      "x-title",
+      "x-zcode-agent",
       "x-platform",
-      "x-client-language",
-      "x-client-timezone",
       "x-os-category",
       "x-os-version",
       "x-request-id",

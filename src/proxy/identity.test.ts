@@ -7,7 +7,7 @@
  * X-Title / HTTP-Referer identity set.
  */
 import { describe, it, expect } from "bun:test";
-import { buildIdentityHeaders } from "./identity.js";
+import { buildAgentIdentityHeaders, buildIdentityHeaders } from "./identity.js";
 import type { ProxyIdentity } from "../config/types.js";
 
 const BASE: ProxyIdentity = {
@@ -192,5 +192,50 @@ describe("buildIdentityHeaders", () => {
     const osVerIdx = keys.indexOf("X-Os-Version");
     const deviceIdx = keys.indexOf("X-Device-Mid");
     expect(osVerIdx).toBeLessThan(deviceIdx);
+  });
+});
+
+describe("buildAgentIdentityHeaders", () => {
+  it("emits the GLM agent model-provider User-Agent", () => {
+    const h = buildAgentIdentityHeaders(BASE);
+    expect(h["User-Agent"]).toBe("ZCode/3.2.5 ai-sdk/provider-utils/4.0.27 runtime/node.js/24");
+  });
+
+  it("uses os.release() for X-Os-Version on the model-provider path", () => {
+    const h = buildAgentIdentityHeaders(BASE) as unknown as Record<string, string>;
+    const os = require("node:os");
+    expect(h["X-Os-Version"]).toBe(os.release());
+  });
+
+  it("does not emit host-only source headers on model requests", () => {
+    const h = buildAgentIdentityHeaders({
+      ...BASE,
+      releaseChannel: "production",
+      deviceMid: "device-mid-test",
+    }) as unknown as Record<string, string | undefined>;
+
+    expect(h["X-Client-Language"]).toBeUndefined();
+    expect(h["X-Client-Timezone"]).toBeUndefined();
+    expect(h["X-Release-Channel"]).toBeUndefined();
+    expect(h["X-Device-Mid"]).toBeUndefined();
+  });
+
+  it("normalizes sourceTitle like the GLM agent provider", () => {
+    expect(buildAgentIdentityHeaders({ ...BASE, sourceTitle: "cli" })["X-Title"]).toBe("Z Code@cli");
+    expect(buildAgentIdentityHeaders({ ...BASE, sourceTitle: "Z Code@electron" })["X-Title"]).toBe("Z Code@electron");
+  });
+
+  it("emits agent headers in the zcode.cjs $yo + WOr order", () => {
+    const h = buildAgentIdentityHeaders(BASE);
+    expect(Object.keys(h)).toEqual([
+      "HTTP-Referer",
+      "User-Agent",
+      "X-ZCode-App-Version",
+      "X-Title",
+      "X-ZCode-Agent",
+      "X-Platform",
+      "X-Os-Category",
+      "X-Os-Version",
+    ]);
   });
 });

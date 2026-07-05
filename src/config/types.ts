@@ -29,9 +29,8 @@ export interface AuthConfig {
 }
 
 /**
- * Identity headers injected on every upstream request to mimic the ZCode
- * desktop client. Mirrors the `eYn` builder in the reverse-engineered bundle
- * (`_reverse/zcode.cjs`); see `_reverse/NOTEPAD.md` "How Credential is Used".
+ * Identity values used to mimic the ZCode desktop client. Source/config calls
+ * and model-provider calls use different official header sets.
  *
  * Resolution: env var (matches ZCode's own convention) → YAML override → default.
  * `appVersion` must be printable ASCII (`/^[\x20-\x7e]+$/`); non-conforming
@@ -62,9 +61,8 @@ export interface ProxyIdentity {
    */
   deviceMid?: string;
   /**
-   * ZCode agent marker used by the official GLM agent provider. Only sent on
-   * start-plan /v1/messages requests, where the desktop agent path identifies
-   * itself as `X-ZCode-Agent: glm`.
+   * ZCode agent marker used by the official GLM agent model-provider path.
+   * Sent on upstream model requests as `X-ZCode-Agent: glm` by default.
    */
   zcodeAgent?: string;
 }

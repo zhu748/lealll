@@ -177,7 +177,7 @@ docker run --rm -p 8080:8080 \
 | `ZCODE_APP_VERSION` | `3.2.5` | `User-Agent: ZCode/{version}` sent to upstream. The start-plan captcha config request also sends this as `app_version`, matching the official client. Must be printable ASCII. |
 | `ZCODE_SOURCE_TITLE` | `Z Code@electron` | `X-Title` sent to upstream. |
 | `ZCODE_REFERER_ORIGIN` | `https://zcode.z.ai` | `HTTP-Referer` URL sent to upstream. |
-| `ZCODE_AGENT` | `glm` | `X-ZCode-Agent` sent on start-plan requests to mirror the official GLM agent provider. |
+| `ZCODE_AGENT` | `glm` | `X-ZCode-Agent` sent on upstream model requests to mirror the official GLM agent provider. |
 | `ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT` | enabled | Start-plan pre-solves and sends fresh Aliyun captcha runtime headers before each model attempt, matching ZCode. Set to `0`, `false`, `off`, `no`, or `never` to solve only after an explicit `3007` challenge. |
 | `ZCODE_CAPTCHA_SOLVER` | `auto` | Captcha solver strategy: `auto` prefers a real Chrome/Edge CDP page (matching ZCode's Electron renderer) and falls back to JSDOM, `chrome` forces Chrome/Edge, `jsdom` forces the single-binary fallback. |
 | `ZCODE_CAPTCHA_LANGUAGE` | host locale | Optional Aliyun SDK language override: `cn` or `en`. When unset, Chinese host locales use `cn`; all others use `en`, matching the official client's locale behavior. |
@@ -598,7 +598,7 @@ curl http://localhost:8080/v1/models \
 | `identity.sourceTitle` | `ZCODE_SOURCE_TITLE` | `Z Code@electron` | `X-Title` |
 | `identity.refererOrigin` | `ZCODE_REFERER_ORIGIN` | `https://zcode.z.ai` | `HTTP-Referer` URL |
 | `identity.deviceMid` | `ZCODE_DEVICE_MID` | auto-read from ZCode telemetry | Optional `X-Device-Mid` |
-| `identity.zcodeAgent` | `ZCODE_AGENT` | `glm` | `X-ZCode-Agent` for start-plan requests |
+| `identity.zcodeAgent` | `ZCODE_AGENT` | `glm` | `X-ZCode-Agent` for model requests |
 | `server.maxRequestBodyBytes` | `ZCODE_PROXY_MAX_REQUEST_BODY_BYTES` | `67108864` | Max client request body size in bytes; set `0` to disable. |
 | — | `ZCODE_CAPTCHA_LANGUAGE` | host locale | Optional Aliyun SDK language override: `cn` or `en` |
 | — | `ZCODE_CAPTCHA_CHROME_STOP_GRACE_MS` | `2000` | Max wait before force-closing the Chrome captcha helper after a dashboard stop request. |

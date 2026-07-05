@@ -1,11 +1,15 @@
 /**
- * Identity header builder — emits the headers ZCode actually sends upstream.
+ * Identity header builders.
+ *
+ * ZCode has two related but different header sets:
+ *   - host/source headers for desktop API calls such as /client/configs
+ *   - GLM agent model-provider headers for /v1/messages traffic
  *
  * === 2026-06-28 REVERSE-ENGINEERED FROM app.asar (Mf() offset 886853 + SDK
  *     literal offset 1085109 + yU offset 887429) — REAL CLIENT WIRE ORDER ===
  *
- * The real ZCode desktop client sends the identity headers in this exact
- * order (after content-type / auth / anthropic-version, before x-request-id):
+ * The real ZCode desktop host sends the source headers in this exact order
+ * for host API calls (for example captcha client config):
  *
  *   4.  User-Agent              : ZCode/{appVersion}        (e.g. ZCode/3.2.5)
  *   5.  HTTP-Referer            : https://zcode.z.ai
@@ -45,18 +49,23 @@
  *      os.version() returns an empty string (rare, but possible on minimal
  *      containers).
  *
- * IMPORTANT: the real client sends `ZCode/{appVersion}` as the User-Agent,
- * NOT the Vercel AI SDK's `ai-sdk/anthropic/{version}`. A previous revision
- * (see git history) shipped `ai-sdk/anthropic/3.0.81` and stripped all the
- * X-ZCode-* / X-Title / HTTP-Referer headers — that was based on a flawed
- * reverse-engineering note and is the OPPOSITE of what the real client does.
- * The client proves it IS ZCode precisely via these identity headers; a
- * request that claims to be ZCode but omits them is itself a fingerprint.
+ * The GLM agent model-provider path is different. In
+ * D:\zcode\resources\glm\zcode.cjs it builds provider headers via
+ * `$yo() + WOr()`:
+ *
+ *   HTTP-Referer → User-Agent → [X-ZCode-App-Version] → X-Title →
+ *   X-ZCode-Agent → X-Platform → X-Os-Category → [X-Os-Version]
+ *
+ * That path does NOT include X-Client-Language, X-Client-Timezone,
+ * X-Release-Channel, or X-Device-Mid. It also uses os.release() for
+ * X-Os-Version because WOr() imports node:os.release(), while the desktop
+ * host source-header path uses os.version().
  */
 import os from "node:os";
 import type { ProxyIdentity } from "../config/types.js";
 
 const ASCII_PRINTABLE = /^[\x20-\x7e]+$/;
+const MODEL_USER_AGENT_SUFFIX = "ai-sdk/provider-utils/4.0.27 runtime/node.js/24";
 
 export interface IdentityHeaders {
   "User-Agent": string;
@@ -70,6 +79,17 @@ export interface IdentityHeaders {
   "X-Os-Version"?: string;
   "X-Device-Mid"?: string;
   "X-Release-Channel"?: string;
+}
+
+export interface AgentIdentityHeaders {
+  "HTTP-Referer": string;
+  "User-Agent": string;
+  "X-ZCode-App-Version"?: string;
+  "X-Title": string;
+  "X-ZCode-Agent": string;
+  "X-Platform": string;
+  "X-Os-Category": string;
+  "X-Os-Version"?: string;
 }
 
 /**
@@ -104,6 +124,7 @@ interface CachedEnv {
   clientLanguage: string;
   clientTimezone: string;
   osVersion: string;
+  osRelease: string;
 }
 
 let _cachedEnv: CachedEnv | null = null;
@@ -136,6 +157,13 @@ function getCachedEnv(): CachedEnv {
     /* keep empty */
   }
 
+  let osRelease = "";
+  try {
+    osRelease = os.release() || "";
+  } catch {
+    /* keep empty */
+  }
+
   _cachedEnv = {
     platform,
     arch,
@@ -143,6 +171,7 @@ function getCachedEnv(): CachedEnv {
     clientLanguage,
     clientTimezone,
     osVersion,
+    osRelease,
   };
   return _cachedEnv;
 }
@@ -233,7 +262,52 @@ export function buildIdentityHeaders(id: ProxyIdentity): IdentityHeaders {
   return headers as IdentityHeaders;
 }
 
+/**
+ * Build GLM agent model-provider headers.
+ *
+ * This mirrors `D:\zcode\resources\glm\zcode.cjs`:
+ *   $yo(env, opts, apiKey) -> HTTP-Referer/User-Agent/App-Version/Title/Agent
+ *   WOr()                 -> Platform/Os-Category/Os-Version
+ *
+ * These are the headers seen on real /v1/messages model requests. They are
+ * intentionally narrower than buildIdentityHeaders(): no client language,
+ * timezone, release channel, or deviceMid are sent on the model-provider path.
+ */
+export function buildAgentIdentityHeaders(id: ProxyIdentity): AgentIdentityHeaders {
+  const env = getCachedEnv();
+  const appVersion = normalizePrintable(id.appVersion);
+  const refererOrigin = normalizePrintable(id.refererOrigin) ?? "https://zcode.z.ai";
+  const sourceTitle = normalizeAgentSourceTitle(id.sourceTitle);
+  const agent = normalizePrintable(id.zcodeAgent) ?? "glm";
+
+  const headers: Partial<AgentIdentityHeaders> = {
+    "HTTP-Referer": refererOrigin,
+    "User-Agent": `ZCode/${appVersion ?? "unknown"} ${MODEL_USER_AGENT_SUFFIX}`,
+  };
+
+  if (appVersion) {
+    headers["X-ZCode-App-Version"] = appVersion;
+  }
+
+  headers["X-Title"] = sourceTitle;
+  headers["X-ZCode-Agent"] = agent;
+  headers["X-Platform"] = `${env.platform}-${env.arch}`;
+  headers["X-Os-Category"] = env.osCategory;
+
+  if (env.osRelease) {
+    headers["X-Os-Version"] = env.osRelease;
+  }
+
+  return headers as AgentIdentityHeaders;
+}
+
 function normalizePrintable(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
   return trimmed && ASCII_PRINTABLE.test(trimmed) ? trimmed : undefined;
+}
+
+function normalizeAgentSourceTitle(value: string | undefined): string {
+  const title = normalizePrintable(value);
+  if (!title) return "Z Code@electron";
+  return title.startsWith("Z Code@") ? title : `Z Code@${title}`;
 }

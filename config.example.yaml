@@ -108,9 +108,9 @@ models:
   - glm-5.1
   - glm-5.2
 
-# Identity headers injected on every upstream request to mimic the ZCode
-# desktop client (User-Agent, X-ZCode-App-Version, X-Title, X-ZCode-Agent,
-# HTTP-Referer). All optional; env vars override YAML, which overrides defaults.
+# Identity values used to mimic the ZCode desktop client. Source/config calls
+# and model-provider calls use different official header sets. All optional;
+# env vars override YAML, which overrides defaults.
 identity:
   # Mirrors process.env.ZCODE_APP_VERSION in the ZCode bundle.
   # Must be printable ASCII; non-conforming values fall back to the default.
@@ -126,7 +126,7 @@ identity:
   sourceTitle: "Z Code@electron"
   # HTTP-Referer URL. Default "https://zcode.z.ai".
   refererOrigin: "https://zcode.z.ai"
-  # X-ZCode-Agent header for start-plan requests. Default "glm".
+  # X-ZCode-Agent header for upstream model requests. Default "glm".
   # Env var: ZCODE_AGENT.
   zcodeAgent: "glm"
 

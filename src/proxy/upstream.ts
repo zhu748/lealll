@@ -17,27 +17,25 @@
  * This is a strict whitelist: anything not on the list is dropped by
  * construction (we never read it from the inbound request in the first place).
  *
- * Whitelist (sent in this exact wire order, mirroring the real ZCode client):
+ * Whitelist (explicit model-provider headers; transport may reorder them on
+ * the actual wire):
  *
  *   1.  content-type             : application/json
  *   2.  x-api-key | authorization : <upstream credential>     (format-dependent, mutually exclusive)
  *   3.  anthropic-beta           : mid-conversation-system-2026-04-07 (Anthropic upstream only)
  *   4.  anthropic-version        : 2023-06-01                  (Anthropic upstream only)
- *   5.  User-Agent               : ZCode/{appVersion}
+ *   5.  User-Agent               : ZCode/{appVersion} ai-sdk/provider-utils/4.0.27 runtime/node.js/24
  *   6.  HTTP-Referer             : https://zcode.z.ai
- *   7.  X-Title                  : Z Code@electron
- *   8.  X-ZCode-App-Version      : {appVersion}
- *   9.  X-Platform               : {platform}-{arch}           (e.g. win32-x64)
- *   10. X-Release-Channel        : {channel}                   (ONLY when non-empty)
- *   11. X-Client-Language        : {Intl locale}                (e.g. zh-CN)
- *   12. X-Client-Timezone        : {Intl timeZone}              (e.g. Asia/Shanghai)
- *   13. X-Os-Category            : macos | windows | linux
- *   14. X-Os-Version             : {os.version()}               (ONLY when non-empty)
- *   15. X-ZCode-Agent            : glm                           (start-plan only)
- *   16. x-request-id             : <fresh UUIDv4 per request attempt>
- *   17. x-zcode-trace-id         : <stable UUIDv4 per credential>  (start-plan only)
- *   18. x-query-id               : <fresh UUIDv4 per user query>   (start-plan only)
- *   19. x-session-id             : <stable UUIDv4 per credential>  (start-plan only)
+ *   7.  X-ZCode-App-Version      : {appVersion}                 (ONLY when printable)
+ *   8.  X-Title                  : Z Code@electron
+ *   9.  X-ZCode-Agent            : glm
+ *   10. X-Platform               : {platform}-{arch}             (e.g. win32-x64)
+ *   11. X-Os-Category            : macos | windows | linux
+ *   12. X-Os-Version             : {os.release()}                (ONLY when non-empty)
+ *   13. x-request-id             : <fresh UUIDv4 per request attempt>
+ *   14. x-zcode-trace-id         : <stable UUIDv4 per credential>  (start-plan only)
+ *   15. x-query-id               : <fresh UUIDv4 per user query>   (start-plan only)
+ *   16. x-session-id             : <stable UUIDv4 per credential>  (start-plan only)
  *
  * Auto-added by fetch/transport (do NOT set manually):
  *   - host (from URL)
@@ -47,10 +45,10 @@
  *
  * IMPORTANT CORRECTIONS vs v0.2.2 (verified against the 2026-06-28 unpacking):
  *
- *   1. WIRE ORDER: the real client sends content-type FIRST, then auth,
- *      then anthropic-version, THEN the identity block, then x-request-id.
- *      v0.2.2 sent the identity block first — that was wrong. We now match
- *      the real client's order exactly.
+ *   1. MODEL PROVIDER IDENTITY: model requests are built by the GLM agent
+ *      `$yo() + WOr()` path, not by the desktop host's full
+ *      buildZCodeSourceHeaders() path. Do not send host-only language,
+ *      timezone, release channel, or device-mid headers on /v1/messages.
  *
  *   2. ACCEPT HEADER: v0.2.2 explicitly set `accept: text/event-stream`.
  *      The real client DOES NOT send this header at all on /v1/messages
@@ -62,30 +60,26 @@
  *      `gzip` overrode the runtime default and was a fingerprint mismatch.
  *      We no longer set it; fetch adds it automatically.
  *
- *   4. X-RELEASE-CHANNEL: v0.2.2 did not emit this header at all. The real
- *      client emits it conditionally (only when channel is non-empty).
- *      We now mirror that via identity.releaseChannel.
+ *   4. X-OS-VERSION: desktop host source headers use os.version(), but the
+ *      GLM model-provider path uses os.release() via WOr(). Upstream model
+ *      requests now use that agent-specific value.
  *
- *   5. X-OS-VERSION: v0.2.2 used `os.release()` (kernel version number).
- *      The real client uses `os.version()` (OS product name). Fixed in
- *      identity.ts.
+ * `extraHeaders` is the ONLY way for trusted internal subsystems
+ * to inject headers upstream. It is reserved for proxy-internal use — never
+ * for passthrough of client headers. The start-plan captcha challenge path uses
+ * this hook only after upstream returns an explicit Aliyun 3007 response, unless
+ * the operator has not explicitly disabled preflight with
+ * ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT=0.
  *
-* `extraHeaders` is the ONLY way for trusted internal subsystems
-* to inject headers upstream. It is reserved for proxy-internal use — never
-* for passthrough of client headers. The start-plan captcha challenge path uses
-* this hook only after upstream returns an explicit Aliyun 3007 response, unless
-* the operator has not explicitly disabled preflight with
-* ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT=0.
- *
- * CONFIRMED NOT SENT (real client wire capture, 2026-06-28):
+ * PASSTHROUGH / POLICY NOTES (real client wire capture, 2026-06-28):
  *   - anthropic-beta            ✅ fixed ZCode value only; downstream values are never passed through
  *   - x-session-id              ✅ start-plan only, dynamic attribution
  *   - x-query-id                ✅ start-plan only, dynamic attribution
  *   - x-zcode-trace-id          ✅ start-plan only, dynamic attribution
-  *   - x-aliyun-captcha-*        ❌ from downstream clients; ✅ only after
-  *                                  an explicit start-plan 3007 challenge, or
-  *                                  during ZCode-aligned preflight
- *   - X-ZCode-Agent             ✅ start-plan only (official GLM agent provider)
+ *   - x-aliyun-captcha-*        ❌ from downstream clients; ✅ only after
+ *                                  an explicit start-plan 3007 challenge, or
+ *                                  during ZCode-aligned preflight
+ *   - X-ZCode-Agent             ✅ official GLM agent provider marker
  *   - accept                    ❌ (not on /v1/messages; was a v0.2.2 bug)
  *   - any x-stainless-*         ❌ (Anthropic SDK fingerprint)
  *   - any x-claude-* / x-claude-code-*  ❌ (Claude Code CLI fingerprint)
@@ -95,7 +89,7 @@ import type { ProviderDef } from "../provider/types.js";
 import type { Credential } from "../auth/types.js";
 import type { ProxyIdentity } from "../config/types.js";
 import { credentialString } from "../auth/types.js";
-import { buildIdentityHeaders } from "./identity.js";
+import { buildAgentIdentityHeaders } from "./identity.js";
 
 const ANTHROPIC_VERSION = "2023-06-01";
 const ANTHROPIC_BETA = "mid-conversation-system-2026-04-07";
@@ -177,8 +171,8 @@ function buildStartPlanAttributionHeaders(
 }
 
 /**
- * Derive the client IP for logging/diagnostics (NOT for session IDs — see
- * the note in buildAuthHeaders: the real client sends no session header).
+ * Derive the client IP for logging/diagnostics only. It is never used to
+ * derive upstream attribution headers.
  *
  * vceshi0.0.8+ SECURITY: previously this read X-Forwarded-For unconditionally
  * to key a session-ID cache; any client could spoof XFF to share/pollute
@@ -227,8 +221,8 @@ export function buildUpstreamURL(format: Format, provider: ProviderDef, plan: "c
 }
 
 /**
- * Build the COMPLETE upstream header set (content-type + auth + identity +
- * trace) in the exact wire order the real ZCode desktop client uses.
+ * Build the COMPLETE upstream header set (content-type + auth + GLM agent
+ * model-provider identity + trace).
  *
  * This is a strict whitelist — no client header is read or passthrough'd.
  * See the module-level header comment for the full whitelist rationale.
@@ -248,18 +242,15 @@ export function buildUpstreamHeaders(
   const startPlanAuthorization = plan === "start-plan"
     ? normalizeBearerHeader(cred.jwt ?? credStr)
     : undefined;
-  const id = buildIdentityHeaders(identity);
+  const id = buildAgentIdentityHeaders(identity);
 
-  // Build the ordered whitelist. Order matches the real ZCode desktop
-  // client's wire shape (reverse-engineered 2026-06-28 from app.asar
-  // Mf() offset 886853 + SDK literal offset 1085109 + yU offset 887429):
+  // Build the explicit whitelist. The set matches the GLM agent model
+  // provider path from zcode.cjs ($yo + WOr + model attribution headers).
   //
-  //   content-type → auth → anthropic-version → identity block → x-request-id
+  //   content-type → auth → anthropic-version → agent identity block → x-request-id
   //
   // We construct the object key-by-key rather than spreading, so the
-  // insertion order is the wire order (JavaScript engines preserve object
-  // key insertion order for non-integer string keys, and Headers
-  // construction in Bun/whatwg-fetch iterates the record in order).
+  // insertion order is stable for tests and for transports that preserve it.
   //
   // NOTE on header name case: HTTP/2 (which z.ai uses via Cloudflare) forces
   // lowercase on the wire regardless of what we set. We use the real
@@ -295,36 +286,21 @@ export function buildUpstreamHeaders(
     headers["authorization"] = `Bearer ${credStr}`;
   }
 
-  // === 4-14. Identity block (in real client wire order) ===
-  // Insert each identity header in order. Optional headers (X-Release-Channel,
-  // X-Os-Version) are already absent from `id` when their value was empty
-  // (buildIdentityHeaders handles that), so they simply don't appear in the
-  // output map — preserving the wire order of the headers that ARE present.
-  headers["user-agent"] = id["User-Agent"];
+  // === 4-12. GLM agent model-provider identity block ===
+  // This intentionally differs from the desktop host/source headers used for
+  // /api/v1/client/configs. Real model requests do not carry language,
+  // timezone, release-channel, or deviceMid headers.
   headers["http-referer"] = id["HTTP-Referer"];
-  headers["x-title"] = id["X-Title"];
-  headers["x-zcode-app-version"] = id["X-ZCode-App-Version"];
-  headers["x-platform"] = id["X-Platform"];
-  if (id["X-Release-Channel"]) {
-    headers["x-release-channel"] = id["X-Release-Channel"];
+  headers["user-agent"] = id["User-Agent"];
+  if (id["X-ZCode-App-Version"]) {
+    headers["x-zcode-app-version"] = id["X-ZCode-App-Version"];
   }
-  headers["x-client-language"] = id["X-Client-Language"];
-  headers["x-client-timezone"] = id["X-Client-Timezone"];
+  headers["x-title"] = id["X-Title"];
+  headers["x-zcode-agent"] = id["X-ZCode-Agent"];
+  headers["x-platform"] = id["X-Platform"];
   headers["x-os-category"] = id["X-Os-Category"];
   if (id["X-Os-Version"]) {
     headers["x-os-version"] = id["X-Os-Version"];
-  }
-  if (id["X-Device-Mid"]) {
-    headers["x-device-mid"] = id["X-Device-Mid"];
-  }
-
-  // === 15. X-ZCode-Agent (start-plan only) ===
-  // The official desktop GLM agent provider attaches this marker to its
-  // provider headers. Keep coding-plan unchanged, but mirror the start-plan
-  // agent path because zcode.z.ai applies a stricter gateway policy there.
-  if (plan === "start-plan") {
-    const agent = identity.zcodeAgent?.trim() || "glm";
-    headers["x-zcode-agent"] = agent;
   }
 
   // === 16. x-request-id (LAST — fresh UUIDv4 per request attempt) ===
@@ -411,10 +387,9 @@ export function buildUpstreamRequest(
   /**
    * vceshi0.0.8+: socket-aware client IP resolver, retained for diagnostics.
    * NOTE: as of the whitelist rework (v0.2.2+) it is no longer used to derive
-   * a session ID (the real client sends no session header — see module header)
-   * AND no longer used to read client headers (the whitelist ignores them
-   * entirely). Kept in the signature for API stability; the value is
-   * intentionally unused for header construction.
+   * any upstream attribution header AND no longer used to read client headers
+   * (the whitelist ignores them entirely). Kept in the signature for API
+   * stability; the value is intentionally unused for header construction.
    */
   resolveClientIp?: (req: Request) => string | undefined,
   trustProxy?: boolean,
