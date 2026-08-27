@@ -682,19 +682,12 @@ function validate(config: ProxyConfig): void {
     throw new Error(`server.port ${config.server.port} is out of range (1-65535)`);
   }
 
-  // v0.2.0.8 SECURITY: enforce a minimum length on proxyApiKey. A 1-character
-  // key passes the existing "truthy" check but is brute-forceable in seconds.
-  // 8 chars is the hard floor (blocks trivial keys like "x" or "test" while
-  // keeping existing short-but-real deployments working); we recommend 32+ in
-  // docs. Empty is allowed (loopback-only admin mode).
-  if (config.auth.proxyApiKey !== undefined && config.auth.proxyApiKey !== null && config.auth.proxyApiKey !== "") {
-    if (config.auth.proxyApiKey.length < 8) {
-      throw new Error(
-        `auth.proxyApiKey must be at least 8 characters (current: ${config.auth.proxyApiKey.length}). ` +
-        `Use a strong random string (32+ chars recommended). Set ZCODE_PROXY_API_KEY to a longer value.`,
-      );
-    }
-  }
+  // v0.3.5.0: the hard 8-char minimum on proxyApiKey was REMOVED (user
+  // request — short personal keys are the owner's choice; this proxy is
+  // typically loopback/LAN-only). Any non-empty key is now accepted.
+  // A soft advisory is printed at startup (see index.ts serve banner) when
+  // the key is shorter than 8 chars and the server is reachable from the
+  // network — advice without blocking.
 
   if (config.auth.mode === "apikey") {
     const hasGlobal = typeof config.auth.apiKey === "string" && config.auth.apiKey.length > 0;

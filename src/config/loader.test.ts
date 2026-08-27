@@ -701,6 +701,35 @@ auth:
 `);
     expect(() => loadConfig(path)).toThrow("corsAllowList");
   });
+
+  // v0.3.5.0: the hard 8-char minimum on proxyApiKey was REMOVED at user
+  // request — any non-empty key (even 1-7 chars) must load without throwing.
+  // A soft advisory is printed at serve startup instead (see index.ts).
+  it("accepts short proxyApiKey values (8-char minimum removed, v0.3.5.0)", () => {
+    for (const key of ["abc", "12345", "x"]) {
+      const path = writeYaml(`
+auth:
+  mode: apikey
+  apiKey: "upstream-key"
+  proxyApiKey: "${key}"
+`);
+      const cfg = loadConfig(path);
+      expect(cfg.auth.proxyApiKey).toBe(key);
+    }
+  });
+
+  // The shipped template (bundled into the binary AND packed into release
+  // zips as config.yaml) must default to oauth + zai and include glm-5.3.
+  // Regression guard for the v0.3.4.0 packaging gap: the example model list
+  // was missing glm-5.3, so fresh installs only saw 9 models.
+  it("config.example.yaml: defaults to oauth mode, provider zai, 10 models incl. glm-5.3", () => {
+    const cfg = loadConfig("./config.example.yaml");
+    expect(cfg.auth.mode).toBe("oauth");
+    expect(cfg.provider).toBe("zai");
+    expect(cfg.models).toHaveLength(10);
+    expect(cfg.models).toContain("glm-5.3");
+    expect(cfg.defaultModel).toBe("glm-4.6");
+  });
 });
 
 describe("resolveDefaultIdentity", () => {

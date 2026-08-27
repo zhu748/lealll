@@ -2,6 +2,34 @@
 
 A reverse proxy for Z.AI / Bigmodel.cn coding-plan APIs that exposes both OpenAI-compatible and Anthropic-format endpoints.
 
+## v0.3.5.0 — Out-of-Box Defaults (oauth-first, glm-5.3, no key-length gate)
+
+Three packaging gaps reported against the v0.3.4.0 Windows zip — all
+fixed at the template/loader level so both fresh downloads and `init`-
+generated configs pick them up.
+
+- **`auth.proxyApiKey` no longer enforces an 8-character minimum.** The
+  old hard error (`must be at least 8 characters`) blocked startup for
+  users who deliberately want a short personal key on a loopback/LAN
+  deployment. Any non-empty key now loads; the empty value keeps its
+  "loopback-only admin" meaning. A non-blocking startup NOTE (with
+  brute-force advice when bound to 0.0.0.0) replaces the hard gate —
+  the owner decides, the proxy advises.
+- **Shipped `config.yaml` now defaults to `mode: oauth` + `provider: zai`.**
+  OAuth is the primary flow for a coding-plan proxy (login once, refresh
+  forever); the old template defaulted to `apikey` with a placeholder
+  upstream key, which made first run fail confusingly. The server already
+  starts fine in oauth mode before login (API calls 503, dashboard offers
+  OAuth login / ZCode import with hot-swap), so the new default is a
+  download → run → click-login experience. `apikey` mode is unchanged and
+  still fully supported.
+- **`glm-5.3` added to the shipped model list.** The registry has had it
+  since v0.3.2, but the template's `models:` array (which overrides the
+  registry when set) still listed 9 models — fresh installs showed
+  "models: 9 available" and no glm-5.3. The template now lists all 10
+  models; a regression test pins template mode/provider/model-count so
+  this drift can't happen again.
+
 ## v0.3.4.0 — Client-Disconnect Propagation + Dual Server Adapter
 
 A deep audit of the v0.3.3.0 node:http migration surfaced one critical
@@ -197,12 +225,25 @@ model routing/mappings, quota queries, and ZCode desktop credential import.
 bun install
 
 # Start the proxy — first run auto-creates config.yaml from the bundled
-# template if it doesn't already exist (no need to cp from config.example.yaml)
+# template if it doesn't already exist (no need to cp from config.example.yaml).
+# The template defaults to oauth mode + zai provider: the server starts,
+# then you log in from the dashboard or via the CLI.
 bun run src/index.ts
+
+# Log in (opens the browser) — coding plan on Z.AI:
+bun run src/index.ts auth login zai --plan=coding-plan
+# ...or on Bigmodel, and/or --plan=start-plan for the free tier.
 
 # Or specify a config path
 bun run src/index.ts /path/to/config.yaml
 ```
+
+Prefer an API key instead of OAuth? Set `auth.mode: apikey` and
+`auth.apiKey` in `config.yaml` (see the comments in `config.example.yaml`).
+`proxyApiKey` (the key your own clients must present) is optional and may
+now be any length — leaving it empty disables client auth entirely
+(loopback-only admin mode).
+
 
 ## Deploy to Render
 

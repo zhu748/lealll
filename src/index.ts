@@ -365,7 +365,8 @@ async function serve(configPath?: string): Promise<void> {
   const path = configPath ?? process.env.ZCODE_PROXY_CONFIG ?? "config.yaml";
   if (await ensureConfigFile(path)) {
     console.log(`Created ${path} from bundled template.`);
-    console.log(`Edit auth.apiKey, or run: zcode-proxy auth login <zai|bigmodel>\n`);
+    console.log(`Default mode is OAuth — run: zcode-proxy auth login <zai|bigmodel>`);
+    console.log(`(or start the server and log in from the dashboard at /admin)\n`);
   }
   const config = loadConfig(path);
 
@@ -585,6 +586,20 @@ async function serve(configPath?: string): Promise<void> {
     console.warn("  ⚠  WARNING: auth.proxyApiKey is NOT configured.");
     console.warn("  ⚠  Anyone who can reach this port can use your upstream credentials.");
     console.warn("  ⚠  Set `auth.proxyApiKey` in config.yaml or env ZCODE_PROXY_API_KEY.");
+    console.warn("");
+  } else if (config.auth.proxyApiKey.length < 8) {
+    // v0.3.5.0: the hard 8-char minimum was removed at user request — any
+    // non-empty key is accepted. Keep a non-blocking advisory here so the
+    // owner at least sees the brute-force risk when exposed to the network.
+    const exposed = server.hostname === "0.0.0.0" || server.hostname === "::";
+    console.warn("");
+    console.warn(`  ⚠  NOTE: proxyApiKey is ${config.auth.proxyApiKey.length} chars (short).`);
+    if (exposed) {
+      console.warn("  ⚠  The proxy is bound on all interfaces — a short key is brute-forceable.");
+      console.warn("  ⚠  Consider a longer key (32+ chars) or bind server.host to 127.0.0.1.");
+    } else {
+      console.warn("  ⚠  Fine for loopback-only use; use a longer key (32+ chars) if you bind 0.0.0.0.");
+    }
     console.warn("");
   }
 

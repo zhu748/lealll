@@ -63,17 +63,24 @@ server:
 #   - "http://localhost:3000"
 
 auth:
-  # "apikey" = use a pre-obtained API key directly
-  # "oauth"  = use OAuth login flow (run `zcode-proxy auth login <zai|bigmodel>` first)
-  mode: apikey
+  # "oauth"  = OAuth login flow (DEFAULT — run `zcode-proxy auth login <zai|bigmodel>`
+  #            first, or start the server and log in from the dashboard at /admin).
+  #            The server starts even before login: API requests return 503
+  #            until a credential is added, and the dashboard offers
+  #            "OAuth 登录" / "从 ZCode 导入" buttons — no restart needed.
+  # "apikey" = use a pre-obtained API key directly (set auth.apiKey below)
+  mode: oauth
 
-  # For apikey mode:
+  # Only used in apikey mode (ignored in oauth mode):
   #   Z.AI:     "yourApiKey.yourSecretKey"
   #   Bigmodel: "yourApiKey"
   apiKey: "YOUR_API_KEY_HERE"
 
-  # Key that clients must provide to use the proxy.
-  # Set to null/omit to disable client auth.
+  # Key that clients must provide to use the proxy (the "admin password" —
+  # it gates both /v1/* API calls and the /admin dashboard).
+  # Set to null/omit to disable client auth (loopback-only mode).
+  # Any length is accepted (v0.3.5.0 removed the old 8-char minimum);
+  # 32+ random chars recommended when binding to 0.0.0.0.
   proxyApiKey: "your-proxy-secret"
 
   # For oauth mode (path to stored credentials from login flow):
@@ -107,6 +114,7 @@ models:
   - glm-5v-turbo
   - glm-5.1
   - glm-5.2
+  - glm-5.3
 
 # Identity values used to mimic the ZCode desktop client (v0.3.0: model
 # requests carry the FULL pio header set — see identity.ts). All optional;
