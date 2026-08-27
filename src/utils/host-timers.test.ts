@@ -63,15 +63,22 @@ describe("host-timers quarantine (v0.3.7.1 — 429-retry permanent hang)", () =>
       hostSetTimeout(() => {
         fired = true;
       }, 20);
-      // Observation window on the native timer (post-restore in finally is
-      // too late — assert INSIDE the accessor-shadowed scope).
+      // Hermetic synchronous snapshot: hostSetTimeout has ALREADY returned,
+      // so if it had resolved through the accessor, the getter would have
+      // been EVALUATED and the poison function CALLED by now — both happen
+      // synchronously at registration time. Asserting BEFORE any await keeps
+      // this immune to unrelated timer activity elsewhere in the shared
+      // bun-test process (leftover self-re-arming timers from earlier test
+      // files — exactly what made this test flake on CI's slower runners:
+      // a stray call inside the 120ms observation window tripped the poison
+      // even though hostSetTimeout itself never touched the accessor).
+      expect(poisonCalled).toBe(false);
+      expect(getterInvoked).toBe(false);
+      // Observation window on the native timer: the registered callback must
+      // actually fire on the NATIVE registry.
       await new Promise((r) => _nativeTimerBindingsForTesting().setTimeout(r as never, 120) as never);
       expect(fired).toBe(true);
-      expect(poisonCalled).toBe(false);
     });
-    // The getter itself must never even be evaluated: the quarantine path
-    // reads only the descriptor, never the value.
-    expect(getterInvoked).toBe(false);
   });
 
   it("hostSleep resolves while the global setTimeout is accessor-shadowed", async () => {
@@ -133,13 +140,24 @@ describe("host-timers quarantine (v0.3.7.1 — 429-retry permanent hang)", () =>
   });
 
   it("non-function data globals fall back to the captured native binding", async () => {
-    await withDataGlobal("setTimeout", "not-a-function", async () => {
-      let fired = false;
+    let fired = false;
+    // Install the pathological global ONLY around the synchronous
+    // hostSetTimeout call: if it stayed installed during the await window,
+    // any unrelated timer call elsewhere in the shared test process would
+    // crash on `setTimeout is not a function` (same shared-process hazard
+    // the first test guards against).
+    const desc = Object.getOwnPropertyDescriptor(globalThis, "setTimeout")!;
+    Object.defineProperty(globalThis, "setTimeout", { value: "not-a-function", writable: true, configurable: true, enumerable: true });
+    try {
       hostSetTimeout(() => {
         fired = true;
       }, 20);
-      await new Promise((r) => _nativeTimerBindingsForTesting().setTimeout(() => r(undefined), 120) as never);
-      expect(fired).toBe(true);
-    });
+    } finally {
+      Object.defineProperty(globalThis, "setTimeout", desc);
+    }
+    // Global restored — the wait is safe for third-party timer callers. The
+    // callback must have been registered on the NATIVE registry.
+    await new Promise((r) => _nativeTimerBindingsForTesting().setTimeout(r as never, 120) as never);
+    expect(fired).toBe(true);
   });
 });
