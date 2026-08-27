@@ -41,9 +41,8 @@ describe("EndpointRoutingService", () => {
     for (const url of [
       "https://api.z.ai/api/coding/paas/v4/chat/completions",
       "https://open.bigmodel.cn/api/anthropic/v1/messages",
-      // start-plan URLs (v0.3.7 mirror + legacy gateway) are never remapped.
+      // The start-plan mirror is never remapped.
       "https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages",
-      "https://zcode.z.ai/api/v1/zcode-plan/chat/completions",
     ]) {
       const resolved = await svc.resolve(url);
       expect(resolved.routed).toBeFalse();

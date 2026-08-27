@@ -16,8 +16,8 @@
  *      live). start-plan now routes through the Anthropic mirror
  *      `/api/v1/zcode-plan/anthropic/v1/messages` (verified live: 401
  *      without auth = registered, auth-gated route). This is the pre-v0.3.0
- *      behavior, restored. ZCODE_STARTPLAN_UPSTREAM=openai restores the
- *      legacy gateway URL/pipeline if the endpoint ever returns.
+ *      behavior, restored. The removed route is no longer retained as a
+ *      runtime fallback.
  *
  * === v0.3.0 (upstream zcode-api v2.6.0 alignment, ZCode 3.9.x wire shape) ===
  *
@@ -89,7 +89,7 @@ import { credentialString } from "../auth/types.js";
 import { buildIdentityHeaders } from "./identity.js";
 import { buildZcodeTraceHeaders } from "./trace-headers.js";
 import { sessionIdForHeader, shouldUseExactTraceHeaders, type SessionHeaderContext } from "./session-context.js";
-import { startPlanUpstreamStyle, upstreamAcceptEncoding } from "./runtime-options.js";
+import { upstreamAcceptEncoding } from "./runtime-options.js";
 
 export interface UpstreamClientSession {
   source?: "none" | "explicit" | "lineage";
@@ -112,7 +112,6 @@ const ALIYUN_CAPTCHA_HEADERS = new Set([
 ]);
 
 const STARTPLAN_ANTHROPIC_BASE = "https://zcode.z.ai/api/v1/zcode-plan/anthropic";
-const STARTPLAN_OPENAI_BASE = "https://zcode.z.ai/api/v1/zcode-plan";
 
 function normalizeBearerHeader(token: string | undefined): string | undefined {
   const trimmed = token?.trim();
@@ -157,14 +156,11 @@ function clientIp(
  * gateway path was removed server-side (404) around 2026-08-27.
  * coding-plan mirrors the real ZCode client — Anthropic upstream
  * (api.z.ai/api/anthropic, possibly remapped to the ultra endpoint by
- * endpoint-routing.ts at dispatch time). ZCODE_STARTPLAN_UPSTREAM=openai
- * restores the legacy v0.3.0 gateway URL.
+ * endpoint-routing.ts at dispatch time).
  */
 export function buildUpstreamURL(format: Format, provider: ProviderDef, plan: "coding-plan" | "start-plan" = "coding-plan"): string {
   if (plan === "start-plan") {
-    return startPlanUpstreamStyle() === "openai"
-      ? `${STARTPLAN_OPENAI_BASE}/chat/completions`
-      : `${STARTPLAN_ANTHROPIC_BASE}/v1/messages`;
+    return `${STARTPLAN_ANTHROPIC_BASE}/v1/messages`;
   }
   if (format === "anthropic") {
     return `${provider.anthropicBaseURL}/v1/messages`;
@@ -214,8 +210,6 @@ function buildTraceHeaders(plan: "coding-plan" | "start-plan", clientSession?: U
  * - Anthropic upstream, start-plan  → `Authorization: Bearer {jwt}` + `anthropic-version`
  *                                         (v0.3.7 default — zcode.z.ai mirror)
  * - OpenAI upstream, coding-plan    → `Authorization: Bearer {cred}`
- * - OpenAI upstream, start-plan     → `Authorization: Bearer {jwt}`
- *                                         (legacy ZCODE_STARTPLAN_UPSTREAM=openai)
  */
 export function buildAuthHeaders(
   format: Format,

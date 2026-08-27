@@ -114,7 +114,7 @@ export interface OpenAIChatResponse {
 /**
  * OpenAI usage block. `prompt_tokens` is *inclusive* of cache hits on most
  * compatible upstreams, so the Anthropic `input_tokens` (exclusive of cache)
- * is derived by subtracting the cache buckets — see `openaiUsageToAnthropic`
+ * is derived by subtracting the cache buckets when converting usage
  * (aligned with upstream zcode-api v2.6.0).
  */
 export interface OpenAIUsage {

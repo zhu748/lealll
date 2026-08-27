@@ -126757,10 +126757,6 @@ function startPlanCaptchaPreflightEnabled() {
   if (raw === "0" || raw === "false" || raw === "off" || raw === "no" || raw === "never") return false;
   return raw === "1" || raw === "true" || raw === "on" || raw === "yes" || raw === "always";
 }
-function startPlanUpstreamStyle() {
-  const raw = process.env.ZCODE_STARTPLAN_UPSTREAM?.trim().toLowerCase();
-  return raw === "openai" || raw === "gateway" ? "openai" : "anthropic";
-}
 function upstreamAcceptEncoding() {
   const raw = process.env.ZCODE_UPSTREAM_ACCEPT_ENCODING?.trim();
   return raw && raw.length > 0 ? raw : "identity";
@@ -126774,7 +126770,6 @@ var ALIYUN_CAPTCHA_HEADERS = /* @__PURE__ */ new Set([
   "x-aliyun-captcha-verify-region"
 ]);
 var STARTPLAN_ANTHROPIC_BASE = "https://zcode.z.ai/api/v1/zcode-plan/anthropic";
-var STARTPLAN_OPENAI_BASE = "https://zcode.z.ai/api/v1/zcode-plan";
 function normalizeBearerHeader(token) {
   const trimmed = token?.trim();
   if (!trimmed) return void 0;
@@ -126798,7 +126793,7 @@ function clientIp(req, resolveClientIp, trustProxy) {
 }
 function buildUpstreamURL(format, provider, plan = "coding-plan") {
   if (plan === "start-plan") {
-    return startPlanUpstreamStyle() === "openai" ? `${STARTPLAN_OPENAI_BASE}/chat/completions` : `${STARTPLAN_ANTHROPIC_BASE}/v1/messages`;
+    return `${STARTPLAN_ANTHROPIC_BASE}/v1/messages`;
   }
   if (format === "anthropic") {
     return `${provider.anthropicBaseURL}/v1/messages`;
@@ -126965,9 +126960,6 @@ function transformRequestBodyObj(parsed, ctx) {
   if (typeof parsed !== "object" || parsed === null) return void 0;
   let modified = false;
   if (ctx.format === "openai") {
-    if (ctx.startPlan) {
-      modified = applyStartPlanOpenAISystem(parsed) || modified;
-    }
     modified = applyStreamOptionsIncludeUsage(parsed) || modified;
   }
   if (ctx.format === "anthropic") {
@@ -127392,31 +127384,6 @@ function applyStartPlanSystem(body2) {
   body2.system = newSystem;
   return true;
 }
-function applyStartPlanOpenAISystem(body2) {
-  const messages = body2.messages;
-  if (!Array.isArray(messages)) return false;
-  const officialTexts = ZCODE_SYSTEM_BLOCKS.map((b) => b.text);
-  if (messages.length >= officialTexts.length) {
-    let alreadyInjected = true;
-    for (let i = 0; i < officialTexts.length; i++) {
-      const m = messages[i];
-      const text = typeof m?.content === "string" ? m.content : void 0;
-      if (m?.role !== "system" || text !== officialTexts[i]) {
-        alreadyInjected = false;
-        break;
-      }
-    }
-    if (alreadyInjected) return false;
-  }
-  const model = typeof body2.model === "string" ? body2.model : void 0;
-  const official = buildStartPlanSystem(void 0, model).map((block) => ({
-    role: "system",
-    content: typeof block === "object" && block !== null && "text" in block ? String(block.text) : ""
-  }));
-  body2.messages = [...official, ...messages];
-  return true;
-}
-
 // src/proxy/sse-error-detector.ts
 init_sse();
 var SSE_ERROR_STATUS_MAP = {
@@ -128074,197 +128041,6 @@ function parseContentBlockIndex(value2, maxIndex) {
 // src/proxy/handler.ts
 init_anthropic_to_responses();
 
-// src/translator/anthropic-to-openai.ts
-function translateRequestAnthropicToOpenAI(req) {
-  const messages = [];
-  if (req.system) {
-    const systemText = typeof req.system === "string" ? req.system : req.system.map((s) => s.text).join("\n");
-    messages.push({ role: "system", content: systemText });
-  }
-  for (const m of req.messages) {
-    messages.push(...translateMessageAnthropicToOpenAI(m));
-  }
-  const result3 = {
-    model: req.model,
-    messages,
-    ...req.temperature !== void 0 ? { temperature: req.temperature } : {},
-    ...req.top_p !== void 0 ? { top_p: req.top_p } : {},
-    ...req.stream !== void 0 ? { stream: req.stream } : {},
-    ...req.max_tokens !== void 0 ? { max_tokens: req.max_tokens } : {}
-  };
-  if (req.stop_sequences?.length) {
-    result3.stop = req.stop_sequences.length === 1 ? req.stop_sequences[0] : req.stop_sequences;
-  }
-  if (req.thinking) {
-    result3.thinking = req.thinking;
-  }
-  if (req.tools?.length) {
-    result3.tools = req.tools.map((t) => ({
-      type: "function",
-      function: {
-        name: t.name,
-        ...t.description ? { description: t.description } : {},
-        ...t.input_schema ? { parameters: t.input_schema } : {}
-      }
-    }));
-  }
-  if (req.tool_choice) {
-    const translated = mapToolChoiceAnthropicToOpenAI(req.tool_choice);
-    if (translated !== void 0) result3.tool_choice = translated;
-  }
-  return result3;
-}
-function mapToolChoiceAnthropicToOpenAI(choice) {
-  switch (choice.type) {
-    case "auto":
-      return "auto";
-    case "any":
-      return "required";
-    case "tool":
-      return { type: "function", function: { name: choice.name } };
-    default:
-      return void 0;
-  }
-}
-function translateResponseOpenAIToAnthropic(resp) {
-  const choice = resp.choices?.[0];
-  const content2 = [];
-  if (choice?.message?.reasoning_content) {
-    content2.push({ type: "thinking", thinking: choice.message.reasoning_content });
-  }
-  if (choice?.message?.content) {
-    const textContent = typeof choice.message.content === "string" ? choice.message.content : Array.isArray(choice.message.content) ? choice.message.content.filter((c) => c.type === "text").map((c) => c.text ?? "").join("") : "";
-    if (textContent) content2.push({ type: "text", text: textContent });
-  }
-  if (choice?.message?.tool_calls) {
-    for (const tc of choice.message.tool_calls) {
-      let input = {};
-      try {
-        input = JSON.parse(tc.function.arguments);
-      } catch {
-        input = {};
-      }
-      content2.push({
-        type: "tool_use",
-        id: tc.id,
-        name: tc.function.name,
-        input
-      });
-    }
-  }
-  const stopReason = mapFinishReasonToStopReason(choice?.finish_reason);
-  return {
-    id: resp.id,
-    type: "message",
-    role: "assistant",
-    content: content2.length > 0 ? content2 : [{ type: "text", text: "" }],
-    model: resp.model,
-    stop_reason: stopReason,
-    stop_sequence: null,
-    usage: openaiUsageToAnthropic(resp.usage)
-  };
-}
-function translateMessageAnthropicToOpenAI(m) {
-  if (typeof m.content === "string") {
-    return [{ role: m.role, content: m.content }];
-  }
-  const result3 = [];
-  const contentParts = [];
-  const toolCalls = [];
-  const reasoningParts = [];
-  for (const block of m.content) {
-    switch (block.type) {
-      case "text": {
-        contentParts.push({ type: "text", text: block.text });
-        break;
-      }
-      case "image": {
-        if (block.source.type === "base64") {
-          contentParts.push({
-            type: "image_url",
-            image_url: { url: `data:${block.source.media_type};base64,${block.source.data}` }
-          });
-        }
-        break;
-      }
-      case "tool_use": {
-        toolCalls.push({
-          id: block.id,
-          type: "function",
-          function: { name: block.name, arguments: JSON.stringify(block.input ?? {}) }
-        });
-        break;
-      }
-      case "tool_result": {
-        result3.push({
-          role: "tool",
-          tool_call_id: block.tool_use_id,
-          content: toolResultContentToOpenAI(block.content, block.is_error === true)
-        });
-        break;
-      }
-      case "thinking": {
-        if (block.thinking.length > 0) reasoningParts.push(block.thinking);
-        break;
-      }
-      default:
-        break;
-    }
-  }
-  const hasReasoning = m.role === "assistant" && reasoningParts.length > 0;
-  if (contentParts.length > 0 || toolCalls.length > 0 || hasReasoning) {
-    const content2 = contentParts.length === 0 ? null : contentParts.length === 1 && contentParts[0].type === "text" ? contentParts[0].text ?? "" : contentParts;
-    result3.push({
-      role: m.role,
-      content: content2,
-      ...hasReasoning ? { reasoning_content: reasoningParts.join("\n") } : {},
-      ...toolCalls.length > 0 ? { tool_calls: toolCalls } : {}
-    });
-  }
-  if (result3.length === 0) {
-    result3.push({ role: m.role, content: null });
-  }
-  return result3;
-}
-function toolResultContentToOpenAI(content2, isError) {
-  const body2 = flattenToolResultContent(content2);
-  return isError && body2.length > 0 ? `[tool_error] ${body2}` : body2;
-}
-function flattenToolResultContent(content2) {
-  if (typeof content2 === "string") return content2;
-  if (!Array.isArray(content2)) return "";
-  const texts = content2.filter((b) => b.type === "text").map((b) => b.text);
-  if (texts.length > 0) return texts.join("");
-  return JSON.stringify(content2);
-}
-function mapFinishReasonToStopReason(finishReason) {
-  switch (finishReason) {
-    case "stop":
-      return "end_turn";
-    case "length":
-      return "max_tokens";
-    case "tool_calls":
-      return "tool_use";
-    case "content_filter":
-      return "end_turn";
-    default:
-      return null;
-  }
-}
-function openaiUsageToAnthropic(usage) {
-  const promptTokens = usage?.prompt_tokens ?? 0;
-  const cacheRead = usage?.cache_read_input_tokens ?? usage?.prompt_tokens_details?.cached_tokens ?? 0;
-  const cacheCreation = usage?.cache_creation_input_tokens ?? 0;
-  const inputTokens = Math.max(0, promptTokens - cacheRead - cacheCreation);
-  const result3 = {
-    input_tokens: inputTokens,
-    output_tokens: usage?.completion_tokens ?? 0
-  };
-  if (cacheRead > 0) result3.cache_read_input_tokens = cacheRead;
-  if (cacheCreation > 0) result3.cache_creation_input_tokens = cacheCreation;
-  return result3;
-}
-
 // src/translator/sse-translator.ts
 init_sse();
 init_constants();
@@ -128541,261 +128317,6 @@ function mapStopReason(stopReason) {
       return "stop";
   }
 }
-function openaiSseToAnthropicSse(upstream, model = "glm-4.6") {
-  const encoder2 = new TextEncoder();
-  const decoder = new TextDecoder();
-  let buffer2 = "";
-  let messageStarted = false;
-  let blockIndex = 0;
-  let activeBlock = null;
-  const toolBlocks = /* @__PURE__ */ new Map();
-  const openToolBlockIndices = [];
-  let outputTokens = 0;
-  let latestUsage;
-  let pendingStopReason = null;
-  let contentClosed = false;
-  let messageDeltaSent = false;
-  let messageStopped = false;
-  const messageId = `msg_${Date.now()}`;
-  return new ReadableStream({
-    async start(controller) {
-      const reader = upstream.getReader();
-      let errored = false;
-      const enqueueAnthropicEvent = (eventType, data2) => {
-        controller.enqueue(encoder2.encode(formatAnthropicSSE(eventType, data2)));
-      };
-      const closeActiveBlock = () => {
-        if (!activeBlock) return;
-        enqueueAnthropicEvent("content_block_stop", {
-          type: "content_block_stop",
-          index: activeBlock.index
-        });
-        activeBlock = null;
-      };
-      const closeToolBlocks = () => {
-        for (const idx of openToolBlockIndices) {
-          enqueueAnthropicEvent("content_block_stop", {
-            type: "content_block_stop",
-            index: idx
-          });
-        }
-        openToolBlockIndices.length = 0;
-      };
-      const ensureActiveBlock = (type2) => {
-        if (activeBlock?.type === type2) return activeBlock.index;
-        closeActiveBlock();
-        const index = blockIndex++;
-        activeBlock = { type: type2, index };
-        enqueueAnthropicEvent("content_block_start", {
-          type: "content_block_start",
-          index,
-          content_block: type2 === "text" ? { type: "text", text: "" } : { type: "thinking", thinking: "", signature: "" }
-        });
-        return index;
-      };
-      const handleToolCalls = (toolCalls) => {
-        closeActiveBlock();
-        for (const tc of toolCalls) {
-          const idx = tc.index ?? 0;
-          let state2 = toolBlocks.get(idx);
-          if (!state2) {
-            state2 = { index: blockIndex++, id: "", name: "", started: false, pendingArgs: "" };
-            toolBlocks.set(idx, state2);
-          }
-          if (tc.id) state2.id = tc.id;
-          if (tc.function?.name) state2.name = tc.function.name;
-          if (!state2.started && state2.id && state2.name) {
-            state2.started = true;
-            enqueueAnthropicEvent("content_block_start", {
-              type: "content_block_start",
-              index: state2.index,
-              content_block: { type: "tool_use", id: state2.id, name: state2.name, input: {} }
-            });
-            openToolBlockIndices.push(state2.index);
-            if (state2.pendingArgs.length > 0) {
-              enqueueAnthropicEvent("content_block_delta", {
-                type: "content_block_delta",
-                index: state2.index,
-                delta: { type: "input_json_delta", partial_json: state2.pendingArgs }
-              });
-              state2.pendingArgs = "";
-            }
-          }
-          const argsDelta = tc.function?.arguments;
-          if (argsDelta) {
-            if (state2.started) {
-              enqueueAnthropicEvent("content_block_delta", {
-                type: "content_block_delta",
-                index: state2.index,
-                delta: { type: "input_json_delta", partial_json: argsDelta }
-              });
-            } else {
-              state2.pendingArgs += argsDelta;
-            }
-          }
-        }
-      };
-      const startPendingToolBlocks = () => {
-        const lateStarts = [];
-        for (const [openaiIdx, state2] of toolBlocks) {
-          if (state2.started) continue;
-          if (!state2.pendingArgs && !state2.id && !state2.name) continue;
-          state2.started = true;
-          lateStarts.push({
-            index: state2.index,
-            id: state2.id || `tool_call_${openaiIdx}`,
-            name: state2.name || "unknown_tool",
-            args: state2.pendingArgs
-          });
-          state2.pendingArgs = "";
-          openToolBlockIndices.push(state2.index);
-        }
-        lateStarts.sort((a, b) => a.index - b.index);
-        for (const ls of lateStarts) {
-          enqueueAnthropicEvent("content_block_start", {
-            type: "content_block_start",
-            index: ls.index,
-            content_block: { type: "tool_use", id: ls.id, name: ls.name, input: {} }
-          });
-          if (ls.args.length > 0) {
-            enqueueAnthropicEvent("content_block_delta", {
-              type: "content_block_delta",
-              index: ls.index,
-              delta: { type: "input_json_delta", partial_json: ls.args }
-            });
-          }
-        }
-      };
-      const closeContent = () => {
-        if (contentClosed) return;
-        contentClosed = true;
-        closeActiveBlock();
-        startPendingToolBlocks();
-        closeToolBlocks();
-      };
-      const finalizeStream = () => {
-        closeContent();
-        if (!messageDeltaSent) {
-          messageDeltaSent = true;
-          const usage = openaiUsageToAnthropic(latestUsage);
-          if (!latestUsage) usage.output_tokens = outputTokens;
-          enqueueAnthropicEvent("message_delta", {
-            type: "message_delta",
-            delta: {
-              stop_reason: pendingStopReason ?? "end_turn",
-              stop_sequence: null
-            },
-            usage
-          });
-        }
-        if (!messageStopped) {
-          messageStopped = true;
-          enqueueAnthropicEvent("message_stop", { type: "message_stop" });
-        }
-      };
-      try {
-        while (true) {
-          const { done, value: value2 } = await reader.read();
-          if (done) break;
-          buffer2 += decoder.decode(value2, { stream: true });
-          const lines = buffer2.split("\n");
-          buffer2 = lines.pop() ?? "";
-          for (const line of lines) {
-            if (!line.startsWith("data: ")) continue;
-            const dataStr = line.slice(6).trim();
-            if (dataStr === "[DONE]") {
-              finalizeStream();
-              continue;
-            }
-            try {
-              const chunk = JSON.parse(dataStr);
-              const choice = chunk.choices?.[0];
-              if (chunk.usage) {
-                latestUsage = chunk.usage;
-                outputTokens = chunk.usage.completion_tokens ?? outputTokens;
-              }
-              if (!messageStarted) {
-                messageStarted = true;
-                const startUsage = openaiUsageToAnthropic(chunk.usage);
-                enqueueAnthropicEvent("message_start", {
-                  type: "message_start",
-                  message: {
-                    id: chunk.id ?? messageId,
-                    type: "message",
-                    role: "assistant",
-                    content: [],
-                    model: chunk.model || model,
-                    stop_reason: null,
-                    stop_sequence: null,
-                    usage: startUsage
-                  }
-                });
-              }
-              if (choice?.delta?.content) {
-                const index = ensureActiveBlock("text");
-                enqueueAnthropicEvent("content_block_delta", {
-                  type: "content_block_delta",
-                  index,
-                  delta: { type: "text_delta", text: choice.delta.content }
-                });
-              }
-              if (choice?.delta?.reasoning_content) {
-                const index = ensureActiveBlock("thinking");
-                enqueueAnthropicEvent("content_block_delta", {
-                  type: "content_block_delta",
-                  index,
-                  delta: { type: "thinking_delta", thinking: choice.delta.reasoning_content }
-                });
-              }
-              if (choice?.delta?.tool_calls?.length) {
-                handleToolCalls(choice.delta.tool_calls);
-              }
-              if (choice?.finish_reason) {
-                pendingStopReason = mapFinishReason(choice.finish_reason);
-                closeContent();
-              }
-            } catch {
-            }
-          }
-        }
-        finalizeStream();
-      } catch (err) {
-        errored = true;
-        try {
-          controller.error(err);
-        } catch {
-        }
-      } finally {
-        if (!errored) {
-          try {
-            controller.close();
-          } catch {
-          }
-        }
-        reader.releaseLock();
-      }
-    }
-  });
-}
-function formatAnthropicSSE(eventType, data2) {
-  return `event: ${eventType}
-data: ${JSON.stringify(data2)}
-
-`;
-}
-function mapFinishReason(finishReason) {
-  switch (finishReason) {
-    case "stop":
-      return "end_turn";
-    case "length":
-      return "max_tokens";
-    case "tool_calls":
-      return "tool_use";
-    default:
-      return "end_turn";
-  }
-}
-
 // src/proxy/client-signing.ts
 init_identity();
 init_host_timers();
@@ -128819,7 +128340,6 @@ var VERIFY_SIGNATURE_INVALID = "VERIFY_SIGNATURE_INVALID";
 var VERIFY_APIKEY_EXPIRED = "VERIFY_APIKEY_EXPIRED";
 var UNSIGNED_PATHS = /* @__PURE__ */ new Set([
   "/api/v1/zcode-plan/anthropic/v1/messages",
-  "/api/v1/zcode-plan/chat/completions",
   "/api/v1/off-peak/anthropic/v1/messages"
 ]);
 var SIGNING_HEADER_NAMES = /* @__PURE__ */ new Set([
@@ -130492,9 +130012,7 @@ async function proxyRequest(clientReq, format, opts) {
   if (currentPlan !== config.plan) {
     proxyLog(`${reqId} plan resolved from active credential: ${config.plan} \u2192 ${currentPlan}`);
   }
-  void (format === "openai" || format === "openai-responses");
-  const upstreamFormatForPlan = (plan) => plan === "start-plan" && startPlanUpstreamStyle() === "openai" ? "openai" : "anthropic";
-  let upstreamFormat = upstreamFormatForPlan(currentPlan);
+  const upstreamFormat = "anthropic";
   const applyModelRewrite = () => {
     if (format === "anthropic" && currentPlan === "coding-plan") return;
     if (!parsedBody || typeof parsedBody !== "object") return;
@@ -130513,28 +130031,15 @@ async function proxyRequest(clientReq, format, opts) {
       if (meta.model === clientModel) meta.model = fallback;
     }
   };
-  const buildUpstreamBodyObjForPlan = (plan) => {
+  const buildUpstreamBodyObj = () => {
     applyModelRewrite();
-    if (plan === "start-plan" && upstreamFormatForPlan(plan) === "openai") {
-      if (format === "anthropic") {
-        const translated2 = translateRequestAnthropicToOpenAI(parsedBody);
-        return { obj: translated2 };
-      }
-      if (format === "openai") {
-        return { obj: structuredClone(parsedBody) };
-      }
-      const forceThinkingModels2 = config.responsesThinking?.models;
-      const anthropicObj = translateClientBodyObj(parsedBody, "openai-responses", forceThinkingModels2 ? { forceThinkingModels: forceThinkingModels2 } : void 0);
-      if (anthropicObj instanceof Response) return { obj: void 0, error: anthropicObj };
-      return { obj: translateRequestAnthropicToOpenAI(anthropicObj) };
-    }
     if (format === "anthropic") return { obj: parsedBody };
     const forceThinkingModels = format === "openai-responses" ? config.responsesThinking?.models : void 0;
     const translated = translateClientBodyObj(parsedBody, format, forceThinkingModels ? { forceThinkingModels } : void 0);
     if (translated instanceof Response) return { obj: void 0, error: translated };
     return { obj: translated };
   };
-  const initialPipeline = buildUpstreamBodyObjForPlan(currentPlan);
+  const initialPipeline = buildUpstreamBodyObj();
   if (initialPipeline.error) return initialPipeline.error;
   let upstreamBodyObj = initialPipeline.obj;
   let transformedObj = transformRequestBodyObj(upstreamBodyObj, { format: upstreamFormat, userId: cred.userId, startPlan: currentPlan === "start-plan", thinkingLevel: config.thinkingLevel === "high" ? "high" : "max" });
@@ -130556,11 +130061,10 @@ async function proxyRequest(clientReq, format, opts) {
       transformedCacheKey = newKey;
       return;
     }
-    const pipeline = buildUpstreamBodyObjForPlan(newPlan);
+    const pipeline = buildUpstreamBodyObj();
     if (pipeline.error) {
       return;
     }
-    upstreamFormat = upstreamFormatForPlan(newPlan);
     transformedObj = transformRequestBodyObj(pipeline.obj, {
       format: upstreamFormat,
       userId: newUserId,
@@ -131375,90 +130879,7 @@ async function proxyRequest(clientReq, format, opts) {
       }
     }
   }
-  const responseNeedsTranslation = upstreamFormat !== format;
-  if (upstreamFormat === "openai" && format !== "openai") {
-    if (!upstreamResp.ok) {
-      const errBody = upstreamErrorPreview ?? await readResponseTextPreview(upstreamResp, {
-        maxBytes: ERROR_RESPONSE_PREVIEW_BYTES,
-        timeoutMs: 3e3
-      }).then((r2) => r2.text).catch(() => "");
-      try {
-        await upstreamResp.body?.cancel();
-      } catch (e) {
-        void e;
-      }
-      printRow(reqId, format, meta, upstreamResp.status, started, headersAt, 0, 0, 0, hadRetryAttempt, 0, currentCredentialStatsKey(), totalCaptchaMs);
-      return errorResponse(upstreamResp.status, "upstream_error", `upstream returned ${upstreamResp.status}: ${errBody.slice(0, 200)}`);
-    }
-    if (format === "anthropic") {
-      if (isSSE && upstreamResp.body) {
-        const translated = openaiSseToAnthropicSse(upstreamResp.body, meta.model);
-        const stats2 = createStatsTransform(reqId, format, meta, upstreamResp.status, started, null, currentCredentialStatsKey(), totalCaptchaMs, hadRetryAttempt);
-        return translatedSseResponse(withSseHeartbeat(observeStatsStream(translated, stats2), config.server.sseHeartbeatMs ?? 0));
-      }
-      try {
-        const openaiJson = await upstreamResp.json();
-        const anthropicMsg = translateResponseOpenAIToAnthropic(openaiJson);
-        const respHeaders = new Headers();
-        for (const h of ["x-request-id"]) {
-          const v = upstreamResp.headers.get(h);
-          if (v) respHeaders.set(h, v);
-        }
-        respHeaders.set("content-type", "application/json");
-        upstreamResp = new Response(JSON.stringify(anthropicMsg), {
-          status: upstreamResp.status,
-          statusText: upstreamResp.statusText,
-          headers: respHeaders
-        });
-        isSSE = false;
-      } catch (err) {
-        proxyLog(`${reqId} OpenAI\u2192Anthropic batch translation failed: ${err.message}`);
-        printRow(reqId, format, meta, 502, started, headersAt, 0, 0, 0, hadRetryAttempt, 0, currentCredentialStatsKey(), totalCaptchaMs);
-        return errorResponse(502, "translation_failed", err.message);
-      }
-    } else {
-      const customToolNames = responsesCustomToolNames(parsedBody);
-      if (isSSE && upstreamResp.body) {
-        const anthropicStream = openaiSseToAnthropicSse(upstreamResp.body, meta.model);
-        const translated = anthropicSseToResponsesSse(anthropicStream, meta.model, { customToolNames });
-        const stats2 = createStatsTransform(reqId, format, meta, upstreamResp.status, started, null, currentCredentialStatsKey(), totalCaptchaMs, hadRetryAttempt);
-        return translatedSseResponse(withSseHeartbeat(observeStatsStream(translated, stats2), config.server.sseHeartbeatMs ?? 0));
-      }
-      try {
-        const openaiJson = await upstreamResp.json();
-        const anthropicMsg = translateResponseOpenAIToAnthropic(openaiJson);
-        const respHeaders = new Headers();
-        respHeaders.set("content-type", "application/json");
-        upstreamResp = new Response(JSON.stringify(anthropicMsg), {
-          status: upstreamResp.status,
-          statusText: upstreamResp.statusText,
-          headers: respHeaders
-        });
-        isSSE = false;
-      } catch (err) {
-        proxyLog(`${reqId} OpenAI\u2192Anthropic batch translation failed: ${err.message}`);
-        printRow(reqId, format, meta, 502, started, headersAt, 0, 0, 0, hadRetryAttempt, 0, currentCredentialStatsKey(), totalCaptchaMs);
-        return errorResponse(502, "translation_failed", err.message);
-      }
-      return await translatedResponsesBatchResponse(
-        clientReq,
-        upstreamResp,
-        meta.model,
-        reqId,
-        format,
-        meta,
-        started,
-        headersAt,
-        parsedBody?.previous_response_id,
-        parsedBody?.input,
-        customToolNames,
-        currentCredentialStatsKey(),
-        totalCaptchaMs,
-        hadRetryAttempt
-      );
-    }
-  }
-  if (responseNeedsTranslation && format !== "anthropic" && upstreamFormat === "anthropic") {
+  if (format !== "anthropic") {
     if (!upstreamResp.ok) {
       const errBody = upstreamErrorPreview ?? await readResponseTextPreview(upstreamResp, {
         maxBytes: ERROR_RESPONSE_PREVIEW_BYTES,

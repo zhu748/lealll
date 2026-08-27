@@ -126,6 +126,15 @@ describe("buildUpstreamURL", () => {
       "https://open.bigmodel.cn/api/anthropic/v1/messages",
     );
   });
+
+  it("always uses the live Anthropic mirror for start-plan", () => {
+    expect(buildUpstreamURL("anthropic", ZAI_PROVIDER, "start-plan")).toBe(
+      "https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages",
+    );
+    expect(buildUpstreamURL("openai", ZAI_PROVIDER, "start-plan")).toBe(
+      "https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages",
+    );
+  });
 });
 
 describe("buildAuthHeaders", () => {
@@ -637,48 +646,6 @@ describe("buildUpstreamRequest", () => {
     expect(h["x-zcode-trace-id"]).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
     expect(h["x-query-id"]).toBeUndefined();
     expect(h["x-session-id"]).toBeUndefined();
-  });
-
-  it("emits headers in stable construction order (start-plan with JWT, legacy OpenAI upstream)", () => {
-    // Legacy ZCODE_STARTPLAN_UPSTREAM=openai path: authorization: Bearer <jwt>,
-    // NO anthropic-beta/anthropic-version.
-    // The trace block uses the exact path (ZCode attribution): without a
-    // client session it carries request-id / session-type / trace-id only.
-    const jwtCred: Credential = { apiKey: "k", secret: "s", jwt: "jwt-token-xyz", provider: "zai" };
-    const h = buildUpstreamHeaders("openai", jwtCred, IDENTITY, "start-plan");
-
-    const expectedOrder = [
-      "content-type",
-      "accept-encoding",
-      "HTTP-Referer",
-      "User-Agent",
-      "X-ZCode-App-Version",
-      "X-Title",
-      "X-ZCode-Agent",
-      "X-Platform",
-      "X-Release-Channel",
-      "X-Client-Language",
-      "X-Client-Timezone",
-      "X-Os-Category",
-      "X-Os-Version",
-      "x-request-id",
-      "x-zcode-session-type",
-      "x-zcode-trace-id",
-      "authorization",
-    ];
-
-    const actualOrder = Object.keys(h);
-    expect(actualOrder).toEqual(expectedOrder);
-
-    // Verify the JWT auth value.
-    expect(h["authorization"]).toBe("Bearer jwt-token-xyz");
-    expect(h["X-ZCode-Agent"]).toBe("glm");
-    expect(h["x-request-id"]).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
-    expect(h["x-zcode-trace-id"]).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
-    // x-api-key / anthropic-* must NOT be present on the OpenAI gateway path.
-    expect(h["x-api-key"]).toBeUndefined();
-    expect(h["anthropic-version"]).toBeUndefined();
-    expect(h["anthropic-beta"]).toBeUndefined();
   });
 
   it("uses start-plan apiKey as Bearer auth when jwt field is absent", () => {
@@ -1707,9 +1674,7 @@ describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
       plan: "start-plan",
     };
     const originalPreflight = process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
-    const originalUpstreamStyle = process.env.ZCODE_STARTPLAN_UPSTREAM;
     delete process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
-    delete process.env.ZCODE_STARTPLAN_UPSTREAM;
     const captchaTokenProvider = mock(async () => {
       return { verifyParam: "fresh-preflight-param", region: "cn-shanghai", solveMs: 11 };
     });
@@ -1774,23 +1739,20 @@ describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
     } finally {
       if (originalPreflight === undefined) delete process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
       else process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = originalPreflight;
-      if (originalUpstreamStyle === undefined) delete process.env.ZCODE_STARTPLAN_UPSTREAM;
-      else process.env.ZCODE_STARTPLAN_UPSTREAM = originalUpstreamStyle;
     }
   });
 
-  it("start-plan anthropic client passes through to the mirror untranslated (v0.3.7 user regression)", async () => {
+  it("start-plan Claude Code request keeps Anthropic protocol and is rewritten to ZCode wire shape", async () => {
     // The exact user-reported scenario: Claude Code (anthropic /v1/messages)
     // on a start-plan account — previously 404 "404 page not found" from the
-    // removed OpenAI gateway; now the Anthropic mirror with passthrough body.
+    // removed OpenAI gateway; now the Anthropic mirror with an Anthropic body
+    // that is aligned to the real ZCode client wire shape before forwarding.
     const startPlanConfig: ProxyConfig = {
       ...testConfig,
       plan: "start-plan",
     };
     const originalPreflight = process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
-    const originalUpstreamStyle = process.env.ZCODE_STARTPLAN_UPSTREAM;
     delete process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
-    delete process.env.ZCODE_STARTPLAN_UPSTREAM;
     const captchaTokenProvider = mock(async () => {
       return { verifyParam: "fresh-preflight-param", region: "cn-shanghai", solveMs: 11 };
     });
@@ -1803,13 +1765,23 @@ describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
         expect(req.headers.get("x-api-key")).toBeNull();
         expect(req.headers.get("x-aliyun-captcha-verify-param")).toBe("fresh-preflight-param");
         const reqBody = JSON.parse(await req.text());
-        // Anthropic client → NO request translation; the body keeps the
-        // Anthropic wire shape (messages[] + top-level system[] + max_tokens).
+        // There is no Anthropic→OpenAI protocol conversion. The body remains
+        // Anthropic, but it is NOT passed through byte-for-byte: the ZCode
+        // identity, normalization, defaults, and fingerprint cleanup apply.
         expect(Array.isArray(reqBody.messages)).toBe(true);
         expect(reqBody.messages[0].role).toBe("user");
+        expect(reqBody.messages[0].content).toEqual([
+          { type: "text", text: "hi", cache_control: { type: "ephemeral" } },
+        ]);
         expect(Array.isArray(reqBody.system)).toBe(true);
         expect(reqBody.system[0].text).toBe("You are ZCode, an interactive coding agent");
+        expect(reqBody.system.some((block: any) => block.text === "You are ZCode model working in Claude Code.")).toBe(true);
+        expect(reqBody.system.some((block: any) => block.text?.startsWith("x-anthropic-billing-header:"))).toBe(false);
         expect(typeof reqBody.max_tokens).toBe("number");
+        expect(reqBody.stream).toBe(true);
+        expect(reqBody.tool_choice).toEqual({ type: "auto" });
+        expect(reqBody.metadata).toBeUndefined();
+        expect(reqBody.context_management).toBeUndefined();
         return new Response(JSON.stringify({
           id: "msg_sp_ant",
           type: "message",
@@ -1827,7 +1799,20 @@ describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
       const clientReq = new Request("http://localhost:8080/v1/messages", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: '{"model":"glm-5.3","max_tokens":1024,"thinking":{"type":"adaptive"},"messages":[{"role":"user","content":"hi"}]}',
+        body: JSON.stringify({
+          model: "glm-5.3",
+          max_tokens: 1024,
+          thinking: { type: "adaptive" },
+          system: [
+            { type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." },
+            { type: "text", text: "x-anthropic-billing-header: cc_version=1.0" },
+          ],
+          messages: [{ role: "user", content: "hi" }],
+          tools: [{ name: "Read", description: "Read a file", input_schema: { type: "object", properties: {} } }],
+          metadata: { user_id: "claude-code-user" },
+          context_management: { edits: [] },
+          stream: false,
+        }),
       });
 
       const resp = await proxyRequest(clientReq, "anthropic", {
@@ -1845,65 +1830,6 @@ describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
     } finally {
       if (originalPreflight === undefined) delete process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
       else process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = originalPreflight;
-      if (originalUpstreamStyle === undefined) delete process.env.ZCODE_STARTPLAN_UPSTREAM;
-      else process.env.ZCODE_STARTPLAN_UPSTREAM = originalUpstreamStyle;
-    }
-  });
-
-  it("ZCODE_STARTPLAN_UPSTREAM=openai restores the legacy gateway pipeline (escape hatch)", async () => {
-    // The server flipped endpoints once already — this guards the escape
-    // hatch so users can flip back without a new release if the OpenAI
-    // gateway endpoint ever returns.
-    const startPlanConfig: ProxyConfig = {
-      ...testConfig,
-      plan: "start-plan",
-    };
-    const originalPreflight = process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
-    const originalUpstreamStyle = process.env.ZCODE_STARTPLAN_UPSTREAM;
-    process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = "0";
-    process.env.ZCODE_STARTPLAN_UPSTREAM = "openai";
-
-    try {
-      const fetchMock = mock(async (req: Request): Promise<Response> => {
-        expect(req.url).toBe("https://zcode.z.ai/api/v1/zcode-plan/chat/completions");
-        expect(req.headers.get("authorization")).toBe("Bearer jwt-mock");
-        expect(req.headers.get("anthropic-version")).toBeNull();
-        const reqBody = JSON.parse(await req.text());
-        // Legacy gateway pipeline: OpenAI body + gateway system blocks as
-        // leading system messages.
-        expect(reqBody.messages[0].role).toBe("system");
-        expect(reqBody.messages[0].content).toContain("You are ZCode");
-        return new Response(JSON.stringify({
-          id: "chatcmpl-legacy",
-          object: "chat.completion",
-          created: 1750000000,
-          model: "glm-4.6",
-          choices: [{ index: 0, message: { role: "assistant", content: "legacy gateway reply" }, finish_reason: "stop" }],
-          usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
-        }), { status: 200, headers: { "content-type": "application/json" } });
-      });
-
-      const auth = new AuthManager({ mode: "oauth", provider: "zai" });
-      auth.setOAuthCredential({ apiKey: "dummy", provider: "zai", plan: "start-plan", jwt: "jwt-mock" });
-      const clientReq = new Request("http://localhost:8080/v1/chat/completions", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: '{"model":"glm-4.6","messages":[{"role":"user","content":"hi"}]}',
-      });
-
-      const resp = await proxyRequest(clientReq, "openai", {
-        config: startPlanConfig,
-        auth,
-        fetchImpl: fetchMock as any,
-      });
-      expect(resp.status).toBe(200);
-      const body = await resp.json();
-      expect(body.choices[0].message.content).toBe("legacy gateway reply");
-    } finally {
-      if (originalPreflight === undefined) delete process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
-      else process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = originalPreflight;
-      if (originalUpstreamStyle === undefined) delete process.env.ZCODE_STARTPLAN_UPSTREAM;
-      else process.env.ZCODE_STARTPLAN_UPSTREAM = originalUpstreamStyle;
     }
   });
 

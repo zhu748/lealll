@@ -48,7 +48,6 @@ const VERIFY_APIKEY_EXPIRED = "VERIFY_APIKEY_EXPIRED";
 /** Paths the client never signs (decoded, trailing-slash-stripped). */
 const UNSIGNED_PATHS = new Set([
   "/api/v1/zcode-plan/anthropic/v1/messages",
-  "/api/v1/zcode-plan/chat/completions",
   "/api/v1/off-peak/anthropic/v1/messages",
 ]);
 

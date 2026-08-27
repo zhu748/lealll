@@ -195,7 +195,7 @@ bash -n release/start.sh
 | **node:http 背压泵只等 `drain`** | 客户端在写缓冲满时断开 → `drain` 永不触发 → 泵闭钥永久挂起（每断开一次泄漏一个） | drain 等待同时监听 `close`；`res.end()` 包 try/catch |
 | **"宿主关键全局"名单按假设维护** | `print` 被误列入 HOST_CRITICAL_GLOBALS（以为 Bun 自带 print()——实际没有）→ Bun 下 guest 脚本裸 `print` ReferenceError，FeiLin 监听器每次求解中途炸（v0.3.5.0 Windows 报错刷屏） | 排除逻辑必须"宿主真定义才保护"：首个 installer 对宿主描述符做 epoch 快照，判断以快照为准；新增关键名前先 `bun -e "console.log(typeof X)"` 实测 |
 | **别名清理盲删 globalThis 属性** | happy-dom 窗口 own props 含 setTimeout 四件套 → 清理把宿主全局一起删了 → 最后一波求解后服务端所有定时器抛 `setTimeout is not defined` | install 时快照宿主原始描述符，remove 时恢复（未定义过的 delete）；回归测试覆盖 epoch 生命周期 |
-| **上游网关端点被服务端删除** | start-plan 全部 `upstream 404 404 page not found`（2026-08-27，zcode.z.ai 下线 `/api/v1/zcode-plan/chat/completions`）；上游 zcode-api 同样中招 | 发版前对上游关键端点做无鉴权探活（404=路由没了，401=路由存活）；端点选择做成 env 可切（`ZCODE_STARTPLAN_UPSTREAM`），服务端再翻转时用户免发版自救；A/B 复现验证修复 |
+| **上游网关端点被服务端删除** | start-plan 全部 `upstream 404 404 page not found`（2026-08-27，zcode.z.ai 下线 `/api/v1/zcode-plan/chat/completions`）；上游 zcode-api 同样中招 | 发版前对上游关键端点做无鉴权探活（404=路由没了，401=路由存活）；删除已确认下线的兼容管线，固定使用存活的 Anthropic 镜像；A/B 复现验证修复 |
 | 无脑复用脚本不检查 CLI 变更 | 脚本命令与实际 CLI 不匹配，用户运行报错 | 每次发版必须执行 Section 4 |
 | **版本号与 tag 不一致就打 tag** | CI 版本校验步直接失败 | Section 1 先改好 package.json |
 | **手动删了 Release 没删 tag** | 重新推同名 tag 后 Release 内容错乱 | 覆盖发版按 Section 3.1 顺序删 tag 重打 |
@@ -209,7 +209,7 @@ bash -n release/start.sh
 | Plan | 上游地址 | 认证方式 | 用途 |
 |------|---------|---------|------|
 | `coding-plan` | `{provider}.anthropicBase` / `{provider}.openaiBase` | `x-api-key: {apiKey}` | API Key 直连 |
-| `start-plan` | `https://zcode.z.ai/api/v1/zcode-plan/chat/completions` | `Authorization: Bearer {jwt}` + 验证码 token | 通过 ZCode 网关（free 试用层） |
+| `start-plan` | `https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages` | `Authorization: Bearer {jwt}` + 验证码 token | 通过 ZCode Anthropic 镜像（free 试用层） |
 
 **Plan 在以下位置生效**：
 1. **CLI** — `auth login bigmodel --plan=start-plan`

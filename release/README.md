@@ -73,15 +73,15 @@
 >
 > **修复**：start-plan 切回 Anthropic 镜像 `https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages`（v0.3.0 之前的原始路径，恢复）：
 >
-> - 两种套餐现在都说 Anthropic 上游——start-plan 直接复用久经考验的 coding-plan 管线（wire-shape 对齐、SSE→batch 折叠、会话上下文、SSE 错误检测），Claude Code 等 Anthropic 客户端请求体**不再翻译**、原样透传。
+> - 两种套餐现在都使用 Anthropic 上游——start-plan 直接复用久经考验的 coding-plan 管线（wire-shape 对齐、SSE→batch 折叠、会话上下文、SSE 错误检测）。Claude Code 等 Anthropic 客户端不再做 Anthropic→OpenAI 的跨协议翻译，但请求体仍会经过 ZCode system 注入、身份改写、字段清洗和 wire-shape 对齐，绝非字节级原样透传。
 > - 鉴权为 `Authorization: Bearer <jwt>` + `anthropic-version`（头构造器本就保留着这条路径的支持）。
 > - 网关 3012 内容检查所需的 ZCode 官方系统块 + 动态模型行（`applyStartPlanSystem`）从未被删除，自动重新生效。
 > - 验证码预检 / 3007 挑战 / 重试语义完全不变。
-> - **逃生舱**：服务端已经翻转过一次端点，所以旧网关管线保留在 `ZCODE_STARTPLAN_UPSTREAM=openai` 环境变量后面——万一网关端点哪天回来了，用户无需等新版即可切回。
+> - 后续再次实测确认旧 OpenAI 路由的 GET/POST 都稳定返回裸 404，因此旧网关管线和环境变量兼容开关已删除。
 >
-> **验证**（编译后的真实二进制直连线上网关）：默认配置下 start-plan 请求到达镜像路由、假 JWT 得到 401 `start_plan_jwt_invalid`（路由存在、鉴权已处理）；`ZCODE_STARTPLAN_UPSTREAM=openai` 则逐字节复现用户的 `upstream 404 404 page not found`（A/B 对照确认诊断）。
+> **验证**（无真实凭证直连线上网关）：旧 OpenAI 路由 GET/POST 均返回 `404 page not found`；Anthropic 镜像 POST 使用假 JWT 返回 401（路由存在、鉴权已处理）。
 >
-> 测试 1261/1261（+3：镜像路由端到端、用户场景 anthropic 透传回归、逃生舱守护；另加 start-plan anthropic 头序测试）；tsc 干净；linux-x64 编译冒烟通过。
+> 测试覆盖镜像路由端到端、Claude Code Anthropic 请求体的 ZCode wire-shape 改写和 start-plan Anthropic 头序。
 >
 > **升级建议**：**所有 start-plan（免费套餐）用户必须升级**——v0.3.0 至 v0.3.6.2 的所有版本都打的是已删除的路由，必然 404。coding-plan 用户不受影响，但也建议顺手升级。
 
