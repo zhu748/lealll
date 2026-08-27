@@ -2,6 +2,35 @@
 
 A reverse proxy for Z.AI / Bigmodel.cn coding-plan APIs that exposes both OpenAI-compatible and Anthropic-format endpoints.
 
+## v0.3.9.0 — Thinking tiers aligned with the real zcode client (three tiers, max_tokens 128000)
+
+The real zcode client updated its thinking controls: it now exposes **three**
+tiers (最高 / 高 / 低) and sends `max_tokens: 128000` on every request.
+Captured wire shapes (2026-08, glm-5.3):
+
+| Tier | max_tokens | thinking.budget_tokens | output_config.effort |
+|------|-----------|------------------------|----------------------|
+| 最高 (max, default) | 128000 | 32000 | `"max"` |
+| 高 (high) | 128000 | 16000 | `"high"` |
+| 低 (low, NEW) | 128000 | 8000 | `"low"` |
+| 不思考 (no thinking) | 128000 | — (field absent) | — (field absent) |
+
+The proxy previously only modeled two tiers (max/high) and injected
+`max_tokens: 64000` — both now outdated fingerprints.
+
+Changes:
+
+- `injectZCodeThinkingFormat` injects the three-tier table above; unknown
+  tier values fall back to `max`. The "no thinking" wire shape (no `thinking`
+  field → only `max_tokens=128000`, thinking never forced on) is unchanged
+  apart from the max_tokens bump.
+- New `low` tier selectable from the dashboard (代理规则 → ZCode 思考等级),
+  YAML (`anthropic.thinkingLevel: low|high|max`), and env
+  (`ZCODE_PROXY_THINKING_LEVEL=low|high|max`). Hot-reloadable as before.
+- `config.example.yaml` now documents and ships `anthropic.thinkingLevel`.
+- Existing configs with `thinkingLevel: high|max` keep working unchanged;
+  invalid values still normalize to `max`.
+
 ## v0.3.8.1 — Token stats fixed for start-plan (compressed passthrough regression)
 
 Symptom: after v0.3.7, every start-plan request logged `in:- out:-` with no

@@ -262,16 +262,18 @@ export function loadConfig(path: string): ProxyConfig {
   // if present in existing configs (no error, just dead config).
 
   // --- ZCode thinking level (controls budget_tokens + effort when thinking enabled) ---
-  // Two tiers mirror real ZCode desktop client:
-  //   "max"  (default): max_tokens=64000, budget_tokens=32000, effort="max"
-  //   "high"          : max_tokens=64000, budget_tokens=16000, effort="high"
-  // When client doesn't send `thinking`, only max_tokens=64000 is injected
+  // Three tiers mirror real ZCode desktop client (v0.3.9: zcode added a 低 tier
+  // and bumped max_tokens 64000 → 128000, captured 2026-08):
+  //   "max"  (default): max_tokens=128000, budget_tokens=32000, effort="max"
+  //   "high"          : max_tokens=128000, budget_tokens=16000, effort="high"
+  //   "low"           : max_tokens=128000, budget_tokens=8000,  effort="low"
+  // When client doesn't send `thinking`, only max_tokens=128000 is injected
   // (ZCode "no thinking" mode) — proxy never forces thinking on.
-  // Env var: ZCODE_PROXY_THINKING_LEVEL=high|max
+  // Env var: ZCODE_PROXY_THINKING_LEVEL=low|high|max
   const thinkingLevelEnv = process.env.ZCODE_PROXY_THINKING_LEVEL;
-  const thinkingLevel: "high" | "max" = thinkingLevelEnv === "high" || parsed?.anthropic?.thinkingLevel === "high"
-    ? "high"
-    : "max";
+  const thinkingLevelRaw = thinkingLevelEnv ?? parsed?.anthropic?.thinkingLevel;
+  const thinkingLevel: "low" | "high" | "max" =
+    thinkingLevelRaw === "low" || thinkingLevelRaw === "high" ? thinkingLevelRaw : "max";
 
   const config: ProxyConfig = {
     server: { port, host, upstreamTimeoutMs, trustProxy, sseHeartbeatMs, maxRequestBodyBytes },

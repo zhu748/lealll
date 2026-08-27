@@ -1615,7 +1615,7 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
       opts.config.modelMappings = newConfig.modelMappings;
       if (newConfig.responsesThinking) opts.config.responsesThinking = newConfig.responsesThinking;
       // v0.2.0.4: forceStreamAnthropic removed — stream:true is now unconditional.
-      if (newConfig.thinkingLevel !== undefined) opts.config.thinkingLevel = newConfig.thinkingLevel === "high" ? "high" : "max";
+      if (newConfig.thinkingLevel !== undefined) opts.config.thinkingLevel = newConfig.thinkingLevel === "low" || newConfig.thinkingLevel === "high" ? newConfig.thinkingLevel : "max";
       if (authBody) opts.config.auth = newConfig.auth;
       if (hasCorsAllowList) {
         if (Array.isArray((newConfig as any).corsAllowList)) {
@@ -3723,7 +3723,7 @@ function sanitizeConfig(config: ProxyConfig): Record<string, unknown> {
     modelMappings: config.modelMappings ?? [],
     responsesThinking: config.responsesThinking ?? { models: [] },
     // v0.2.0.4: forceStreamAnthropic removed — stream:true is now unconditional.
-    thinkingLevel: config.thinkingLevel === "high" ? "high" : "max",
+    thinkingLevel: config.thinkingLevel === "low" || config.thinkingLevel === "high" ? config.thinkingLevel : "max",
   };
 }
 
@@ -3800,7 +3800,7 @@ function configToYaml(config: ProxyConfig): string {
       // v0.2.0.4: forceStream removed — stream:true is now unconditional.
       // Always persist thinkingLevel so users can see/change it in YAML.
       // Default "max" mirrors real ZCode desktop client's max tier.
-      thinkingLevel: config.thinkingLevel === "high" ? "high" : "max",
+      thinkingLevel: config.thinkingLevel === "low" || config.thinkingLevel === "high" ? config.thinkingLevel : "max",
     },
   };
 

@@ -1558,8 +1558,9 @@ td input{font-family:var(--font-mono)}
                 <select id="cfgThinkingLevel" class="form-control" style="width:auto;min-width:160px">
                   <option value="max">最高（budget_tokens=32000，effort=max）</option>
                   <option value="high">高（budget_tokens=16000，effort=high）</option>
+                  <option value="low">低（budget_tokens=8000，effort=low）</option>
                 </select>
-                <div class="form-help" style="padding-top:6px">控制开启思考时注入的 ZCode 档位。客户端发送 <code class="code-inline">thinking.type=enabled</code> 时按此档位改写：<strong>最高</strong> → max_tokens=64000 / budget_tokens=32000 / effort=max；<strong>高</strong> → max_tokens=64000 / budget_tokens=16000 / effort=high。客户端不发 thinking 字段时只注入 max_tokens=64000，不强制开思考（对应 ZCode「不思考」模式）。默认「最高」（与真实 ZCode 客户端 max 档位一致）。</div>
+                <div class="form-help" style="padding-top:6px">控制开启思考时注入的 ZCode 档位。客户端发送 <code class="code-inline">thinking.type=enabled</code> 时按此档位改写：<strong>最高</strong> → max_tokens=128000 / budget_tokens=32000 / effort=max；<strong>高</strong> → max_tokens=128000 / budget_tokens=16000 / effort=high；<strong>低</strong> → max_tokens=128000 / budget_tokens=8000 / effort=low。客户端不发 thinking 字段时只注入 max_tokens=128000，不强制开思考（对应 ZCode「不思考」模式）。默认「最高」（与真实 ZCode 客户端 max 档位一致）。</div>
               </div>
             </div>
           </div>
@@ -2904,7 +2905,7 @@ async function loadSettings(force=false){
     document.getElementById('cfgLogLevel').value=c.logging?.level||'info';
     document.getElementById('cfgVerboseLog').checked=!!c.logging?.verbose;
     document.getElementById('cfgDebugLog').checked=!!c.logging?.debug;
-    document.getElementById('cfgThinkingLevel').value=(c.thinkingLevel==='high'?'high':'max');
+    document.getElementById('cfgThinkingLevel').value=(c.thinkingLevel==='low'||c.thinkingLevel==='high')?c.thinkingLevel:'max';
   }catch(e){if(dashboardCanUpdate()&&dashboardActionCurrent(requestInitGeneration,requestAuthToken)){console.error('loadSettings failed:',e);toast('加载设置失败','error')}}
 }
 function readSettingsNumberInput(id,label,opts={}){
@@ -2988,7 +2989,7 @@ async function saveSettings(){
     },
     identity:{appVersion:document.getElementById('cfgAppVer').value,sourceTitle:document.getElementById('cfgSrcTitle').value,refererOrigin:document.getElementById('cfgReferer').value},
     logging:{level:document.getElementById('cfgLogLevel').value,verbose:document.getElementById('cfgVerboseLog').checked,debug:document.getElementById('cfgDebugLog').checked},
-    thinkingLevel:document.getElementById('cfgThinkingLevel').value==='high'?'high':'max'
+    thinkingLevel:(function(){const v=document.getElementById('cfgThinkingLevel').value;return (v==='low'||v==='high')?v:'max';})()
   };
   const apiKey=document.getElementById('cfgApiKey').value;
   const proxyApiKey=document.getElementById('cfgProxyApiKey').value;

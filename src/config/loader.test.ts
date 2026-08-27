@@ -39,6 +39,7 @@ beforeEach(() => {
   delete process.env.ZCODE_PROXY_SSE_HEARTBEAT_MS;
   delete process.env.ZCODE_PROXY_MAX_REQUEST_BODY_BYTES;
   delete process.env.ZCODE_PROXY_CORS_ALLOWLIST;
+  delete process.env.ZCODE_PROXY_THINKING_LEVEL;
 });
 
 afterEach(() => {
@@ -729,6 +730,26 @@ auth:
     expect(cfg.models).toHaveLength(10);
     expect(cfg.models).toContain("glm-5.3");
     expect(cfg.defaultModel).toBe("glm-4.6");
+    // v0.3.9: template ships the three-tier thinkingLevel explicitly.
+    expect(cfg.thinkingLevel).toBe("max");
+  });
+
+  it("thinkingLevel: three tiers from YAML, env override, and invalid fallback (v0.3.9)", () => {
+    const low = writeYaml("auth:\n  mode: oauth\nanthropic:\n  thinkingLevel: low\n");
+    expect(loadConfig(low).thinkingLevel).toBe("low");
+    const high = writeYaml("auth:\n  mode: oauth\nanthropic:\n  thinkingLevel: high\n");
+    expect(loadConfig(high).thinkingLevel).toBe("high");
+    // Invalid YAML value → falls back to max
+    const bogus = writeYaml("auth:\n  mode: oauth\nanthropic:\n  thinkingLevel: ultra\n");
+    expect(loadConfig(bogus).thinkingLevel).toBe("max");
+    // Env var overrides YAML
+    const yamlMax = writeYaml("auth:\n  mode: oauth\nanthropic:\n  thinkingLevel: max\n");
+    process.env.ZCODE_PROXY_THINKING_LEVEL = "low";
+    try {
+      expect(loadConfig(yamlMax).thinkingLevel).toBe("low");
+    } finally {
+      delete process.env.ZCODE_PROXY_THINKING_LEVEL;
+    }
   });
 });
 

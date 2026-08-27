@@ -490,19 +490,22 @@ export interface ProxyConfig {
    * ZCode thinking level — controls the budget_tokens + effort injected when
    * the client sends `thinking.type=enabled`.
    *
-   * Two levels mirror the real ZCode desktop client's two thinking tiers:
-   *   - "max"  (default): max_tokens=64000, budget_tokens=32000, effort="max"
-   *   - "high"          : max_tokens=64000, budget_tokens=16000, effort="high"
+   * Three levels mirror the real ZCode desktop client's three thinking tiers
+   * (v0.3.9: zcode client added a 低 tier and bumped max_tokens to 128000,
+   * captured 2026-08):
+   *   - "max"  (default): max_tokens=128000, budget_tokens=32000, effort="max"
+   *   - "high"          : max_tokens=128000, budget_tokens=16000, effort="high"
+   *   - "low"           : max_tokens=128000, budget_tokens=8000,  effort="low"
    *
    * When the client does NOT send a `thinking` field, the proxy only injects
-   * max_tokens=64000 (matching ZCode's "no thinking" wire shape) — it does
+   * max_tokens=128000 (matching ZCode's "no thinking" wire shape) — it does
    * NOT force thinking on. This lets the dashboard user choose between
-   * thinking-off (just don't send thinking) and thinking-on at high or max
+   * thinking-off (just don't send thinking) and thinking-on at low/high/max
    * intensity.
    *
    * Hot-reloadable via Dashboard. Default: "max".
    *
    * @see body-transformer.ts `injectZCodeThinkingFormat`
    */
-  thinkingLevel?: "high" | "max";
+  thinkingLevel?: "low" | "high" | "max";
 }

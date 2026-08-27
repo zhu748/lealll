@@ -477,7 +477,7 @@ export async function proxyRequest(
   if (initialPipeline.error) return initialPipeline.error;
   let upstreamBodyObj: unknown = initialPipeline.obj;
 
-  let transformedObj = transformRequestBodyObj(upstreamBodyObj, { format: upstreamFormat, userId: cred.userId, startPlan: currentPlan === "start-plan", thinkingLevel: config.thinkingLevel === "high" ? "high" : "max" });
+  let transformedObj = transformRequestBodyObj(upstreamBodyObj, { format: upstreamFormat, userId: cred.userId, startPlan: currentPlan === "start-plan", thinkingLevel: config.thinkingLevel === "low" || config.thinkingLevel === "high" ? config.thinkingLevel : "max" });
 
   // v0.2.2+ PERF: cache transformed body keyed by (userId|plan|thinkingLevel).
   // On credential switch mid-retry, the transform is re-run even though
@@ -532,7 +532,7 @@ export async function proxyRequest(
       format: upstreamFormat,
       userId: newUserId,
       startPlan: newPlan === "start-plan",
-      thinkingLevel: config.thinkingLevel === "high" ? "high" : "max",
+      thinkingLevel: config.thinkingLevel === "low" || config.thinkingLevel === "high" ? config.thinkingLevel : "max",
     });
     transformedBody = transformedObj !== undefined ? JSON.stringify(transformedObj) : undefined;
     transformedCacheKey = newKey;

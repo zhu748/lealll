@@ -1,5 +1,26 @@
 # zcode-proxy 使用说明
 
+> **v0.3.9.0 — 思考档位对齐真实 ZCode 客户端（三档 + max_tokens=128000）**
+>
+> 真实 zcode 客户端更新了思考控制：现在提供**三档**（最高 / 高 / 低），且所有请求的 `max_tokens` 从 64000 提升到 **128000**。抓包实锤（2026-08，glm-5.3）：
+>
+> | 档位 | max_tokens | thinking.budget_tokens | output_config.effort |
+> |------|-----------|------------------------|----------------------|
+> | 最高（max，默认） | 128000 | 32000 | `max` |
+> | 高（high） | 128000 | 16000 | `high` |
+> | 低（low，**新增**） | 128000 | 8000 | `low` |
+> | 不思考 | 128000 | —（不发该字段） | —（不发该字段） |
+>
+> 代理此前只实现两档（max/high）且注入 `max_tokens=64000` —— 两处都成了过期指纹。
+>
+> **修复**：`injectZCodeThinkingFormat` 按上表三档注入；未知档位回退 `max`；「不思考」wire 形态（不发 thinking 字段 → 只注入 `max_tokens=128000`，从不强制开思考）除 max_tokens 外语义不变。
+>
+> - 新增「低」档：Dashboard（代理规则 → ZCode 思考等级）、YAML（`anthropic.thinkingLevel: low|high|max`）、环境变量（`ZCODE_PROXY_THINKING_LEVEL=low|high|max`）三处均可选，依旧支持热切换。
+> - `config.example.yaml` 显式文档化并内置 `anthropic.thinkingLevel`。
+> - 已有配置里的 `thinkingLevel: high|max` 继续有效；非法值仍归一化为 `max`。
+>
+> 测试覆盖：三档注入（low/high/max 各自 budget+effort 断言）、max→low 档位切换幂等、loader 三档解析 + 环境变量覆盖 + 非法值回退、模板字段守护。
+
 > **v0.3.8.1 — 修复 start-plan token 统计消失（`in:- out:-` 无 tok/s）**
 >
 > 现象：v0.3.7 之后 start-plan 请求全部成功返回,但日志/看板里 token 列全部变成 `in:- out:-`,tok/s 也没有了。
