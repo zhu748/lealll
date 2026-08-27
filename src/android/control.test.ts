@@ -3,6 +3,7 @@ import { Readable } from "node:stream";
 import {
   handleControlRequestForTest,
   handleControlRequestWithHooksForTest,
+  defaultControlIdentity,
   LogBuffer,
   type ControlState,
   type HandlerContext,
@@ -265,5 +266,40 @@ describe("LogBuffer", () => {
     const result = buf.since(0);
     expect(result.lines).toEqual(["b", "c"]);
     expect(result.nextSince).toBe(3);
+  });
+});
+
+describe("control identity (v0.3.4 — Android OAuth fingerprint)", () => {
+  it("defaultControlIdentity returns the full ZCode client identity", () => {
+    const identity = defaultControlIdentity();
+    // Shape must match ProxyIdentity — a bare Node UA here was the v0.3.2
+    // desktop bug this closes for the Android bundle.
+    expect(identity.appVersion).toBe("3.9.2");
+    expect(identity.sourceTitle).toBe("cli");
+    expect(identity.refererOrigin).toContain("z.ai");
+    expect(identity.zcodeAgent).toBe("glm");
+  });
+
+  it("defaultControlIdentity honors ZCODE_APP_VERSION env override", () => {
+    const prev = process.env.ZCODE_APP_VERSION;
+    process.env.ZCODE_APP_VERSION = "9.9.9";
+    try {
+      expect(defaultControlIdentity().appVersion).toBe("9.9.9");
+    } finally {
+      if (prev === undefined) delete process.env.ZCODE_APP_VERSION;
+      else process.env.ZCODE_APP_VERSION = prev;
+    }
+  });
+});
+
+describe("control body size cap (v0.3.4)", () => {
+  it("rejects control bodies larger than 1MB without buffering them fully", async () => {
+    // ~1.1MB body — readBody must reject instead of accumulating it all.
+    const big = "x".repeat(1100 * 1024);
+    const req = makeStubRequest({ body: JSON.stringify({ cmd: "status", pad: big }).slice(0, 1100 * 1024) });
+    const state: ControlState = { provider: "bigmodel", plan: "coding-plan", proxyPort: 0 };
+    // The stub Request stream is backed by a single chunk; the cap check
+    // fires as soon as the cumulative size crosses maxBytes.
+    await expect(handleControlRequestForTest(req, state)).rejects.toThrow("too large");
   });
 });

@@ -18,9 +18,11 @@
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
 import type { ProviderId } from "../provider/types.js";
 import type { Credential } from "../auth/types.js";
+import type { ProxyIdentity } from "../config/types.js";
 import { ZaiOAuthClient, BigmodelOAuthClient } from "../auth/oauth.js";
 import { KeyResolver } from "../auth/resolver.js";
 import { saveCredential, clearCredential, loadCredential } from "../auth/store.js";
+import { resolveDefaultIdentity } from "../config/loader.js";
 
 /** Supported plan tiers. Mirrors `ProxyConfig.plan`. */
 export type PlanTier = "coding-plan" | "start-plan";
@@ -84,6 +86,14 @@ export interface ControlState {
 interface StartControlOpts {
   port: number;
   state: ControlState;
+  /**
+   * Client identity (UA / app-version / platform headers) attached to OAuth
+   * token-exchange requests (v0.3.4). Without this, the Android bundle's
+   * exchange went out with Node's bare UA — a WAF fingerprint mismatch the
+   * desktop builds already fixed in v0.3.2. Falls back to the built-in
+   * default identity (env-overridable) when omitted.
+   */
+  identity?: ProxyIdentity;
   /** Start the proxy server. Returns the bound port on success. */
   onStartProxy?: () => Promise<LifecycleResult>;
   /** Stop the proxy server. */
@@ -142,9 +152,11 @@ export class LogBuffer {
 /** Start the control listener bound to 127.0.0.1. Resolves once listening. */
 export function startControlListener(opts: StartControlOpts): Promise<{ close(): Promise<void> }> {
   const logBuffer = opts.logBuffer ?? new LogBuffer();
+  const identity = opts.identity ?? defaultControlIdentity();
   const server: Server = createServer(async (req, res) => {
     try {
       const result = await handleControlRequest(req, opts.state, {
+        identity,
         onStartProxy: opts.onStartProxy,
         onStopProxy: opts.onStopProxy,
         onSetConfig: opts.onSetConfig,
@@ -172,6 +184,8 @@ export interface ControlHandlerResult {
 
 /** Context passed to `handleControlRequest` for hook wiring + log access. */
 export interface HandlerContext {
+  /** Client identity for OAuth exchange requests (see StartControlOpts.identity). */
+  identity?: ProxyIdentity;
   onStartProxy?: () => Promise<LifecycleResult>;
   onStopProxy?: () => Promise<{ ok: true } | { ok: false; error: string }>;
   onSetConfig?: (changes: { provider?: ProviderId; plan?: PlanTier }) => Promise<ConfigUpdateResult>;
@@ -185,7 +199,7 @@ export function handleControlRequestForTest(
   onShutdown?: () => Promise<void> | void,
 ): Promise<ControlHandlerResult> {
   // Backwards-compatible shape: only `onShutdown` is wired.
-  const ctx: HandlerContext = { onShutdown, logBuffer: new LogBuffer() };
+  const ctx: HandlerContext = { onShutdown, logBuffer: new LogBuffer(), identity: defaultControlIdentity() };
   return handleControlRequest(req, state, ctx);
 }
 
@@ -246,7 +260,9 @@ async function dispatch(
     }
 
     case "startOAuth": {
-      const client = cmd.provider === "bigmodel" ? new BigmodelOAuthClient() : new ZaiOAuthClient();
+      const client = cmd.provider === "bigmodel"
+        ? new BigmodelOAuthClient(undefined, undefined, undefined, undefined, ctx.identity)
+        : new ZaiOAuthClient(undefined, undefined, undefined, undefined, ctx.identity);
       const started = await client.start();
       const callbackUrlObj = new URL(started.callbackUrl);
       const callbackPort = callbackUrlObj.port ? Number(callbackUrlObj.port) : 80;
@@ -353,6 +369,29 @@ function isLoopback(addr: string | undefined): boolean {
   return addr === "127.0.0.1" || addr === "::1" || addr === "::ffff:127.0.0.1";
 }
 
+/**
+ * Default identity for control-path OAuth when none is wired from config.
+ * Mirrors the CLI fallback (env override > built-in ZCode defaults) so the
+ * Android token exchange still carries a real ZCode client fingerprint.
+ * Exported for direct unit testing.
+ */
+export function defaultControlIdentity(): ProxyIdentity {
+  // resolveDefaultIdentity is pure (env override > built-in ZCode defaults) —
+  // no config.yaml read, no side effects. The try/catch is belt-and-suspenders
+  // so a loader regression can never take down the control listener.
+  try {
+    return resolveDefaultIdentity();
+  } catch {
+    return {
+      appVersion: "3.9.2",
+      sourceTitle: "Z Code@cli",
+      refererOrigin: "https://zcode.z.ai",
+      releaseChannel: "production",
+      zcodeAgent: "glm",
+    };
+  }
+}
+
 function writeJson(res: ServerResponse, status: number, body: unknown): void {
   const json = JSON.stringify(body);
   res.writeHead(status, {
@@ -362,10 +401,19 @@ function writeJson(res: ServerResponse, status: number, body: unknown): void {
   res.end(json);
 }
 
-function readBody(req: IncomingMessage): Promise<string> {
+function readBody(req: IncomingMessage, maxBytes = 1 * 1024 * 1024): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on("data", (c: Buffer) => chunks.push(c));
+    let received = 0;
+    req.on("data", (c: Buffer) => {
+      received += c.length;
+      if (received > maxBytes) {
+        reject(new Error("control request body too large"));
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
     req.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
     req.on("error", reject);
   });

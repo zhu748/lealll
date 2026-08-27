@@ -2,19 +2,27 @@
  * HTTP server bootstrap with routing and proxy API key auth.
  * Includes admin dashboard routes.
  *
- * Runs on `node:http.createServer` (not `Bun.serve`) so the same code works
- * on Bun (dev mode, source TS, compiled binaries) and on Node (the Android
- * bundle — libnode via Termux libs). Bun implements `node:http` natively;
- * Node has no `Bun.serve`, so node:http is the common denominator.
+ * v0.3.4 dual adapter:
+ * - Bun (dev mode, source TS, compiled desktop binaries) → `Bun.serve`,
+ *   which natively aborts `req.signal` when the TCP client disconnects
+ *   (mid-request AND mid-stream) and auto-cancels response streams.
+ * - Node (the Android bundle — libnode via Termux libs) → `node:http`,
+ *   where res 'close' / req 'aborted' fire correctly on disconnects.
  *
- * Migration notes (v0.3.3.0, pattern ported from upstream zcode-api):
- * - `idleTimeout: 0` (old Bun.serve setting) maps to zeroed/raised Node
- *   server timeouts — long LLM reasoning calls must not be killed.
- * - Client IP (previously `Bun.serve#requestIP`) is read from
- *   `req.socket.remoteAddress` in the node adapter and stashed on the Web
- *   Request via a symbol; `resolveClientIp` reads it from there.
- * - `/async/*` routes get a 24h per-request socket timeout (off-peak queue
- *   waits can exceed Node's defaults).
+ * Why not node:http everywhere? Bun's node:http compat layer emits NO
+ * disconnect events after the request body is consumed (verified against
+ * Bun 1.3.14 — no res 'close', no req 'aborted', no socket 'close', even on
+ * a raw TCP RST), so client-disconnect detection would be impossible on the
+ * desktop builds. The routing layer (createFetchHandler) is shared verbatim
+ * between both adapters.
+ *
+ * Migration notes (v0.3.3.0, node:http adapter retained for Node):
+ * - `idleTimeout: 0` (Bun.serve) / zeroed-raised Node server timeouts —
+ *   long LLM reasoning calls must not be killed.
+ * - Client IP: Bun adapter reads `server.requestIP(req)`; node adapter
+ *   stashes `req.socket.remoteAddress` on the Web Request via a symbol.
+ * - `/async/*` routes get a 24h per-request socket timeout under node:http
+ *   (off-peak queue waits can exceed Node's defaults).
  *
  * @see .omo/plans/zcode-proxy.md Task 7
  */
@@ -187,7 +195,81 @@ export function createFetchHandler(opts: ServerOptions): (req: Request) => Promi
 }
 
 /**
- * Start the HTTP server on node:http. Resolves once the listener is bound.
+ * Start the HTTP server. Resolves once the listener is bound.
+ *
+ * v0.3.4 dual adapter: Bun builds use `Bun.serve` (native client-disconnect
+ * detection — `req.signal` aborts the moment the TCP peer disappears, and
+ * response streams are cancelled automatically), while the Android bundle
+ * (real Node via libnode) uses `node:http`. This split is NOT cosmetic:
+ * Bun's node:http compatibility layer emits NO events (res 'close', req
+ * 'aborted', socket 'close' — none) when a client disconnects after its
+ * request body was consumed, so client-disconnect detection is impossible
+ * through node:http under Bun. Verified empirically against Bun 1.3.14;
+ * real Node emits res 'close' correctly (the Android path keeps the
+ * triple-listener node adapter).
+ */
+export function startServer(opts: ServerOptions): Promise<ProxyServer> {
+  if (typeof Bun !== "undefined" && typeof Bun.serve === "function") {
+    return startBunServer(opts);
+  }
+  return startNodeServer(opts);
+}
+
+/** Bun-native server: Bun.serve with its built-in disconnect detection. */
+async function startBunServer(opts: ServerOptions): Promise<ProxyServer> {
+  // Forward-declare `server` so the resolveClientIp closure can reference it.
+  // The closure is only invoked from inside fetch(req), which only runs
+  // AFTER Bun.serve returns and assigns to `server`.
+  let server: ReturnType<typeof Bun.serve> | undefined;
+
+  const resolveClientIp = (req: Request): string | undefined => {
+    try { return server?.requestIP(req)?.address; } catch { return undefined; }
+  };
+
+  const adminOpts: AdminOptions = {
+    config: opts.config,
+    auth: opts.auth,
+    configPath: opts.configPath ?? "config.yaml",
+    startTime: Date.now(),
+    fetchImpl: opts.fetchImpl,
+    resolveClientIp,
+  };
+
+  const handler = createFetchHandler({ ...opts, adminOpts, resolveClientIp });
+  const { port: requestedPort, host } = opts.config.server;
+
+  server = Bun.serve({
+    port: requestedPort,
+    hostname: host,
+    // 自用代理：禁用空闲超时，避免长 reasoning 的 LLM 请求被杀（v0.3.2 及更早
+    // 桌面版的原行为）。/async/ 错峰排队需要保持连接数小时，同样依赖此设置。
+    idleTimeout: 0,
+    fetch(req) {
+      // CORS headers are already added inside the handler (see
+      // createFetchHandler) — no need to add them again here.
+      return handler(req);
+    },
+  });
+
+  return {
+    hostname: server.hostname ?? host,
+    port: server.port ?? requestedPort,
+    // Bun.serve#stop(closeActiveConnections): stop() = graceful (in-flight
+    // finish), stop(true) = destroy active connections — exactly the
+    // ProxyServer stop(force) contract.
+    stop: (force = false) => {
+      server?.stop(force);
+      return Promise.resolve();
+    },
+    close: () => {
+      server?.stop(false);
+      return Promise.resolve();
+    },
+  };
+}
+
+/**
+ * node:http server (Android bundle — real Node via libnode).
  *
  * Server timeout policy (mirrors the old `Bun.serve({ idleTimeout: 0 })` for
  * self-hosted long reasoning calls):
@@ -197,7 +279,7 @@ export function createFetchHandler(opts: ServerOptions): (req: Request) => Promi
  *   - `/async/*` requests additionally get a 24h socket timeout so an
  *     off-peak queue wait (which can legitimately take hours) survives.
  */
-export function startServer(opts: ServerOptions): Promise<ProxyServer> {
+function startNodeServer(opts: ServerOptions): Promise<ProxyServer> {
   // Client IP: captured per-request from the node socket by the adapter
   // below (equivalent of Bun.serve's server.requestIP(req)).
   const resolveClientIp = (req: Request): string | undefined =>
@@ -218,11 +300,22 @@ export function startServer(opts: ServerOptions): Promise<ProxyServer> {
   const server: Server = createServer(async (req, res) => {
     // Abort plumbing: when the client disconnects mid-request/mid-stream,
     // abort the Web-level signal so upstream fetches get cancelled.
+    //
+    // v0.3.4 CRITICAL FIX: Bun's node:http implementation does NOT emit
+    // `close` on the ServerResponse when the client aborts mid-request
+    // (verified empirically: only `aborted` on the IncomingMessage and
+    // `close` on the socket fire — res 'close' never does). The old
+    // res-only listener meant client disconnects were INVISIBLE to the
+    // proxy on the desktop (Bun) builds, so the abort chain added in
+    // v0.3.4 would never have triggered there. Listen on all three
+    // signals; abort() is idempotent and guarded by writableEnded.
     const abortController = new AbortController();
     const onClientClose = (): void => {
       if (!res.writableEnded) abortController.abort();
     };
-    res.on("close", onClientClose);
+    res.on("close", onClientClose);        // real Node: fires on disconnect
+    req.on("aborted", onClientClose);      // Bun: the ONLY mid-request signal
+    res.socket?.on("close", onClientClose); // belt + suspenders (both runtimes)
 
     // Off-peak async routes hold the connection open for minutes-to-hours
     // while waiting for a ticket. Lift the per-request socket timeout to 24h
@@ -255,6 +348,14 @@ export function startServer(opts: ServerOptions): Promise<ProxyServer> {
   return new Promise<ProxyServer>((resolve, reject) => {
     server.once("error", reject);
     server.listen(requestedPort, host, () => {
+      // After a successful listen, swap the one-shot bind-error listener for
+      // a permanent logger: an unhandled 'error' event on a Node server is
+      // FATAL (process crash) — e.g. a rare runtime socket error would take
+      // the whole proxy down instead of just that connection.
+      server.removeListener("error", reject);
+      server.on("error", (err) => {
+        console.error(`[server] runtime server error: ${(err as Error).message}`);
+      });
       const addr = server.address();
       const actualPort = typeof addr === "object" && addr ? addr.port : requestedPort;
       const stop = (force = false): Promise<void> => new Promise<void>((done) => {
@@ -342,14 +443,28 @@ async function writeWebResponseToNodeResp(
   abortSignal?.addEventListener("abort", onAbort);
   try {
     // Backpressure-aware pump: wait for drain when the socket is full.
+    // v0.3.4 fix: also resolve the wait on 'close' — if the client disconnects
+    // while the write buffer is full, Node never emits 'drain' on a destroyed
+    // socket, and the old drain-only wait hung this pump closure forever (one
+    // leaked closure + buffers per aborted streaming response).
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
       if (!res.write(Buffer.from(value))) {
-        await new Promise<void>((resolve) => res.once("drain", () => resolve()));
+        await new Promise<void>((resolve) => {
+          const finish = (): void => {
+            res.removeListener("drain", onDrain);
+            res.removeListener("close", onClose);
+            resolve();
+          };
+          const onDrain = (): void => finish();
+          const onClose = (): void => finish();
+          res.once("drain", onDrain);
+          res.once("close", onClose);
+        });
       }
     }
-    res.end();
+    try { res.end(); } catch { /* client already gone */ }
   } catch (err) {
     if (abortSignal?.aborted) {
       try { res.end(); } catch { /* client gone */ }

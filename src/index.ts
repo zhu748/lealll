@@ -323,6 +323,10 @@ async function runAndroid(): Promise<void> {
   const controlListener = await startControlListener({
     port: controlPort,
     state: controlState,
+    // v0.3.4: Android OAuth token exchanges now carry the full real-client
+    // fingerprint (config.yaml identity > env override > built-in defaults)
+    // — previously they went out with Node's bare UA (WAF fingerprint gap).
+    identity: config.identity,
     logBuffer,
     onStartProxy: startProxy,
     onStopProxy: stopProxy,

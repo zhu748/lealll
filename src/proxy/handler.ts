@@ -187,6 +187,20 @@ export async function proxyRequest(
   opts: ProxyHandlerOptions,
 ): Promise<Response> {
   const { config, auth } = opts;
+  // Client-disconnect propagation (v0.3.4): the node:http server adapter
+  // aborts `clientReq.signal` the moment the TCP client disappears
+  // mid-request. Mirror that onto a dedicated controller so every upstream
+  // fetch attempt can cancel its in-flight request immediately. Without
+  // this, a client that vanishes during a batch (buffered) generation or a
+  // retry backoff leaves the upstream running to completion — burning the
+  // account's quota for a response nobody will ever read, and pinning
+  // retry slots against a dead connection.
+  const clientGone = new AbortController();
+  const onClientGone = (): void => clientGone.abort();
+  if (clientReq.signal) {
+    if (clientReq.signal.aborted) clientGone.abort();
+    else clientReq.signal.addEventListener("abort", onClientGone, { once: true });
+  }
   // wrapFetchWithSocksBridge transparently routes SOCKS proxies (socks4://,
   // socks4a://, socks5://, socks5h://) through a local HTTP-CONNECT→SOCKS
   // bridge. Bun's native fetch only supports HTTP/HTTPS proxies and would
@@ -734,6 +748,13 @@ export async function proxyRequest(
     const defaultTimeout = meta.stream ? DEFAULT_UPSTREAM_TIMEOUT_STREAM_MS : DEFAULT_UPSTREAM_TIMEOUT_BATCH_MS;
     const timeoutMs = normalizeTimerMs(configuredTimeout > 0 ? configuredTimeout : defaultTimeout, defaultTimeout);
     const ctrl = new AbortController();
+    // Link the client-gone signal into this attempt's controller: aborting
+    // ctrl cancels the in-flight upstream fetch AND (for streaming)
+    // propagates through wrapResponseBodyWithUpstreamTimeout's onAbort to
+    // tear down the body stream. `{ once: true }` + bounded retry attempts
+    // keep the listener count tiny.
+    if (clientGone.signal.aborted) ctrl.abort();
+    else clientGone.signal.addEventListener("abort", () => ctrl.abort(), { once: true });
     const timer = setTimeout(() => ctrl.abort(), timeoutMs);
     timer.unref?.();
     // Bun's native fetch accepts `{ proxy: "http://..." }` / `socks5://...`
@@ -826,6 +847,9 @@ export async function proxyRequest(
           });
         } catch (err) {
           clearTimeout(timer);
+          if (clientGone.signal.aborted) {
+            throw new Error("client disconnected before upstream response");
+          }
           if (ctrl.signal.aborted) {
             throw new Error(`upstream timeout after ${timeoutMs}ms`);
           }
@@ -836,8 +860,11 @@ export async function proxyRequest(
       }
     } catch (err) {
       clearTimeout(timer);
-      // Distinguish abort (timeout) from real network errors so the error
-      // message surfaces the actual cause to the client.
+      // Distinguish abort (timeout / client-gone) from real network errors
+      // so the error message surfaces the actual cause to the client.
+      if (clientGone.signal.aborted) {
+        throw new Error("client disconnected before upstream response");
+      }
       if (ctrl.signal.aborted) {
         throw new Error(`upstream timeout after ${timeoutMs}ms`);
       }
@@ -955,6 +982,14 @@ export async function proxyRequest(
     }
   } catch (err) {
     const errMsg = (err as Error).message ?? String(err);
+    // Client already disconnected — retrying would burn upstream quota for a
+    // response nobody will read. Bail immediately (499 = nginx's "client
+    // closed request"; the client won't see the body either way).
+    if (clientGone.signal.aborted) {
+      proxyLog(`${reqId} client disconnected during initial fetch — not retrying`);
+      printRow(reqId, format, meta, 499, started, Date.now(), 0, 0, 0);
+      return errorResponse(499, "client_disconnected", "Client closed the connection before the response completed");
+    }
     if (config.retry.maxRetries <= 0) {
       printRow(reqId, format, meta, 502, started, Date.now(), 0, 0, 0);
       return errorResponse(502, "upstream_unreachable", errMsg);
@@ -1027,6 +1062,11 @@ export async function proxyRequest(
     let rotated = false;
     if (maxRotations > 0) {
       for (let rot = 0; rot < maxRotations; rot++) {
+      // v0.3.4: no point rotating proxies for a client that's already gone.
+      if (clientGone.signal.aborted) {
+        proxyLog(`${reqId} client disconnected during WAF rotation — surfacing error`);
+        break;
+      }
       // If we were using a per-account proxy (cred.proxy), there's no pool
       // rotation to do — bail and surface the WAF error.
       if (cred.proxy) break;
@@ -1274,6 +1314,13 @@ export async function proxyRequest(
       Math.min(config.retry.maxRetries + extraAttemptsFromSwitches, MAX_TOTAL_ATTEMPTS);
 
     for (let attempt = 1; attempt <= effectiveRetryLimit(); attempt++) {
+      // v0.3.4: client disconnected during the backoff window — every further
+      // attempt (and the sleep itself) is wasted work and wasted quota.
+      if (clientGone.signal.aborted) {
+        proxyLog(`${reqId} client disconnected during retry backoff — aborting retry loop`);
+        printRow(reqId, format, meta, 499, started, Date.now(), 0, 0, 0, hadRetryAttempt, 0, currentCredentialStatsKey(), totalCaptchaMs);
+        return errorResponse(499, "client_disconnected", "Client closed the connection before the response completed");
+      }
       // v0.2.2+ safety: if we've hit the hard cap, force-exit the loop
       // immediately. This catches the edge case where extraAttemptsFromSwitches
       // grew faster than the cap check (the for-condition only re-evaluates
@@ -1299,6 +1346,16 @@ export async function proxyRequest(
       );
       hadRetryAttempt = true;
       await sleep(delayMs);
+
+      // v0.3.4: re-check AFTER the backoff sleep — the abort may have arrived
+      // while we were sleeping (the loop-top check only catches it between
+      // iterations). Without this, one extra upstream fetch slips through for
+      // every client that disconnects during backoff.
+      if (clientGone.signal.aborted) {
+        proxyLog(`${reqId} client disconnected during retry backoff — aborting retry loop`);
+        printRow(reqId, format, meta, 499, started, Date.now(), 0, 0, 0, hadRetryAttempt, 0, currentCredentialStatsKey(), totalCaptchaMs);
+        return errorResponse(499, "client_disconnected", "Client closed the connection before the response completed");
+      }
 
       // Credential switching: if the current credential has failed
       // consecutively enough times, switch to another stored credential

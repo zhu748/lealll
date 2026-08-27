@@ -861,6 +861,81 @@ describe("proxyRequest", () => {
     expect(text).toContain("message_stop");
   });
 
+  // v0.3.4: client-disconnect propagation. The server adapter aborts the
+  // inbound Request's signal when the TCP client disappears; proxyRequest
+  // must cancel the in-flight upstream fetch (not let it run to completion)
+  // and return 499 instead of retrying.
+  it("aborts the upstream fetch and returns 499 when the client disconnects mid-batch", async () => {
+    const ac = new AbortController();
+    let upstreamAborted = false;
+    const fetchMock = mock(async (_req: Request, init?: RequestInit): Promise<Response> => {
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          upstreamAborted = true;
+          reject(new Error("upstream aborted"));
+        });
+      });
+    });
+
+    const auth = new AuthManager({ mode: "apikey", provider: "zai", apiKey: "testkey.testsecret" });
+    const clientReq = new Request("http://localhost:8080/v1/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: '{"model":"glm-4.6","messages":[{"role":"user","content":"Hi"}]}',
+      signal: ac.signal,
+    });
+
+    const pending = proxyRequest(clientReq, "anthropic", { config: testConfig, auth, fetchImpl: fetchMock as any });
+    // Give the fetch a tick to start, then kill the client connection.
+    await new Promise((r) => setTimeout(r, 10));
+    ac.abort();
+
+    const resp = await pending;
+    expect(resp.status).toBe(499);
+    const body = await resp.json() as { error: { type: string } };
+    expect(body.error.type).toBe("client_disconnected");
+    // The upstream fetch WAS cancelled (quota no longer burns for dead clients).
+    expect(upstreamAborted).toBe(true);
+    // ...and exactly one upstream call happened (no retries for a dead client).
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("skips the retry loop entirely when the client disconnects during backoff", async () => {
+    const ac = new AbortController();
+    let calls = 0;
+    const fetchMock = mock(async (): Promise<Response> => {
+      calls++;
+      return new Response(JSON.stringify({ error: { type: "overloaded_error" } }), {
+        status: 529,
+        headers: { "content-type": "application/json" },
+      });
+    });
+
+    const retryConfig: ProxyConfig = {
+      ...testConfig,
+      retry: { maxRetries: 5, initialDelayMs: 60, maxDelayMs: 1000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3 },
+    };
+    const auth = new AuthManager({ mode: "apikey", provider: "zai", apiKey: "testkey.testsecret" });
+    const clientReq = new Request("http://localhost:8080/v1/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: '{"model":"glm-4.6","messages":[{"role":"user","content":"Hi"}]}',
+      signal: ac.signal,
+    });
+
+    const pending = proxyRequest(clientReq, "anthropic", { config: retryConfig, auth, fetchImpl: fetchMock as any });
+    // First attempt returns 529 → retry loop sleeps 60ms. Abort mid-sleep.
+    await new Promise((r) => setTimeout(r, 20));
+    ac.abort();
+
+    const resp = await pending;
+    expect(resp.status).toBe(499);
+    const body = await resp.json() as { error: { type: string } };
+    expect(body.error.type).toBe("client_disconnected");
+    // Only the FIRST attempt ran — the loop exited before attempt #2.
+    expect(calls).toBe(1);
+  });
+
   it("forwards content-encoding from upstream response (decompress: false passthrough)", async () => {
     const fetchMock = mock(async (_req: Request, init?: RequestInit & { decompress?: boolean }): Promise<Response> => {
       expect(init?.decompress).toBe(false);

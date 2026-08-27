@@ -2,6 +2,46 @@
 
 A reverse proxy for Z.AI / Bigmodel.cn coding-plan APIs that exposes both OpenAI-compatible and Anthropic-format endpoints.
 
+## v0.3.4.0 — Client-Disconnect Propagation + Dual Server Adapter
+
+A deep audit of the v0.3.3.0 node:http migration surfaced one critical
+runtime gap and two latent resource bugs — all fixed and regression-tested
+(1230/1230 green, +6 tests).
+
+- **Client disconnects now cancel upstream work (quota saver)**. When a
+  client vanishes mid-request (Ctrl+C on Claude Code, SDK timeout, tab
+  closed), the proxy now aborts the in-flight upstream fetch **immediately**
+  and returns 499 `client_disconnected` instead of letting the generation
+  run to completion for a response nobody will read. The abort also skips
+  the retry loop (checked at loop top AND after every backoff sleep — a
+  disconnect during backoff previously burned one extra attempt per retry)
+  and stops WAF proxy-rotation early.
+- **Dual server adapter — `Bun.serve` on Bun, `node:http` on Node
+  (Android)**. The v0.3.3.0 migration put every runtime on `node:http`,
+  which silently lost disconnect detection on desktop: Bun's `node:http`
+  compat layer emits **no events at all** (no `res 'close'`, no `req
+  'aborted'`, not even socket `'close'` on a raw TCP RST) once a request
+  body has been consumed — verified empirically on Bun 1.3.14. The proxy
+  was structurally blind to disappearing clients. Desktop builds are back
+  on `Bun.serve` (native `req.signal` abort + auto stream cancellation);
+  the Android bundle keeps `node:http` (real Node emits `res 'close'`
+  correctly) with triple disconnect listeners. Routing, CORS, admin
+  dashboard, timeouts: identical on both adapters.
+- **Backpressure pump hang fix (`node:http` adapter)**: when a streaming
+  client disconnected while the write buffer was full, the pump awaited a
+  `drain` event that Node never emits on a destroyed socket — the closure
+  (plus its buffers) hung forever, one leak per aborted stream. The wait
+  now also resolves on `'close'`, and the trailing `res.end()` is
+  exception-guarded. A post-listen `server.on("error")` logger was also
+  added (an unhandled server error is process-fatal in Node).
+- **Android OAuth client fingerprint**: the control listener's
+  `startOAuth` built OAuth clients *without* the identity parameter, so the
+  Android token exchange went out with Node's bare UA — the exact WAF
+  fingerprint gap v0.3.2 fixed for desktop. The control protocol now
+  carries the full ZCode client identity (config.yaml identity > env
+  override > built-in defaults), and the control request body is capped at
+  1MB (was unbounded).
+
 ## v0.3.3.0 — Android APK Support (upstream parity)
 
 The server core now runs on **both Bun and Node**, unlocking the Android

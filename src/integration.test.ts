@@ -21,6 +21,9 @@ let mockUpstreamServer: ReturnType<typeof Bun.serve>;
 let proxyPort: number;
 let mockPort: number;
 let config: ReturnType<typeof loadConfig>;
+// v0.3.4: counts aborted upstream requests observed by the mock server —
+// used by the client-disconnect propagation integration test.
+let upstreamAbortCount = 0;
 // Snapshot of HOME so afterEach can restore it (we redirect HOME to a tmpdir
 // so the test never touches the user's real ~/.zcode-proxy/credentials.json).
 let realHome: string | undefined;
@@ -45,6 +48,13 @@ beforeAll(async () => {
       const responseModel = parsed.model ?? "glm-4.6";
 
       if (url.pathname.includes("/v1/messages")) {
+        // v0.3.4 test hook: model "glm-hang" never responds — the request
+        // hangs until the PROXY aborts its fetch (client-disconnect test).
+        if (parsed.model === "glm-hang") {
+          return new Promise<Response>(() => {
+            req.signal.addEventListener("abort", () => { upstreamAbortCount++; });
+          });
+        }
         if (parsed.stream) {
           // v0.2.0.4+: proxy now forces stream:true to upstream regardless of
           // client's stream preference (wire-shape alignment with real ZCode
@@ -181,6 +191,37 @@ describe("integration: OpenAI streaming translation", () => {
     const text = await resp.text();
     expect(text).toContain("chat.completion.chunk");
     expect(text).toContain("data: [DONE]");
+  });
+});
+
+describe("integration: client-disconnect propagation (v0.3.4)", () => {
+  it("cancels the in-flight upstream fetch when the client disconnects", async () => {
+    const before = upstreamAbortCount;
+    const ac = new AbortController();
+
+    const pending = fetch(proxyUrl("/v1/messages"), {
+      method: "POST",
+      headers: { ...authHeader(), "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({
+        model: "glm-hang",
+        max_tokens: 16,
+        messages: [{ role: "user", content: "will hang" }],
+      }),
+      signal: ac.signal,
+    }).catch((err: unknown) => ({ aborted: true, err }));
+
+    // Let the request reach the (hanging) upstream, then drop the client.
+    await new Promise((r) => setTimeout(r, 150));
+    expect(upstreamAbortCount).toBe(before); // still hanging, not aborted
+    ac.abort();
+
+    const outcome = await pending;
+    expect((outcome as { aborted?: boolean }).aborted).toBe(true);
+
+    // The proxy must propagate the disconnect: its upstream fetch is torn
+    // down (before v0.3.4 the generation ran to completion, burning quota).
+    await new Promise((r) => setTimeout(r, 200));
+    expect(upstreamAbortCount).toBe(before + 1);
   });
 });
 
