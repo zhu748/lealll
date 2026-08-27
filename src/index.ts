@@ -700,9 +700,11 @@ async function serve(configPath?: string): Promise<void> {
     const stopAndFlushLogs = async () => {
       await runShutdownCleanup({
         stopServer: () => server.stop(),
+        // v0.3.8: direct pool+solver shutdown (the ChromeCaptchaHelper shim
+        // was removed with the legacy dashboard captcha page).
         shutdownCaptchaHelper: async () => {
-          const { shutdownChromeCaptchaHelper } = await import("./proxy/captcha.js");
-          await shutdownChromeCaptchaHelper("process shutdown");
+          const { shutdownCaptcha } = await import("./proxy/captcha.js");
+          shutdownCaptcha();
         },
         flushLogs: flushLogFileForShutdown,
       });

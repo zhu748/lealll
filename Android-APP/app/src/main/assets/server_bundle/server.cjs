@@ -107177,6 +107177,50 @@ ${captureLines}` : capture.stack;
   }
 });
 
+// src/proxy/captcha-guest-rejections.ts
+function formatNote(value2) {
+  try {
+    if (value2 instanceof Error) {
+      const frames2 = String(value2.stack ?? "").split("\n").filter((l) => FRAME_LINE_RE.test(l)).slice(0, 3).map((l) => l.trim().replace(/^at\s+/, "")).join(" | ");
+      return `${value2.name || "Error"}: ${String(value2.message).slice(0, 200)}${frames2 ? ` @ ${frames2}` : ""}`;
+    }
+    return `non-Error: ${String(value2).slice(0, 200)}`;
+  } catch {
+    return "unformattable rejection";
+  }
+}
+function isGuestOriginError(value2) {
+  if (!(value2 instanceof Error)) return false;
+  const stack = String(value2.stack ?? "");
+  if (!stack) return false;
+  for (const line of stack.split("\n")) {
+    if (FRAME_LINE_RE.test(line) && GUEST_FRAME_RE.test(line)) return true;
+  }
+  return false;
+}
+function noteGuestError(value2) {
+  if (!isGuestOriginError(value2)) return false;
+  try {
+    if (_notes.length >= MAX_NOTES) _notes.shift();
+    _notes.push(formatNote(value2));
+  } catch {
+  }
+  return true;
+}
+function peekGuestErrorNotes(count = 4) {
+  return _notes.slice(-Math.max(0, count));
+}
+var GUEST_FRAME_RE, FRAME_LINE_RE, MAX_NOTES, _notes;
+var init_captcha_guest_rejections = __esm({
+  "src/proxy/captcha-guest-rejections.ts"() {
+    "use strict";
+    GUEST_FRAME_RE = /alicdn\.com\//i;
+    FRAME_LINE_RE = /^\s*at\b/;
+    MAX_NOTES = 40;
+    _notes = [];
+  }
+});
+
 // src/utils/host-timers.ts
 function resolveBinding(name2) {
   let desc;
@@ -107717,6 +107761,8 @@ function installNativeToString(w2) {
         try {
           const v = desc.get.call(obj);
           if (typeof v === "function") mask(v);
+          else if (v && typeof v.catch === "function") v.catch(() => {
+          });
         } catch (_) {
         }
       }
@@ -108704,6 +108750,7 @@ async function createDom(region, prefix2) {
       }
     });
     process.on("uncaughtException", (err) => {
+      if (noteGuestError(err)) return;
       try {
         const msg = err && err.message ? err.message : String(err);
         process.stderr.write(`[captcha-guest-uncaught] ${msg}
@@ -108900,6 +108947,52 @@ function installGlobalWindowAlias(g, w2) {
   gDefine("__capWindowFor", { get() {
     return w2;
   }, configurable: true });
+  if (firstInstaller) {
+    try {
+      const origConsole = g.console;
+      if (origConsole && typeof origConsole.log === "function") {
+        const wrapConsoleMethod = (method2) => {
+          const origFn = origConsole[method2];
+          if (typeof origFn !== "function") return null;
+          const fn = function __capConsoleFilter(...args) {
+            try {
+              const st = new Error().stack || "";
+              let checked2 = 0;
+              for (const line of st.split("\n")) {
+                if (!/^\s*at/.test(line)) continue;
+                if (/alicdn\.com\//i.test(line)) return void 0;
+                if (++checked2 >= 10) break;
+              }
+            } catch (_) {
+            }
+            return origFn.apply(origConsole, args);
+          };
+          try {
+            Object.defineProperty(fn, "toString", {
+              value: () => `function ${method2}() { [native code] }`,
+              configurable: true,
+              writable: true
+            });
+          } catch (_) {
+          }
+          return fn;
+        };
+        const filtered = Object.create(origConsole);
+        for (const m of Object.getOwnPropertyNames(origConsole)) {
+          if (/^[A-Z]/.test(m)) continue;
+          const f = wrapConsoleMethod(m);
+          if (f) {
+            try {
+              Object.defineProperty(filtered, m, { value: f, configurable: true, writable: true });
+            } catch (_) {
+            }
+          }
+        }
+        gDefine("console", { value: filtered, configurable: true, writable: true });
+      }
+    } catch (_) {
+    }
+  }
 }
 function removeGlobalWindowAlias(g, w2) {
   if (_aliasRefCount <= 0) return;
@@ -109125,9 +109218,17 @@ async function solveTraceless(opts) {
     let out = err;
     try {
       const guestErrs = w2.__capGuestErrors;
+      const hostNotes = peekGuestErrorNotes(4);
+      const parts = [];
       if (Array.isArray(guestErrs) && guestErrs.length > 0) {
         const tail = guestErrs.slice(-6).map((s) => String(s).slice(0, 160)).join(" ;; ");
-        const suffix = ` | guestErrors[${guestErrs.length}]: ${tail}`.slice(0, 1200);
+        parts.push(`guestErrors[${guestErrs.length}]: ${tail}`);
+      }
+      if (hostNotes.length > 0) {
+        parts.push(`hostUH[${hostNotes.length}]: ${hostNotes.join(" ;; ").slice(0, 600)}`);
+      }
+      if (parts.length > 0) {
+        const suffix = ` | ${parts.join(" | ")}`.slice(0, 1200);
         if (err instanceof Error) {
           err.message += suffix;
         } else {
@@ -109156,6 +109257,7 @@ var init_captcha_happy = __esm({
     import_node_os3 = __toESM(require("node:os"), 1);
     import_node_path2 = __toESM(require("node:path"), 1);
     import_node_worker_threads = require("node:worker_threads");
+    init_captcha_guest_rejections();
     init_host_timers();
     SYNC_FETCH_BUF_BYTES = 8 * 1024 * 1024;
     SYNC_FETCH_HEADER_BYTES = 64;
@@ -109657,6 +109759,11 @@ function resolvePoolOpts(opts) {
     solveRetries: opts.solveRetries ?? SOLVE_RETRIES,
     staggerMs: opts.staggerMs ?? DEFAULT_STAGGER_MS,
     solveConcurrency: opts.solveConcurrency ?? DEFAULT_SOLVE_CONCURRENCY,
+    solveBackoffBaseMs: Math.max(0, opts.solveBackoffBaseMs ?? DEFAULT_SOLVE_BACKOFF_BASE_MS),
+    solveBackoffCapMs: Math.max(0, opts.solveBackoffCapMs ?? DEFAULT_SOLVE_BACKOFF_CAP_MS),
+    bgSolveConcurrency: Math.max(1, opts.bgSolveConcurrency ?? DEFAULT_BG_SOLVE_CONCURRENCY),
+    breakerStreak: Math.max(1, opts.breakerStreak ?? DEFAULT_BREAKER_STREAK),
+    breakerCooldownsMs: (opts.breakerCooldownsMs && opts.breakerCooldownsMs.length > 0 ? opts.breakerCooldownsMs : DEFAULT_BREAKER_COOLDOWNS_MS).filter((v) => v > 0),
     emptyTakeRace: Math.max(1, opts.emptyTakeRace ?? EMPTY_TAKE_RACE),
     onCaptchaIpBlock: opts.onCaptchaIpBlock
   };
@@ -109688,7 +109795,7 @@ async function prefillCaptchaPool(cfg, count) {
 function urgentCaptchaRefill() {
   pool.requestUrgentRefill();
 }
-var CertifyIdRegistry, DEFAULT_POOL_MIN, DEFAULT_POOL_MAX, DEFAULT_TOKEN_TTL_MS, DEFAULT_REFILL_INTERVAL_MS, DEFAULT_STAGGER_MS, DEFAULT_SOLVE_CONCURRENCY, DEFAULT_SCALE_DOWN_IDLE_MS, DEFAULT_IDLE_FLOOR, DEFAULT_DEEP_IDLE_AFTER_MS, EMPTY_TAKE_RACE, SOLVE_RETRIES, SCALE_UP_STEP, TAKE_RATE_WINDOW_MS, CaptchaTokenPool, pool;
+var CertifyIdRegistry, DEFAULT_POOL_MIN, DEFAULT_POOL_MAX, DEFAULT_TOKEN_TTL_MS, DEFAULT_REFILL_INTERVAL_MS, DEFAULT_STAGGER_MS, DEFAULT_SOLVE_CONCURRENCY, DEFAULT_SCALE_DOWN_IDLE_MS, DEFAULT_IDLE_FLOOR, DEFAULT_SOLVE_BACKOFF_BASE_MS, DEFAULT_SOLVE_BACKOFF_CAP_MS, DEFAULT_BG_SOLVE_CONCURRENCY, DEFAULT_BREAKER_STREAK, DEFAULT_BREAKER_COOLDOWN_SCHEDULE, DEFAULT_BREAKER_COOLDOWNS_MS, DEFAULT_DEEP_IDLE_AFTER_MS, EMPTY_TAKE_RACE, SOLVE_RETRIES, SCALE_UP_STEP, TAKE_RATE_WINDOW_MS, CaptchaTokenPool, pool;
 var init_captcha_pool = __esm({
   "src/proxy/captcha-pool.ts"() {
     "use strict";
@@ -109733,6 +109840,12 @@ var init_captcha_pool = __esm({
     );
     DEFAULT_SCALE_DOWN_IDLE_MS = Number(process.env.CAPTCHA_POOL_SCALE_DOWN_IDLE_MS || 12e4);
     DEFAULT_IDLE_FLOOR = Number(process.env.CAPTCHA_POOL_IDLE_FLOOR || 1);
+    DEFAULT_SOLVE_BACKOFF_BASE_MS = Number(process.env.CAPTCHA_SOLVE_BACKOFF_BASE_MS || 500);
+    DEFAULT_SOLVE_BACKOFF_CAP_MS = Number(process.env.CAPTCHA_SOLVE_BACKOFF_CAP_MS || 4e3);
+    DEFAULT_BG_SOLVE_CONCURRENCY = Math.max(1, Number(process.env.CAPTCHA_BG_SOLVE_CONCURRENCY || 2));
+    DEFAULT_BREAKER_STREAK = Math.max(1, Number(process.env.CAPTCHA_BREAKER_STREAK || 2));
+    DEFAULT_BREAKER_COOLDOWN_SCHEDULE = (process.env.CAPTCHA_BREAKER_COOLDOWN_MS || "").split(",").map((v) => Number(v.trim())).filter((v) => Number.isFinite(v) && v > 0);
+    DEFAULT_BREAKER_COOLDOWNS_MS = DEFAULT_BREAKER_COOLDOWN_SCHEDULE.length > 0 ? DEFAULT_BREAKER_COOLDOWN_SCHEDULE : [3e4, 6e4, 12e4, 3e5, 6e5];
     DEFAULT_DEEP_IDLE_AFTER_MS = Number(process.env.CAPTCHA_DEEP_IDLE_AFTER_MS || 9e5);
     EMPTY_TAKE_RACE = Math.max(1, Number(process.env.CAPTCHA_EMPTY_TAKE_RACE || 3));
     SOLVE_RETRIES = Number(process.env.ZCODE_CAPTCHA_RETRIES || 4);
@@ -109758,6 +109871,10 @@ var init_captcha_pool = __esm({
       mintFailures = [];
       mintSuccesses = [];
       lastStormResetAt = 0;
+      // Mint circuit-breaker state: consecutive all-failed solve waves + the
+      // current index into breakerCooldownsMs. Any minted token resets both.
+      failWaveStreak = 0;
+      breakerCooldownIdx = 0;
       constructor(opts = {}) {
         const hasOpts = Object.keys(opts).length > 0;
         this.opts = resolvePoolOpts(opts);
@@ -109855,11 +109972,19 @@ var init_captcha_pool = __esm({
       async prefill(cfg, count) {
         this.cfg = cfg;
         const target2 = Math.min(count ?? this.effectiveTarget, this.effectiveTarget);
+        let lastReady = -1;
+        let stagnantRounds = 0;
         while (this.tokens.length + this.activeSolves < target2) {
+          if (Date.now() < this.pausedUntil) break;
           const need = target2 - this.tokens.length - this.activeSolves;
           if (need <= 0) break;
-          const concurrency = this.governor?.enabled ? this.governor.backgroundConcurrency(this.tokens.length) : this.opts.solveConcurrency;
+          const concurrency = this.governor?.enabled ? Math.min(this.governor.backgroundConcurrency(this.tokens.length), this.opts.bgSolveConcurrency) : Math.min(this.opts.solveConcurrency, this.opts.bgSolveConcurrency);
           await this.solveBatch(cfg, need, Math.max(1, concurrency));
+          const ready = this.tokens.length;
+          if (ready > lastReady) stagnantRounds = 0;
+          else stagnantRounds += 1;
+          lastReady = ready;
+          if (stagnantRounds >= 4) break;
         }
       }
       requestUrgentRefill() {
@@ -109895,6 +110020,8 @@ var init_captcha_pool = __esm({
           return;
         }
         this.tokens.push({ param, cachedAt: Date.now(), certifyId });
+        this.failWaveStreak = 0;
+        this.breakerCooldownIdx = 0;
       }
       pruneExpired() {
         const now = Date.now();
@@ -110007,7 +110134,8 @@ var init_captcha_pool = __esm({
         if (need <= 0) return;
         this.refillInFlight = true;
         try {
-          await this.solveBatch(this.cfg, need, Math.max(1, concurrency));
+          const waveConcurrency = opts.urgent ? concurrency : Math.min(concurrency, this.opts.bgSolveConcurrency);
+          await this.solveBatch(this.cfg, need, Math.max(1, waveConcurrency));
         } finally {
           this.refillInFlight = false;
         }
@@ -110016,22 +110144,44 @@ var init_captcha_pool = __esm({
       async solveBatch(cfg, need, concurrency = this.opts.solveConcurrency) {
         let remaining = need;
         while (remaining > 0 && this.tokens.length + this.activeSolves < this.effectiveTarget) {
+          if (Date.now() < this.pausedUntil) break;
           const wave = Math.min(remaining, concurrency, this.deficit());
           if (wave <= 0) break;
           if (this.opts.staggerMs > 0) await this.waitForStagger();
           const results = await Promise.allSettled(
             Array.from({ length: wave }, () => this.solveOne(cfg))
           );
+          let fulfilled = 0;
           for (const r2 of results) {
             if (r2.status === "fulfilled") {
+              fulfilled += 1;
               this.pushToken(r2.value);
             } else {
               console.warn("[captcha-pool] parallel solve failed:", r2.reason);
             }
           }
           remaining -= wave;
-          if (results.every((r2) => r2.status === "rejected")) break;
+          if (fulfilled === 0) {
+            const firstReason = results[0]?.status === "rejected" ? String(results[0].reason) : "unknown";
+            this.noteAllFailedWave(firstReason);
+            break;
+          }
         }
+      }
+      /** A solve wave where every solver failed. Trip the breaker past the
+       *  streak threshold: park background solving with an escalating cooldown
+       *  (30s → 60s → 120s → 300s → 600s). Any banked token resets the ladder. */
+      noteAllFailedWave(latestReason) {
+        this.failWaveStreak += 1;
+        if (this.failWaveStreak < this.opts.breakerStreak) return;
+        const schedule = this.opts.breakerCooldownsMs.length > 0 ? this.opts.breakerCooldownsMs : [3e4];
+        const idx = Math.min(this.breakerCooldownIdx, schedule.length - 1);
+        const cooldown = schedule[idx];
+        this.breakerCooldownIdx = Math.min(this.breakerCooldownIdx + 1, schedule.length - 1);
+        this.pausedUntil = Math.max(this.pausedUntil, Date.now() + cooldown);
+        console.warn(
+          `[captcha-pool] mint breaker tripped (${this.failWaveStreak} consecutive all-failed waves; latest: ${latestReason.slice(0, 120)}) \u2014 background solving parked for ${Math.round(cooldown / 1e3)}s (on-demand solves for live requests still run)`
+        );
       }
       async waitForStagger() {
         const elapsed = Date.now() - this.lastSolveAt;
@@ -110078,6 +110228,13 @@ var init_captcha_pool = __esm({
           let lastErr = null;
           let sawIpBlock = false;
           for (let attempt = 1; attempt <= this.opts.solveRetries; attempt += 1) {
+            if (attempt > 1 && this.opts.solveBackoffBaseMs > 0) {
+              const backoff = Math.min(
+                this.opts.solveBackoffBaseMs * 2 ** (attempt - 2),
+                Math.max(1, this.opts.solveBackoffCapMs)
+              );
+              await new Promise((r2) => setTimeout(r2, backoff));
+            }
             try {
               const param = await runCaptchaSolve(cfg.sceneId, cfg.region, cfg.prefix);
               if (!param) {
@@ -110179,12 +110336,9 @@ __export(captcha_exports, {
   configureCaptchaSolving: () => configureCaptchaSolving,
   detectCaptchaChallenge: () => detectCaptchaChallenge,
   getCaptchaToken: () => getCaptchaToken,
-  getChromeCaptchaHelperStatus: () => getChromeCaptchaHelperStatus,
   shutdownCaptcha: () => shutdownCaptcha,
-  shutdownChromeCaptchaHelper: () => shutdownChromeCaptchaHelper,
   startCaptchaPool: () => startCaptchaPool,
-  urgentCaptcha: () => urgentCaptcha,
-  warmupChromeCaptchaHelper: () => warmupChromeCaptchaHelper
+  urgentCaptcha: () => urgentCaptcha
 });
 function detectCaptchaChallenge(resp) {
   const v = resp.headers.get(CAPTCHA_HEADER);
@@ -110241,24 +110395,6 @@ function configureCaptchaSolving(opts) {
 }
 function _clearCaptchaConfigCacheForTesting() {
   cachedConfig = { value: null, expiresAt: 0 };
-}
-function getChromeCaptchaHelperStatus() {
-  const stats2 = getCaptchaPoolStats();
-  return {
-    running: stats2.target > 0 || stats2.activeSolves > 0,
-    backend: "happy-pool",
-    ready: stats2.ready,
-    target: stats2.target,
-    activeSolves: stats2.activeSolves
-  };
-}
-async function warmupChromeCaptchaHelper(appVersion) {
-  await startCaptchaPool(appVersion || process.env.ZCODE_APP_VERSION || "3.9.1");
-  return getChromeCaptchaHelperStatus();
-}
-async function shutdownChromeCaptchaHelper(_reason = "manual") {
-  shutdownCaptcha();
-  return getChromeCaptchaHelperStatus();
 }
 var CAPTCHA_HEADER, REGION_HEADER, CONFIGS_API, RETRY_HEADERS, cachedConfig;
 var init_captcha = __esm({
@@ -117881,10 +118017,6 @@ td input{font-family:var(--font-mono)}
           <span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg></span>
           <span class="nav-text">\u4EE3\u7406\u6C60</span>
         </div>
-        <div class="nav-item" data-page="captcha-helper">
-          <span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg></span>
-          <span class="nav-text">\u9A8C\u8BC1\u7801\u52A9\u624B</span>
-        </div>
       </div>
       <div class="nav-section">
         <div class="nav-section-title">\u51ED\u8BC1</div>
@@ -117977,6 +118109,13 @@ td input{font-family:var(--font-mono)}
             </div>
             <div class="stat-value" id="statRetries">0</div>
             <div class="stat-label">\u603B\u91CD\u8BD5\u6B21\u6570</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-icon icon-success">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg>
+            </div>
+            <div class="stat-value" id="statCaptchaPool">\u2014</div>
+            <div class="stat-label">\u9A8C\u8BC1\u7801\u6C60\uFF08\u5C31\u7EEA/\u76EE\u6807\uFF09</div>
           </div>
         </div>
         <div class="card">
@@ -118790,65 +118929,6 @@ td input{font-family:var(--font-mono)}
         </div>
       </div>
 
-      <!-- ============================================================ Captcha Helper ============================================================ -->
-      <div class="page" id="page-captcha-helper">
-        <div class="main-header">
-          <div class="header-left">
-            <h1>\u9A8C\u8BC1\u7801\u52A9\u624B</h1>
-            <div class="subtitle">Start-plan Chrome CDP \u5E38\u9A7B\u9A8C\u8BC1\u72B6\u6001</div>
-          </div>
-          <div class="header-actions">
-            <button class="btn btn-ghost btn-sm" onclick="loadCaptchaHelper()">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
-              \u5237\u65B0
-            </button>
-          </div>
-        </div>
-        <div class="stats-grid">
-          <div class="stat-card">
-            <div class="stat-icon icon-success"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/></svg></div>
-            <div class="stat-value" id="captchaHelperRunning">-</div>
-            <div class="stat-label">\u8FD0\u884C\u72B6\u6001</div>
-          </div>
-          <div class="stat-card">
-            <div class="stat-icon icon-info"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8 2v4M16 2v4M8 18v4M16 18v4M2 8h4M2 16h4M18 8h4M18 16h4"/></svg></div>
-            <div class="stat-value" id="captchaHelperMode">-</div>
-            <div class="stat-label">\u6A21\u5F0F</div>
-          </div>
-          <div class="stat-card">
-            <div class="stat-icon icon-warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg></div>
-            <div class="stat-value" id="captchaHelperSolves">0</div>
-            <div class="stat-label">\u9A8C\u8BC1\u6B21\u6570</div>
-          </div>
-          <div class="stat-card">
-            <div class="stat-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg></div>
-            <div class="stat-value" id="captchaHelperIdle">-</div>
-            <div class="stat-label">\u7A7A\u95F2\u56DE\u6536</div>
-          </div>
-        </div>
-        <div class="card">
-          <div class="card-header">
-            <div class="card-title">
-              <span class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></span>
-              Chrome CDP
-            </div>
-            <div style="display:flex;gap:8px;flex-wrap:wrap">
-              <button class="btn btn-primary btn-sm" onclick="warmupCaptchaHelper()">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
-                \u9884\u70ED
-              </button>
-              <button class="btn btn-ghost btn-sm" onclick="stopCaptchaHelper()">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12"/></svg>
-                \u505C\u6B62
-              </button>
-            </div>
-          </div>
-          <div class="card-body" id="captchaHelperDetail">
-            <div class="skeleton" style="height:20px;width:220px"></div>
-          </div>
-        </div>
-      </div>
-
       <!-- ============================================================ Debug Dumps ============================================================ -->
       <div class="page" id="page-debug">
         <div class="main-header">
@@ -119232,7 +119312,6 @@ function doLogout(){
   clearProxyPoolPollTimer();
   clearProxyPoolProgressHideTimer();
   invalidateProxyPoolLoads();
-  invalidateCaptchaHelperLoads();
   ppTestAllRunning=false;
   ppTestPollErrorCount=0;
   // vceshi0.0.7+: cancel any in-flight OAuth poll loop.
@@ -119324,7 +119403,6 @@ document.querySelectorAll('.nav-item').forEach(el=>{
     // to the bottom, which looks empty).
     const main=document.querySelector('.main-content');
     if(main)main.scrollTop=0;
-    if(el.dataset.page==='captcha-helper')loadCaptchaHelper();
   });
 });
 
@@ -119415,6 +119493,14 @@ function applyStatsSnapshot(d){
   }
   document.getElementById('statRequests').textContent=d.total||0;
   document.getElementById('statRetries').textContent=d.retried||0;
+  // v0.3.8: captcha token pool health (start-plan). target===0 \u2192 the pool
+  // is not running (coding-plan, or the pre-solver is parked) \u2192 em dash.
+  // Rides on the /admin/api/stats snapshot; no separate polling loop.
+  const poolEl=document.getElementById('statCaptchaPool');
+  if(poolEl){
+    const cp=d.captchaPool;
+    poolEl.textContent=(cp&&typeof cp.target==='number'&&cp.target>0)?(String(cp.ready)+'/'+String(cp.target)):'\u2014';
+  }
   if(d.byCredential){
     _cachedByCredential=d.byCredential;
     const accountsPage=document.getElementById('page-accounts');
@@ -119479,7 +119565,6 @@ async function initDashboard(){
     loadStats(),
     loadDebugDumps(),
     loadProxyPool(),
-    loadCaptchaHelper(),
     checkRunningTestJob(),
   ]).catch(e => console.error('initDashboard batch 2 failed:', e));
   connectLogStream();
@@ -119553,104 +119638,6 @@ function formatDurationMs(ms){
   const m=Math.floor(s/60),ss=s%60;
   if(m>=60){const h=Math.floor(m/60);return \`\${h}h \${String(m%60).padStart(2,'0')}m\`}
   return \`\${m}m \${String(ss).padStart(2,'0')}s\`;
-}
-
-let captchaHelperLoadInFlight=false;
-let captchaHelperLoadPending=false;
-let captchaHelperGeneration=0;
-function invalidateCaptchaHelperLoads(){
-  captchaHelperGeneration++;
-  captchaHelperLoadPending=false;
-}
-
-function renderCaptchaHelperStatus(d){
-  const running=d&&d.running;
-  document.getElementById('captchaHelperRunning').textContent=d?.busy?'\u9A8C\u8BC1\u4E2D':(running?'\u8FD0\u884C\u4E2D':'\u672A\u8FD0\u884C');
-  document.getElementById('captchaHelperMode').textContent=d?.mode==='persistent'?'\u5E38\u9A7B':'\u5355\u6B21';
-  document.getElementById('captchaHelperSolves').textContent=String(d?.solveCount??0);
-  const idleText=d?.nextIdleShutdownAt?formatDurationMs(d.nextIdleShutdownAt-Date.now()):formatDurationMs(d?.idleTimeoutMs??0);
-  document.getElementById('captchaHelperIdle').textContent=idleText;
-  const badge=d?.busy?'<span class="badge badge-warn"><span class="badge-dot"></span>\u9A8C\u8BC1\u4E2D</span>':(running?'<span class="badge badge-success"><span class="badge-dot"></span>\u8FD0\u884C\u4E2D</span>':'<span class="badge badge-muted">\u672A\u8FD0\u884C</span>');
-  document.getElementById('captchaHelperDetail').innerHTML=\`
-    <div class="kv-grid">
-      <span class="kv-key">\u72B6\u6001</span><span class="kv-val">\${badge}</span>
-      <span class="kv-key">Keepalive</span><span class="kv-val">\${d?.keepAlive?'\u5F00\u542F':'\u5173\u95ED'}</span>
-      <span class="kv-key">SDK</span><span class="kv-val">\${d?.sdkReady?'\u5DF2\u9884\u70ED':'\u672A\u9884\u70ED'}</span>
-      <span class="kv-key">Chrome</span><span class="kv-val"><code class="code-inline">\${escapeHtml(d?.chromePath||'\u672A\u627E\u5230')}</code></span>
-      <span class="kv-key">Profile</span><span class="kv-val"><code class="code-inline">\${escapeHtml(d?.userDataDir||'-')}</code></span>
-      <span class="kv-key">\u7AEF\u53E3</span><span class="kv-val">\${d?.port??'-'}</span>
-      <span class="kv-key">\u7A97\u53E3</span><span class="kv-val">\${d?.visible?'\u53EF\u89C1':'\u9690\u85CF'}</span>
-      <span class="kv-key">\u542F\u52A8\u65F6\u95F4</span><span class="kv-val">\${formatTimestamp(d?.startedAt)}</span>
-      <span class="kv-key">\u6700\u8FD1\u9A8C\u8BC1</span><span class="kv-val">\${formatTimestamp(d?.lastSolveAt)}</span>
-      <span class="kv-key">\u4EA4\u4E92\u6B21\u6570</span><span class="kv-val">\${d?.interactiveCount??0}</span>
-      \${d?.sdkPreloadError?\`<span class="kv-key">SDK \u9519\u8BEF</span><span class="kv-val"><span class="badge badge-warn">\${escapeHtml(d.sdkPreloadError)}</span></span>\`:''}
-      \${d?.lastError?\`<span class="kv-key">\u6700\u8FD1\u9519\u8BEF</span><span class="kv-val"><span class="badge badge-danger">\${escapeHtml(d.lastError)}</span></span>\`:''}
-    </div>\`;
-}
-
-async function loadCaptchaHelper(){
-  if(document.hidden||!dashboardActive())return;
-  if(captchaHelperLoadInFlight){captchaHelperLoadPending=true;return;}
-  captchaHelperLoadPending=false;
-  const generation=captchaHelperGeneration;
-  const requestAuthToken=authToken;
-  const requestInitGeneration=dashboardInitGeneration;
-  captchaHelperLoadInFlight=true;
-  try{
-    const d=await fetchJsonWithTimeout(API+'/admin/api/captcha-helper',{headers:authHeaders()},5000);
-    if(generation!==captchaHelperGeneration||document.hidden||!dashboardActionCurrent(requestInitGeneration,requestAuthToken))return;
-    renderCaptchaHelperStatus(d);
-  }catch(e){
-    if(generation===captchaHelperGeneration&&!document.hidden&&dashboardActionCurrent(requestInitGeneration,requestAuthToken)){
-      console.error('loadCaptchaHelper failed:',e);
-      document.getElementById('captchaHelperDetail').innerHTML='<span class="badge badge-danger">\u52A0\u8F7D\u5931\u8D25</span>';
-    }
-  }finally{
-    captchaHelperLoadInFlight=false;
-    if(captchaHelperLoadPending&&!document.hidden&&dashboardActionCurrent(requestInitGeneration,requestAuthToken)){
-      captchaHelperLoadPending=false;
-      loadCaptchaHelper();
-    }
-  }
-}
-
-async function warmupCaptchaHelper(){
-  if(!beginExclusiveAction('captchaHelperAction','\u9A8C\u8BC1\u7801\u52A9\u624B\u64CD\u4F5C\u6B63\u5728\u8FDB\u884C\u4E2D\uFF0C\u8BF7\u7A0D\u5019'))return;
-  invalidateCaptchaHelperLoads();
-  const generation=captchaHelperGeneration;
-  try{
-    const d=await fetchJsonMutationWithTimeout(API+'/admin/api/captcha-helper/warmup',{method:'POST',headers:authHeaders()});
-    if(generation!==captchaHelperGeneration||document.hidden||!dashboardActive())return;
-    renderCaptchaHelperStatus(d);
-    toast(d.running?'\u9A8C\u8BC1\u7801\u52A9\u624B\u5DF2\u9884\u70ED':'\u9A8C\u8BC1\u7801\u52A9\u624B\u672A\u542F\u7528\u5E38\u9A7B\u6A21\u5F0F',d.running?'success':'warn');
-  }catch(e){
-    if(generation===captchaHelperGeneration&&!document.hidden&&dashboardActive()){
-      console.error('warmupCaptchaHelper failed:',e);
-      toast('\u9884\u70ED\u5931\u8D25\uFF1A'+e.message,'error');
-      loadCaptchaHelper();
-    }
-  }finally{
-    endExclusiveAction('captchaHelperAction');
-  }
-}
-
-async function stopCaptchaHelper(){
-  if(!beginExclusiveAction('captchaHelperAction','\u9A8C\u8BC1\u7801\u52A9\u624B\u64CD\u4F5C\u6B63\u5728\u8FDB\u884C\u4E2D\uFF0C\u8BF7\u7A0D\u5019'))return;
-  invalidateCaptchaHelperLoads();
-  const generation=captchaHelperGeneration;
-  try{
-    const d=await fetchJsonMutationWithTimeout(API+'/admin/api/captcha-helper/stop',{method:'POST',headers:authHeaders()});
-    if(generation!==captchaHelperGeneration||document.hidden||!dashboardActive())return;
-    renderCaptchaHelperStatus(d);
-    toast('\u9A8C\u8BC1\u7801\u52A9\u624B\u5DF2\u505C\u6B62');
-  }catch(e){
-    if(generation===captchaHelperGeneration&&!document.hidden&&dashboardActive()){
-      console.error('stopCaptchaHelper failed:',e);
-      toast('\u505C\u6B62\u5931\u8D25\uFF1A'+e.message,'error');
-    }
-  }finally{
-    endExclusiveAction('captchaHelperAction');
-  }
 }
 
 // --- Settings ---
@@ -121865,7 +121852,6 @@ document.addEventListener('visibilitychange', () => {
     clearLogReconnectTimer();
     clearProxyPoolPollTimer();
     clearProxyPoolProgressHideTimer();
-    invalidateCaptchaHelperLoads();
     clearAccountViewsRefreshTimer();
     clearAccountFilterTimer();
     clearLogRenderTimer();
@@ -122678,7 +122664,7 @@ var init_package = __esm({
   "package.json"() {
     package_default = {
       name: "zcode-proxy",
-      version: "0.3.7.1",
+      version: "0.3.8.0",
       type: "module",
       scripts: {
         dev: "bun run src/index.ts",
@@ -123327,6 +123313,18 @@ function withLinkedAbortSignal(baseFetch, signal2) {
       upstreamSignal.removeEventListener("abort", onAbort);
     }
   });
+}
+async function ensureCaptchaPoolForStartPlan(cred, appVersion) {
+  if (cred.plan !== "start-plan" && !cred.jwt) return;
+  try {
+    const pool2 = captchaPoolStats();
+    if (pool2.target > 0 || pool2.activeSolves > 0) return;
+    const { startCaptchaPool: startCaptchaPool2 } = await Promise.resolve().then(() => (init_captcha(), captcha_exports));
+    await startCaptchaPool2(appVersion || "3.9.1");
+    console.log("  captcha: token pool started (start-plan credential saved)");
+  } catch (e) {
+    console.warn(`[captcha] pool start after login failed (non-fatal): ${e.message}`);
+  }
 }
 function probeStartPlanActivation(cred, fetchImpl, appVersion, identity) {
   if (cred.plan !== "start-plan" || !cred.jwt) return;
@@ -124499,6 +124497,7 @@ async function handleAdminRouteInner(req, opts) {
               opts.auth.setOAuthCredential(existingActive);
             }
             probeStartPlanActivation(cred, opts.fetchImpl ?? fetch, opts.config.identity?.appVersion, opts.config.identity);
+            void ensureCaptchaPoolForStartPlan(cred, opts.config.identity?.appVersion);
             const flow = activeFlows.get(flowId);
             if (flow) {
               flow.status = "ready";
@@ -124547,6 +124546,7 @@ async function handleAdminRouteInner(req, opts) {
             opts.auth.setOAuthCredential(existingActive);
           }
           probeStartPlanActivation(cred, opts.fetchImpl ?? fetch, opts.config.identity?.appVersion, opts.config.identity);
+          void ensureCaptchaPoolForStartPlan(cred, opts.config.identity?.appVersion);
           const flow = activeFlows.get(init.flowId);
           if (flow) {
             flow.status = "ready";
@@ -124838,27 +124838,10 @@ async function handleAdminRouteInner(req, opts) {
       return errorResponse(500, "save_failed", err.message);
     }
   }
-  if (path2 === "/admin/api/captcha-helper" && method2 === "GET") {
-    return jsonResp(getChromeCaptchaHelperStatus());
-  }
-  if (path2 === "/admin/api/captcha-helper/warmup" && method2 === "POST") {
-    try {
-      const status = await warmupChromeCaptchaHelper();
-      appendLog("info", status.running ? "Captcha helper warmed up (Chrome CDP persistent session active)" : "Captcha helper warmup skipped (persistent Chrome disabled or ephemeral profile)");
-      return jsonResp(status);
-    } catch (err) {
-      appendLog("warn", `Captcha helper warmup failed: ${err.message}`);
-      return errorResponse(500, "captcha_helper_failed", err.message);
-    }
-  }
-  if (path2 === "/admin/api/captcha-helper/stop" && method2 === "POST") {
-    const status = await shutdownChromeCaptchaHelper("admin stop");
-    appendLog("info", "Captcha helper stopped by admin");
-    return jsonResp(status);
-  }
   if (path2 === "/admin/api/stats" && method2 === "GET") {
     return jsonResp({
       ...stats,
+      captchaPool: captchaPoolStats(),
       uptime: Date.now() - opts.startTime
     });
   }
@@ -126730,6 +126713,22 @@ function hasExplicitTraceHeaders(session) {
   return Boolean(session?.requestId || session?.traceId || session?.queryId);
 }
 
+// src/proxy/runtime-options.ts
+var reqCounter = 0;
+function nextReqId() {
+  return `#${String(++reqCounter).padStart(3, "0")}`;
+}
+function startPlanCaptchaPreflightEnabled() {
+  const raw = process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT?.trim().toLowerCase();
+  if (!raw) return true;
+  if (raw === "0" || raw === "false" || raw === "off" || raw === "no" || raw === "never") return false;
+  return raw === "1" || raw === "true" || raw === "on" || raw === "yes" || raw === "always";
+}
+function startPlanUpstreamStyle() {
+  const raw = process.env.ZCODE_STARTPLAN_UPSTREAM?.trim().toLowerCase();
+  return raw === "openai" || raw === "gateway" ? "openai" : "anthropic";
+}
+
 // src/proxy/upstream.ts
 var ANTHROPIC_VERSION = "2023-06-01";
 var ANTHROPIC_BETA = "mid-conversation-system-2026-04-07";
@@ -126738,6 +126737,7 @@ var ALIYUN_CAPTCHA_HEADERS = /* @__PURE__ */ new Set([
   "x-aliyun-captcha-verify-region"
 ]);
 var STARTPLAN_ANTHROPIC_BASE = "https://zcode.z.ai/api/v1/zcode-plan/anthropic";
+var STARTPLAN_OPENAI_BASE = "https://zcode.z.ai/api/v1/zcode-plan";
 function normalizeBearerHeader(token) {
   const trimmed = token?.trim();
   if (!trimmed) return void 0;
@@ -126761,7 +126761,7 @@ function clientIp(req, resolveClientIp, trustProxy) {
 }
 function buildUpstreamURL(format, provider, plan = "coding-plan") {
   if (plan === "start-plan") {
-    return `${STARTPLAN_ANTHROPIC_BASE}/v1/messages`;
+    return startPlanUpstreamStyle() === "openai" ? `${STARTPLAN_OPENAI_BASE}/chat/completions` : `${STARTPLAN_ANTHROPIC_BASE}/v1/messages`;
   }
   if (format === "anthropic") {
     return `${provider.anthropicBaseURL}/v1/messages`;
@@ -128037,6 +128037,197 @@ function parseContentBlockIndex(value2, maxIndex) {
 // src/proxy/handler.ts
 init_anthropic_to_responses();
 
+// src/translator/anthropic-to-openai.ts
+function translateRequestAnthropicToOpenAI(req) {
+  const messages = [];
+  if (req.system) {
+    const systemText = typeof req.system === "string" ? req.system : req.system.map((s) => s.text).join("\n");
+    messages.push({ role: "system", content: systemText });
+  }
+  for (const m of req.messages) {
+    messages.push(...translateMessageAnthropicToOpenAI(m));
+  }
+  const result3 = {
+    model: req.model,
+    messages,
+    ...req.temperature !== void 0 ? { temperature: req.temperature } : {},
+    ...req.top_p !== void 0 ? { top_p: req.top_p } : {},
+    ...req.stream !== void 0 ? { stream: req.stream } : {},
+    ...req.max_tokens !== void 0 ? { max_tokens: req.max_tokens } : {}
+  };
+  if (req.stop_sequences?.length) {
+    result3.stop = req.stop_sequences.length === 1 ? req.stop_sequences[0] : req.stop_sequences;
+  }
+  if (req.thinking) {
+    result3.thinking = req.thinking;
+  }
+  if (req.tools?.length) {
+    result3.tools = req.tools.map((t) => ({
+      type: "function",
+      function: {
+        name: t.name,
+        ...t.description ? { description: t.description } : {},
+        ...t.input_schema ? { parameters: t.input_schema } : {}
+      }
+    }));
+  }
+  if (req.tool_choice) {
+    const translated = mapToolChoiceAnthropicToOpenAI(req.tool_choice);
+    if (translated !== void 0) result3.tool_choice = translated;
+  }
+  return result3;
+}
+function mapToolChoiceAnthropicToOpenAI(choice) {
+  switch (choice.type) {
+    case "auto":
+      return "auto";
+    case "any":
+      return "required";
+    case "tool":
+      return { type: "function", function: { name: choice.name } };
+    default:
+      return void 0;
+  }
+}
+function translateResponseOpenAIToAnthropic(resp) {
+  const choice = resp.choices?.[0];
+  const content2 = [];
+  if (choice?.message?.reasoning_content) {
+    content2.push({ type: "thinking", thinking: choice.message.reasoning_content });
+  }
+  if (choice?.message?.content) {
+    const textContent = typeof choice.message.content === "string" ? choice.message.content : Array.isArray(choice.message.content) ? choice.message.content.filter((c) => c.type === "text").map((c) => c.text ?? "").join("") : "";
+    if (textContent) content2.push({ type: "text", text: textContent });
+  }
+  if (choice?.message?.tool_calls) {
+    for (const tc of choice.message.tool_calls) {
+      let input = {};
+      try {
+        input = JSON.parse(tc.function.arguments);
+      } catch {
+        input = {};
+      }
+      content2.push({
+        type: "tool_use",
+        id: tc.id,
+        name: tc.function.name,
+        input
+      });
+    }
+  }
+  const stopReason = mapFinishReasonToStopReason(choice?.finish_reason);
+  return {
+    id: resp.id,
+    type: "message",
+    role: "assistant",
+    content: content2.length > 0 ? content2 : [{ type: "text", text: "" }],
+    model: resp.model,
+    stop_reason: stopReason,
+    stop_sequence: null,
+    usage: openaiUsageToAnthropic(resp.usage)
+  };
+}
+function translateMessageAnthropicToOpenAI(m) {
+  if (typeof m.content === "string") {
+    return [{ role: m.role, content: m.content }];
+  }
+  const result3 = [];
+  const contentParts = [];
+  const toolCalls = [];
+  const reasoningParts = [];
+  for (const block of m.content) {
+    switch (block.type) {
+      case "text": {
+        contentParts.push({ type: "text", text: block.text });
+        break;
+      }
+      case "image": {
+        if (block.source.type === "base64") {
+          contentParts.push({
+            type: "image_url",
+            image_url: { url: `data:${block.source.media_type};base64,${block.source.data}` }
+          });
+        }
+        break;
+      }
+      case "tool_use": {
+        toolCalls.push({
+          id: block.id,
+          type: "function",
+          function: { name: block.name, arguments: JSON.stringify(block.input ?? {}) }
+        });
+        break;
+      }
+      case "tool_result": {
+        result3.push({
+          role: "tool",
+          tool_call_id: block.tool_use_id,
+          content: toolResultContentToOpenAI(block.content, block.is_error === true)
+        });
+        break;
+      }
+      case "thinking": {
+        if (block.thinking.length > 0) reasoningParts.push(block.thinking);
+        break;
+      }
+      default:
+        break;
+    }
+  }
+  const hasReasoning = m.role === "assistant" && reasoningParts.length > 0;
+  if (contentParts.length > 0 || toolCalls.length > 0 || hasReasoning) {
+    const content2 = contentParts.length === 0 ? null : contentParts.length === 1 && contentParts[0].type === "text" ? contentParts[0].text ?? "" : contentParts;
+    result3.push({
+      role: m.role,
+      content: content2,
+      ...hasReasoning ? { reasoning_content: reasoningParts.join("\n") } : {},
+      ...toolCalls.length > 0 ? { tool_calls: toolCalls } : {}
+    });
+  }
+  if (result3.length === 0) {
+    result3.push({ role: m.role, content: null });
+  }
+  return result3;
+}
+function toolResultContentToOpenAI(content2, isError) {
+  const body2 = flattenToolResultContent(content2);
+  return isError && body2.length > 0 ? `[tool_error] ${body2}` : body2;
+}
+function flattenToolResultContent(content2) {
+  if (typeof content2 === "string") return content2;
+  if (!Array.isArray(content2)) return "";
+  const texts = content2.filter((b) => b.type === "text").map((b) => b.text);
+  if (texts.length > 0) return texts.join("");
+  return JSON.stringify(content2);
+}
+function mapFinishReasonToStopReason(finishReason) {
+  switch (finishReason) {
+    case "stop":
+      return "end_turn";
+    case "length":
+      return "max_tokens";
+    case "tool_calls":
+      return "tool_use";
+    case "content_filter":
+      return "end_turn";
+    default:
+      return null;
+  }
+}
+function openaiUsageToAnthropic(usage) {
+  const promptTokens = usage?.prompt_tokens ?? 0;
+  const cacheRead = usage?.cache_read_input_tokens ?? usage?.prompt_tokens_details?.cached_tokens ?? 0;
+  const cacheCreation = usage?.cache_creation_input_tokens ?? 0;
+  const inputTokens = Math.max(0, promptTokens - cacheRead - cacheCreation);
+  const result3 = {
+    input_tokens: inputTokens,
+    output_tokens: usage?.completion_tokens ?? 0
+  };
+  if (cacheRead > 0) result3.cache_read_input_tokens = cacheRead;
+  if (cacheCreation > 0) result3.cache_creation_input_tokens = cacheCreation;
+  return result3;
+}
+
 // src/translator/sse-translator.ts
 init_sse();
 init_constants();
@@ -128311,6 +128502,260 @@ function mapStopReason(stopReason) {
       return "tool_calls";
     default:
       return "stop";
+  }
+}
+function openaiSseToAnthropicSse(upstream, model = "glm-4.6") {
+  const encoder2 = new TextEncoder();
+  const decoder = new TextDecoder();
+  let buffer2 = "";
+  let messageStarted = false;
+  let blockIndex = 0;
+  let activeBlock = null;
+  const toolBlocks = /* @__PURE__ */ new Map();
+  const openToolBlockIndices = [];
+  let outputTokens = 0;
+  let latestUsage;
+  let pendingStopReason = null;
+  let contentClosed = false;
+  let messageDeltaSent = false;
+  let messageStopped = false;
+  const messageId = `msg_${Date.now()}`;
+  return new ReadableStream({
+    async start(controller) {
+      const reader = upstream.getReader();
+      let errored = false;
+      const enqueueAnthropicEvent = (eventType, data2) => {
+        controller.enqueue(encoder2.encode(formatAnthropicSSE(eventType, data2)));
+      };
+      const closeActiveBlock = () => {
+        if (!activeBlock) return;
+        enqueueAnthropicEvent("content_block_stop", {
+          type: "content_block_stop",
+          index: activeBlock.index
+        });
+        activeBlock = null;
+      };
+      const closeToolBlocks = () => {
+        for (const idx of openToolBlockIndices) {
+          enqueueAnthropicEvent("content_block_stop", {
+            type: "content_block_stop",
+            index: idx
+          });
+        }
+        openToolBlockIndices.length = 0;
+      };
+      const ensureActiveBlock = (type2) => {
+        if (activeBlock?.type === type2) return activeBlock.index;
+        closeActiveBlock();
+        const index = blockIndex++;
+        activeBlock = { type: type2, index };
+        enqueueAnthropicEvent("content_block_start", {
+          type: "content_block_start",
+          index,
+          content_block: type2 === "text" ? { type: "text", text: "" } : { type: "thinking", thinking: "", signature: "" }
+        });
+        return index;
+      };
+      const handleToolCalls = (toolCalls) => {
+        closeActiveBlock();
+        for (const tc of toolCalls) {
+          const idx = tc.index ?? 0;
+          let state2 = toolBlocks.get(idx);
+          if (!state2) {
+            state2 = { index: blockIndex++, id: "", name: "", started: false, pendingArgs: "" };
+            toolBlocks.set(idx, state2);
+          }
+          if (tc.id) state2.id = tc.id;
+          if (tc.function?.name) state2.name = tc.function.name;
+          if (!state2.started && state2.id && state2.name) {
+            state2.started = true;
+            enqueueAnthropicEvent("content_block_start", {
+              type: "content_block_start",
+              index: state2.index,
+              content_block: { type: "tool_use", id: state2.id, name: state2.name, input: {} }
+            });
+            openToolBlockIndices.push(state2.index);
+            if (state2.pendingArgs.length > 0) {
+              enqueueAnthropicEvent("content_block_delta", {
+                type: "content_block_delta",
+                index: state2.index,
+                delta: { type: "input_json_delta", partial_json: state2.pendingArgs }
+              });
+              state2.pendingArgs = "";
+            }
+          }
+          const argsDelta = tc.function?.arguments;
+          if (argsDelta) {
+            if (state2.started) {
+              enqueueAnthropicEvent("content_block_delta", {
+                type: "content_block_delta",
+                index: state2.index,
+                delta: { type: "input_json_delta", partial_json: argsDelta }
+              });
+            } else {
+              state2.pendingArgs += argsDelta;
+            }
+          }
+        }
+      };
+      const startPendingToolBlocks = () => {
+        const lateStarts = [];
+        for (const [openaiIdx, state2] of toolBlocks) {
+          if (state2.started) continue;
+          if (!state2.pendingArgs && !state2.id && !state2.name) continue;
+          state2.started = true;
+          lateStarts.push({
+            index: state2.index,
+            id: state2.id || `tool_call_${openaiIdx}`,
+            name: state2.name || "unknown_tool",
+            args: state2.pendingArgs
+          });
+          state2.pendingArgs = "";
+          openToolBlockIndices.push(state2.index);
+        }
+        lateStarts.sort((a, b) => a.index - b.index);
+        for (const ls of lateStarts) {
+          enqueueAnthropicEvent("content_block_start", {
+            type: "content_block_start",
+            index: ls.index,
+            content_block: { type: "tool_use", id: ls.id, name: ls.name, input: {} }
+          });
+          if (ls.args.length > 0) {
+            enqueueAnthropicEvent("content_block_delta", {
+              type: "content_block_delta",
+              index: ls.index,
+              delta: { type: "input_json_delta", partial_json: ls.args }
+            });
+          }
+        }
+      };
+      const closeContent = () => {
+        if (contentClosed) return;
+        contentClosed = true;
+        closeActiveBlock();
+        startPendingToolBlocks();
+        closeToolBlocks();
+      };
+      const finalizeStream = () => {
+        closeContent();
+        if (!messageDeltaSent) {
+          messageDeltaSent = true;
+          const usage = openaiUsageToAnthropic(latestUsage);
+          if (!latestUsage) usage.output_tokens = outputTokens;
+          enqueueAnthropicEvent("message_delta", {
+            type: "message_delta",
+            delta: {
+              stop_reason: pendingStopReason ?? "end_turn",
+              stop_sequence: null
+            },
+            usage
+          });
+        }
+        if (!messageStopped) {
+          messageStopped = true;
+          enqueueAnthropicEvent("message_stop", { type: "message_stop" });
+        }
+      };
+      try {
+        while (true) {
+          const { done, value: value2 } = await reader.read();
+          if (done) break;
+          buffer2 += decoder.decode(value2, { stream: true });
+          const lines = buffer2.split("\n");
+          buffer2 = lines.pop() ?? "";
+          for (const line of lines) {
+            if (!line.startsWith("data: ")) continue;
+            const dataStr = line.slice(6).trim();
+            if (dataStr === "[DONE]") {
+              finalizeStream();
+              continue;
+            }
+            try {
+              const chunk = JSON.parse(dataStr);
+              const choice = chunk.choices?.[0];
+              if (chunk.usage) {
+                latestUsage = chunk.usage;
+                outputTokens = chunk.usage.completion_tokens ?? outputTokens;
+              }
+              if (!messageStarted) {
+                messageStarted = true;
+                const startUsage = openaiUsageToAnthropic(chunk.usage);
+                enqueueAnthropicEvent("message_start", {
+                  type: "message_start",
+                  message: {
+                    id: chunk.id ?? messageId,
+                    type: "message",
+                    role: "assistant",
+                    content: [],
+                    model: chunk.model || model,
+                    stop_reason: null,
+                    stop_sequence: null,
+                    usage: startUsage
+                  }
+                });
+              }
+              if (choice?.delta?.content) {
+                const index = ensureActiveBlock("text");
+                enqueueAnthropicEvent("content_block_delta", {
+                  type: "content_block_delta",
+                  index,
+                  delta: { type: "text_delta", text: choice.delta.content }
+                });
+              }
+              if (choice?.delta?.reasoning_content) {
+                const index = ensureActiveBlock("thinking");
+                enqueueAnthropicEvent("content_block_delta", {
+                  type: "content_block_delta",
+                  index,
+                  delta: { type: "thinking_delta", thinking: choice.delta.reasoning_content }
+                });
+              }
+              if (choice?.delta?.tool_calls?.length) {
+                handleToolCalls(choice.delta.tool_calls);
+              }
+              if (choice?.finish_reason) {
+                pendingStopReason = mapFinishReason(choice.finish_reason);
+                closeContent();
+              }
+            } catch {
+            }
+          }
+        }
+        finalizeStream();
+      } catch (err) {
+        errored = true;
+        try {
+          controller.error(err);
+        } catch {
+        }
+      } finally {
+        if (!errored) {
+          try {
+            controller.close();
+          } catch {
+          }
+        }
+        reader.releaseLock();
+      }
+    }
+  });
+}
+function formatAnthropicSSE(eventType, data2) {
+  return `event: ${eventType}
+data: ${JSON.stringify(data2)}
+
+`;
+}
+function mapFinishReason(finishReason) {
+  switch (finishReason) {
+    case "stop":
+      return "end_turn";
+    case "length":
+      return "max_tokens";
+    case "tool_calls":
+      return "tool_use";
+    default:
+      return "end_turn";
   }
 }
 
@@ -129912,18 +130357,6 @@ function translateClientBodyObj(parsed, format, opts) {
   }
 }
 
-// src/proxy/runtime-options.ts
-var reqCounter = 0;
-function nextReqId() {
-  return `#${String(++reqCounter).padStart(3, "0")}`;
-}
-function startPlanCaptchaPreflightEnabled() {
-  const raw = process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT?.trim().toLowerCase();
-  if (!raw) return true;
-  if (raw === "0" || raw === "false" || raw === "off" || raw === "no" || raw === "never") return false;
-  return raw === "1" || raw === "true" || raw === "on" || raw === "yes" || raw === "always";
-}
-
 // src/proxy/handler.ts
 init_translated_response();
 init_response_body();
@@ -130023,7 +130456,7 @@ async function proxyRequest(clientReq, format, opts) {
     proxyLog(`${reqId} plan resolved from active credential: ${config.plan} \u2192 ${currentPlan}`);
   }
   void (format === "openai" || format === "openai-responses");
-  const upstreamFormatForPlan = (plan) => plan === "start-plan" ? "anthropic" : "anthropic";
+  const upstreamFormatForPlan = (plan) => plan === "start-plan" && startPlanUpstreamStyle() === "openai" ? "openai" : "anthropic";
   let upstreamFormat = upstreamFormatForPlan(currentPlan);
   const applyModelRewrite = () => {
     if (format === "anthropic" && currentPlan === "coding-plan") return;
@@ -130044,8 +130477,20 @@ async function proxyRequest(clientReq, format, opts) {
     }
   };
   const buildUpstreamBodyObjForPlan = (plan) => {
-    void plan;
     applyModelRewrite();
+    if (plan === "start-plan" && upstreamFormatForPlan(plan) === "openai") {
+      if (format === "anthropic") {
+        const translated2 = translateRequestAnthropicToOpenAI(parsedBody);
+        return { obj: translated2 };
+      }
+      if (format === "openai") {
+        return { obj: structuredClone(parsedBody) };
+      }
+      const forceThinkingModels2 = config.responsesThinking?.models;
+      const anthropicObj = translateClientBodyObj(parsedBody, "openai-responses", forceThinkingModels2 ? { forceThinkingModels: forceThinkingModels2 } : void 0);
+      if (anthropicObj instanceof Response) return { obj: void 0, error: anthropicObj };
+      return { obj: translateRequestAnthropicToOpenAI(anthropicObj) };
+    }
     if (format === "anthropic") return { obj: parsedBody };
     const forceThinkingModels = format === "openai-responses" ? config.responsesThinking?.models : void 0;
     const translated = translateClientBodyObj(parsedBody, format, forceThinkingModels ? { forceThinkingModels } : void 0);
@@ -130885,6 +131330,88 @@ async function proxyRequest(clientReq, format, opts) {
     }
   }
   const responseNeedsTranslation = upstreamFormat !== format;
+  if (upstreamFormat === "openai" && format !== "openai") {
+    if (!upstreamResp.ok) {
+      const errBody = upstreamErrorPreview ?? await readResponseTextPreview(upstreamResp, {
+        maxBytes: ERROR_RESPONSE_PREVIEW_BYTES,
+        timeoutMs: 3e3
+      }).then((r2) => r2.text).catch(() => "");
+      try {
+        await upstreamResp.body?.cancel();
+      } catch (e) {
+        void e;
+      }
+      printRow(reqId, format, meta, upstreamResp.status, started, headersAt, 0, 0, 0, hadRetryAttempt, 0, currentCredentialStatsKey(), totalCaptchaMs);
+      return errorResponse(upstreamResp.status, "upstream_error", `upstream returned ${upstreamResp.status}: ${errBody.slice(0, 200)}`);
+    }
+    if (format === "anthropic") {
+      if (isSSE && upstreamResp.body) {
+        const translated = openaiSseToAnthropicSse(upstreamResp.body, meta.model);
+        const stats2 = createStatsTransform(reqId, format, meta, upstreamResp.status, started, null, currentCredentialStatsKey(), totalCaptchaMs, hadRetryAttempt);
+        return translatedSseResponse(withSseHeartbeat(observeStatsStream(translated, stats2), config.server.sseHeartbeatMs ?? 0));
+      }
+      try {
+        const openaiJson = await upstreamResp.json();
+        const anthropicMsg = translateResponseOpenAIToAnthropic(openaiJson);
+        const respHeaders = new Headers();
+        for (const h of ["x-request-id"]) {
+          const v = upstreamResp.headers.get(h);
+          if (v) respHeaders.set(h, v);
+        }
+        respHeaders.set("content-type", "application/json");
+        upstreamResp = new Response(JSON.stringify(anthropicMsg), {
+          status: upstreamResp.status,
+          statusText: upstreamResp.statusText,
+          headers: respHeaders
+        });
+        isSSE = false;
+      } catch (err) {
+        proxyLog(`${reqId} OpenAI\u2192Anthropic batch translation failed: ${err.message}`);
+        printRow(reqId, format, meta, 502, started, headersAt, 0, 0, 0, hadRetryAttempt, 0, currentCredentialStatsKey(), totalCaptchaMs);
+        return errorResponse(502, "translation_failed", err.message);
+      }
+    } else {
+      const customToolNames = responsesCustomToolNames(parsedBody);
+      if (isSSE && upstreamResp.body) {
+        const anthropicStream = openaiSseToAnthropicSse(upstreamResp.body, meta.model);
+        const translated = anthropicSseToResponsesSse(anthropicStream, meta.model, { customToolNames });
+        const stats2 = createStatsTransform(reqId, format, meta, upstreamResp.status, started, null, currentCredentialStatsKey(), totalCaptchaMs, hadRetryAttempt);
+        return translatedSseResponse(withSseHeartbeat(observeStatsStream(translated, stats2), config.server.sseHeartbeatMs ?? 0));
+      }
+      try {
+        const openaiJson = await upstreamResp.json();
+        const anthropicMsg = translateResponseOpenAIToAnthropic(openaiJson);
+        const respHeaders = new Headers();
+        respHeaders.set("content-type", "application/json");
+        upstreamResp = new Response(JSON.stringify(anthropicMsg), {
+          status: upstreamResp.status,
+          statusText: upstreamResp.statusText,
+          headers: respHeaders
+        });
+        isSSE = false;
+      } catch (err) {
+        proxyLog(`${reqId} OpenAI\u2192Anthropic batch translation failed: ${err.message}`);
+        printRow(reqId, format, meta, 502, started, headersAt, 0, 0, 0, hadRetryAttempt, 0, currentCredentialStatsKey(), totalCaptchaMs);
+        return errorResponse(502, "translation_failed", err.message);
+      }
+      return await translatedResponsesBatchResponse(
+        clientReq,
+        upstreamResp,
+        meta.model,
+        reqId,
+        format,
+        meta,
+        started,
+        headersAt,
+        parsedBody?.previous_response_id,
+        parsedBody?.input,
+        customToolNames,
+        currentCredentialStatsKey(),
+        totalCaptchaMs,
+        hadRetryAttempt
+      );
+    }
+  }
   if (responseNeedsTranslation && format !== "anthropic" && upstreamFormat === "anthropic") {
     if (!upstreamResp.ok) {
       const errBody = upstreamErrorPreview ?? await readResponseTextPreview(upstreamResp, {
@@ -132621,6 +133148,7 @@ async function ensureNodeFetchNoTimeouts() {
 
 // src/index.ts
 init_proxy_pool();
+init_captcha_guest_rejections();
 init_store();
 init_oauth();
 init_resolver();
@@ -132628,12 +133156,14 @@ init_zcode_config();
 init_fs();
 init_version2();
 var import_node_child_process = require("node:child_process");
+var import_node_http4 = require("node:http");
 var import_node_fs7 = require("node:fs");
 var import_node_path9 = require("node:path");
 var import_yaml3 = __toESM(require_dist(), 1);
 init_host_timers();
 var LOG_LEVEL_ORDER = { debug: 0, info: 1, warn: 2, error: 3 };
 process.on("uncaughtException", (err) => {
+  if (noteGuestError(err)) return;
   try {
     console.error("[uncaughtException]", err?.stack ?? err);
   } catch {
@@ -132645,6 +133175,7 @@ process.on("uncaughtException", (err) => {
   }
 });
 process.on("unhandledRejection", (reason2) => {
+  if (noteGuestError(reason2)) return;
   try {
     console.error("[unhandledRejection]", reason2 instanceof Error ? reason2.stack ?? reason2 : String(reason2));
   } catch {
@@ -132970,6 +133501,18 @@ async function serve(configPath) {
   if (logFile) setLogFilePath2(logFile);
   const server = await startServer({ config, auth, configPath: path2 });
   const url2 = `http://${server.hostname}:${server.port}`;
+  try {
+    const warmupServer = (0, import_node_http4.createServer)((_req, res) => {
+      res.writeHead(200);
+      res.end("ok");
+    });
+    await new Promise((resolve2, reject) => {
+      warmupServer.once("error", reject);
+      warmupServer.listen(0, "127.0.0.1", () => resolve2());
+    });
+    warmupServer.close();
+  } catch {
+  }
   console.log(`zcode-proxy ${VERSION} listening on ${url2}`);
   console.log(`  provider: ${config.provider}`);
   console.log(`  plan: ${config.plan}`);
@@ -132983,21 +133526,28 @@ async function serve(configPath) {
   } catch (e) {
     console.warn(`[proxy-pool] init failed (non-fatal): ${e.message}`);
   }
-  const anyStartPlanCredential = await (async () => {
-    try {
-      const accounts = await exportAccounts();
-      return accounts.some((a) => a.credential?.plan === "start-plan" || Boolean(a.credential?.jwt));
-    } catch {
-      return false;
-    }
-  })();
-  if (config.plan === "start-plan" || anyStartPlanCredential) {
-    try {
-      const { startCaptchaPool: startCaptchaPool2 } = await Promise.resolve().then(() => (init_captcha(), captcha_exports));
-      await startCaptchaPool2(config.identity.appVersion);
-      console.log("  captcha: token pool pre-solver started (start-plan)");
-    } catch (e) {
-      console.warn(`[captcha] pool warmup failed (non-fatal): ${e.message}`);
+  const storedAccounts = await exportAccounts().catch(() => []);
+  const anyStartPlanCredential = storedAccounts.length > 0 && storedAccounts.some((a) => a.credential?.plan === "start-plan" || Boolean(a.credential?.jwt));
+  const freshOauthInstall = config.auth.mode === "oauth" && storedAccounts.length === 0;
+  if (freshOauthInstall) {
+    console.log("  captcha: pre-solver deferred until first login (no stored credential)");
+  } else if (config.plan === "start-plan" || anyStartPlanCredential) {
+    const preSolverDelayMs = Math.max(0, Number(process.env.CAPTCHA_PRESOLVER_DELAY_MS ?? 1e4));
+    const startPreSolver = async () => {
+      try {
+        const { startCaptchaPool: startCaptchaPool2 } = await Promise.resolve().then(() => (init_captcha(), captcha_exports));
+        await startCaptchaPool2(config.identity.appVersion);
+        console.log("  captcha: token pool pre-solver started (start-plan)");
+      } catch (e) {
+        console.warn(`[captcha] pool warmup failed (non-fatal): ${e.message}`);
+      }
+    };
+    if (preSolverDelayMs > 0) {
+      console.log(`  captcha: pre-solver starts in ${Math.round(preSolverDelayMs / 1e3)}s (idle-loop grace for login)`);
+      const t = setTimeout(() => void startPreSolver(), preSolverDelayMs);
+      t.unref?.();
+    } else {
+      void startPreSolver();
     }
   }
   if (server.hostname === "0.0.0.0" || server.hostname === "::") {
@@ -133042,9 +133592,11 @@ Received ${signal2}, shutting down gracefully...`);
     const stopAndFlushLogs = async () => {
       await runShutdownCleanup({
         stopServer: () => server.stop(),
+        // v0.3.8: direct pool+solver shutdown (the ChromeCaptchaHelper shim
+        // was removed with the legacy dashboard captcha page).
         shutdownCaptchaHelper: async () => {
-          const { shutdownChromeCaptchaHelper: shutdownChromeCaptchaHelper2 } = await Promise.resolve().then(() => (init_captcha(), captcha_exports));
-          await shutdownChromeCaptchaHelper2("process shutdown");
+          const { shutdownCaptcha: shutdownCaptcha2 } = await Promise.resolve().then(() => (init_captcha(), captcha_exports));
+          shutdownCaptcha2();
         },
         flushLogs: flushLogFileForShutdown2
       });

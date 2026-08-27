@@ -142,41 +142,12 @@ export function _clearCaptchaConfigCacheForTesting(): void {
   cachedConfig = { value: null, expiresAt: 0 };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Admin-facing helper status/control.
-//
-// The dashboard's "captcha helper" panel used to control the hidden Chrome CDP
-// renderer (legacy solver). With the happy-dom pool those controls now map to
-// the token pool: GET reports pool stats, warmup pre-solves to the idle
-// minimum, stop releases the pool + solver. The function names are kept so
-// admin/api.ts and index.ts keep working unchanged.
-// ─────────────────────────────────────────────────────────────────────────────
-
-export interface ChromeCaptchaHelperStatus {
-  running: boolean;
-  backend: "happy-pool";
-  ready: number;
-  target: number;
-  activeSolves: number;
-}
-
-export function getChromeCaptchaHelperStatus(): ChromeCaptchaHelperStatus {
-  const stats = getCaptchaPoolStats();
-  return {
-    running: stats.target > 0 || stats.activeSolves > 0,
-    backend: "happy-pool",
-    ready: stats.ready,
-    target: stats.target,
-    activeSolves: stats.activeSolves,
-  };
-}
-
-export async function warmupChromeCaptchaHelper(appVersion?: string): Promise<ChromeCaptchaHelperStatus> {
-  await startCaptchaPool(appVersion || process.env.ZCODE_APP_VERSION || "3.9.1");
-  return getChromeCaptchaHelperStatus();
-}
-
-export async function shutdownChromeCaptchaHelper(_reason = "manual"): Promise<ChromeCaptchaHelperStatus> {
-  shutdownCaptcha();
-  return getChromeCaptchaHelperStatus();
-}
+// v0.3.8: the admin-facing ChromeCaptchaHelper* shims (getChromeCaptchaHelper
+// Status / warmupChromeCaptchaHelper / shutdownChromeCaptchaHelper) were
+// removed together with the dashboard's legacy 验证码助手 page — that page
+// controlled the pre-v0.3.0 Chrome CDP renderer and, since the happy-dom
+// pool replaced it, rendered only dead fields (mode/solveCount/chromePath/
+// port/... never exist in the pool-backed response). The pool itself needs
+// no manual control: boot pre-solve + demand refill are fully automatic, and
+// the old "stop" button killed the production token supply. Pool health is
+// surfaced read-only via captchaPoolStats() on /admin/api/stats.

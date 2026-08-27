@@ -638,29 +638,32 @@ describe("recordStat — captchaMs field (G4)", () => {
   });
 });
 
-describe("/admin/api/captcha-helper — token pool status", () => {
-  it("returns pool status (v0.3.0 happy-pool backend)", async () => {
+describe("captcha-helper removal + pool stats on /admin/api/stats (v0.3.8)", () => {
+  it("the legacy Chrome-CDP captcha-helper routes are gone (fall through to null)", async () => {
     const opts = makeAdminOpts();
-    const resp = await callAdmin(authedReq("/admin/api/captcha-helper"), opts);
-    expect(resp!.status).toBe(200);
-    const body = await resp!.json();
-    // v0.3.0: the Chrome CDP renderer is replaced by the in-process happy-dom
-    // pre-solved token pool — the status endpoint now reports pool metrics.
-    expect(body).toMatchObject({
-      backend: "happy-pool",
-      running: false,
-    });
-    expect(typeof body.ready).toBe("number");
-    expect(typeof body.target).toBe("number");
-    expect(typeof body.activeSolves).toBe("number");
+    // The pre-v0.3.0 Chrome CDP renderer was replaced by the happy-dom token
+    // pool in v0.3.0; these control routes only served the removed dashboard
+    // 验证码助手 page (and "stop" killed the production token supply).
+    expect(await callAdmin(authedReq("/admin/api/captcha-helper"), opts)).toBeNull();
+    expect(await callAdmin(authedReq("/admin/api/captcha-helper/warmup", { method: "POST" }), opts)).toBeNull();
+    expect(await callAdmin(authedReq("/admin/api/captcha-helper/stop", { method: "POST" }), opts)).toBeNull();
   });
 
-  it("stop endpoint is idempotent", async () => {
+  it("/admin/api/stats reports read-only captchaPool health (pool not running)", async () => {
     const opts = makeAdminOpts();
-    const resp = await callAdmin(authedReq("/admin/api/captcha-helper/stop", { method: "POST" }), opts);
+    const resp = await callAdmin(authedReq("/admin/api/stats"), opts);
     expect(resp!.status).toBe(200);
     const body = await resp!.json();
-    expect(body.running).toBe(false);
+    // v0.3.8: pool health rides on the stats snapshot — the dashboard
+    // Overview renders it as the 验证码池 (就绪/目标) card; target === 0
+    // means the pool is not running (coding-plan / pre-solver parked).
+    // (Explicit field asserts — toMatchObject + expect.any mangles the
+    // received object under bun's runner, breaking subsequent asserts.)
+    const cp = body.captchaPool as { ready: number; target: number; activeSolves: number };
+    expect(typeof cp.ready).toBe("number");
+    expect(typeof cp.target).toBe("number");
+    expect(typeof cp.activeSolves).toBe("number");
+    expect(cp.target).toBe(0);
   });
 });
 

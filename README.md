@@ -2,6 +2,38 @@
 
 A reverse proxy for Z.AI / Bigmodel.cn coding-plan APIs that exposes both OpenAI-compatible and Anthropic-format endpoints.
 
+## v0.3.8.0 — Dashboard cleanup (legacy captcha page removed, pool health on Overview)
+
+The dashboard still carried a 验证码助手 (Captcha Helper) page — a leftover
+from the pre-v0.3.0 Chrome CDP solver. Since v0.3.0 replaced that solver with
+the fully automatic in-process happy-dom token pool, the page rendered only
+dead data: it displayed Chrome-era fields (模式/验证次数/Keepalive/SDK/
+Chrome 路径/端口/窗口/交互次数) that never exist in the pool-backed API
+response — 模式 permanently "单次", 验证次数 permanently "0", the detail
+card permanently all-dashes. Its "停止" button was worse than useless: it
+shut down the production token supply (stopCaptchaPool), after which
+start-plan requests had to fall back to slow on-demand solves.
+
+Removed and replaced:
+
+- **Deleted**: the 验证码助手 nav item, page, all its JS (load/warmup/stop/
+  in-flight coalescing/invalidate hooks), and the three backend routes
+  (`GET /admin/api/captcha-helper`, `POST .../warmup`, `POST .../stop`).
+- **Deleted**: the `ChromeCaptchaHelper*` shims in `src/proxy/captcha.ts`
+  (the happy-dom pool needs no manual control — boot pre-solve + demand
+  refill are fully automatic; process-exit cleanup now calls
+  `shutdownCaptcha()` directly).
+- **Added**: pool health now rides on the existing `/admin/api/stats`
+  snapshot as a read-only `captchaPool` field (`ready/target/activeSolves`)
+  — no separate polling loop, no mutation surface. The Overview page
+  renders it as a new 验证码池（就绪/目标）stat card; it shows an em dash
+  while the pool is not configured (coding-plan, or start-plan before the
+  first login starts the pre-solver).
+- Android `server.cjs` bundle regenerated from the updated sources.
+
+Tests updated to pin the removal (routes fall through to null; the page and
+its JS are absent from the dashboard HTML) and the new stats field.
+
 ## v0.3.7.1 — 429-retry permanent hang fix (host timer quarantine)
 
 Reported 2026-08-27: a start-plan request hit 429 and the proxy logged
@@ -1070,8 +1102,6 @@ curl http://localhost:8080/v1/models \
 | `identity.deviceMid` | `ZCODE_DEVICE_MID` | auto-read from ZCode telemetry | Optional `X-Device-Mid` |
 | `identity.zcodeAgent` | `ZCODE_AGENT` | `glm` | `X-ZCode-Agent` for model requests |
 | `server.maxRequestBodyBytes` | `ZCODE_PROXY_MAX_REQUEST_BODY_BYTES` | `67108864` | Max client request body size in bytes; set `0` to disable. |
-| — | `ZCODE_CAPTCHA_LANGUAGE` | host locale | Optional Aliyun SDK language override: `cn` or `en` |
-| — | `ZCODE_CAPTCHA_CHROME_STOP_GRACE_MS` | `2000` | Max wait before force-closing the Chrome captcha helper after a dashboard stop request. |
 | — | `ZCODE_PROXY_LEGACY_SEED` | unset | Manual one-time recovery seed for credentials.json encrypted by an older version. See Security Notes. `ZCODE_PROXY_CREDENTIAL_SECRET` is intentionally NOT consulted — it was the #1 cause of credential loss on restart. |
 | — | `ZCODE_PROXY_ALLOW_PLAINTEXT_STORE` | unset | Set to `1` to allow loading a plaintext credentials.json (debug/test only) |
 | — | `ZCODE_PROXY_CORS_ALLOWLIST` | unset | Comma-separated allowed origins for `Access-Control-Allow-Origin`. When unset, browser requests with an `Origin` header get `null`; server-to-server requests without `Origin` get `*`. When set, only listed origins get `Access-Control-Allow-Origin: <origin>`; all others get `null`. |

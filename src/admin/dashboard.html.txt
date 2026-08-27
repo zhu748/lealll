@@ -1248,10 +1248,6 @@ td input{font-family:var(--font-mono)}
           <span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg></span>
           <span class="nav-text">代理池</span>
         </div>
-        <div class="nav-item" data-page="captcha-helper">
-          <span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg></span>
-          <span class="nav-text">验证码助手</span>
-        </div>
       </div>
       <div class="nav-section">
         <div class="nav-section-title">凭证</div>
@@ -1344,6 +1340,13 @@ td input{font-family:var(--font-mono)}
             </div>
             <div class="stat-value" id="statRetries">0</div>
             <div class="stat-label">总重试次数</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-icon icon-success">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg>
+            </div>
+            <div class="stat-value" id="statCaptchaPool">—</div>
+            <div class="stat-label">验证码池（就绪/目标）</div>
           </div>
         </div>
         <div class="card">
@@ -2157,65 +2160,6 @@ td input{font-family:var(--font-mono)}
         </div>
       </div>
 
-      <!-- ============================================================ Captcha Helper ============================================================ -->
-      <div class="page" id="page-captcha-helper">
-        <div class="main-header">
-          <div class="header-left">
-            <h1>验证码助手</h1>
-            <div class="subtitle">Start-plan Chrome CDP 常驻验证状态</div>
-          </div>
-          <div class="header-actions">
-            <button class="btn btn-ghost btn-sm" onclick="loadCaptchaHelper()">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
-              刷新
-            </button>
-          </div>
-        </div>
-        <div class="stats-grid">
-          <div class="stat-card">
-            <div class="stat-icon icon-success"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/></svg></div>
-            <div class="stat-value" id="captchaHelperRunning">-</div>
-            <div class="stat-label">运行状态</div>
-          </div>
-          <div class="stat-card">
-            <div class="stat-icon icon-info"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8 2v4M16 2v4M8 18v4M16 18v4M2 8h4M2 16h4M18 8h4M18 16h4"/></svg></div>
-            <div class="stat-value" id="captchaHelperMode">-</div>
-            <div class="stat-label">模式</div>
-          </div>
-          <div class="stat-card">
-            <div class="stat-icon icon-warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg></div>
-            <div class="stat-value" id="captchaHelperSolves">0</div>
-            <div class="stat-label">验证次数</div>
-          </div>
-          <div class="stat-card">
-            <div class="stat-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg></div>
-            <div class="stat-value" id="captchaHelperIdle">-</div>
-            <div class="stat-label">空闲回收</div>
-          </div>
-        </div>
-        <div class="card">
-          <div class="card-header">
-            <div class="card-title">
-              <span class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></span>
-              Chrome CDP
-            </div>
-            <div style="display:flex;gap:8px;flex-wrap:wrap">
-              <button class="btn btn-primary btn-sm" onclick="warmupCaptchaHelper()">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
-                预热
-              </button>
-              <button class="btn btn-ghost btn-sm" onclick="stopCaptchaHelper()">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12"/></svg>
-                停止
-              </button>
-            </div>
-          </div>
-          <div class="card-body" id="captchaHelperDetail">
-            <div class="skeleton" style="height:20px;width:220px"></div>
-          </div>
-        </div>
-      </div>
-
       <!-- ============================================================ Debug Dumps ============================================================ -->
       <div class="page" id="page-debug">
         <div class="main-header">
@@ -2599,7 +2543,6 @@ function doLogout(){
   clearProxyPoolPollTimer();
   clearProxyPoolProgressHideTimer();
   invalidateProxyPoolLoads();
-  invalidateCaptchaHelperLoads();
   ppTestAllRunning=false;
   ppTestPollErrorCount=0;
   // vceshi0.0.7+: cancel any in-flight OAuth poll loop.
@@ -2691,7 +2634,6 @@ document.querySelectorAll('.nav-item').forEach(el=>{
     // to the bottom, which looks empty).
     const main=document.querySelector('.main-content');
     if(main)main.scrollTop=0;
-    if(el.dataset.page==='captcha-helper')loadCaptchaHelper();
   });
 });
 
@@ -2782,6 +2724,14 @@ function applyStatsSnapshot(d){
   }
   document.getElementById('statRequests').textContent=d.total||0;
   document.getElementById('statRetries').textContent=d.retried||0;
+  // v0.3.8: captcha token pool health (start-plan). target===0 → the pool
+  // is not running (coding-plan, or the pre-solver is parked) → em dash.
+  // Rides on the /admin/api/stats snapshot; no separate polling loop.
+  const poolEl=document.getElementById('statCaptchaPool');
+  if(poolEl){
+    const cp=d.captchaPool;
+    poolEl.textContent=(cp&&typeof cp.target==='number'&&cp.target>0)?(String(cp.ready)+'/'+String(cp.target)):'—';
+  }
   if(d.byCredential){
     _cachedByCredential=d.byCredential;
     const accountsPage=document.getElementById('page-accounts');
@@ -2846,7 +2796,6 @@ async function initDashboard(){
     loadStats(),
     loadDebugDumps(),
     loadProxyPool(),
-    loadCaptchaHelper(),
     checkRunningTestJob(),
   ]).catch(e => console.error('initDashboard batch 2 failed:', e));
   connectLogStream();
@@ -2920,104 +2869,6 @@ function formatDurationMs(ms){
   const m=Math.floor(s/60),ss=s%60;
   if(m>=60){const h=Math.floor(m/60);return `${h}h ${String(m%60).padStart(2,'0')}m`}
   return `${m}m ${String(ss).padStart(2,'0')}s`;
-}
-
-let captchaHelperLoadInFlight=false;
-let captchaHelperLoadPending=false;
-let captchaHelperGeneration=0;
-function invalidateCaptchaHelperLoads(){
-  captchaHelperGeneration++;
-  captchaHelperLoadPending=false;
-}
-
-function renderCaptchaHelperStatus(d){
-  const running=d&&d.running;
-  document.getElementById('captchaHelperRunning').textContent=d?.busy?'验证中':(running?'运行中':'未运行');
-  document.getElementById('captchaHelperMode').textContent=d?.mode==='persistent'?'常驻':'单次';
-  document.getElementById('captchaHelperSolves').textContent=String(d?.solveCount??0);
-  const idleText=d?.nextIdleShutdownAt?formatDurationMs(d.nextIdleShutdownAt-Date.now()):formatDurationMs(d?.idleTimeoutMs??0);
-  document.getElementById('captchaHelperIdle').textContent=idleText;
-  const badge=d?.busy?'<span class="badge badge-warn"><span class="badge-dot"></span>验证中</span>':(running?'<span class="badge badge-success"><span class="badge-dot"></span>运行中</span>':'<span class="badge badge-muted">未运行</span>');
-  document.getElementById('captchaHelperDetail').innerHTML=`
-    <div class="kv-grid">
-      <span class="kv-key">状态</span><span class="kv-val">${badge}</span>
-      <span class="kv-key">Keepalive</span><span class="kv-val">${d?.keepAlive?'开启':'关闭'}</span>
-      <span class="kv-key">SDK</span><span class="kv-val">${d?.sdkReady?'已预热':'未预热'}</span>
-      <span class="kv-key">Chrome</span><span class="kv-val"><code class="code-inline">${escapeHtml(d?.chromePath||'未找到')}</code></span>
-      <span class="kv-key">Profile</span><span class="kv-val"><code class="code-inline">${escapeHtml(d?.userDataDir||'-')}</code></span>
-      <span class="kv-key">端口</span><span class="kv-val">${d?.port??'-'}</span>
-      <span class="kv-key">窗口</span><span class="kv-val">${d?.visible?'可见':'隐藏'}</span>
-      <span class="kv-key">启动时间</span><span class="kv-val">${formatTimestamp(d?.startedAt)}</span>
-      <span class="kv-key">最近验证</span><span class="kv-val">${formatTimestamp(d?.lastSolveAt)}</span>
-      <span class="kv-key">交互次数</span><span class="kv-val">${d?.interactiveCount??0}</span>
-      ${d?.sdkPreloadError?`<span class="kv-key">SDK 错误</span><span class="kv-val"><span class="badge badge-warn">${escapeHtml(d.sdkPreloadError)}</span></span>`:''}
-      ${d?.lastError?`<span class="kv-key">最近错误</span><span class="kv-val"><span class="badge badge-danger">${escapeHtml(d.lastError)}</span></span>`:''}
-    </div>`;
-}
-
-async function loadCaptchaHelper(){
-  if(document.hidden||!dashboardActive())return;
-  if(captchaHelperLoadInFlight){captchaHelperLoadPending=true;return;}
-  captchaHelperLoadPending=false;
-  const generation=captchaHelperGeneration;
-  const requestAuthToken=authToken;
-  const requestInitGeneration=dashboardInitGeneration;
-  captchaHelperLoadInFlight=true;
-  try{
-    const d=await fetchJsonWithTimeout(API+'/admin/api/captcha-helper',{headers:authHeaders()},5000);
-    if(generation!==captchaHelperGeneration||document.hidden||!dashboardActionCurrent(requestInitGeneration,requestAuthToken))return;
-    renderCaptchaHelperStatus(d);
-  }catch(e){
-    if(generation===captchaHelperGeneration&&!document.hidden&&dashboardActionCurrent(requestInitGeneration,requestAuthToken)){
-      console.error('loadCaptchaHelper failed:',e);
-      document.getElementById('captchaHelperDetail').innerHTML='<span class="badge badge-danger">加载失败</span>';
-    }
-  }finally{
-    captchaHelperLoadInFlight=false;
-    if(captchaHelperLoadPending&&!document.hidden&&dashboardActionCurrent(requestInitGeneration,requestAuthToken)){
-      captchaHelperLoadPending=false;
-      loadCaptchaHelper();
-    }
-  }
-}
-
-async function warmupCaptchaHelper(){
-  if(!beginExclusiveAction('captchaHelperAction','验证码助手操作正在进行中，请稍候'))return;
-  invalidateCaptchaHelperLoads();
-  const generation=captchaHelperGeneration;
-  try{
-    const d=await fetchJsonMutationWithTimeout(API+'/admin/api/captcha-helper/warmup',{method:'POST',headers:authHeaders()});
-    if(generation!==captchaHelperGeneration||document.hidden||!dashboardActive())return;
-    renderCaptchaHelperStatus(d);
-    toast(d.running?'验证码助手已预热':'验证码助手未启用常驻模式',d.running?'success':'warn');
-  }catch(e){
-    if(generation===captchaHelperGeneration&&!document.hidden&&dashboardActive()){
-      console.error('warmupCaptchaHelper failed:',e);
-      toast('预热失败：'+e.message,'error');
-      loadCaptchaHelper();
-    }
-  }finally{
-    endExclusiveAction('captchaHelperAction');
-  }
-}
-
-async function stopCaptchaHelper(){
-  if(!beginExclusiveAction('captchaHelperAction','验证码助手操作正在进行中，请稍候'))return;
-  invalidateCaptchaHelperLoads();
-  const generation=captchaHelperGeneration;
-  try{
-    const d=await fetchJsonMutationWithTimeout(API+'/admin/api/captcha-helper/stop',{method:'POST',headers:authHeaders()});
-    if(generation!==captchaHelperGeneration||document.hidden||!dashboardActive())return;
-    renderCaptchaHelperStatus(d);
-    toast('验证码助手已停止');
-  }catch(e){
-    if(generation===captchaHelperGeneration&&!document.hidden&&dashboardActive()){
-      console.error('stopCaptchaHelper failed:',e);
-      toast('停止失败：'+e.message,'error');
-    }
-  }finally{
-    endExclusiveAction('captchaHelperAction');
-  }
 }
 
 // --- Settings ---
@@ -5232,7 +5083,6 @@ document.addEventListener('visibilitychange', () => {
     clearLogReconnectTimer();
     clearProxyPoolPollTimer();
     clearProxyPoolProgressHideTimer();
-    invalidateCaptchaHelperLoads();
     clearAccountViewsRefreshTimer();
     clearAccountFilterTimer();
     clearLogRenderTimer();

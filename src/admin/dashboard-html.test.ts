@@ -487,19 +487,28 @@ describe("dashboard HTML inline scripts", () => {
     expect(html).toContain("toast('已清空','success');loadDebugDumps();hideDebugDetail();");
   });
 
-  it("coalesces captcha helper status loads and ignores stale action responses", () => {
+  it("the legacy Chrome-CDP captcha helper page is fully removed (v0.3.8)", () => {
     const html = readDashboardHtml();
-    expect(html).toContain("let captchaHelperLoadInFlight=false");
-    expect(html).toContain("let captchaHelperLoadPending=false");
-    expect(html).toContain("let captchaHelperGeneration=0");
-    expect(html).toContain("function invalidateCaptchaHelperLoads()");
-    expect(html).toContain("if(captchaHelperLoadInFlight){captchaHelperLoadPending=true;return;}");
-    expect(html).toContain("captchaHelperLoadPending=false;\n  const generation=captchaHelperGeneration;");
-    expect(html).toContain("const generation=captchaHelperGeneration;\n  const requestAuthToken=authToken;\n  const requestInitGeneration=dashboardInitGeneration;");
-    expect(html).toContain("if(generation!==captchaHelperGeneration||document.hidden||!dashboardActionCurrent(requestInitGeneration,requestAuthToken))return;");
-    expect(html).toContain("if(!beginExclusiveAction('captchaHelperAction','验证码助手操作正在进行中，请稍候'))return;");
-    expect(html).toContain("finally{\n    endExclusiveAction('captchaHelperAction');\n  }");
-    expect(html).toContain("invalidateCaptchaHelperLoads();");
+    // The pre-v0.3.0 Chrome CDP renderer page rendered only dead fields after
+    // the happy-dom pool replaced it (mode/solveCount/chromePath/port never
+    // existed in the pool-backed response) — removed wholesale in v0.3.8.
+    expect(html).not.toContain("captcha-helper");
+    expect(html).not.toContain("captchaHelper");
+    expect(html).not.toContain("CaptchaHelper");
+    expect(html).not.toContain("验证码助手");
+    expect(html).not.toContain("page-captcha-helper");
+  });
+
+  it("overview renders captcha token pool health on the stats snapshot (v0.3.8)", () => {
+    const html = readDashboardHtml();
+    // Pool health rides on /admin/api/stats (no separate polling loop), is
+    // filled by applyStatsSnapshot, and shows an em dash when the pool is
+    // not running (target === 0: coding-plan, or the pre-solver is parked).
+    expect(html).toContain('id="statCaptchaPool"');
+    expect(html).toContain("验证码池（就绪/目标）");
+    expect(html).toContain("const poolEl=document.getElementById('statCaptchaPool');");
+    expect(html).toContain("const cp=d.captchaPool;");
+    expect(html).toContain("cp.target>0)?(String(cp.ready)+'/'+String(cp.target)):'—'");
   });
 
   it("guards config-like saves from duplicate submits and stale overwrites", () => {

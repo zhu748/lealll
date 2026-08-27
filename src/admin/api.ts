@@ -13,7 +13,7 @@ import { KeyResolver } from "../auth/resolver.js";
 import { queryQuota } from "../auth/quota.js";
 import { readZCodeImport, detectZCodeProvider, listAvailableZCodeImports } from "../auth/zcode-config.js";
 import { errorResponse } from "../proxy/translated-response.js";
-import { getChromeCaptchaHelperStatus, warmupChromeCaptchaHelper, shutdownChromeCaptchaHelper } from "../proxy/captcha.js";
+import { captchaPoolStats } from "../proxy/captcha.js";
 import { wrapFetchWithSocksBridge, makeProxiedFetcher } from "../proxy/proxied-fetch.js";
 import { timingSafeEqual } from "../utils/crypto.js";
 import { atomicWriteFile, createMutex } from "../utils/fs.js";
@@ -692,7 +692,11 @@ function withLinkedAbortSignal(baseFetch: typeof fetch, signal: AbortSignal): ty
 async function ensureCaptchaPoolForStartPlan(cred: AppCredential, appVersion?: string): Promise<void> {
   if (cred.plan !== "start-plan" && !cred.jwt) return;
   try {
-    if (getChromeCaptchaHelperStatus().running) return;
+    // v0.3.8: pool-running check via the stats helper (the ChromeCaptchaHelper
+    // shim was removed with the legacy dashboard page). Same predicate the
+    // old shim used: target > 0 or an in-flight solve.
+    const pool = captchaPoolStats();
+    if (pool.target > 0 || pool.activeSolves > 0) return;
     const { startCaptchaPool } = await import("../proxy/captcha.js");
     await startCaptchaPool(appVersion || "3.9.1");
     console.log("  captcha: token pool started (start-plan credential saved)");
@@ -2977,35 +2981,22 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
     }
   }
 
-  // Chrome captcha helper state/control. Warmup starts the hidden persistent
-  // CDP renderer without solving a token; stop releases the browser/profile.
-  if (path === "/admin/api/captcha-helper" && method === "GET") {
-    return jsonResp(getChromeCaptchaHelperStatus());
-  }
-
-  if (path === "/admin/api/captcha-helper/warmup" && method === "POST") {
-    try {
-      const status = await warmupChromeCaptchaHelper();
-      appendLog("info", status.running
-        ? "Captcha helper warmed up (Chrome CDP persistent session active)"
-        : "Captcha helper warmup skipped (persistent Chrome disabled or ephemeral profile)");
-      return jsonResp(status);
-    } catch (err) {
-      appendLog("warn", `Captcha helper warmup failed: ${(err as Error).message}`);
-      return errorResponse(500, "captcha_helper_failed", (err as Error).message);
-    }
-  }
-
-  if (path === "/admin/api/captcha-helper/stop" && method === "POST") {
-    const status = await shutdownChromeCaptchaHelper("admin stop");
-    appendLog("info", "Captcha helper stopped by admin");
-    return jsonResp(status);
-  }
+  // v0.3.8: the legacy Chrome-CDP "captcha helper" routes (GET status /
+  // POST warmup / POST stop) were removed with the dashboard's 验证码助手 page —
+  // the happy-dom token pool is fully automatic (boot pre-solve + demand
+  // refill), and the old stop button killed the production token supply.
+  // Pool health is now a read-only `captchaPool` field on /admin/api/stats,
+  // rendered on the dashboard Overview page.
 
   // Get stats
   if (path === "/admin/api/stats" && method === "GET") {
+    // v0.3.8: captchaPool (ready/target/activeSolves) rides along with the
+    // stats snapshot — the Overview page renders it as the 验证码池 card.
+    // target === 0 means the pool is not running (coding-plan, or start-plan
+    // pre-solver parked); the UI shows "—" in that case.
     return jsonResp({
       ...stats,
+      captchaPool: captchaPoolStats(),
       uptime: Date.now() - opts.startTime,
     });
   }
