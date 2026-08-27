@@ -14,7 +14,10 @@ const API_KEY_SECRET = "testsecret";
 const GATE_URL = "https://zcode.z.ai/api/v1/agent/configs";
 const HANDSHAKE_URL = "https://api.z.ai/api/paas/c1f3a7e2/v2/client";
 const LLM_URL = "https://api.z.ai/api/coding/paas/v4/chat/completions";
-const STARTPLAN_URL = "https://zcode.z.ai/api/v1/zcode-plan/chat/completions";
+// v0.3.7: the Anthropic mirror is the live start-plan route; the OpenAI
+// gateway path is the legacy ZCODE_STARTPLAN_UPSTREAM=openai escape hatch.
+const STARTPLAN_URL = "https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages";
+const STARTPLAN_LEGACY_URL = "https://zcode.z.ai/api/v1/zcode-plan/chat/completions";
 const OFFPEAK_URL = "https://zcode.z.ai/api/v1/off-peak/anthropic/v1/messages";
 
 const BASE_PAIRS: UpstreamHeaderPair[] = [
@@ -200,7 +203,7 @@ describe("ClientSigningManager.sign", () => {
     const fixture = await buildHandshakeFixture();
     const calls: MockCalls = { gate: 0, handshakes: [] };
     const manager = new ClientSigningManager({ identity, fetchImpl: signingFetchFixture(fixture, calls) });
-    for (const url of [STARTPLAN_URL, OFFPEAK_URL, "https://api.z.ai/api/v1/zcode-plan/chat/completions/"]) {
+    for (const url of [STARTPLAN_URL, STARTPLAN_LEGACY_URL, OFFPEAK_URL, "https://api.z.ai/api/v1/zcode-plan/chat/completions/"]) {
       const signed = await manager.sign(url, BASE_PAIRS, { credential: CRED, appVersion: "3.8.1" });
       expect(signed).toBe(BASE_PAIRS);
     }

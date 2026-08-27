@@ -8,13 +8,22 @@
  * originally spoke OpenAI. The route's format is tracked separately in
  * `handler.ts` for response translation decisions.
  *
+ * === v0.3.7 (zcode.z.ai gateway endpoint removal, 2026-08-27) ===
+ *
+ *   1. START-PLAN ENDPOINT: the OpenAI gateway path
+ *      `/api/v1/zcode-plan/chat/completions` was REMOVED server-side —
+ *      every request returns Go's default "404 page not found" (verified
+ *      live). start-plan now routes through the Anthropic mirror
+ *      `/api/v1/zcode-plan/anthropic/v1/messages` (verified live: 401
+ *      without auth = registered, auth-gated route). This is the pre-v0.3.0
+ *      behavior, restored. ZCODE_STARTPLAN_UPSTREAM=openai restores the
+ *      legacy gateway URL/pipeline if the endpoint ever returns.
+ *
  * === v0.3.0 (upstream zcode-api v2.6.0 alignment, ZCode 3.9.x wire shape) ===
  *
- *   1. START-PLAN ENDPOINT: start-plan now routes through the zcode.z.ai
- *      OpenAI gateway (`/api/v1/zcode-plan/chat/completions`) instead of the
- *      legacy Anthropic mirror. The current ZCode client (v3.8.1+) uses the
- *      OpenAI gateway for start-plan traffic; Anthropic-format clients are
- *      translated before this builder is called.
+ *   1. START-PLAN ENDPOINT: start-plan switched to the zcode.z.ai OpenAI
+ *      gateway (`/api/v1/zcode-plan/chat/completions`) — superseded by the
+ *      v0.3.7 restoration above (endpoint removed server-side).
  *
  *   2. IDENTITY BLOCK: model requests carry the FULL `pio` header set
  *      (see identity.ts) — the June-2026 narrow agent set is obsolete.
@@ -77,6 +86,7 @@ import { credentialString } from "../auth/types.js";
 import { buildIdentityHeaders } from "./identity.js";
 import { buildZcodeTraceHeaders } from "./trace-headers.js";
 import { sessionIdForHeader, shouldUseExactTraceHeaders, type SessionHeaderContext } from "./session-context.js";
+import { startPlanUpstreamStyle } from "./runtime-options.js";
 
 export interface UpstreamClientSession {
   source?: "none" | "explicit" | "lineage";
@@ -98,6 +108,7 @@ const ALIYUN_CAPTCHA_HEADERS = new Set([
   "x-aliyun-captcha-verify-region",
 ]);
 
+const STARTPLAN_ANTHROPIC_BASE = "https://zcode.z.ai/api/v1/zcode-plan/anthropic";
 const STARTPLAN_OPENAI_BASE = "https://zcode.z.ai/api/v1/zcode-plan";
 
 function normalizeBearerHeader(token: string | undefined): string | undefined {
@@ -139,14 +150,18 @@ function clientIp(
 /**
  * Build the upstream URL based on format + plan + provider.
  *
- * v0.3.0 (ZCode 3.8.1+ alignment): start-plan uses the zcode.z.ai OpenAI
- * gateway; coding-plan mirrors the real ZCode client — Anthropic upstream
+ * v0.3.7: start-plan uses the zcode.z.ai Anthropic mirror — the OpenAI
+ * gateway path was removed server-side (404) around 2026-08-27.
+ * coding-plan mirrors the real ZCode client — Anthropic upstream
  * (api.z.ai/api/anthropic, possibly remapped to the ultra endpoint by
- * endpoint-routing.ts at dispatch time).
+ * endpoint-routing.ts at dispatch time). ZCODE_STARTPLAN_UPSTREAM=openai
+ * restores the legacy v0.3.0 gateway URL.
  */
 export function buildUpstreamURL(format: Format, provider: ProviderDef, plan: "coding-plan" | "start-plan" = "coding-plan"): string {
   if (plan === "start-plan") {
-    return `${STARTPLAN_OPENAI_BASE}/chat/completions`;
+    return startPlanUpstreamStyle() === "openai"
+      ? `${STARTPLAN_OPENAI_BASE}/chat/completions`
+      : `${STARTPLAN_ANTHROPIC_BASE}/v1/messages`;
   }
   if (format === "anthropic") {
     return `${provider.anthropicBaseURL}/v1/messages`;
@@ -193,8 +208,11 @@ function buildTraceHeaders(plan: "coding-plan" | "start-plan", clientSession?: U
  *
  * Auth scheme selection:
  * - Anthropic upstream, coding-plan → `x-api-key: {cred}` + `anthropic-version`
+ * - Anthropic upstream, start-plan  → `Authorization: Bearer {jwt}` + `anthropic-version`
+ *                                         (v0.3.7 default — zcode.z.ai mirror)
  * - OpenAI upstream, coding-plan    → `Authorization: Bearer {cred}`
- * - start-plan (OpenAI gateway)     → `Authorization: Bearer {jwt}`
+ * - OpenAI upstream, start-plan     → `Authorization: Bearer {jwt}`
+ *                                         (legacy ZCODE_STARTPLAN_UPSTREAM=openai)
  */
 export function buildAuthHeaders(
   format: Format,

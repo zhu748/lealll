@@ -22,3 +22,4 @@ zcode-proxy-debug-*.json
 /header-debug/
 # Render: local data dir (only relevant if you `docker run` with a bind mount)
 /data/
+/zcode-proxy-linux-*

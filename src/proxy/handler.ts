@@ -6,13 +6,17 @@
  * anthropic endpoint in coding-plan), then translates the response back to
  * OpenAI format. Anthropic clients pass through unchanged in coding-plan.
  *
- * **v0.3.0 (upstream zcode-api v2.6.0 alignment)**: start-plan now routes
- * through the zcode.z.ai OpenAI gateway (`/api/v1/zcode-plan/chat/completions`).
- * The upstream format is plan-dependent:
- *   - coding-plan → Anthropic upstream (existing wire-shape-aligned path)
- *   - start-plan  → OpenAI upstream; Anthropic-format clients are translated
- *                   Anthropic→OpenAI on the request and OpenAI→Anthropic on
- *                   the response (sse + batch)
+ * **v0.3.7 (zcode.z.ai gateway endpoint removal)**: start-plan routes
+ * through the zcode.z.ai Anthropic mirror
+ * (`/api/v1/zcode-plan/anthropic/v1/messages`) — the OpenAI gateway path
+ * was removed server-side (404). The upstream format is plan-independent:
+ *   - coding-plan → Anthropic upstream (api.z.ai/api/anthropic, existing
+ *                    wire-shape-aligned path)
+ *   - start-plan  → Anthropic upstream (zcode.z.ai mirror); OpenAI-format
+ *                   clients are translated OpenAI→Anthropic on the request
+ *                   and Anthropic→OpenAI on the response (same pipeline as
+ *                   coding-plan). ZCODE_STARTPLAN_UPSTREAM=openai restores
+ *                   the legacy v0.3.0 gateway pipeline.
  *
  * Also integrated from upstream v2.6.0: session-context (stable per-
  * conversation upstream session UUIDs + x-zcode-session-type attribution),
@@ -78,7 +82,7 @@ import {
 import { checkWafBlock } from "./waf.js";
 import { logUpstreamResponseDebug } from "./upstream-debug.js";
 import { translateClientBodyObj } from "./request-translation.js";
-import { nextReqId, startPlanCaptchaPreflightEnabled } from "./runtime-options.js";
+import { nextReqId, startPlanCaptchaPreflightEnabled, startPlanUpstreamStyle } from "./runtime-options.js";
 import {
   errorResponse,
   passthroughResponse,
@@ -354,13 +358,14 @@ export async function proxyRequest(
   // Responses API format (used by Codex CLI).
   void (format === "openai" || format === "openai-responses"); // translateMode superseded by plan-aware upstreamFormat (v0.3.0)
 
-  // v0.3.0: the UPSTREAM format is plan-dependent (ZCode 3.8.1+ alignment):
-  //   - coding-plan → Anthropic upstream (api.z.ai/api/anthropic, wire-shape
-  //     aligned — unchanged from v0.2.x)
-  //   - start-plan  → OpenAI upstream (zcode.z.ai/api/v1/zcode-plan/chat/
-  //     completions); Anthropic-format clients are translated both ways.
+  // v0.3.7: BOTH plans speak the Anthropic upstream. The zcode.z.ai OpenAI
+  // gateway endpoint (/api/v1/zcode-plan/chat/completions) was removed
+  // server-side (404 since ~2026-08-27); the Anthropic mirror
+  // (zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages) is the only live
+  // start-plan route. ZCODE_STARTPLAN_UPSTREAM=openai restores the legacy
+  // gateway pipeline.
   const upstreamFormatForPlan = (plan: "coding-plan" | "start-plan"): Format =>
-    plan === "start-plan" ? "openai" : "anthropic";
+    plan === "start-plan" && startPlanUpstreamStyle() === "openai" ? "openai" : "anthropic";
   let upstreamFormat: Format = upstreamFormatForPlan(currentPlan);
 
   // Model rewrite for translation / gateway modes:
@@ -397,16 +402,19 @@ export async function proxyRequest(
   // =====================================================================
   //  FORMAT CONVERSION ORCHESTRATION (Claude Code + Codex → ZCode upstream)
   // =====================================================================
-  //  v0.3.0: the pipeline is a pure function of the plan, so a mid-retry
-  //  credential switch (which may flip coding-plan ↔ start-plan) can re-run
-  //  it from the pristine parsedBody:
+  //  v0.3.7: both plans speak the Anthropic upstream, so the pipeline is a
+  //  single path; the plan only changes URL (provider vs zcode.z.ai mirror),
+  //  auth scheme (x-api-key vs Bearer JWT), and the body-transformer's
+  //  startPlan system-block injection (applyStartPlanSystem). A mid-retry
+  //  credential switch can re-run the pipeline from the pristine parsedBody:
   //
-  //    coding-plan (Anthropic upstream — v0.2.x behavior, unchanged):
+  //    start-plan AND coding-plan (Anthropic upstream — v0.3.7):
   //      Claude Code (anthropic)  ─→ alignZCodeRequestFormat ─→ upstream
   //      OpenAI     (openai)      ─→ openai-to-anthropic ─→ align ─→ upstream
   //      Codex      (responses)   ─→ responses-to-anthropic ─→ align ─→ upstream
   //
-  //    start-plan (OpenAI gateway — upstream v2.6.0 alignment):
+  //    legacy ZCODE_STARTPLAN_UPSTREAM=openai (start-plan OpenAI gateway,
+  //      v0.3.0..v0.3.6.2 behavior — endpoint removed server-side):
   //      Claude Code (anthropic)  ─→ anthropic-to-openai ─→ gateway-system ─→ upstream
   //      OpenAI     (openai)      ─→ gateway-system ─→ upstream (same format)
   //      Codex      (responses)   ─→ responses-to-anthropic ─→ anthropic-to-openai
@@ -423,8 +431,10 @@ export async function proxyRequest(
   const buildUpstreamBodyObjForPlan = (plan: "coding-plan" | "start-plan"): { obj: unknown; error?: Response } => {
     applyModelRewrite();
 
-    if (plan === "start-plan") {
-      // OpenAI upstream via the zcode.z.ai gateway.
+    if (plan === "start-plan" && upstreamFormatForPlan(plan) === "openai") {
+      // Legacy OpenAI gateway pipeline (ZCODE_STARTPLAN_UPSTREAM=openai).
+      // Kept because the server flipped endpoints once already — flips back
+      // without a new release.
       if (format === "anthropic") {
         const translated = translateRequestAnthropicToOpenAI(parsedBody as AnthropicMessagesRequest);
         return { obj: translated as unknown as Record<string, unknown> };
@@ -444,7 +454,10 @@ export async function proxyRequest(
       return { obj: translateRequestAnthropicToOpenAI(anthropicObj as AnthropicMessagesRequest) as unknown as Record<string, unknown> };
     }
 
-    // coding-plan: Anthropic upstream (existing wire-shape-aligned path).
+    // Anthropic upstream — coding-plan (api.z.ai/api/anthropic) AND start-plan
+    // (zcode.z.ai Anthropic mirror, v0.3.7). Same translation pipeline; the
+    // plan only changes URL, auth scheme, and startPlan system-block
+    // injection inside transformRequestBodyObj.
     if (format === "anthropic") return { obj: parsedBody };
     const forceThinkingModels = format === "openai-responses"
       ? config.responsesThinking?.models
@@ -1804,10 +1817,11 @@ export async function proxyRequest(
   // format it expects. This makes the wire-shape alignment transparent to
   // non-stream clients (Claude Code, SDK calls, integration tests, etc.).
   //
-  // v0.3.0: this reassembly is ANTHROPIC-upstream only — the coding-plan path
-  // forces stream:true, so non-stream clients need the SSE→batch buffer. The
-  // start-plan OpenAI path does NOT force stream (upstream v2.6.0 behavior):
-  // the upstream honors the client's stream preference directly.
+  // v0.3.7: start-plan (Anthropic mirror) ALSO forces stream:true inside
+  // alignZCodeRequestFormat — same wire shape as coding-plan — so non-stream
+  // clients on BOTH plans get the SSE→batch buffer. The legacy OpenAI gateway
+  // path (ZCODE_STARTPLAN_UPSTREAM=openai) does NOT force stream: the upstream
+  // honored the client's stream preference directly.
   //
   // Both passthrough AND translation paths benefit (translatedBatchResponse /
   // translatedResponsesBatchResponse both expect a JSON body — the synthetic
@@ -1887,13 +1901,13 @@ export async function proxyRequest(
   }
 
   // =====================================================================
-  //  v0.3.0 RESPONSE TRANSLATION (plan-aware)
+  //  v0.3.7 RESPONSE TRANSLATION
   //
-  //  coding-plan (Anthropic upstream — unchanged v0.2.x behavior):
+  //  Both plans (Anthropic upstream):
   //    anthropic client        → passthrough (bottom branches)
   //    openai / responses      → Anthropic→client translation (translateMode)
   //
-  //  start-plan (OpenAI upstream — new):
+  //  legacy ZCODE_STARTPLAN_UPSTREAM=openai (start-plan OpenAI upstream):
   //    openai client           → passthrough (bottom branches, format-aware
   //                              stats already parse OpenAI chunks)
   //    anthropic client        → OpenAI→Anthropic translation (sse + batch)
@@ -1902,8 +1916,9 @@ export async function proxyRequest(
   const responseNeedsTranslation = upstreamFormat !== format;
 
   if (upstreamFormat === "openai" && format !== "openai") {
-    // start-plan with an Anthropic-format or Responses-format client: the
-    // upstream spoke OpenAI — translate the response back.
+    // Legacy start-plan OpenAI gateway (ZCODE_STARTPLAN_UPSTREAM=openai) with
+    // an Anthropic-format or Responses-format client: the upstream spoke
+    // OpenAI — translate the response back.
     if (!upstreamResp.ok) {
       const errBody = upstreamErrorPreview ?? (await readResponseTextPreview(upstreamResp, {
         maxBytes: ERROR_RESPONSE_PREVIEW_BYTES,

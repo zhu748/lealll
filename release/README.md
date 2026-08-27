@@ -1,5 +1,33 @@
 # zcode-proxy 使用说明
 
+> **v0.3.7.0 — 修复 start-plan 全部 404（zcode.z.ai 下线了 OpenAI 网关端点）**
+>
+> 针对 v0.3.6.2 "所有请求 `upstream 404 404 page not found`"的反馈。账号、JWT、验证码、身份指纹全部正常——模型请求打的是一个**已被服务端删除的路由**。直接实测 zcode.z.ai 网关：
+>
+> | 路径 | 状态 | 含义 |
+> |------|------|------|
+> | `POST /api/v1/zcode-plan/chat/completions` | **404** `404 page not found` | 路由已被服务端删除（Go 默认 mux 404） |
+> | `POST /api/v1/zcode-plan/anthropic/v1/messages` | **401** | 路由**存活**，正常鉴权拦截 |
+> | `GET /api/v1/zcode-plan/billing/balance` | 401 | 额度接口不受影响 |
+>
+> v0.3.0 从上游 zcode-api v2.6.0 对齐来的 OpenAI 网关路径，在 2026-08-27 前后被服务端下线。上游仓库 master 同样写死这个死链——他们的 start-plan 一样是坏的（截至 2026-08-27 上游无 issue/修复），本修复**领先上游一个端点翻转**。
+>
+> **修复**：start-plan 切回 Anthropic 镜像 `https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages`（v0.3.0 之前的原始路径，恢复）：
+>
+> - 两种套餐现在都说 Anthropic 上游——start-plan 直接复用久经考验的 coding-plan 管线（wire-shape 对齐、SSE→batch 折叠、会话上下文、SSE 错误检测），Claude Code 等 Anthropic 客户端请求体**不再翻译**、原样透传。
+> - 鉴权为 `Authorization: Bearer <jwt>` + `anthropic-version`（头构造器本就保留着这条路径的支持）。
+> - 网关 3012 内容检查所需的 ZCode 官方系统块 + 动态模型行（`applyStartPlanSystem`）从未被删除，自动重新生效。
+> - 验证码预检 / 3007 挑战 / 重试语义完全不变。
+> - **逃生舱**：服务端已经翻转过一次端点，所以旧网关管线保留在 `ZCODE_STARTPLAN_UPSTREAM=openai` 环境变量后面——万一网关端点哪天回来了，用户无需等新版即可切回。
+>
+> **验证**（编译后的真实二进制直连线上网关）：默认配置下 start-plan 请求到达镜像路由、假 JWT 得到 401 `start_plan_jwt_invalid`（路由存在、鉴权已处理）；`ZCODE_STARTPLAN_UPSTREAM=openai` 则逐字节复现用户的 `upstream 404 404 page not found`（A/B 对照确认诊断）。
+>
+> 测试 1261/1261（+3：镜像路由端到端、用户场景 anthropic 透传回归、逃生舱守护；另加 start-plan anthropic 头序测试）；tsc 干净；linux-x64 编译冒烟通过。
+>
+> **升级建议**：**所有 start-plan（免费套餐）用户必须升级**——v0.3.0 至 v0.3.6.2 的所有版本都打的是已删除的路由，必然 404。coding-plan 用户不受影响，但也建议顺手升级。
+
+---
+
 > **v0.3.6.2 — 修复 OAuth 登录卡死（铸币熔断 + 求解退避 + 登录优先启动）**
 >
 > 针对 v0.3.6.x "点击开始登录，一直卡在'初始化中...'，然后超时"的反馈。通过给真实服务器插桩复现定位：`oauth/init` 接口本身极轻（绑定回环端口 + 拼 URL，handler 约 20ms 就完成），**真正的凶手是验证码预求解器把共享事件循环饿死**——每个 happy-dom 求解含数百毫秒级同步执行块；一旦铸币持续失败（IP 被标记 / WAF 降级 / FeiLin 指纹失败），令牌池**永不停止重试**，实测事件循环停顿达 **4–5.7 秒**且无限循环。多轮转的请求（读 body 流 → 起 node:http 监听 → 写响应）穿不过这些停顿，响应写回被卡 35–90 秒；而单轮转请求（状态查询）碰巧挤过间隙所以秒回。用户机器上的 `L[$]` 报错刷屏正是同一死亡螺旋的可听症状。

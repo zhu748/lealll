@@ -2,6 +2,56 @@
 
 A reverse proxy for Z.AI / Bigmodel.cn coding-plan APIs that exposes both OpenAI-compatible and Anthropic-format endpoints.
 
+## v0.3.7.0 — start-plan endpoint fixed (zcode.z.ai removed the OpenAI gateway)
+
+Reported against v0.3.6.2: every start-plan request failed with
+`upstream 404 404 page not found` — the account, JWT, captcha, and identity
+fingerprint were all fine; the model request was simply hitting a dead route.
+
+Live-probed the zcode.z.ai gateway directly:
+
+| Path | Status | Meaning |
+|------|--------|---------|
+| `POST /api/v1/zcode-plan/chat/completions` | **404** `404 page not found` | route REMOVED server-side (Go default mux 404) |
+| `POST /api/v1/zcode-plan/anthropic/v1/messages` | **401** | route ALIVE, auth-gated |
+| `GET /api/v1/zcode-plan/billing/balance` | 401 | quota endpoints unaffected |
+
+The OpenAI gateway path (adopted in v0.3.0 from upstream zcode-api v2.6.0)
+was removed server-side around 2026-08-27. Upstream zcode-api's master has
+the same dead URL hardcoded — their start-plan path is equally broken (no
+issue filed there as of 2026-08-27); this fix leads upstream by a full
+endpoint flip.
+
+**Fix**: start-plan now routes through the Anthropic mirror
+`/api/v1/zcode-plan/anthropic/v1/messages` (the pre-v0.3.0 behavior,
+restored):
+
+- Both plans now speak the Anthropic upstream — start-plan reuses the
+  battle-tested coding-plan pipeline (wire-shape alignment, SSE→batch
+  folding, session-context, SSE error detection) instead of the gateway
+  translation pipeline.
+- Auth is `Authorization: Bearer <jwt>` + `anthropic-version` — the header
+  builder already supported this combination (it was the pre-v0.3.0 path).
+- The body-transformer's start-plan system blocks (`applyStartPlanSystem`:
+  zcode_system.json blocks + dynamic model line, the gateway 3012 content
+  check) were never removed — they activate again automatically.
+- Captcha preflight / 3007 challenge / retry semantics are unchanged.
+- **Escape hatch**: the server flipped endpoints once already, so the legacy
+  gateway pipeline is kept behind `ZCODE_STARTPLAN_UPSTREAM=openai`. If the
+  gateway endpoint ever returns, users flip back without a new release.
+
+Verified end-to-end against the live gateway with the compiled binary:
+
+- Default: start-plan request reaches the mirror and gets **401** with a
+  fake JWT (`start_plan_jwt_invalid` — route exists, auth processed).
+- `ZCODE_STARTPLAN_UPSTREAM=openai`: byte-for-byte reproduces the user's
+  `upstream 404 404 page not found` (A/B control confirming the diagnosis).
+
+Tests: 1261/1261 (+3: mirror routing e2e, anthropic-client passthrough
+regression for the exact user scenario, escape-hatch guard; plus a new
+start-plan anthropic header-order test). tsc clean; linux-x64 compile smoke
+passed.
+
 ## v0.3.6.2 — OAuth Login Hang Fixed (mint breaker, solve backoff, login-first startup)
 
 Reported against v0.3.6.x: clicking "开始登录" in the dashboard hung at
@@ -320,9 +370,11 @@ What's new (from upstream):
   in-process solver, deterministic fingerprints, no browser/jsdom dependency);
   each start-plan request takes an already-solved token in sub-millisecond
   time. CPU-governed, demand-driven pool sizing, F008 duplicate protection.
-- **start-plan routes through the zcode.z.ai OpenAI gateway**
-  (`/api/v1/zcode-plan/chat/completions`, ZCode 3.8.1+ wire shape) —
-  Anthropic-format clients (Claude Code) are translated both ways.
+- **start-plan routes through the zcode.z.ai Anthropic mirror**
+  (`/api/v1/zcode-plan/anthropic/v1/messages`, v0.3.7) — the OpenAI gateway
+  path (`/api/v1/zcode-plan/chat/completions`) was removed server-side on
+  2026-08-27 and now 404s. OpenAI-format clients are translated both ways;
+  `ZCODE_STARTPLAN_UPSTREAM=openai` restores the legacy gateway pipeline.
 - **Session-context inference** — replicates ZCode's single-user-identity
   UUID generation: multi-turn conversations reuse the same upstream
   `x-session-id` (explicit client headers or conversation-lineage hashing),
@@ -536,6 +588,7 @@ docker run --rm -p 8080:8080 \
 | `ZCODE_REFERER_ORIGIN` | `https://zcode.z.ai` | `HTTP-Referer` URL sent to upstream. |
 | `ZCODE_AGENT` | `glm` | `X-ZCode-Agent` sent on upstream model requests to mirror the official GLM agent provider. |
 | `ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT` | enabled | Start-plan pre-solves and sends fresh Aliyun captcha runtime headers before each model attempt, matching ZCode. Set to `0`, `false`, `off`, `no`, or `never` to solve only after an explicit `3007` challenge. |
+| `ZCODE_STARTPLAN_UPSTREAM` | `anthropic` | v0.3.7: start-plan upstream wire style. `anthropic` (default) routes through the zcode.z.ai Anthropic mirror (`/api/v1/zcode-plan/anthropic/v1/messages`); `openai` restores the legacy v0.3.0 gateway pipeline (`/api/v1/zcode-plan/chat/completions` — removed server-side 2026-08-27, currently 404). |
 | `ZCODE_CAPTCHA_SOLVER` | `auto` | Captcha solver strategy: `auto` prefers a real Chrome/Edge CDP page (matching ZCode's Electron renderer) and falls back to JSDOM, `chrome` forces Chrome/Edge, `jsdom` forces the single-binary fallback. |
 | `ZCODE_CAPTCHA_LANGUAGE` | host locale | Optional Aliyun SDK language override: `cn` or `en`. When unset, Chinese host locales use `cn`; all others use `en`, matching the official client's locale behavior. |
 | `ZCODE_CAPTCHA_CHROME_INTERACTIVE` | `0` | Set to `1` to show the Chrome captcha fallback window on screen when Aliyun escalates from traceless verification to an interactive challenge. |

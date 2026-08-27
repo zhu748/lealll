@@ -592,9 +592,54 @@ describe("buildUpstreamRequest", () => {
     expect(h["X-Device-Mid"]).toBe("device-mid-test");
   });
 
-  it("emits headers in stable construction order (start-plan with JWT, OpenAI upstream)", () => {
-    // v0.3.0: start-plan routes through the zcode.z.ai OpenAI gateway —
-    // authorization: Bearer <jwt>, NO anthropic-beta/anthropic-version.
+  it("emits headers in stable construction order (start-plan, Anthropic mirror — v0.3.7 default)", () => {
+    // v0.3.7: start-plan routes through the zcode.z.ai Anthropic mirror —
+    // authorization: Bearer <jwt> + anthropic-version + anthropic-beta. The
+    // trace block uses the exact path (ZCode attribution): without a client
+    // session it carries request-id / session-type / trace-id only (no
+    // x-query-id / x-session-id — those are coding-plan observe-mode only).
+    const jwtCred: Credential = { apiKey: "k", secret: "s", jwt: "jwt-token-xyz", provider: "zai" };
+    const h = buildUpstreamHeaders("anthropic", jwtCred, IDENTITY, "start-plan");
+
+    const expectedOrder = [
+      "content-type",
+      "accept-encoding",
+      "anthropic-beta",
+      "HTTP-Referer",
+      "User-Agent",
+      "X-ZCode-App-Version",
+      "X-Title",
+      "X-ZCode-Agent",
+      "X-Platform",
+      "X-Release-Channel",
+      "X-Client-Language",
+      "X-Client-Timezone",
+      "X-Os-Category",
+      "X-Os-Version",
+      "x-request-id",
+      "x-zcode-session-type",
+      "x-zcode-trace-id",
+      "authorization",
+      "anthropic-version",
+    ];
+
+    const actualOrder = Object.keys(h);
+    expect(actualOrder).toEqual(expectedOrder);
+
+    // Bearer JWT auth, never x-api-key, on the start-plan mirror path.
+    expect(h["authorization"]).toBe("Bearer jwt-token-xyz");
+    expect(h["anthropic-version"]).toBe("2023-06-01");
+    expect(h["x-api-key"]).toBeUndefined();
+    expect(h["X-ZCode-Agent"]).toBe("glm");
+    expect(h["x-request-id"]).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+    expect(h["x-zcode-trace-id"]).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+    expect(h["x-query-id"]).toBeUndefined();
+    expect(h["x-session-id"]).toBeUndefined();
+  });
+
+  it("emits headers in stable construction order (start-plan with JWT, legacy OpenAI upstream)", () => {
+    // Legacy ZCODE_STARTPLAN_UPSTREAM=openai path: authorization: Bearer <jwt>,
+    // NO anthropic-beta/anthropic-version.
     // The trace block uses the exact path (ZCode attribution): without a
     // client session it carries request-id / session-type / trace-id only.
     const jwtCred: Credential = { apiKey: "k", secret: "s", jwt: "jwt-token-xyz", provider: "zai" };
@@ -1620,41 +1665,55 @@ describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
     expect(resp.headers.get("content-encoding")).toBe("gzip");
   });
 
-  it("start-plan OpenAI request routes through the zcode.z.ai OpenAI gateway", async () => {
+  it("start-plan request routes through the zcode.z.ai Anthropic mirror (v0.3.7)", async () => {
+    // v0.3.7: the OpenAI gateway path (/api/v1/zcode-plan/chat/completions)
+    // was removed server-side (404); start-plan routes through the Anthropic
+    // mirror with Bearer JWT auth. OpenAI-format clients are translated
+    // OpenAI→Anthropic on the request and Anthropic→OpenAI on the response.
     const startPlanConfig: ProxyConfig = {
       ...testConfig,
       plan: "start-plan",
     };
     const originalPreflight = process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
+    const originalUpstreamStyle = process.env.ZCODE_STARTPLAN_UPSTREAM;
     delete process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
+    delete process.env.ZCODE_STARTPLAN_UPSTREAM;
     const captchaTokenProvider = mock(async () => {
       return { verifyParam: "fresh-preflight-param", region: "cn-shanghai", solveMs: 11 };
     });
 
     try {
       const fetchMock = mock(async (req: Request): Promise<Response> => {
-        // v0.3.0: start-plan now hits the OpenAI gateway (chat/completions).
-        expect(req.url).toBe("https://zcode.z.ai/api/v1/zcode-plan/chat/completions");
+        // v0.3.7: start-plan hits the Anthropic mirror — NOT the removed
+        // OpenAI gateway path.
+        expect(req.url).toBe("https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages");
         expect(req.headers.get("authorization")).toBe("Bearer jwt-mock");
+        expect(req.headers.get("anthropic-version")).toBe("2023-06-01");
+        expect(req.headers.get("x-api-key")).toBeNull();
+        expect(req.headers.get("anthropic-beta")).toBeTruthy();
         expect(req.headers.get("x-zcode-trace-id")).toMatch(/^[0-9a-f-]{36}$/i);
         expect(req.headers.get("x-zcode-session-type")).toBe("main");
         expect(req.headers.get("x-aliyun-captcha-verify-param")).toBe("fresh-preflight-param");
         expect(req.headers.get("x-aliyun-captcha-verify-region")).toBe("cn-shanghai");
         const reqBody = JSON.parse(await req.text());
-        expect(reqBody.messages).toBeDefined();
-        // Gateway system blocks are injected as leading system messages.
-        expect(reqBody.messages[0].role).toBe("system");
-        expect(reqBody.messages[0].content).toContain("You are ZCode");
-        // stream passthrough: client sent no stream field → not forced on the
-        // OpenAI gateway path (upstream v2.6.0 behavior).
-        expect(reqBody.stream).toBeUndefined();
+        // OpenAI client translated to the Anthropic wire shape: messages[],
+        // max_tokens, stream forced on (alignZCodeRequestFormat).
+        expect(Array.isArray(reqBody.messages)).toBe(true);
+        expect(reqBody.messages[0].role).toBe("user");
+        // start-plan system blocks injected into top-level system[]
+        // (applyStartPlanSystem — the gateway 3012 content check requires them).
+        expect(Array.isArray(reqBody.system)).toBe(true);
+        expect(reqBody.system[0].text).toBe("You are ZCode, an interactive coding agent");
+        expect(reqBody.stream).toBe(true);
         return new Response(JSON.stringify({
-          id: "chatcmpl-sp",
-          object: "chat.completion",
-          created: 1750000000,
+          id: "msg_sp",
+          type: "message",
+          role: "assistant",
+          content: [{ type: "text", text: "start-plan reply" }],
           model: "glm-4.6",
-          choices: [{ index: 0, message: { role: "assistant", content: "start-plan reply" }, finish_reason: "stop" }],
-          usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+          stop_reason: "end_turn",
+          stop_sequence: null,
+          usage: { input_tokens: 5, output_tokens: 3 },
         }), { status: 200, headers: { "content-type": "application/json" } });
       });
 
@@ -1677,11 +1736,142 @@ describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
       expect(resp.status).toBe(200);
       expect(resp.headers.get("content-type")).toBe("application/json");
       const body = await resp.json();
+      // Anthropic upstream response translated back to OpenAI chat.completion.
       expect(body.object).toBe("chat.completion");
       expect(body.choices[0].message.content).toBe("start-plan reply");
     } finally {
       if (originalPreflight === undefined) delete process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
       else process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = originalPreflight;
+      if (originalUpstreamStyle === undefined) delete process.env.ZCODE_STARTPLAN_UPSTREAM;
+      else process.env.ZCODE_STARTPLAN_UPSTREAM = originalUpstreamStyle;
+    }
+  });
+
+  it("start-plan anthropic client passes through to the mirror untranslated (v0.3.7 user regression)", async () => {
+    // The exact user-reported scenario: Claude Code (anthropic /v1/messages)
+    // on a start-plan account — previously 404 "404 page not found" from the
+    // removed OpenAI gateway; now the Anthropic mirror with passthrough body.
+    const startPlanConfig: ProxyConfig = {
+      ...testConfig,
+      plan: "start-plan",
+    };
+    const originalPreflight = process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
+    const originalUpstreamStyle = process.env.ZCODE_STARTPLAN_UPSTREAM;
+    delete process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
+    delete process.env.ZCODE_STARTPLAN_UPSTREAM;
+    const captchaTokenProvider = mock(async () => {
+      return { verifyParam: "fresh-preflight-param", region: "cn-shanghai", solveMs: 11 };
+    });
+
+    try {
+      const fetchMock = mock(async (req: Request): Promise<Response> => {
+        expect(req.url).toBe("https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages");
+        expect(req.headers.get("authorization")).toBe("Bearer jwt-mock");
+        expect(req.headers.get("anthropic-version")).toBe("2023-06-01");
+        expect(req.headers.get("x-api-key")).toBeNull();
+        expect(req.headers.get("x-aliyun-captcha-verify-param")).toBe("fresh-preflight-param");
+        const reqBody = JSON.parse(await req.text());
+        // Anthropic client → NO request translation; the body keeps the
+        // Anthropic wire shape (messages[] + top-level system[] + max_tokens).
+        expect(Array.isArray(reqBody.messages)).toBe(true);
+        expect(reqBody.messages[0].role).toBe("user");
+        expect(Array.isArray(reqBody.system)).toBe(true);
+        expect(reqBody.system[0].text).toBe("You are ZCode, an interactive coding agent");
+        expect(typeof reqBody.max_tokens).toBe("number");
+        return new Response(JSON.stringify({
+          id: "msg_sp_ant",
+          type: "message",
+          role: "assistant",
+          content: [{ type: "text", text: "mirror passthrough reply" }],
+          model: "glm-5.3",
+          stop_reason: "end_turn",
+          stop_sequence: null,
+          usage: { input_tokens: 5, output_tokens: 3 },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      });
+
+      const auth = new AuthManager({ mode: "oauth", provider: "zai" });
+      auth.setOAuthCredential({ apiKey: "dummy", provider: "zai", plan: "start-plan", jwt: "jwt-mock" });
+      const clientReq = new Request("http://localhost:8080/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: '{"model":"glm-5.3","max_tokens":1024,"thinking":{"type":"adaptive"},"messages":[{"role":"user","content":"hi"}]}',
+      });
+
+      const resp = await proxyRequest(clientReq, "anthropic", {
+        config: startPlanConfig,
+        auth,
+        fetchImpl: fetchMock as any,
+        captchaTokenProvider,
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(resp.status).toBe(200);
+      const body = await resp.json();
+      // Anthropic upstream + anthropic client → response passthrough.
+      expect(body.type).toBe("message");
+      expect(body.content[0].text).toBe("mirror passthrough reply");
+    } finally {
+      if (originalPreflight === undefined) delete process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
+      else process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = originalPreflight;
+      if (originalUpstreamStyle === undefined) delete process.env.ZCODE_STARTPLAN_UPSTREAM;
+      else process.env.ZCODE_STARTPLAN_UPSTREAM = originalUpstreamStyle;
+    }
+  });
+
+  it("ZCODE_STARTPLAN_UPSTREAM=openai restores the legacy gateway pipeline (escape hatch)", async () => {
+    // The server flipped endpoints once already — this guards the escape
+    // hatch so users can flip back without a new release if the OpenAI
+    // gateway endpoint ever returns.
+    const startPlanConfig: ProxyConfig = {
+      ...testConfig,
+      plan: "start-plan",
+    };
+    const originalPreflight = process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
+    const originalUpstreamStyle = process.env.ZCODE_STARTPLAN_UPSTREAM;
+    process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = "0";
+    process.env.ZCODE_STARTPLAN_UPSTREAM = "openai";
+
+    try {
+      const fetchMock = mock(async (req: Request): Promise<Response> => {
+        expect(req.url).toBe("https://zcode.z.ai/api/v1/zcode-plan/chat/completions");
+        expect(req.headers.get("authorization")).toBe("Bearer jwt-mock");
+        expect(req.headers.get("anthropic-version")).toBeNull();
+        const reqBody = JSON.parse(await req.text());
+        // Legacy gateway pipeline: OpenAI body + gateway system blocks as
+        // leading system messages.
+        expect(reqBody.messages[0].role).toBe("system");
+        expect(reqBody.messages[0].content).toContain("You are ZCode");
+        return new Response(JSON.stringify({
+          id: "chatcmpl-legacy",
+          object: "chat.completion",
+          created: 1750000000,
+          model: "glm-4.6",
+          choices: [{ index: 0, message: { role: "assistant", content: "legacy gateway reply" }, finish_reason: "stop" }],
+          usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      });
+
+      const auth = new AuthManager({ mode: "oauth", provider: "zai" });
+      auth.setOAuthCredential({ apiKey: "dummy", provider: "zai", plan: "start-plan", jwt: "jwt-mock" });
+      const clientReq = new Request("http://localhost:8080/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: '{"model":"glm-4.6","messages":[{"role":"user","content":"hi"}]}',
+      });
+
+      const resp = await proxyRequest(clientReq, "openai", {
+        config: startPlanConfig,
+        auth,
+        fetchImpl: fetchMock as any,
+      });
+      expect(resp.status).toBe(200);
+      const body = await resp.json();
+      expect(body.choices[0].message.content).toBe("legacy gateway reply");
+    } finally {
+      if (originalPreflight === undefined) delete process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
+      else process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = originalPreflight;
+      if (originalUpstreamStyle === undefined) delete process.env.ZCODE_STARTPLAN_UPSTREAM;
+      else process.env.ZCODE_STARTPLAN_UPSTREAM = originalUpstreamStyle;
     }
   });
 
@@ -1707,12 +1897,14 @@ describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
     const originalPreflight = process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
     process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = "0";
     const successBody = JSON.stringify({
-      id: "chatcmpl-sp-retry",
-      object: "chat.completion",
-      created: 1750000000,
+      id: "msg_sp_retry",
+      type: "message",
+      role: "assistant",
+      content: [{ type: "text", text: "ok after retry" }],
       model: "glm-4.6",
-      choices: [{ index: 0, message: { role: "assistant", content: "ok after retry" }, finish_reason: "stop" }],
-      usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+      stop_reason: "end_turn",
+      stop_sequence: null,
+      usage: { input_tokens: 5, output_tokens: 4 },
     });
     const seen: Array<{
       requestId: string | null;
@@ -2027,15 +2219,17 @@ describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
     const tempStoreDir = mkdtempSync(join(tmpdir(), "zcode-proxy-upstream-pool-"));
     const wafHtml = '<html><body><img src="https://errors.aliyun.com/error.png">blocked</body></html>';
     const captchaFailurePayload = JSON.stringify({ code: 3007, msg: "captcha verify failed" });
-    // v0.3.0: start-plan upstream is the OpenAI gateway — success body is a
-    // chat.completion, translated back to the OpenAI client verbatim.
+    // v0.3.7: start-plan upstream is the Anthropic mirror — success body is
+    // an anthropic message, translated back to the OpenAI client.
     const successBody = JSON.stringify({
-      id: "chatcmpl-rotated",
-      object: "chat.completion",
-      created: 1750000000,
+      id: "msg_rotated",
+      type: "message",
+      role: "assistant",
+      content: [{ type: "text", text: "ok after third proxy" }],
       model: "glm-5.2",
-      choices: [{ index: 0, message: { role: "assistant", content: "ok after third proxy" }, finish_reason: "stop" }],
-      usage: { prompt_tokens: 5, completion_tokens: 4, total_tokens: 9 },
+      stop_reason: "end_turn",
+      stop_sequence: null,
+      usage: { input_tokens: 5, output_tokens: 4 },
     });
     const seenProxies: Array<string | undefined> = [];
     const seenCaptchaHeaders: Array<string | null> = [];
@@ -2122,22 +2316,25 @@ describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
     };
 
     const fetchMock = mock(async (req: Request): Promise<Response> => {
-      // v0.3.0: start-plan routes through the zcode.z.ai OpenAI gateway.
-      expect(req.url).toBe("https://zcode.z.ai/api/v1/zcode-plan/chat/completions");
+      // v0.3.7: start-plan routes through the zcode.z.ai Anthropic mirror.
+      expect(req.url).toBe("https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages");
       expect(req.headers.get("authorization")).toBe("Bearer jwt-from-active-account");
       expect(req.headers.get("x-api-key")).toBeNull();
       const reqBody = JSON.parse(await req.text());
-      // Gateway system blocks are injected as leading system messages.
+      // OpenAI client translated to the Anthropic wire shape; start-plan
+      // system blocks in top-level system[].
       expect(Array.isArray(reqBody.messages)).toBe(true);
-      expect(reqBody.messages[0].role).toBe("system");
-      expect(reqBody.messages[0].content).toContain("You are ZCode");
+      expect(Array.isArray(reqBody.system)).toBe(true);
+      expect(reqBody.system[0].text).toBe("You are ZCode, an interactive coding agent");
       return new Response(JSON.stringify({
-        id: "chatcmpl-plan",
-        object: "chat.completion",
-        created: 1750000000,
+        id: "msg_plan",
+        type: "message",
+        role: "assistant",
+        content: [{ type: "text", text: "credential plan wins" }],
         model: "glm-4.6",
-        choices: [{ index: 0, message: { role: "assistant", content: "credential plan wins" }, finish_reason: "stop" }],
-        usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+        stop_reason: "end_turn",
+        stop_sequence: null,
+        usage: { input_tokens: 5, output_tokens: 3 },
       }), { status: 200, headers: { "content-type": "application/json" } });
     });
 
