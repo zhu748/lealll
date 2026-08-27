@@ -2,6 +2,45 @@
 
 A reverse proxy for Z.AI / Bigmodel.cn coding-plan APIs that exposes both OpenAI-compatible and Anthropic-format endpoints.
 
+## v0.3.6.0 — Captcha Solver Fixes (print alias, host-timer survival, quiet solves)
+
+Reported against the v0.3.5.0 Windows exe: opening the app with a
+start-plan credential flooded the terminal with
+`[WINDOW-ERROR] print is not defined ReferenceError` from the Aliyun FeiLin
+captcha script. Root-caused to the happy-dom global-alias machinery (present
+verbatim in upstream too) — two real bugs, both fixed and pinned by
+regression tests:
+
+- **`print` alias gap (the reported error)**. Under Bun, guest script tags
+  execute in the HOST realm, so FeiLin's bare `print()` resolved against
+  `globalThis` — and `print` was excluded from aliasing on the assumption
+  Bun ships a `print()` global (it does not, verified on Linux and Windows).
+  Every solve aborted FeiLin event listeners mid-collection with
+  ReferenceError. Host-critical names are now only protected when the host
+  actually defines them (per-epoch descriptor snapshot), so the window's
+  polyfilled `print` (and any other non-host critical global) resolves
+  exactly as in a real browser realm.
+- **Host timer deletion (latent server breaker)**. The alias cleanup blindly
+  deleted every aliased name — including `setTimeout` / `setInterval` /
+  `clearTimeout` / `clearInterval`, which happy-dom's window also owns. After
+  the last solve's window destruction, any server-side timer call (SSE
+  heartbeat, retry backoff, graceful shutdown) threw
+  `setTimeout is not defined`. Cleanup now restores the snapshotted host
+  descriptors (and removes the previously-leaking `__capWindowFor` getter
+  that kept destroyed windows alive).
+- **Quiet solves, self-diagnosing failures**. A single solve wave used to
+  print dozens of `[WINDOW-ERROR]` / `[UH-REASON]` lines to the console.
+  Guest-realm errors are now collected silently (most-recent 40) and
+  attached to the error message when a solve FAILS — set
+  `CAPTCHA_GUEST_DEBUG=1` for live forensics printing.
+- Polyfilled window methods (`print`, `alert`, `open`, …) are now defined
+  with `enumerable: true`, matching real browser property descriptors (a
+  non-enumerable `window.print` is itself a headless tell).
+
+Validated end-to-end: a real network solve mints a valid 280-char verify
+param with zero error spam; `tsc` clean; 1238/1238 tests (+6 regression
+tests for the alias epoch lifecycle and guest-error collection).
+
 ## v0.3.5.0 — Out-of-Box Defaults (oauth-first, glm-5.3, no key-length gate)
 
 Three packaging gaps reported against the v0.3.4.0 Windows zip — all

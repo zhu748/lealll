@@ -193,7 +193,9 @@ bash -n release/start.sh
 | **安卓配置了 socks:// 代理** | 报“SOCKS 需要 Bun 运行时”（故意的，不静默直连） | 安卓端移除 socks 条目或换 http 代理 |
 | **Bun 下用 node:http 检测客户端断连** | 请求体读完后客户端断开，`res close`/`req aborted`/socket `close` 全都不触发（连 TCP RST 都无感知，Bun 1.3.14 实测）——代理对断连结构性失明，上游请求照跑到完 | v0.3.4 双适配器：Bun 用 `Bun.serve`（原生 req.signal 断连中止），Node/安卓用 node:http（真 Node 事件正确）+ 三重监听。**不要**把 Bun 路径改回 node:http |
 | **node:http 背压泵只等 `drain`** | 客户端在写缓冲满时断开 → `drain` 永不触发 → 泵闭钥永久挂起（每断开一次泄漏一个） | drain 等待同时监听 `close`；`res.end()` 包 try/catch |
-| **无脑复用脚本不检查 CLI 变更** | 脚本命令与实际 CLI 不匹配，用户运行报错 | 每次发版必须执行 Section 4 |
+| **"宿主关键全局"名单按假设维护** | `print` 被误列入 HOST_CRITICAL_GLOBALS（以为 Bun 自带 print()——实际没有）→ Bun 下 guest 脚本裸 `print` ReferenceError，FeiLin 监听器每次求解中途炸（v0.3.5.0 Windows 报错刷屏） | 排除逻辑必须"宿主真定义才保护"：首个 installer 对宿主描述符做 epoch 快照，判断以快照为准；新增关键名前先 `bun -e "console.log(typeof X)"` 实测 |
+| **别名清理盲删 globalThis 属性** | happy-dom 窗口 own props 含 setTimeout 四件套 → 清理把宿主全局一起删了 → 最后一波求解后服务端所有定时器抛 `setTimeout is not defined` | install 时快照宿主原始描述符，remove 时恢复（未定义过的 delete）；回归测试覆盖 epoch 生命周期 |
+| 无脑复用脚本不检查 CLI 变更 | 脚本命令与实际 CLI 不匹配，用户运行报错 | 每次发版必须执行 Section 4 |
 | **版本号与 tag 不一致就打 tag** | CI 版本校验步直接失败 | Section 1 先改好 package.json |
 | **手动删了 Release 没删 tag** | 重新推同名 tag 后 Release 内容错乱 | 覆盖发版按 Section 3.1 顺序删 tag 重打 |
 

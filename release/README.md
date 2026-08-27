@@ -1,5 +1,22 @@
 # zcode-proxy 使用说明
 
+> **v0.3.6.0 — 验证码求解器修复（print 报错、宿主定时器保护、静默求解）**
+>
+> 针对 v0.3.5.0 Windows 包"打开一堆 `[WINDOW-ERROR] print is not defined` 报错"的反馈，根因定位到 happy-dom 全局别名机制（上游同款代码同样存在），修复了两个真实 bug 并加了回归测试。
+>
+> **本次改动**
+>
+> - **修复 `print is not defined` 报错（用户所见问题）**：Bun 下验证码脚本（阿里云 FeiLin）跑在宿主 realm，裸 `print` 查 globalThis；而 `print` 被误列入"宿主关键全局"排除名单（当时假设 Bun 自带 print() 全局——实测没有）。每次求解 FeiLin 的事件监听器都中途炸掉。现在排除逻辑改为"宿主真的定义了才保护"（按 epoch 快照判断），窗口里的 print 桩像真实浏览器一样可解析。
+> - **修复宿主定时器被删的隐性炸弹**：别名清理盲删所有别名——包括 happy-dom 窗口也拥有的 `setTimeout`/`setInterval`/`clearTimeout`/`clearInterval`。最后一波求解结束后，服务端任何定时器调用（SSE 心跳、重试退避、优雅关停）都会抛 `setTimeout is not defined`。清理现在恢复快照的宿主原始描述符（顺带修掉 `__capWindowFor` getter 泄漏——之前会一直持有已销毁窗口）。
+> - **求解静默化 + 失败自诊断**：以前一波求解会打几十行 `[WINDOW-ERROR]`/`[UH-REASON]` 刷屏。现在 guest 错误静默收集（保留最近 40 条），仅当求解**失败**时附加到错误消息里；需要实时取证设 `CAPTCHA_GUEST_DEBUG=1`。
+> - **属性描述符对齐真实浏览器**：`print`/`alert`/`open` 等桩改为 `enumerable: true`（Chrome 里 `window.print` 就是可枚举的——不可枚举本身是 headless 特征）。
+>
+> **验证**：真实网络端到端求解成功铸出 280 字符合法 verify param 且零报错刷屏；tsc 干净；1238/1238 测试（+6 别名生命周期与 guest 错误收集回归测试）。
+>
+> **升级建议**：使用 free/start-plan（免费套餐）的用户强烈建议升级——print 报错不仅是刷屏，还中断了 FeiLin 的指纹采集链路；宿主定时器问题则会在求解间歇期破坏所有服务端定时任务。
+
+---
+
 > **v0.3.5.0 — 开箱默认值修正（oauth 优先 / glm-5.3 / 取消密钥长度限制）**
 >
 > 针对 v0.3.4.0 Windows 包反馈的三个开箱体验问题，全部在配置模板/加载器层面修复——新下载的 zip 和 `init` 生成的配置都直接生效。

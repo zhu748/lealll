@@ -681,17 +681,36 @@ const GUEST_EVAL_PATCH = `
     Object.defineProperty(window.Document.prototype, Symbol.toStringTag, { value: "HTMLDocument", configurable: true });
   } catch (e) {}
   try {
+    // v0.3.6.0: guest-realm errors are COLLECTED silently (bounded) instead
+    // of console.error'd every time. A single solve can throw dozens of
+    // benign window errors (happy-dom env gaps the SDK tolerates), which
+    // buried the user's terminal in red [WINDOW-ERROR] spam on every solve
+    // wave. The host attaches the collected tail to the thrown error when a
+    // solve FAILS (self-diagnosing failures), and CAPTCHA_GUEST_DEBUG=1
+    // restores live printing for forensics.
+    window.__capGuestErrors = [];
+    var __capNote = function(kind, msg) {
+      try {
+        // Keep the TAIL (most recent 40): when a solve fails, the LATEST
+        // guest errors are the diagnostically relevant ones.
+        if (window.__capGuestErrors.length >= 40) {
+          window.__capGuestErrors.shift();
+        }
+        window.__capGuestErrors.push(String(kind) + " " + String(msg).slice(0, 300));
+        if (window.__capGuestDebug) {
+          console.error("[" + kind + "]", msg);
+        }
+      } catch (e2) {}
+    };
     window.addEventListener("unhandledrejection", function(e) {
       var r = e && e.reason;
       try {
-        console.error("[UH-REASON]", typeof r, r && r.stack ? r.stack.split("\\n").slice(0,6).join(" | ") : (r && r.message), JSON.stringify(r));
+        __capNote("UH-REASON", typeof r + " " + (r && r.stack ? r.stack.split("\\n").slice(0,6).join(" | ") : (r && r.message) || String(r)));
       } catch (e2) {}
     });
-  } catch (e) {}
-  try {
     window.addEventListener("error", function(e) {
       try {
-        console.error("[WINDOW-ERROR]", e && e.message, e && e.error && e.error.stack ? e.error.stack.split("\\n").slice(0,6).join(" | ") : "");
+        __capNote("WINDOW-ERROR", (e && e.message || "") + " " + (e && e.error && e.error.stack ? e.error.stack.split("\\n").slice(0,6).join(" | ") : ""));
       } catch (e2) {}
     });
   } catch (e) {}
@@ -776,21 +795,26 @@ function applyPolyfills(w) {
   }
 
   // happy-dom lacks alert/prompt/confirm/open/close (same stubs as
-  // solve-shim.js line ~559-561)
+  // solve-shim.js line ~559-561). enumerable matches real browsers (see
+  // extraGlobals note above).
   if (typeof w.alert !== "function") w.alert = () => {};
   if (typeof w.prompt !== "function") w.prompt = () => null;
   if (typeof w.confirm !== "function") w.confirm = () => false;
   if (typeof w.open !== "function") w.open = () => null;
   if (typeof w.close !== "function") w.close = () => {};
-  try { Object.defineProperty(w, "alert", { value: w.alert, configurable: true, writable: true }); } catch (_) {}
-  try { Object.defineProperty(w, "prompt", { value: w.prompt, configurable: true, writable: true }); } catch (_) {}
-  try { Object.defineProperty(w, "confirm", { value: w.confirm, configurable: true, writable: true }); } catch (_) {}
-  try { Object.defineProperty(w, "open", { value: w.open, configurable: true, writable: true }); } catch (_) {}
-  try { Object.defineProperty(w, "close", { value: w.close, configurable: true, writable: true }); } catch (_) {}
+  try { Object.defineProperty(w, "alert", { value: w.alert, enumerable: true, configurable: true, writable: true }); } catch (_) {}
+  try { Object.defineProperty(w, "prompt", { value: w.prompt, enumerable: true, configurable: true, writable: true }); } catch (_) {}
+  try { Object.defineProperty(w, "confirm", { value: w.confirm, enumerable: true, configurable: true, writable: true }); } catch (_) {}
+  try { Object.defineProperty(w, "open", { value: w.open, enumerable: true, configurable: true, writable: true }); } catch (_) {}
+  try { Object.defineProperty(w, "close", { value: w.close, enumerable: true, configurable: true, writable: true }); } catch (_) {}
 
   // happy-dom lacks browser globals that FeiLin / the pe risk engine probe.
   // A missing one throws ReferenceError inside the VM machine → breaks the
   // collection chain. Ported from solve-shim.js's stub list.
+  // v0.3.6.0: enumerable: true matches real browsers — in Chrome,
+  // getOwnPropertyDescriptor(window, "print") is
+  // {value: ƒ, writable: true, enumerable: true, configurable: true}; a
+  // non-enumerable window.print is itself a headless tell.
   const extraGlobals = {
     print: () => {},
     stop: () => {},
@@ -800,12 +824,12 @@ function applyPolyfills(w) {
     find: () => false,
   };
   for (const [k, v] of Object.entries(extraGlobals)) {
-    try { Object.defineProperty(w, k, { value: v, configurable: true, writable: true }); } catch (_) {}
+    try { Object.defineProperty(w, k, { value: v, enumerable: true, configurable: true, writable: true }); } catch (_) {}
   }
   // happy-dom's own open()/close() are destructive (close() tears the window
   // down); the risk engine probes them → neutralize.
-  try { Object.defineProperty(w, "open", { value: () => null, configurable: true, writable: true }); } catch (_) {}
-  try { Object.defineProperty(w, "close", { value: () => {}, configurable: true, writable: true }); } catch (_) {}
+  try { Object.defineProperty(w, "open", { value: () => null, enumerable: true, configurable: true, writable: true }); } catch (_) {}
+  try { Object.defineProperty(w, "close", { value: () => {}, enumerable: true, configurable: true, writable: true }); } catch (_) {}
 
   if (!w.Option) {
     w.Option = class {
@@ -1731,6 +1755,9 @@ async function createDom(region, prefix) {
     } catch (_) {}
   };
   w.eval(GUEST_EVAL_PATCH);
+  // v0.3.6.0: opt-in live printing of guest-realm errors (default: silent
+  // collection, surfaced only on solve failure — see solveTraceless).
+  w.__capGuestDebug = process.env.CAPTCHA_GUEST_DEBUG === "1";
 
   // Write the page HTML (loads the SDK script)
   w.document.write(HTML);
@@ -1782,8 +1809,33 @@ const EXTRA_WINDOW_PROPS = [
 // destroyDom() pulls `window` out from under a sibling mid-solve.
 let _aliasRefCount = 0;
 
+// v0.3.6.0: snapshot of the host globalThis descriptors taken by the FIRST
+// installer of an alias epoch (refcount 0 -> 1), restored when the last
+// window is destroyed. The old cleanup blindly deleted every aliased name —
+// which DELETED host globals that the happy-dom window also owns as own
+// props (setTimeout/setInterval/clearTimeout/clearInterval): after the last
+// solve's destroyDom, host-side `setTimeout(...)` threw
+// "setTimeout is not defined", breaking every server-side timer (SSE
+// heartbeat, retry backoff, graceful shutdown). Restoring the saved
+// descriptors also removes the __capWindowFor getter that previously leaked
+// (it kept the destroyed window alive forever).
+const _savedGlobalDescMap = new Map();
+
 function installGlobalWindowAlias(g, w) {
+  const firstInstaller = _aliasRefCount === 0;
   _aliasRefCount += 1;
+  // Record the pre-alias host descriptor once per epoch. Later installers
+  // run with aliases already present, so re-recording would capture window-1
+  // getters instead of the true host state.
+  const record = (prop) => {
+    if (firstInstaller && !_savedGlobalDescMap.has(prop)) {
+      try { _savedGlobalDescMap.set(prop, Object.getOwnPropertyDescriptor(g, prop)); } catch (_) {}
+    }
+  };
+  const gDefine = (prop, desc) => {
+    record(prop);
+    try { Object.defineProperty(g, prop, desc); } catch (_) {}
+  };
   const props = new Set(Object.getOwnPropertyNames(w));
   for (const name of EXTRA_WINDOW_PROPS) props.add(name);
   // also walk the prototype chain one level (BrowserWindow getters like
@@ -1793,58 +1845,60 @@ function installGlobalWindowAlias(g, w) {
     break;
   }
   for (const prop of props) {
-    if (HOST_CRITICAL_GLOBALS.has(prop)) continue;
-    try {
-      Object.defineProperty(g, prop, {
-        get() {
-          return w[prop];
-        },
-        set(v) {
-          try { w[prop] = v; } catch (_) {}
-        },
-        configurable: true,
-      });
-    } catch (_) {}
+    // v0.3.6.0: only protect host-critical names the host ACTUALLY defines.
+    // `print` was listed on the assumption Bun exposes a print() global — it
+    // does not (typeof print === "undefined" under Bun 1.3.14 on Linux and
+    // Windows), so FeiLin's bare `print` references (it calls print() inside
+    // event listeners) threw "ReferenceError: print is not defined",
+    // aborting the listener mid-collection on every solve. When the host
+    // doesn't define the name, aliasing the window's (polyfilled) version is
+    // exactly what a real browser realm resolves.
+    if (HOST_CRITICAL_GLOBALS.has(prop)) {
+      record(prop);
+      if (_savedGlobalDescMap.get(prop) !== undefined) continue; // host-defined → protected
+    }
+    gDefine(prop, {
+      get() {
+        return w[prop];
+      },
+      set(v) {
+        try { w[prop] = v; } catch (_) {}
+      },
+      configurable: true,
+    });
   }
   // w.window/self may not exist as own props on this happy-dom build
   for (const prop of ["window", "self", "top", "parent"]) {
-    try {
-      Object.defineProperty(g, prop, { get() { return w; }, configurable: true });
-    } catch (_) {}
+    gDefine(prop, { get() { return w; }, configurable: true });
   }
   // Guest timers must live on the window's timer registry (destroyed with
   // the window). The host's setTimeout would let pe-VM callbacks fire after
   // destroyDom, when the `window` alias is gone ("window is not defined").
   for (const prop of ["setTimeout", "setInterval", "clearTimeout", "clearInterval"]) {
-    try {
-      Object.defineProperty(g, prop, {
-        get() { return w[prop]?.bind(w); },
-        configurable: true,
-      });
-    } catch (_) {}
+    gDefine(prop, {
+      get() { return w[prop]?.bind(w); },
+      configurable: true,
+    });
   }
   // Dynamic catch-all: guest code occasionally references window methods that
   // only exist on the prototype (moveBy, scrollTo, ...) or lands mid-solve on
   // new props. Proxy fallback for any still-missing global property.
-  try {
-    Object.defineProperty(g, "__capWindowFor", {
-      get() { return w; },
-      configurable: true,
-    });
-  } catch (_) {}
+  gDefine("__capWindowFor", { get() { return w; }, configurable: true });
 }
 function removeGlobalWindowAlias(g, w) {
   _aliasRefCount -= 1;
   if (_aliasRefCount > 0) return;
-  for (const name of Object.getOwnPropertyNames(w)) {
+  // Restore the pre-epoch host descriptors. Names the host did NOT define
+  // (print, window, self, __capWindowFor, ...) had undefined descriptors →
+  // delete them. Names it DID define (setTimeout, console, ...) get their
+  // original data descriptors back.
+  for (const [name, desc] of _savedGlobalDescMap) {
     try {
-      const d = Object.getOwnPropertyDescriptor(g, name);
-      if (d?.get) delete g[name];
+      if (desc) Object.defineProperty(g, name, desc);
+      else delete g[name];
     } catch (_) {}
   }
-  for (const prop of ["window", "self", "top", "parent"]) {
-    try { delete g[prop]; } catch (_) {}
-  }
+  _savedGlobalDescMap.clear();
 }
 
 function destroyDom(win) {
@@ -2069,6 +2123,25 @@ async function solveTraceless(opts) {
       keepWindow = true;
     }
     return out;
+  } catch (err) {
+    // v0.3.6.0: attach the guest-realm error tail (collected silently by the
+    // GUEST_EVAL_PATCH hooks) to the failure — a failed solve becomes
+    // self-diagnosing while successful solves stay quiet. Read BEFORE the
+    // finally-block destroys the window.
+    let out = err;
+    try {
+      const guestErrs = w.__capGuestErrors;
+      if (Array.isArray(guestErrs) && guestErrs.length > 0) {
+        const tail = guestErrs.slice(-6).map((s) => String(s).slice(0, 160)).join(" ;; ");
+        const suffix = ` | guestErrors[${guestErrs.length}]: ${tail}`.slice(0, 1200);
+        if (err instanceof Error) {
+          err.message += suffix;
+        } else {
+          out = new Error(String(err) + suffix);
+        }
+      }
+    } catch (_) {}
+    throw out;
   } finally {
     // Reuse mode: on success the window stays pooled (keepWindow) for the next
     // solve — a ~48% CPU cut. On failure it is destroyed: a stalled window must
@@ -2080,4 +2153,4 @@ async function solveTraceless(opts) {
   }
 }
 
-export { solveTraceless, createDom, destroyDom };
+export { solveTraceless, createDom, destroyDom, installGlobalWindowAlias, removeGlobalWindowAlias, GUEST_EVAL_PATCH };
