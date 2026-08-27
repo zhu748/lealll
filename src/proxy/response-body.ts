@@ -1,4 +1,9 @@
 import { normalizeTimerMs } from "./retry.js";
+// v0.3.7.1: host-captured timers — these guards/loops run per-request,
+// often concurrent with captcha solve epochs; the bare globals resolve
+// through the solver window alias there and get cancelled on window
+// destruction (the 429-retry permanent hang). See utils/host-timers.ts.
+import { hostClearTimeout, hostSetTimeout } from "../utils/host-timers.js";
 
 export class ResponseBodyTooLargeError extends Error {
   constructor(label: string, maxBytes: number, actualBytes: number) {
@@ -146,11 +151,11 @@ export async function readResponseTextPreview(
       const result = await Promise.race([
         reader.read(),
         new Promise<"timeout">(resolve => {
-          timeoutTimer = setTimeout(() => resolve("timeout"), remainingMs);
+          timeoutTimer = hostSetTimeout(() => resolve("timeout"), remainingMs);
         }),
       ]).finally(() => {
         if (timeoutTimer) {
-          clearTimeout(timeoutTimer);
+          hostClearTimeout(timeoutTimer);
           timeoutTimer = null;
         }
       });
@@ -197,7 +202,7 @@ export function wrapResponseBodyWithUpstreamTimeout(
   timeoutMs: number,
 ): Response {
   if (!resp.body) {
-    clearTimeout(timer);
+    hostClearTimeout(timer);
     return resp;
   }
 
@@ -210,7 +215,7 @@ export function wrapResponseBodyWithUpstreamTimeout(
   const cleanup = (releaseReader = true): void => {
     if (finished) return;
     finished = true;
-    clearTimeout(timer);
+    hostClearTimeout(timer);
     ctrl.signal.removeEventListener("abort", onAbort);
     if (releaseReader) {
       try { reader.releaseLock(); } catch {}

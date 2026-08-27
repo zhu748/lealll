@@ -24,6 +24,10 @@ import { createServer as createNodeHttpServer } from "node:http";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { parse, stringify } from "yaml";
+// v0.3.7.1: host-captured timers — boot-failure pause, Android exit and
+// graceful-shutdown races must not resolve through the captcha solver's
+// window alias during solve epochs. See utils/host-timers.ts.
+import { hostSetTimeout } from "./utils/host-timers.js";
 
 const LOG_LEVEL_ORDER: Record<string, number> = { debug: 0, info: 1, warn: 2, error: 3 };
 
@@ -182,7 +186,7 @@ async function fatalError(err: unknown): Promise<void> {
   // Give the user time to read the message before the window disappears.
   // 15s is long enough to read but short enough to not feel stuck when run
   // from an interactive terminal.
-  await new Promise(r => setTimeout(r, 15_000));
+  await new Promise(r => hostSetTimeout(r, 15_000));
   process.exit(1);
 }
 
@@ -350,7 +354,7 @@ async function runAndroid(): Promise<void> {
       // itself keeps the event loop alive, so an immediate return here
       // would leave the process running forever — the Kotlin shell also
       // destroy()s the process, this makes shutdown self-contained).
-      setTimeout(() => process.exit(0), 250).unref?.();
+      hostSetTimeout(() => process.exit(0), 250).unref?.();
     },
   });
 
@@ -705,7 +709,7 @@ async function serve(configPath?: string): Promise<void> {
     };
     Promise.race([
       stopAndFlushLogs(),
-      new Promise<void>(r => setTimeout(r, 30_000)),
+      new Promise<void>(r => hostSetTimeout(r, 30_000)),
     ]).finally(() => process.exit(0));
   };
   process.on("SIGINT", () => shutdown("SIGINT"));

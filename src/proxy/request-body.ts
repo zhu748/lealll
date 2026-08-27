@@ -1,5 +1,10 @@
 import { normalizeTimerMs } from "./retry.js";
 import { parseContentLength } from "./response-body.js";
+// v0.3.7.1: host-captured timers — these guards/loops run per-request,
+// often concurrent with captcha solve epochs; the bare globals resolve
+// through the solver window alias there and get cancelled on window
+// destruction (the 429-retry permanent hang). See utils/host-timers.ts.
+import { hostClearTimeout, hostSetTimeout } from "../utils/host-timers.js";
 
 export const DEFAULT_MAX_REQUEST_BODY_BYTES = 64 * 1024 * 1024;
 const DEFAULT_REQUEST_BODY_IDLE_TIMEOUT_MS = 30_000;
@@ -35,12 +40,12 @@ async function readRequestBodyChunk(
   const result = await Promise.race([
     reader.read(),
     new Promise<"timeout">(resolve => {
-      timer = setTimeout(() => resolve("timeout"), timeout);
+      timer = hostSetTimeout(() => resolve("timeout"), timeout);
       timer.unref?.();
     }),
   ]).finally(() => {
     if (timer) {
-      clearTimeout(timer);
+      hostClearTimeout(timer);
       timer = null;
     }
   });

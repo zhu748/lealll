@@ -1,6 +1,11 @@
 import type { Credential, PlanId } from "./types.js";
 import type { ProviderId } from "../provider/types.js";
 import type { FetchFn } from "./oauth.js";
+// v0.3.7.1: host-captured timers — auth flows (credential rotation
+// during retries, OAuth, quota probes) run concurrent with captcha solve
+// epochs; bare globals resolve through the solver window alias there and are
+// cancelled on window destruction. See utils/host-timers.ts.
+import { hostSetTimeout, hostClearTimeout } from "../utils/host-timers.js";
 
 const ZAI_API_KEY_NAME = "zcode-api-key";
 const DEFAULT_ORG_MARKER = "\u9ED8\u8BA4\u673A\u6784"; // 默认机构
@@ -69,12 +74,12 @@ async function readChunkWithTimeout(
   const result = await Promise.race([
     reader.read(),
     new Promise<"timeout">(resolve => {
-      timer = setTimeout(() => resolve("timeout"), timeout);
+      timer = hostSetTimeout(() => resolve("timeout"), timeout);
       timer.unref?.();
     }),
   ]).finally(() => {
     if (timer) {
-      clearTimeout(timer);
+      hostClearTimeout(timer);
       timer = null;
     }
   });
@@ -104,7 +109,7 @@ async function fetchWithTimeout(
     if (upstreamSignal.aborted) onUpstreamAbort();
     else upstreamSignal.addEventListener("abort", onUpstreamAbort, { once: true });
   }
-  const timer = setTimeout(() => ctrl.abort(), timeout);
+  const timer = hostSetTimeout(() => ctrl.abort(), timeout);
   timer.unref?.();
   try {
     return await fetchImpl(input, { ...init, signal: ctrl.signal });
@@ -114,7 +119,7 @@ async function fetchWithTimeout(
     }
     throw err;
   } finally {
-    clearTimeout(timer);
+    hostClearTimeout(timer);
     if (upstreamSignal) upstreamSignal.removeEventListener("abort", onUpstreamAbort);
   }
 }

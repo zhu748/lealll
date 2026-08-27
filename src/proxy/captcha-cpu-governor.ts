@@ -1,5 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
+// v0.3.7.1: host-captured timers — immune to the captcha window alias.
+import { hostSetInterval, hostClearInterval } from "../utils/host-timers.js";
 
 export type CpuGovernorConfig = {
   /** Host CPU ceiling — 100 = all vCPUs saturated (0 disables governor). */
@@ -72,12 +74,15 @@ export class CaptchaCpuGovernor {
   start(): void {
     if (!this.enabled || this.timer) return;
     void this.tick();
-    this.timer = setInterval(() => void this.tick(), this.cfg.intervalMs);
+    // v0.3.7.1: host-captured interval — start() can run mid-solve-epoch
+    // (pool reconfigure), when the bare global resolves through the captcha
+    // window alias and would be cancelled on window destruction.
+    this.timer = hostSetInterval(() => void this.tick(), this.cfg.intervalMs);
   }
 
   stop(): void {
     if (this.timer) {
-      clearInterval(this.timer);
+      hostClearInterval(this.timer);
       this.timer = null;
     }
   }

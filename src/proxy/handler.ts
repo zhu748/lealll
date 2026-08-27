@@ -101,6 +101,11 @@ import {
   type ResponseTextPreview,
   type ResponseTextPreviewOptions,
 } from "./response-body.js";
+// v0.3.7.1: host-captured timers — these guards/loops run per-request,
+// often concurrent with captcha solve epochs; the bare globals resolve
+// through the solver window alias there and get cancelled on window
+// destruction (the 429-retry permanent hang). See utils/host-timers.ts.
+import { hostClearTimeout, hostSetTimeout } from "../utils/host-timers.js";
 
 export { computeRetryDelayMs, parseRetryAfterMs } from "./retry.js";
 export { checkWafBlock } from "./waf.js";
@@ -768,7 +773,7 @@ export async function proxyRequest(
     // keep the listener count tiny.
     if (clientGone.signal.aborted) ctrl.abort();
     else clientGone.signal.addEventListener("abort", () => ctrl.abort(), { once: true });
-    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    const timer = hostSetTimeout(() => ctrl.abort(), timeoutMs);
     timer.unref?.();
     // Bun's native fetch accepts `{ proxy: "http://..." }` / `socks5://...`
     // Cast through `any` because the option is Bun-specific and not in the
@@ -859,7 +864,7 @@ export async function proxyRequest(
             send: sendOnce,
           });
         } catch (err) {
-          clearTimeout(timer);
+          hostClearTimeout(timer);
           if (clientGone.signal.aborted) {
             throw new Error("client disconnected before upstream response");
           }
@@ -872,7 +877,7 @@ export async function proxyRequest(
         resp = await fetchImpl(req, fetchOpts);
       }
     } catch (err) {
-      clearTimeout(timer);
+      hostClearTimeout(timer);
       // Distinguish abort (timeout / client-gone) from real network errors
       // so the error message surfaces the actual cause to the client.
       if (clientGone.signal.aborted) {

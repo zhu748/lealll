@@ -26,6 +26,11 @@ import { createServer, type Server, type IncomingMessage, type ServerResponse } 
 // IncomingMessage and ServerResponse are used by the CallbackServer class below.
 import type { Socket } from "node:net";
 import { randomBytes } from "node:crypto";
+// v0.3.7.1: host-captured timers — auth flows (credential rotation
+// during retries, OAuth, quota probes) run concurrent with captcha solve
+// epochs; bare globals resolve through the solver window alias there and are
+// cancelled on window destruction. See utils/host-timers.ts.
+import { hostSetTimeout, hostClearTimeout } from "../utils/host-timers.js";
 
 // ---------------------------------------------------------------------------
 // Constants (from ZCode bundle)
@@ -115,12 +120,12 @@ async function readChunkWithTimeout(
   const result = await Promise.race([
     reader.read(),
     new Promise<"timeout">(resolve => {
-      timer = setTimeout(() => resolve("timeout"), timeout);
+      timer = hostSetTimeout(() => resolve("timeout"), timeout);
       timer.unref?.();
     }),
   ]).finally(() => {
     if (timer) {
-      clearTimeout(timer);
+      hostClearTimeout(timer);
       timer = null;
     }
   });
@@ -191,7 +196,7 @@ async function fetchWithTimeout(
     if (upstreamSignal.aborted) onUpstreamAbort();
     else upstreamSignal.addEventListener("abort", onUpstreamAbort, { once: true });
   }
-  const timer = setTimeout(() => ctrl.abort(), timeout);
+  const timer = hostSetTimeout(() => ctrl.abort(), timeout);
   timer.unref?.();
   try {
     return await fetchImpl(input, { ...init, signal: ctrl.signal });
@@ -201,7 +206,7 @@ async function fetchWithTimeout(
     }
     throw err;
   } finally {
-    clearTimeout(timer);
+    hostClearTimeout(timer);
     if (upstreamSignal) upstreamSignal.removeEventListener("abort", onUpstreamAbort);
   }
 }
@@ -340,7 +345,7 @@ class CallbackServer {
         }
       };
       const timeout = normalizeCallbackWaitTimeoutMs(timeoutMs);
-      const timer = setTimeout(() => {
+      const timer = hostSetTimeout(() => {
         if (settled) return;
         settled = true;
         cleanup();
@@ -350,7 +355,7 @@ class CallbackServer {
       waiter = (result) => {
         if (settled) return;
         settled = true;
-        clearTimeout(timer);
+        hostClearTimeout(timer);
         cleanup();
         if (result.error) reject(new Error(result.error));
         else resolve(result.code);
@@ -369,7 +374,7 @@ class CallbackServer {
       const finish = (err?: Error & { code?: string }) => {
         if (settled) return;
         settled = true;
-        if (timer) clearTimeout(timer);
+        if (timer) hostClearTimeout(timer);
         timer = null;
         if (err && err.code !== "ERR_SERVER_NOT_RUNNING") {
           forceClose();
@@ -386,7 +391,7 @@ class CallbackServer {
         try { (this.server as Server & { closeAllConnections?: () => void }).closeAllConnections?.(); } catch {}
         try { (this.server as Server & { closeIdleConnections?: () => void }).closeIdleConnections?.(); } catch {}
       };
-      timer = setTimeout(() => {
+      timer = hostSetTimeout(() => {
         forceClose();
         finish();
       }, CALLBACK_CLOSE_TIMEOUT_MS);

@@ -23,6 +23,19 @@ import os from "node:os";
 import path from "node:path";
 import { Worker } from "node:worker_threads";
 import { noteGuestError, peekGuestErrorNotes } from "./captcha-guest-rejections.js";
+// v0.3.7.1 (429-retry permanent hang): MUST be imported before any alias
+// install — this module-load ordering guarantees host-timers captures the
+// native host timer functions before installGlobalWindowAlias can shadow
+// the global names with the solving window's registry. All HOST-side timer
+// call sites in this file (waitFor, solve timeout guard, stall detector)
+// use these bindings; only guest-facing polyfills use the window's own
+// w.setTimeout explicitly.
+import {
+  hostSetTimeout,
+  hostSetInterval,
+  hostClearTimeout,
+  hostClearInterval,
+} from "../utils/host-timers.js";
 
 // ── Blocking fetch for sync XHR (self-contained builds) ────────────────────
 // happy-dom implements sync XHR by spawning `process.argv[0] -e <script>`,
@@ -938,8 +951,13 @@ function applyPolyfills(w) {
       interval = 16;
     };
 
-  w.requestIdleCallback = w.requestIdleCallback || ((cb) => setTimeout(() => cb({ didTimeout: false, timeRemaining: () => 10 }), 1));
-  w.cancelIdleCallback = w.cancelIdleCallback || ((id) => clearTimeout(id));
+  // v0.3.7.1: bind to THIS window's own registry (w.setTimeout), never the
+  // bare global — during solve epochs the bare name resolves through the
+  // alias to the LAST-installed window (a sibling!), whose destruction
+  // would cancel the callback. Window-bound is also the correct guest
+  // semantic: the callback dies with its window.
+  w.requestIdleCallback = w.requestIdleCallback || ((cb) => w.setTimeout(() => cb({ didTimeout: false, timeRemaining: () => 10 }), 1));
+  w.cancelIdleCallback = w.cancelIdleCallback || ((id) => w.clearTimeout(id));
 
   w.matchMedia =
     w.matchMedia ||
@@ -1230,8 +1248,8 @@ function applyPolyfills(w) {
       }
     };
 
-  w.requestAnimationFrame = w.requestAnimationFrame || ((cb) => setTimeout(() => cb(Date.now()), 16));
-  w.cancelAnimationFrame = w.cancelAnimationFrame || ((id) => clearTimeout(id));
+  w.requestAnimationFrame = w.requestAnimationFrame || ((cb) => w.setTimeout(() => cb(Date.now()), 16));
+  w.cancelAnimationFrame = w.cancelAnimationFrame || ((id) => w.clearTimeout(id));
 
   try {
     Object.defineProperty(w.document, "hidden", { value: false, configurable: true });
@@ -1555,7 +1573,10 @@ function simulateBehavior(w, durationMs = 600) {
     i += 1;
     const done = Date.now() - start >= durationMs;
     if (i <= steps && !done) {
-      setTimeout(moveStep, 26 + Math.floor(Math.random() * 32));
+      // v0.3.7.1: window-bound stepping — the simulation must die with ITS
+      // window, not a sibling's registry (bare name resolves through the
+      // alias to the last-installed window during concurrent solves).
+      w.setTimeout(moveStep, 26 + Math.floor(Math.random() * 32));
     } else {
       fire("mousedown", MouseEvent, { clientX: Math.round(x), clientY: Math.round(y), button: 0, buttons: 1 });
       fire("mouseup", MouseEvent, { clientX: Math.round(x), clientY: Math.round(y), button: 0, buttons: 0 });
@@ -1569,18 +1590,22 @@ function simulateBehavior(w, durationMs = 600) {
 }
 
 function waitFor(cond, timeoutMs = 15_000, intervalMs = 40) {
+  // v0.3.7.1: HOST timers — this poll orchestrates a solve from the host
+  // side and must survive window destruction (the bare global resolves
+  // through the window alias during solve epochs; a window close cancels
+  // the poll interval, hanging waitFor forever).
   return new Promise((res, rej) => {
     const started = Date.now();
-    const timer = setInterval(() => {
+    const timer = hostSetInterval(() => {
       let ok = false;
       try {
         ok = cond();
       } catch (_) {}
       if (ok) {
-        clearInterval(timer);
+        hostClearInterval(timer);
         res();
       } else if (Date.now() - started > timeoutMs) {
-        clearInterval(timer);
+        hostClearInterval(timer);
         rej(new Error("timeout"));
       }
     }, intervalMs);
@@ -1834,6 +1859,14 @@ let _aliasRefCount = 0;
 const _savedGlobalDescMap = new Map();
 
 function installGlobalWindowAlias(g, w) {
+  // v0.3.7.1: self-heal a negative refcount (a double destroyDom drove it
+  // below zero once) — otherwise firstInstaller stays false with an EMPTY
+  // descriptor snapshot, the HOST_CRITICAL_GLOBALS check
+  // (`_savedGlobalDescMap.get(prop) !== undefined`) then fails open, and the
+  // install shadows console/process/fetch/crypto/performance with window
+  // getters — a server-wide catastrophe (every later console.log and fetch
+  // routed through a happy-dom window).
+  if (_aliasRefCount < 0) _aliasRefCount = 0;
   const firstInstaller = _aliasRefCount === 0;
   _aliasRefCount += 1;
   // Record the pre-alias host descriptor once per epoch. Later installers
@@ -1967,6 +2000,11 @@ function installGlobalWindowAlias(g, w) {
   }
 }
 function removeGlobalWindowAlias(g, w) {
+  // v0.3.7.1: clamp at zero. A double destroyDom for the same window (reuse
+  // path: solveTraceless finally + discardReusableWindow) used to drive the
+  // refcount negative; the next install then ran with an empty snapshot and
+  // shadowed host-critical globals (see the matching self-heal in install).
+  if (_aliasRefCount <= 0) return;
   _aliasRefCount -= 1;
   if (_aliasRefCount > 0) return;
   // Restore the pre-epoch host descriptors. Names the host did NOT define
@@ -2109,7 +2147,14 @@ async function solveTraceless(opts) {
     simulateBehavior(w, 600);
 
     const param = await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
+      // v0.3.7.1: HOST timers for both guards. These were previously bare
+      // `setTimeout`/`setInterval` calls made AFTER installGlobalWindowAlias
+      // — i.e. registered on the solving window's own registry — so
+      // `happyDOM.close()` in destroyDom CANCELLED the very guards that
+      // were supposed to bound the solve. A stalled solve then never
+      // settled, and the pool's take deadline (same bug) never fired
+      // either: the request hung forever (the 429-retry permanent hang).
+      const timer = hostSetTimeout(() => {
         const peUrl = (() => { try { return w.__lastPeUrl || "?"; } catch (_) { return "?"; } })();
         const reqs = _requestLog
           .filter((r) => r.at >= solveStart)
@@ -2125,7 +2170,7 @@ async function solveTraceless(opts) {
       // (seen across rotated pe.0xx versions) — abort early so the caller
       // can retry with a fresh InitCaptchaV3 (new pe version).
       const stallMs = opts.stallMs ?? Number(process.env.CAPTCHA_STALL_MS || 6_000);
-      const stallTimer = setInterval(() => {
+      const stallTimer = hostSetInterval(() => {
         const last = _requestLog[_requestLog.length - 1];
         if (last && Date.now() - last.at > stallMs) {
           const peUrl = (() => { try { return w.__lastPeUrl || "?"; } catch (_) { return "?"; } })();
@@ -2134,14 +2179,14 @@ async function solveTraceless(opts) {
             .filter((r) => r.at >= solveStart)
             .map((r) => `${(r.at - solveStart)}ms ${r.method} ${String(r.url).replace(/^https?:\/\//, "").slice(0, 60)}`)
             .slice(-12);
-          clearTimeout(timer);
-          clearInterval(stallTimer);
+          hostClearTimeout(timer);
+          hostClearInterval(stallTimer);
           reject(new Error(`captcha solve stall pe=${peUrl.split("/").pop() || peUrl} lastXhr=${(last.at - solveStart)}ms reqs=${JSON.stringify(reqs)}`));
         }
       }, 500);
       const finish = (fn) => (value) => {
-        clearTimeout(timer);
-        clearInterval(stallTimer);
+        hostClearTimeout(timer);
+        hostClearInterval(stallTimer);
         fn(value);
       };
       try {
@@ -2173,7 +2218,7 @@ async function solveTraceless(opts) {
           onError: (err) => finish(reject)(new Error(`onError: ${JSON.stringify(err)}`)),
         });
       } catch (err) {
-        clearTimeout(timer);
+        hostClearTimeout(timer);
         reject(err);
       }
     });

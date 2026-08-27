@@ -14,6 +14,11 @@
  */
 import { buildIdentityHeaders } from "./identity.js";
 import type { ProxyIdentity } from "../config/types.js";
+// v0.3.7.1: host-captured timers — these guards/loops run per-request,
+// often concurrent with captcha solve epochs; the bare globals resolve
+// through the solver window alias there and get cancelled on window
+// destruction (the 429-retry permanent hang). See utils/host-timers.ts.
+import { hostClearTimeout, hostSetTimeout } from "../utils/host-timers.js";
 
 const DEFAULT_ORIGIN = "https://zcode.z.ai";
 const CONFIG_PATH = "/api/v1/agent/configs";
@@ -150,7 +155,7 @@ export class EndpointRoutingService {
     if (key) headers["x-api-key"] = key;
 
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.requestTimeoutMs);
+    const timer = hostSetTimeout(() => controller.abort(), this.requestTimeoutMs);
     try {
       const resp = await this.fetchImpl(this.configUrl, {
         method: "GET",
@@ -184,7 +189,7 @@ export class EndpointRoutingService {
     } catch {
       this.retryAfter = this.now() + this.failureCooldownMs;
     } finally {
-      clearTimeout(timer);
+      hostClearTimeout(timer);
     }
   }
 }

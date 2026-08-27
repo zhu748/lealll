@@ -18,6 +18,11 @@
 import type { UpstreamHeaderPair } from "./upstream.js";
 import { buildIdentityHeaders } from "./identity.js";
 import type { ProxyIdentity } from "../config/types.js";
+// v0.3.7.1: host-captured timers — these guards/loops run per-request,
+// often concurrent with captcha solve epochs; the bare globals resolve
+// through the solver window alias there and get cancelled on window
+// destruction (the 429-retry permanent hang). See utils/host-timers.ts.
+import { hostClearTimeout, hostSetTimeout } from "../utils/host-timers.js";
 
 const DEFAULT_ORIGIN = "https://zcode.z.ai";
 const GATE_PATH = "/api/v1/agent/configs";
@@ -454,7 +459,7 @@ export class ClientSigningManager {
         .filter(([name]) => name !== "X-ZCode-Agent" && name !== "X-Device-Mid"),
     );
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), GATE_TIMEOUT_MS);
+    const timer = hostSetTimeout(() => controller.abort(), GATE_TIMEOUT_MS);
     try {
       const resp = await this.fetchImpl(this.gateUrl, {
         method: "GET",
@@ -470,7 +475,7 @@ export class ClientSigningManager {
       const signature = data.codingPlanSignature as Record<string, unknown> | undefined;
       return signature?.enable === true ? "enabled" : "disabled";
     } finally {
-      clearTimeout(timer);
+      hostClearTimeout(timer);
     }
   }
 
@@ -505,7 +510,7 @@ export class ClientSigningManager {
     );
 
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), HANDSHAKE_TIMEOUT_MS);
+    const timer = hostSetTimeout(() => controller.abort(), HANDSHAKE_TIMEOUT_MS);
     try {
       const resp = await this.fetchImpl(`${origin}${HANDSHAKE_PATH}`, {
         method: "POST",
@@ -522,7 +527,7 @@ export class ClientSigningManager {
       if (typeof cipher !== "string" || !cipher) throw new Error("handshake_omitted_privateCipher");
       return await decryptSigningPrivateKey(parsedCred.apiKeyId, parsedCred.apiKeySecret, cipher);
     } finally {
-      clearTimeout(timer);
+      hostClearTimeout(timer);
     }
   }
 

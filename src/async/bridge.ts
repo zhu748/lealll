@@ -23,6 +23,10 @@ import { isTicketExpired, isTicketReady } from "./types.js";
 import { keepaliveFrame } from "./keepalive.js";
 import { buildIdentityHeaders } from "../proxy/identity.js";
 import type { ProxyIdentity } from "../config/types.js";
+// v0.3.7.1: host-captured timers — runs concurrent with captcha
+// solve epochs; bare globals resolve through the solver window alias there
+// and get cancelled on window destruction. See utils/host-timers.js.
+import { hostClearInterval, hostClearTimeout, hostSetInterval, hostSetTimeout } from "../utils/host-timers.js";
 
 const EXPIRED_MARKER = "off-peak-ticket-expired";
 
@@ -175,11 +179,11 @@ export function runAsyncBridge(opts: BridgeOptions): { stream: ReadableStream<Ui
       let keepAliveTimer: ReturnType<typeof setInterval> | undefined;
       function startKeepalive(): void {
         if (keepAliveTimer) return;
-        keepAliveTimer = setInterval(() => emitKeepalive(controller), opts.keepAliveIntervalMs);
+        keepAliveTimer = hostSetInterval(() => emitKeepalive(controller), opts.keepAliveIntervalMs);
       }
       function stopKeepalive(): void {
         if (keepAliveTimer) {
-          clearInterval(keepAliveTimer);
+          hostClearInterval(keepAliveTimer);
           keepAliveTimer = undefined;
         }
       }
@@ -466,12 +470,12 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
       resolve();
       return;
     }
-    const t = setTimeout(() => {
+    const t = hostSetTimeout(() => {
       signal?.removeEventListener("abort", onAbort);
       resolve();
     }, ms);
     const onAbort = (): void => {
-      clearTimeout(t);
+      hostClearTimeout(t);
       resolve();
     };
     signal?.addEventListener("abort", onAbort, { once: true });

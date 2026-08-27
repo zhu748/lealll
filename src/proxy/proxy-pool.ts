@@ -51,6 +51,11 @@ import { validateProxyUrl } from "../auth/store.js";
 import { PROXY_POOL as PROXY_POOL_CONST } from "../utils/constants.js";
 import { runtimeLog, runtimeWarn } from "../utils/log.js";
 import { wrapFetchWithSocksBridge } from "./proxied-fetch.js";
+// v0.3.7.1: host-captured timers — these guards/loops run per-request,
+// often concurrent with captcha solve epochs; the bare globals resolve
+// through the solver window alias there and get cancelled on window
+// destruction (the 429-retry permanent hang). See utils/host-timers.ts.
+import { hostClearInterval, hostClearTimeout, hostSetInterval, hostSetTimeout } from "../utils/host-timers.js";
 
 // --------------------------------------------------------------------
 // Types
@@ -417,12 +422,12 @@ async function readSourceChunkWithTimeout(
   const result = await Promise.race([
     reader.read(),
     new Promise<"timeout">(resolve => {
-      timer = setTimeout(() => resolve("timeout"), timeout);
+      timer = hostSetTimeout(() => resolve("timeout"), timeout);
       timer.unref?.();
     }),
   ]).finally(() => {
     if (timer) {
-      clearTimeout(timer);
+      hostClearTimeout(timer);
       timer = null;
     }
   });
@@ -609,9 +614,9 @@ function scheduleFailureFlush(): void {
   if (failureFlushScheduled) return;
   failureFlushScheduled = true;
   if (failureFlushTimer) {
-    try { clearTimeout(failureFlushTimer); } catch {}
+    try { hostClearTimeout(failureFlushTimer); } catch {}
   }
-  failureFlushTimer = setTimeout(() => {
+  failureFlushTimer = hostSetTimeout(() => {
     failureFlushScheduled = false;
     failureFlushTimer = null;
     // Fire-and-forget — caller doesn't wait for disk write.
@@ -1007,7 +1012,7 @@ export async function importFromUrl(
   let text: string;
   try {
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), PROXY_POOL_CONST.SOURCE_FETCH_TIMEOUT_MS);
+    const timer = hostSetTimeout(() => ctrl.abort(), PROXY_POOL_CONST.SOURCE_FETCH_TIMEOUT_MS);
     timer.unref?.();
     try {
       const resp = await fetchImpl(source.url, {
@@ -1020,7 +1025,7 @@ export async function importFromUrl(
       }
       text = await readProxySourceText(resp);
     } finally {
-      clearTimeout(timer);
+      hostClearTimeout(timer);
     }
   } catch (e) {
     return { added: 0, removed: 0, total: 0, fetched: 0, error: truncateProxyPoolError((e as Error).message) };
@@ -1143,7 +1148,7 @@ async function refreshFromSourcesInner(
     async (srcUrl) => {
       try {
         const ctrl = new AbortController();
-        const timer = setTimeout(() => ctrl.abort(), PROXY_POOL_CONST.SOURCE_FETCH_TIMEOUT_MS);
+        const timer = hostSetTimeout(() => ctrl.abort(), PROXY_POOL_CONST.SOURCE_FETCH_TIMEOUT_MS);
         timer.unref?.();
         try {
           const resp = await fetchImpl(srcUrl, {
@@ -1157,7 +1162,7 @@ async function refreshFromSourcesInner(
           const text = await readProxySourceText(resp);
           return { srcUrl, text, error: null as string | null };
         } finally {
-          clearTimeout(timer);
+          hostClearTimeout(timer);
         }
       } catch (e) {
         return { srcUrl, text: null, error: truncateProxyPoolError((e as Error).message) };
@@ -1567,7 +1572,7 @@ export async function markProxyFailed(url: string): Promise<void> {
  */
 export function scheduleAutoRefresh(config?: ProxyPoolConfig): void {
   if (refreshTimer) {
-    clearInterval(refreshTimer);
+    hostClearInterval(refreshTimer);
     refreshTimer = null;
   }
   const rawConfig = config ?? cachedPool?.config;
@@ -1575,7 +1580,7 @@ export function scheduleAutoRefresh(config?: ProxyPoolConfig): void {
   const cfg = normalizeProxyPoolConfig(rawConfig);
   if (!cfg.enabled || cfg.refreshIntervalMin <= 0 || cfg.sourceUrls.length === 0) return;
   const intervalMs = Math.max(1, cfg.refreshIntervalMin) * 60_000;
-  refreshTimer = setInterval(() => {
+  refreshTimer = hostSetInterval(() => {
     // Fire-and-forget, but don't allow slow source URLs to stack overlapping
     // refresh jobs. With several 30s timeout sources and a short interval,
     // overlapping jobs create needless network load and pool-file churn.
@@ -1675,7 +1680,7 @@ export function resolveTestJobResultTtlMs(raw = process.env.ZCODE_PROXY_POOL_TES
 
 function clearTestJobCleanupTimer(): void {
   if (!currentTestJobCleanupTimer) return;
-  try { clearTimeout(currentTestJobCleanupTimer); } catch {}
+  try { hostClearTimeout(currentTestJobCleanupTimer); } catch {}
   currentTestJobCleanupTimer = null;
 }
 
@@ -1708,7 +1713,7 @@ function scheduleCompletedTestJobCleanup(job: TestJobState): void {
     return;
   }
   const delay = Math.max(0, job.finishedAt + ttlMs - Date.now());
-  currentTestJobCleanupTimer = setTimeout(() => {
+  currentTestJobCleanupTimer = hostSetTimeout(() => {
     if (currentTestJob === job) pruneExpiredTestJob();
   }, delay);
   if (typeof currentTestJobCleanupTimer.unref === "function") {
@@ -1861,7 +1866,7 @@ async function runTestJob(
       const target = testTargetOverride ?? "https://api.z.ai";
       const started = Date.now();
       const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 10_000);
+      const timer = hostSetTimeout(() => ctrl.abort(), 10_000);
       if (typeof timer.unref === "function") timer.unref();
       const onJobAbort = () => ctrl.abort();
       if (jobSignal) {
@@ -1895,7 +1900,7 @@ async function runTestJob(
         job.failCount++;
         failedProxies.push(p);
       } finally {
-        clearTimeout(timer);
+        hostClearTimeout(timer);
         if (jobSignal) jobSignal.removeEventListener("abort", onJobAbort);
         job.tested++;
       }
@@ -1941,14 +1946,14 @@ export function _resetForTesting(): void {
   cachedSize = -1;
   lastMtimeCheckAt = 0;
   if (refreshTimer) {
-    clearInterval(refreshTimer);
+    hostClearInterval(refreshTimer);
     refreshTimer = null;
   }
   autoRefreshInFlight = false;
   refreshSourcesInFlight = null;
   clearTestJobCleanupTimer();
   if (failureFlushTimer) {
-    clearTimeout(failureFlushTimer);
+    hostClearTimeout(failureFlushTimer);
     failureFlushTimer = null;
   }
   failureFlushScheduled = false;
@@ -1970,7 +1975,7 @@ export function _testJobResultOrderLengthForTesting(): number {
 /** @internal Flush debounced failure counters immediately (for tests). */
 export async function _flushFailureCountersForTesting(): Promise<void> {
   if (failureFlushTimer) {
-    clearTimeout(failureFlushTimer);
+    hostClearTimeout(failureFlushTimer);
     failureFlushTimer = null;
   }
   failureFlushScheduled = false;

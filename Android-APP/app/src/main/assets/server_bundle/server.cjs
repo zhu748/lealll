@@ -107177,11 +107177,54 @@ ${captureLines}` : capture.stack;
   }
 });
 
+// src/utils/host-timers.ts
+function resolveBinding(name2) {
+  let desc;
+  try {
+    desc = Object.getOwnPropertyDescriptor(globalThis, name2);
+  } catch {
+    desc = void 0;
+  }
+  if (desc && desc.get) return NATIVE[name2];
+  if (desc && desc.writable) {
+    const current = globalThis[name2];
+    if (typeof current === "function") return current;
+  }
+  return NATIVE[name2];
+}
+function hostSetTimeout(handler, timeout, ...rest) {
+  return resolveBinding("setTimeout")(handler, timeout, ...rest);
+}
+function hostSetInterval(handler, timeout, ...rest) {
+  return resolveBinding("setInterval")(handler, timeout, ...rest);
+}
+function hostClearTimeout(id2) {
+  resolveBinding("clearTimeout")(id2);
+}
+function hostClearInterval(id2) {
+  resolveBinding("clearInterval")(id2);
+}
+var NATIVE;
+var init_host_timers = __esm({
+  "src/utils/host-timers.ts"() {
+    "use strict";
+    NATIVE = {
+      setTimeout,
+      setInterval,
+      clearTimeout,
+      clearInterval
+    };
+  }
+});
+
 // src/proxy/captcha-happy.ts
 var captcha_happy_exports = {};
 __export(captcha_happy_exports, {
+  GUEST_EVAL_PATCH: () => GUEST_EVAL_PATCH,
   createDom: () => createDom,
   destroyDom: () => destroyDom,
+  installGlobalWindowAlias: () => installGlobalWindowAlias,
+  removeGlobalWindowAlias: () => removeGlobalWindowAlias,
   solveTraceless: () => solveTraceless
 });
 function ensureSyncFetchWorker() {
@@ -107742,23 +107785,23 @@ function applyPolyfills(w2) {
   if (typeof w2.close !== "function") w2.close = () => {
   };
   try {
-    Object.defineProperty(w2, "alert", { value: w2.alert, configurable: true, writable: true });
+    Object.defineProperty(w2, "alert", { value: w2.alert, enumerable: true, configurable: true, writable: true });
   } catch (_) {
   }
   try {
-    Object.defineProperty(w2, "prompt", { value: w2.prompt, configurable: true, writable: true });
+    Object.defineProperty(w2, "prompt", { value: w2.prompt, enumerable: true, configurable: true, writable: true });
   } catch (_) {
   }
   try {
-    Object.defineProperty(w2, "confirm", { value: w2.confirm, configurable: true, writable: true });
+    Object.defineProperty(w2, "confirm", { value: w2.confirm, enumerable: true, configurable: true, writable: true });
   } catch (_) {
   }
   try {
-    Object.defineProperty(w2, "open", { value: w2.open, configurable: true, writable: true });
+    Object.defineProperty(w2, "open", { value: w2.open, enumerable: true, configurable: true, writable: true });
   } catch (_) {
   }
   try {
-    Object.defineProperty(w2, "close", { value: w2.close, configurable: true, writable: true });
+    Object.defineProperty(w2, "close", { value: w2.close, enumerable: true, configurable: true, writable: true });
   } catch (_) {
   }
   const extraGlobals = {
@@ -107775,17 +107818,17 @@ function applyPolyfills(w2) {
   };
   for (const [k, v] of Object.entries(extraGlobals)) {
     try {
-      Object.defineProperty(w2, k, { value: v, configurable: true, writable: true });
+      Object.defineProperty(w2, k, { value: v, enumerable: true, configurable: true, writable: true });
     } catch (_) {
     }
   }
   try {
-    Object.defineProperty(w2, "open", { value: () => null, configurable: true, writable: true });
+    Object.defineProperty(w2, "open", { value: () => null, enumerable: true, configurable: true, writable: true });
   } catch (_) {
   }
   try {
     Object.defineProperty(w2, "close", { value: () => {
-    }, configurable: true, writable: true });
+    }, enumerable: true, configurable: true, writable: true });
   } catch (_) {
   }
   if (!w2.Option) {
@@ -107899,8 +107942,8 @@ function applyPolyfills(w2) {
     rotationRate = null;
     interval = 16;
   };
-  w2.requestIdleCallback = w2.requestIdleCallback || ((cb) => setTimeout(() => cb({ didTimeout: false, timeRemaining: () => 10 }), 1));
-  w2.cancelIdleCallback = w2.cancelIdleCallback || ((id2) => clearTimeout(id2));
+  w2.requestIdleCallback = w2.requestIdleCallback || ((cb) => w2.setTimeout(() => cb({ didTimeout: false, timeRemaining: () => 10 }), 1));
+  w2.cancelIdleCallback = w2.cancelIdleCallback || ((id2) => w2.clearTimeout(id2));
   w2.matchMedia = w2.matchMedia || (() => ({
     matches: false,
     media: "",
@@ -108247,8 +108290,8 @@ function applyPolyfills(w2) {
       });
     }
   };
-  w2.requestAnimationFrame = w2.requestAnimationFrame || ((cb) => setTimeout(() => cb(Date.now()), 16));
-  w2.cancelAnimationFrame = w2.cancelAnimationFrame || ((id2) => clearTimeout(id2));
+  w2.requestAnimationFrame = w2.requestAnimationFrame || ((cb) => w2.setTimeout(() => cb(Date.now()), 16));
+  w2.cancelAnimationFrame = w2.cancelAnimationFrame || ((id2) => w2.clearTimeout(id2));
   try {
     Object.defineProperty(w2.document, "hidden", { value: false, configurable: true });
     Object.defineProperty(w2.document, "visibilityState", {
@@ -108594,7 +108637,7 @@ function simulateBehavior(w2, durationMs = 600) {
     i += 1;
     const done = Date.now() - start2 >= durationMs;
     if (i <= steps && !done) {
-      setTimeout(moveStep, 26 + Math.floor(Math.random() * 32));
+      w2.setTimeout(moveStep, 26 + Math.floor(Math.random() * 32));
     } else {
       fire("mousedown", MouseEvent2, { clientX: Math.round(x3), clientY: Math.round(y3), button: 0, buttons: 1 });
       fire("mouseup", MouseEvent2, { clientX: Math.round(x3), clientY: Math.round(y3), button: 0, buttons: 0 });
@@ -108610,17 +108653,17 @@ function simulateBehavior(w2, durationMs = 600) {
 function waitFor(cond, timeoutMs = 15e3, intervalMs = 40) {
   return new Promise((res, rej) => {
     const started = Date.now();
-    const timer = setInterval(() => {
+    const timer = hostSetInterval(() => {
       let ok = false;
       try {
         ok = cond();
       } catch (_) {
       }
       if (ok) {
-        clearInterval(timer);
+        hostClearInterval(timer);
         res();
       } else if (Date.now() - started > timeoutMs) {
-        clearInterval(timer);
+        hostClearInterval(timer);
         rej(new Error("timeout"));
       }
     }, intervalMs);
@@ -108793,12 +108836,30 @@ async function createDom(region, prefix2) {
     }
   };
   w2.eval(GUEST_EVAL_PATCH);
+  w2.__capGuestDebug = process.env.CAPTCHA_GUEST_DEBUG === "1";
   w2.document.write(HTML);
   w2.AliyunCaptchaConfig = { region, prefix: prefix2 };
   return { window: w2, browserFrame };
 }
 function installGlobalWindowAlias(g, w2) {
+  if (_aliasRefCount < 0) _aliasRefCount = 0;
+  const firstInstaller = _aliasRefCount === 0;
   _aliasRefCount += 1;
+  const record = (prop) => {
+    if (firstInstaller && !_savedGlobalDescMap.has(prop)) {
+      try {
+        _savedGlobalDescMap.set(prop, Object.getOwnPropertyDescriptor(g, prop));
+      } catch (_) {
+      }
+    }
+  };
+  const gDefine = (prop, desc) => {
+    record(prop);
+    try {
+      Object.defineProperty(g, prop, desc);
+    } catch (_) {
+    }
+  };
   const props = new Set(Object.getOwnPropertyNames(w2));
   for (const name2 of EXTRA_WINDOW_PROPS) props.add(name2);
   for (const proto = Object.getPrototypeOf(w2); proto && proto !== Object.prototype; ) {
@@ -108806,68 +108867,52 @@ function installGlobalWindowAlias(g, w2) {
     break;
   }
   for (const prop of props) {
-    if (HOST_CRITICAL_GLOBALS.has(prop)) continue;
-    try {
-      Object.defineProperty(g, prop, {
-        get() {
-          return w2[prop];
-        },
-        set(v) {
-          try {
-            w2[prop] = v;
-          } catch (_) {
-          }
-        },
-        configurable: true
-      });
-    } catch (_) {
+    if (HOST_CRITICAL_GLOBALS.has(prop)) {
+      record(prop);
+      if (_savedGlobalDescMap.get(prop) !== void 0) continue;
     }
-  }
-  for (const prop of ["window", "self", "top", "parent"]) {
-    try {
-      Object.defineProperty(g, prop, { get() {
-        return w2;
-      }, configurable: true });
-    } catch (_) {
-    }
-  }
-  for (const prop of ["setTimeout", "setInterval", "clearTimeout", "clearInterval"]) {
-    try {
-      Object.defineProperty(g, prop, {
-        get() {
-          return w2[prop]?.bind(w2);
-        },
-        configurable: true
-      });
-    } catch (_) {
-    }
-  }
-  try {
-    Object.defineProperty(g, "__capWindowFor", {
+    gDefine(prop, {
       get() {
-        return w2;
+        return w2[prop];
+      },
+      set(v) {
+        try {
+          w2[prop] = v;
+        } catch (_) {
+        }
       },
       configurable: true
     });
-  } catch (_) {
-  }
-}
-function removeGlobalWindowAlias(g, w2) {
-  _aliasRefCount -= 1;
-  if (_aliasRefCount > 0) return;
-  for (const name2 of Object.getOwnPropertyNames(w2)) {
-    try {
-      const d = Object.getOwnPropertyDescriptor(g, name2);
-      if (d?.get) delete g[name2];
-    } catch (_) {
-    }
   }
   for (const prop of ["window", "self", "top", "parent"]) {
+    gDefine(prop, { get() {
+      return w2;
+    }, configurable: true });
+  }
+  for (const prop of ["setTimeout", "setInterval", "clearTimeout", "clearInterval"]) {
+    gDefine(prop, {
+      get() {
+        return w2[prop]?.bind(w2);
+      },
+      configurable: true
+    });
+  }
+  gDefine("__capWindowFor", { get() {
+    return w2;
+  }, configurable: true });
+}
+function removeGlobalWindowAlias(g, w2) {
+  if (_aliasRefCount <= 0) return;
+  _aliasRefCount -= 1;
+  if (_aliasRefCount > 0) return;
+  for (const [name2, desc] of _savedGlobalDescMap) {
     try {
-      delete g[prop];
+      if (desc) Object.defineProperty(g, name2, desc);
+      else delete g[name2];
     } catch (_) {
     }
   }
+  _savedGlobalDescMap.clear();
 }
 function destroyDom(win) {
   try {
@@ -108986,7 +109031,7 @@ async function solveTraceless(opts) {
     await waitFor(() => typeof w2.initAliyunCaptcha === "function", timeoutMs, 50);
     simulateBehavior(w2, 600);
     const param = await new Promise((resolve2, reject) => {
-      const timer = setTimeout(() => {
+      const timer = hostSetTimeout(() => {
         const peUrl = (() => {
           try {
             return w2.__lastPeUrl || "?";
@@ -108998,7 +109043,7 @@ async function solveTraceless(opts) {
         reject(new Error(`captcha solve timeout pe=${peUrl.split("/").pop() || peUrl} reqs=${JSON.stringify(reqs)}`));
       }, timeoutMs);
       const stallMs = opts.stallMs ?? Number(process.env.CAPTCHA_STALL_MS || 6e3);
-      const stallTimer = setInterval(() => {
+      const stallTimer = hostSetInterval(() => {
         const last = _requestLog[_requestLog.length - 1];
         if (last && Date.now() - last.at > stallMs) {
           const peUrl = (() => {
@@ -109010,14 +109055,14 @@ async function solveTraceless(opts) {
           })();
           noteStallAndMaybeEvict(peUrl);
           const reqs = _requestLog.filter((r2) => r2.at >= solveStart).map((r2) => `${r2.at - solveStart}ms ${r2.method} ${String(r2.url).replace(/^https?:\/\//, "").slice(0, 60)}`).slice(-12);
-          clearTimeout(timer);
-          clearInterval(stallTimer);
+          hostClearTimeout(timer);
+          hostClearInterval(stallTimer);
           reject(new Error(`captcha solve stall pe=${peUrl.split("/").pop() || peUrl} lastXhr=${last.at - solveStart}ms reqs=${JSON.stringify(reqs)}`));
         }
       }, 500);
       const finish = (fn) => (value2) => {
-        clearTimeout(timer);
-        clearInterval(stallTimer);
+        hostClearTimeout(timer);
+        hostClearInterval(stallTimer);
         fn(value2);
       };
       try {
@@ -109049,7 +109094,7 @@ async function solveTraceless(opts) {
           onError: (err) => finish(reject)(new Error(`onError: ${JSON.stringify(err)}`))
         });
       } catch (err) {
-        clearTimeout(timer);
+        hostClearTimeout(timer);
         reject(err);
       }
     });
@@ -109076,6 +109121,22 @@ async function solveTraceless(opts) {
       keepWindow = true;
     }
     return out;
+  } catch (err) {
+    let out = err;
+    try {
+      const guestErrs = w2.__capGuestErrors;
+      if (Array.isArray(guestErrs) && guestErrs.length > 0) {
+        const tail = guestErrs.slice(-6).map((s) => String(s).slice(0, 160)).join(" ;; ");
+        const suffix = ` | guestErrors[${guestErrs.length}]: ${tail}`.slice(0, 1200);
+        if (err instanceof Error) {
+          err.message += suffix;
+        } else {
+          out = new Error(String(err) + suffix);
+        }
+      }
+    } catch (_) {
+    }
+    throw out;
   } finally {
     if (!keepWindow) {
       if (_reusePool.window === w2) _reusePool.window = null;
@@ -109083,7 +109144,7 @@ async function solveTraceless(opts) {
     }
   }
 }
-var import_undici, import_node_crypto2, import_node_fs2, import_node_os3, import_node_path2, import_node_worker_threads, SYNC_FETCH_BUF_BYTES, SYNC_FETCH_HEADER_BYTES, _syncFetchWorker, SYNC_WORKER_SRC, CDN_CACHE_DIR, _memCdnCache, _cookieCache, COOKIE_CACHE_TTL_MS, _DEBUG, proxyUrl, _requestLog, _stallCounts, _bypassPeCacheOnce, fp, HTML, peVmCallRegex, GUEST_EVAL_PATCH, HOST_CRITICAL_GLOBALS, EXTRA_WINDOW_PROPS, _aliasRefCount, _reusePool, REUSE_MAX_SOLVES, REUSE_MAX_IDLE_MS;
+var import_undici, import_node_crypto2, import_node_fs2, import_node_os3, import_node_path2, import_node_worker_threads, SYNC_FETCH_BUF_BYTES, SYNC_FETCH_HEADER_BYTES, _syncFetchWorker, SYNC_WORKER_SRC, CDN_CACHE_DIR, _memCdnCache, _cookieCache, COOKIE_CACHE_TTL_MS, _DEBUG, proxyUrl, _requestLog, _stallCounts, _bypassPeCacheOnce, fp, HTML, peVmCallRegex, GUEST_EVAL_PATCH, HOST_CRITICAL_GLOBALS, EXTRA_WINDOW_PROPS, _aliasRefCount, _savedGlobalDescMap, _reusePool, REUSE_MAX_SOLVES, REUSE_MAX_IDLE_MS;
 var init_captcha_happy = __esm({
   "src/proxy/captcha-happy.ts"() {
     "use strict";
@@ -109095,6 +109156,7 @@ var init_captcha_happy = __esm({
     import_node_os3 = __toESM(require("node:os"), 1);
     import_node_path2 = __toESM(require("node:path"), 1);
     import_node_worker_threads = require("node:worker_threads");
+    init_host_timers();
     SYNC_FETCH_BUF_BYTES = 8 * 1024 * 1024;
     SYNC_FETCH_HEADER_BYTES = 64;
     _syncFetchWorker = null;
@@ -109176,17 +109238,36 @@ var init_captcha_happy = __esm({
     Object.defineProperty(window.Document.prototype, Symbol.toStringTag, { value: "HTMLDocument", configurable: true });
   } catch (e) {}
   try {
+    // v0.3.6.0: guest-realm errors are COLLECTED silently (bounded) instead
+    // of console.error'd every time. A single solve can throw dozens of
+    // benign window errors (happy-dom env gaps the SDK tolerates), which
+    // buried the user's terminal in red [WINDOW-ERROR] spam on every solve
+    // wave. The host attaches the collected tail to the thrown error when a
+    // solve FAILS (self-diagnosing failures), and CAPTCHA_GUEST_DEBUG=1
+    // restores live printing for forensics.
+    window.__capGuestErrors = [];
+    var __capNote = function(kind, msg) {
+      try {
+        // Keep the TAIL (most recent 40): when a solve fails, the LATEST
+        // guest errors are the diagnostically relevant ones.
+        if (window.__capGuestErrors.length >= 40) {
+          window.__capGuestErrors.shift();
+        }
+        window.__capGuestErrors.push(String(kind) + " " + String(msg).slice(0, 300));
+        if (window.__capGuestDebug) {
+          console.error("[" + kind + "]", msg);
+        }
+      } catch (e2) {}
+    };
     window.addEventListener("unhandledrejection", function(e) {
       var r = e && e.reason;
       try {
-        console.error("[UH-REASON]", typeof r, r && r.stack ? r.stack.split("\\n").slice(0,6).join(" | ") : (r && r.message), JSON.stringify(r));
+        __capNote("UH-REASON", typeof r + " " + (r && r.stack ? r.stack.split("\\n").slice(0,6).join(" | ") : (r && r.message) || String(r)));
       } catch (e2) {}
     });
-  } catch (e) {}
-  try {
     window.addEventListener("error", function(e) {
       try {
-        console.error("[WINDOW-ERROR]", e && e.message, e && e.error && e.error.stack ? e.error.stack.split("\\n").slice(0,6).join(" | ") : "");
+        __capNote("WINDOW-ERROR", (e && e.message || "") + " " + (e && e.error && e.error.stack ? e.error.stack.split("\\n").slice(0,6).join(" | ") : ""));
       } catch (e2) {}
     });
   } catch (e) {}
@@ -109346,6 +109427,7 @@ var init_captcha_happy = __esm({
       "find"
     ];
     _aliasRefCount = 0;
+    _savedGlobalDescMap = /* @__PURE__ */ new Map();
     _reusePool = { window: null, browserFrame: null, solves: 0, lastUsedAt: 0 };
     REUSE_MAX_SOLVES = Number(process.env.CAPTCHA_REUSE_MAX_SOLVES || 25);
     REUSE_MAX_IDLE_MS = Number(process.env.CAPTCHA_REUSE_MAX_IDLE_MS || 12e4);
@@ -109418,6 +109500,7 @@ var init_captcha_cpu_governor = __esm({
     "use strict";
     import_promises = __toESM(require("node:fs/promises"), 1);
     import_node_os4 = __toESM(require("node:os"), 1);
+    init_host_timers();
     DEFAULT_CPU_LIMIT = Number(process.env.CAPTCHA_CPU_LIMIT_PCT || 100);
     DEFAULT_INTERVAL_MS = Number(process.env.CAPTCHA_CPU_GOVERNOR_INTERVAL_MS || 2e3);
     TARGET_STEP = 15;
@@ -109447,11 +109530,11 @@ var init_captcha_cpu_governor = __esm({
       start() {
         if (!this.enabled || this.timer) return;
         void this.tick();
-        this.timer = setInterval(() => void this.tick(), this.cfg.intervalMs);
+        this.timer = hostSetInterval(() => void this.tick(), this.cfg.intervalMs);
       }
       stop() {
         if (this.timer) {
-          clearInterval(this.timer);
+          hostClearInterval(this.timer);
           this.timer = null;
         }
       }
@@ -109612,6 +109695,7 @@ var init_captcha_pool = __esm({
     init_captcha_cpu_governor();
     init_captcha_solver();
     init_captcha_token();
+    init_host_timers();
     CertifyIdRegistry = class {
       constructor(ttlMs) {
         this.ttlMs = ttlMs;
@@ -109716,14 +109800,14 @@ var init_captcha_pool = __esm({
         this.stopBackgroundRefill();
         this.governor?.start();
         void this.refill({ urgent: false });
-        this.refillTimer = setInterval(() => {
+        this.refillTimer = hostSetInterval(() => {
           void this.refill({ urgent: false });
         }, this.opts.refillIntervalMs);
       }
       stopBackgroundRefill() {
         this.governor?.stop();
         if (this.refillTimer) {
-          clearInterval(this.refillTimer);
+          hostClearInterval(this.refillTimer);
           this.refillTimer = null;
         }
       }
@@ -109744,7 +109828,7 @@ var init_captcha_pool = __esm({
           param = await Promise.race([
             this.solveRaced(cfg),
             new Promise(
-              (_, rej) => setTimeout(
+              (_, rej) => hostSetTimeout(
                 () => rej(new Error(`captcha take deadline (${raceDeadlineMs}ms)`)),
                 Math.max(1e3, raceDeadlineMs)
               )
@@ -109754,7 +109838,7 @@ var init_captcha_pool = __esm({
           const graceMs = Number(process.env.CAPTCHA_TAKE_GRACE_MS || 1e4);
           const deadline = Date.now() + Math.max(0, graceMs);
           while (Date.now() < deadline) {
-            await new Promise((r2) => setTimeout(r2, 400));
+            await new Promise((r2) => hostSetTimeout(r2, 400));
             const token2 = this.popFresh();
             if (token2) {
               this.markParamIssued(token2);
@@ -109953,7 +110037,7 @@ var init_captcha_pool = __esm({
         const elapsed = Date.now() - this.lastSolveAt;
         const wait = this.opts.staggerMs - elapsed;
         if (wait > 0) {
-          await new Promise((r2) => setTimeout(r2, wait));
+          await new Promise((r2) => hostSetTimeout(r2, wait));
         }
       }
       noteMintFailure(reason2) {
@@ -110260,7 +110344,7 @@ async function waitForBackpressure(controller, maxYieldMs = 1, maxWaitMs = 25) {
   const waitMs = Math.max(yieldMs, Math.min(rawWait > 0 ? rawWait : yieldMs, MAX_BACKPRESSURE_WAIT_MS));
   const deadline = Date.now() + waitMs;
   while (controller.desiredSize !== null && controller.desiredSize <= 0) {
-    await new Promise((r2) => setTimeout(r2, yieldMs));
+    await new Promise((r2) => hostSetTimeout(r2, yieldMs));
     if (Date.now() >= deadline) break;
   }
 }
@@ -110268,6 +110352,7 @@ var MALFORMED_SSE_WARN_LIMIT, MALFORMED_SSE_WARN_WINDOW_MS, MAX_BACKPRESSURE_YIE
 var init_sse = __esm({
   "src/utils/sse.ts"() {
     "use strict";
+    init_host_timers();
     MALFORMED_SSE_WARN_LIMIT = 5;
     MALFORMED_SSE_WARN_WINDOW_MS = 1e4;
     MAX_BACKPRESSURE_YIELD_MS = 100;
@@ -110938,7 +111023,7 @@ async function safeRename(tmp, target2) {
       lastErr = err;
       const code = err?.code;
       if (code === "EPERM" || code === "EBUSY" || code === "EACCES") {
-        await new Promise((r2) => setTimeout(r2, RETRY_DELAY_MS * (attempt + 1)));
+        await new Promise((r2) => hostSetTimeout(r2, RETRY_DELAY_MS * (attempt + 1)));
         continue;
       }
       throw err;
@@ -110975,6 +111060,7 @@ var init_fs = __esm({
     "use strict";
     import_promises2 = require("node:fs/promises");
     import_node_path3 = require("node:path");
+    init_host_timers();
     atomicTmpCounter = 0;
   }
 });
@@ -111344,7 +111430,7 @@ async function readStoreUncached() {
         return markStoreNull("missing");
       }
       if (code === "EPERM" || code === "EBUSY" || code === "EACCES") {
-        await new Promise((r2) => setTimeout(r2, 50 * (attempt + 1)));
+        await new Promise((r2) => hostSetTimeout(r2, 50 * (attempt + 1)));
         continue;
       }
       break;
@@ -111528,7 +111614,7 @@ async function withCrossProcessStoreLock(fn) {
         throw new Error(`Timed out waiting for credential store lock: ${lockDir}`);
       }
       const delay = Math.min(250, 25 * ++attempt);
-      await new Promise((resolve2) => setTimeout(resolve2, delay));
+      await new Promise((resolve2) => hostSetTimeout(resolve2, delay));
     }
   }
   try {
@@ -111693,7 +111779,7 @@ async function clearCredentialAsync() {
           lastErr = err;
           const code = err?.code;
           if (code === "EPERM" || code === "EBUSY" || code === "EACCES") {
-            await new Promise((r2) => setTimeout(r2, RETRY_DELAY_MS * (attempt + 1)));
+            await new Promise((r2) => hostSetTimeout(r2, RETRY_DELAY_MS * (attempt + 1)));
             continue;
           }
           if (code === "ENOENT") {
@@ -112012,6 +112098,7 @@ var init_store = __esm({
     import_node_crypto3 = require("node:crypto");
     init_fs();
     init_log();
+    init_host_timers();
     STORE_DIR = resolveStoreDir();
     STORE_FILE = (0, import_node_path4.join)(STORE_DIR, "credentials.json");
     ENV_LEGACY_SEED = "ZCODE_PROXY_LEGACY_SEED";
@@ -112069,7 +112156,7 @@ function getSocksBridge(socksUrl) {
   const existing = bridges.get(key);
   if (existing) {
     if (existing.idleTimer) {
-      clearTimeout(existing.idleTimer);
+      hostClearTimeout(existing.idleTimer);
       existing.idleTimer = null;
     }
     existing.refCount++;
@@ -112086,7 +112173,7 @@ function getSocksBridge(socksUrl) {
     socket: {
       open(socket) {
         let state2;
-        const handshakeTimer = setTimeout(() => onHandshakeTimeout(state2), HANDSHAKE_TIMEOUT_MS2);
+        const handshakeTimer = hostSetTimeout(() => onHandshakeTimeout(state2), HANDSHAKE_TIMEOUT_MS2);
         handshakeTimer.unref?.();
         state2 = {
           clientSocket: socket,
@@ -112173,8 +112260,8 @@ function releaseBridge(key) {
   entry.refCount--;
   dbg(`release: ${key} refCount=${entry.refCount}`);
   if (entry.refCount <= 0) {
-    if (entry.idleTimer) clearTimeout(entry.idleTimer);
-    entry.idleTimer = setTimeout(() => {
+    if (entry.idleTimer) hostClearTimeout(entry.idleTimer);
+    entry.idleTimer = hostSetTimeout(() => {
       const e = bridges.get(key);
       if (e && e.refCount <= 0) {
         try {
@@ -112511,7 +112598,7 @@ function onHandshakeOk(state2) {
   }
   state2.phase = "tunneling";
   if (state2.handshakeTimer) {
-    clearTimeout(state2.handshakeTimer);
+    hostClearTimeout(state2.handshakeTimer);
     state2.handshakeTimer = null;
   }
   dbg(`tunnel established to ${state2.targetHost}:${state2.targetPort}`);
@@ -112549,7 +112636,7 @@ Connection: close\r
 function cleanupConn(state2) {
   if (state2.phase === "closing" && !state2.clientSocket && !state2.socksSocket) return;
   if (state2.handshakeTimer) {
-    clearTimeout(state2.handshakeTimer);
+    hostClearTimeout(state2.handshakeTimer);
     state2.handshakeTimer = null;
   }
   state2.phase = "closing";
@@ -112572,6 +112659,7 @@ var IDLE_TIMEOUT_MS, HANDSHAKE_TIMEOUT_MS2, MAX_HANDSHAKE_BUFFER_BYTES, DEBUG, b
 var init_socks_bridge = __esm({
   "src/proxy/socks-bridge.ts"() {
     "use strict";
+    init_host_timers();
     IDLE_TIMEOUT_MS = 6e4;
     HANDSHAKE_TIMEOUT_MS2 = 15e3;
     MAX_HANDSHAKE_BUFFER_BYTES = 64 * 1024;
@@ -112982,12 +113070,12 @@ async function readSourceChunkWithTimeout(reader, timeoutMs) {
   const result3 = await Promise.race([
     reader.read(),
     new Promise((resolve2) => {
-      timer = setTimeout(() => resolve2("timeout"), timeout);
+      timer = hostSetTimeout(() => resolve2("timeout"), timeout);
       timer.unref?.();
     })
   ]).finally(() => {
     if (timer) {
-      clearTimeout(timer);
+      hostClearTimeout(timer);
       timer = null;
     }
   });
@@ -113109,11 +113197,11 @@ function scheduleFailureFlush() {
   failureFlushScheduled = true;
   if (failureFlushTimer) {
     try {
-      clearTimeout(failureFlushTimer);
+      hostClearTimeout(failureFlushTimer);
     } catch {
     }
   }
-  failureFlushTimer = setTimeout(() => {
+  failureFlushTimer = hostSetTimeout(() => {
     failureFlushScheduled = false;
     failureFlushTimer = null;
     void flushFailureCounters().catch(() => {
@@ -113398,7 +113486,7 @@ async function importFromUrl(url2, fetchImpl = fetch) {
   let text;
   try {
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), PROXY_POOL.SOURCE_FETCH_TIMEOUT_MS);
+    const timer = hostSetTimeout(() => ctrl.abort(), PROXY_POOL.SOURCE_FETCH_TIMEOUT_MS);
     timer.unref?.();
     try {
       const resp = await fetchImpl(source.url, {
@@ -113414,7 +113502,7 @@ async function importFromUrl(url2, fetchImpl = fetch) {
       }
       text = await readProxySourceText(resp);
     } finally {
-      clearTimeout(timer);
+      hostClearTimeout(timer);
     }
   } catch (e) {
     return { added: 0, removed: 0, total: 0, fetched: 0, error: truncateProxyPoolError(e.message) };
@@ -113481,7 +113569,7 @@ async function refreshFromSourcesInner(fetchImpl) {
     async (srcUrl) => {
       try {
         const ctrl = new AbortController();
-        const timer = setTimeout(() => ctrl.abort(), PROXY_POOL.SOURCE_FETCH_TIMEOUT_MS);
+        const timer = hostSetTimeout(() => ctrl.abort(), PROXY_POOL.SOURCE_FETCH_TIMEOUT_MS);
         timer.unref?.();
         try {
           const resp = await fetchImpl(srcUrl, {
@@ -113498,7 +113586,7 @@ async function refreshFromSourcesInner(fetchImpl) {
           const text = await readProxySourceText(resp);
           return { srcUrl, text, error: null };
         } finally {
-          clearTimeout(timer);
+          hostClearTimeout(timer);
         }
       } catch (e) {
         return { srcUrl, text: null, error: truncateProxyPoolError(e.message) };
@@ -113751,7 +113839,7 @@ async function markProxyFailed(url2) {
 }
 function scheduleAutoRefresh(config) {
   if (refreshTimer) {
-    clearInterval(refreshTimer);
+    hostClearInterval(refreshTimer);
     refreshTimer = null;
   }
   const rawConfig = config ?? cachedPool?.config;
@@ -113759,7 +113847,7 @@ function scheduleAutoRefresh(config) {
   const cfg = normalizeProxyPoolConfig(rawConfig);
   if (!cfg.enabled || cfg.refreshIntervalMin <= 0 || cfg.sourceUrls.length === 0) return;
   const intervalMs = Math.max(1, cfg.refreshIntervalMin) * 6e4;
-  refreshTimer = setInterval(() => {
+  refreshTimer = hostSetInterval(() => {
     if (autoRefreshInFlight) return;
     autoRefreshInFlight = true;
     refreshFromSources().catch((e) => {
@@ -113795,7 +113883,7 @@ function resolveTestJobResultTtlMs(raw = process.env.ZCODE_PROXY_POOL_TEST_JOB_T
 function clearTestJobCleanupTimer() {
   if (!currentTestJobCleanupTimer) return;
   try {
-    clearTimeout(currentTestJobCleanupTimer);
+    hostClearTimeout(currentTestJobCleanupTimer);
   } catch {
   }
   currentTestJobCleanupTimer = null;
@@ -113830,7 +113918,7 @@ function scheduleCompletedTestJobCleanup(job) {
     return;
   }
   const delay = Math.max(0, job.finishedAt + ttlMs - Date.now());
-  currentTestJobCleanupTimer = setTimeout(() => {
+  currentTestJobCleanupTimer = hostSetTimeout(() => {
     if (currentTestJob === job) pruneExpiredTestJob();
   }, delay);
   if (typeof currentTestJobCleanupTimer.unref === "function") {
@@ -113925,7 +114013,7 @@ async function runTestJob(job, proxies, fetchImpl, testTargetOverride, jobSignal
       const target2 = testTargetOverride ?? "https://api.z.ai";
       const started = Date.now();
       const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 1e4);
+      const timer = hostSetTimeout(() => ctrl.abort(), 1e4);
       if (typeof timer.unref === "function") timer.unref();
       const onJobAbort = () => ctrl.abort();
       if (jobSignal) {
@@ -113962,7 +114050,7 @@ async function runTestJob(job, proxies, fetchImpl, testTargetOverride, jobSignal
         job.failCount++;
         failedProxies.push(p);
       } finally {
-        clearTimeout(timer);
+        hostClearTimeout(timer);
         if (jobSignal) jobSignal.removeEventListener("abort", onJobAbort);
         job.tested++;
       }
@@ -114000,6 +114088,7 @@ var init_proxy_pool = __esm({
     init_constants();
     init_log();
     init_proxied_fetch();
+    init_host_timers();
     STORE_DIR2 = resolveStoreDir2();
     POOL_FILE = (0, import_node_path5.join)(STORE_DIR2, "proxy-pool.json");
     DEFAULT_CONFIG = {
@@ -114068,12 +114157,12 @@ async function readChunkWithTimeout(reader, timeoutMs) {
   const result3 = await Promise.race([
     reader.read(),
     new Promise((resolve2) => {
-      timer = setTimeout(() => resolve2("timeout"), timeout);
+      timer = hostSetTimeout(() => resolve2("timeout"), timeout);
       timer.unref?.();
     })
   ]).finally(() => {
     if (timer) {
-      clearTimeout(timer);
+      hostClearTimeout(timer);
       timer = null;
     }
   });
@@ -114139,7 +114228,7 @@ async function fetchWithTimeout(fetchImpl, input, init, timeoutMs) {
     if (upstreamSignal.aborted) onUpstreamAbort();
     else upstreamSignal.addEventListener("abort", onUpstreamAbort, { once: true });
   }
-  const timer = setTimeout(() => ctrl.abort(), timeout);
+  const timer = hostSetTimeout(() => ctrl.abort(), timeout);
   timer.unref?.();
   try {
     return await fetchImpl(input, { ...init, signal: ctrl.signal });
@@ -114149,7 +114238,7 @@ async function fetchWithTimeout(fetchImpl, input, init, timeoutMs) {
     }
     throw err;
   } finally {
-    clearTimeout(timer);
+    hostClearTimeout(timer);
     if (upstreamSignal) upstreamSignal.removeEventListener("abort", onUpstreamAbort);
   }
 }
@@ -114172,6 +114261,7 @@ var init_oauth = __esm({
     init_identity();
     import_node_http = require("node:http");
     import_node_crypto4 = require("node:crypto");
+    init_host_timers();
     ZCODE_OAUTH_BASE = "https://zcode.z.ai/api/v1";
     ZAI_AUTHORIZE_URL = "https://chat.z.ai/api/oauth/authorize";
     ZAI_CLIENT_ID = "client_P8X5CMWmlaRO9gyO-KSqtg";
@@ -114268,7 +114358,7 @@ var init_oauth = __esm({
             }
           };
           const timeout = normalizeCallbackWaitTimeoutMs(timeoutMs);
-          const timer = setTimeout(() => {
+          const timer = hostSetTimeout(() => {
             if (settled) return;
             settled = true;
             cleanup();
@@ -114278,7 +114368,7 @@ var init_oauth = __esm({
           waiter = (result3) => {
             if (settled) return;
             settled = true;
-            clearTimeout(timer);
+            hostClearTimeout(timer);
             cleanup();
             if (result3.error) reject(new Error(result3.error));
             else resolve2(result3.code);
@@ -114296,7 +114386,7 @@ var init_oauth = __esm({
           const finish = (err) => {
             if (settled) return;
             settled = true;
-            if (timer) clearTimeout(timer);
+            if (timer) hostClearTimeout(timer);
             timer = null;
             if (err && err.code !== "ERR_SERVER_NOT_RUNNING") {
               forceClose();
@@ -114322,7 +114412,7 @@ var init_oauth = __esm({
             } catch {
             }
           };
-          timer = setTimeout(() => {
+          timer = hostSetTimeout(() => {
             forceClose();
             finish();
           }, CALLBACK_CLOSE_TIMEOUT_MS);
@@ -114605,12 +114695,12 @@ async function readChunkWithTimeout2(reader, timeoutMs) {
   const result3 = await Promise.race([
     reader.read(),
     new Promise((resolve2) => {
-      timer = setTimeout(() => resolve2("timeout"), timeout);
+      timer = hostSetTimeout(() => resolve2("timeout"), timeout);
       timer.unref?.();
     })
   ]).finally(() => {
     if (timer) {
-      clearTimeout(timer);
+      hostClearTimeout(timer);
       timer = null;
     }
   });
@@ -114635,7 +114725,7 @@ async function fetchWithTimeout2(fetchImpl, input, init, timeoutMs) {
     if (upstreamSignal.aborted) onUpstreamAbort();
     else upstreamSignal.addEventListener("abort", onUpstreamAbort, { once: true });
   }
-  const timer = setTimeout(() => ctrl.abort(), timeout);
+  const timer = hostSetTimeout(() => ctrl.abort(), timeout);
   timer.unref?.();
   try {
     return await fetchImpl(input, { ...init, signal: ctrl.signal });
@@ -114645,7 +114735,7 @@ async function fetchWithTimeout2(fetchImpl, input, init, timeoutMs) {
     }
     throw err;
   } finally {
-    clearTimeout(timer);
+    hostClearTimeout(timer);
     if (upstreamSignal) upstreamSignal.removeEventListener("abort", onUpstreamAbort);
   }
 }
@@ -114679,6 +114769,7 @@ var ZAI_API_KEY_NAME, DEFAULT_ORG_MARKER, DEFAULT_PROJECT_MARKER, DEFAULT_BIZ_AP
 var init_resolver = __esm({
   "src/auth/resolver.ts"() {
     "use strict";
+    init_host_timers();
     ZAI_API_KEY_NAME = "zcode-api-key";
     DEFAULT_ORG_MARKER = "\u9ED8\u8BA4\u673A\u6784";
     DEFAULT_PROJECT_MARKER = "\u9ED8\u8BA4\u9879\u76EE";
@@ -114867,7 +114958,7 @@ function withTimeout(fetchImpl) {
       if (upstreamSignal.aborted) onUpstreamAbort();
       else upstreamSignal.addEventListener("abort", onUpstreamAbort, { once: true });
     }
-    const timer = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS2);
+    const timer = hostSetTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS2);
     timer.unref?.();
     try {
       return await fetchImpl(input, { ...init, signal: ctrl.signal });
@@ -114877,7 +114968,7 @@ function withTimeout(fetchImpl) {
       }
       throw err;
     } finally {
-      clearTimeout(timer);
+      hostClearTimeout(timer);
       if (upstreamSignal) upstreamSignal.removeEventListener("abort", onUpstreamAbort);
     }
   });
@@ -114900,12 +114991,12 @@ async function readChunkWithTimeout3(reader, timeoutMs) {
   const result3 = await Promise.race([
     reader.read(),
     new Promise((resolve2) => {
-      timer = setTimeout(() => resolve2("timeout"), timeoutMs);
+      timer = hostSetTimeout(() => resolve2("timeout"), timeoutMs);
       timer.unref?.();
     })
   ]).finally(() => {
     if (timer) {
-      clearTimeout(timer);
+      hostClearTimeout(timer);
       timer = null;
     }
   });
@@ -115148,6 +115239,7 @@ var init_quota = __esm({
     init_types();
     init_providers();
     init_identity();
+    init_host_timers();
     ZCODE_PLAN_BASE = "https://zcode.z.ai/api/v1/zcode-plan";
     DEFAULT_APP_VERSION = "3.9.2";
     REQUEST_TIMEOUT_MS2 = 15e3;
@@ -115800,11 +115892,11 @@ async function readResponseTextPreview(resp, opts) {
       const result3 = await Promise.race([
         reader.read(),
         new Promise((resolve2) => {
-          timeoutTimer = setTimeout(() => resolve2("timeout"), remainingMs);
+          timeoutTimer = hostSetTimeout(() => resolve2("timeout"), remainingMs);
         })
       ]).finally(() => {
         if (timeoutTimer) {
-          clearTimeout(timeoutTimer);
+          hostClearTimeout(timeoutTimer);
           timeoutTimer = null;
         }
       });
@@ -115844,7 +115936,7 @@ async function readResponseTextPreview(resp, opts) {
 }
 function wrapResponseBodyWithUpstreamTimeout(resp, ctrl, timer, timeoutMs) {
   if (!resp.body) {
-    clearTimeout(timer);
+    hostClearTimeout(timer);
     return resp;
   }
   const reader = resp.body.getReader();
@@ -115856,7 +115948,7 @@ function wrapResponseBodyWithUpstreamTimeout(resp, ctrl, timer, timeoutMs) {
   const cleanup = (releaseReader = true) => {
     if (finished) return;
     finished = true;
-    clearTimeout(timer);
+    hostClearTimeout(timer);
     ctrl.signal.removeEventListener("abort", onAbort);
     if (releaseReader) {
       try {
@@ -115987,6 +116079,7 @@ var init_response_body = __esm({
   "src/proxy/response-body.ts"() {
     "use strict";
     init_retry();
+    init_host_timers();
     ResponseBodyTooLargeError = class extends Error {
       constructor(label2, maxBytes, actualBytes) {
         super(`${label2} is too large (${actualBytes} bytes, limit ${maxBytes} bytes)`);
@@ -122585,7 +122678,7 @@ var init_package = __esm({
   "package.json"() {
     package_default = {
       name: "zcode-proxy",
-      version: "0.3.3.0",
+      version: "0.3.7.1",
       type: "module",
       scripts: {
         dev: "bun run src/index.ts",
@@ -122691,7 +122784,7 @@ async function readJsonBody(req, options2 = {}) {
 async function readRequestBodyChunk(reader, timeoutMs) {
   let timer = null;
   const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new AdminBodyTimeoutError(timeoutMs)), timeoutMs);
+    timer = hostSetTimeout(() => reject(new AdminBodyTimeoutError(timeoutMs)), timeoutMs);
     timer.unref?.();
   });
   try {
@@ -122702,7 +122795,7 @@ async function readRequestBodyChunk(reader, timeoutMs) {
     throw err;
   } finally {
     if (timer) {
-      clearTimeout(timer);
+      hostClearTimeout(timer);
       timer = null;
     }
   }
@@ -122712,6 +122805,7 @@ var init_request_body = __esm({
   "src/admin/request-body.ts"() {
     "use strict";
     init_translated_response();
+    init_host_timers();
     MAX_ADMIN_BODY_BYTES = 1 * 1024 * 1024;
     MAX_ACCOUNT_IMPORT_BODY_BYTES = 3 * 1024 * 1024;
     MAX_PROXY_IMPORT_TEXT_BODY_BYTES = 12 * 1024 * 1024;
@@ -123196,7 +123290,7 @@ function _quotaCacheStateForTesting() {
 function withActivationProbeHardTimeout(task, onTimeout) {
   let timer = null;
   const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => {
+    timer = hostSetTimeout(() => {
       try {
         onTimeout?.();
       } catch {
@@ -123207,7 +123301,7 @@ function withActivationProbeHardTimeout(task, onTimeout) {
   });
   return Promise.race([task, timeout]).finally(() => {
     if (timer) {
-      clearTimeout(timer);
+      hostClearTimeout(timer);
       timer = null;
     }
   });
@@ -123380,7 +123474,7 @@ function setLogFilePath(path2) {
     void flushLogFile();
   }
   if (logFileFlushInterval) {
-    clearInterval(logFileFlushInterval);
+    hostClearInterval(logFileFlushInterval);
     logFileFlushInterval = null;
   }
   logFilePath = path2;
@@ -123391,7 +123485,7 @@ function setLogFilePath(path2) {
       (0, import_node_fs6.mkdirSync)((0, import_node_path7.dirname)(path2), { recursive: true });
     } catch {
     }
-    logFileFlushInterval = setInterval(flushLogFile, LOG.FILE_FLUSH_INTERVAL_MS);
+    logFileFlushInterval = hostSetInterval(flushLogFile, LOG.FILE_FLUSH_INTERVAL_MS);
     if (typeof logFileFlushInterval.unref === "function") {
       logFileFlushInterval.unref();
     }
@@ -123418,7 +123512,7 @@ function _setLogStreamBackpressureLimitForTesting(chunks) {
 }
 function _resetLogFileForTesting() {
   if (logFileFlushInterval) {
-    clearInterval(logFileFlushInterval);
+    hostClearInterval(logFileFlushInterval);
     logFileFlushInterval = null;
   }
   logFilePath = void 0;
@@ -124029,7 +124123,7 @@ async function handleAdminRouteInner(req, opts) {
       }
       const started = Date.now();
       const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 1e4);
+      const timer = hostSetTimeout(() => ctrl.abort(), 1e4);
       timer.unref?.();
       const fetchImpl = wrapFetchWithSocksBridge(opts.fetchImpl ?? fetch);
       try {
@@ -124064,7 +124158,7 @@ async function handleAdminRouteInner(req, opts) {
           target: target2
         });
       } finally {
-        clearTimeout(timer);
+        hostClearTimeout(timer);
       }
     } catch (err) {
       return errorResponse(500, "test_failed", err.message);
@@ -124889,19 +124983,19 @@ async function handleAdminRouteInner(req, opts) {
         let maxTimeout = null;
         const doCleanup = () => {
           closed = true;
-          if (interval) clearInterval(interval);
-          if (heartbeat) clearInterval(heartbeat);
-          if (maxTimeout) clearTimeout(maxTimeout);
+          if (interval) hostClearInterval(interval);
+          if (heartbeat) hostClearInterval(heartbeat);
+          if (maxTimeout) hostClearTimeout(maxTimeout);
           const idx = logWaiters.indexOf(waiter);
           if (idx >= 0) logWaiters.splice(idx, 1);
         };
         cleanup = doCleanup;
-        interval = setInterval(() => {
+        interval = hostSetInterval(() => {
           if (closed) return;
           flushNew();
         }, 2e3);
         interval.unref?.();
-        heartbeat = setInterval(() => {
+        heartbeat = hostSetInterval(() => {
           if (closed) return;
           if (!sendPayload(`: heartbeat
 
@@ -124914,7 +125008,7 @@ async function handleAdminRouteInner(req, opts) {
           }
         }, LOG.HEARTBEAT_MS);
         heartbeat.unref?.();
-        maxTimeout = setTimeout(() => {
+        maxTimeout = hostSetTimeout(() => {
           doCleanup();
           try {
             controller.close();
@@ -125128,7 +125222,7 @@ async function handleAdminRouteInner(req, opts) {
       }
       const started = Date.now();
       const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 1e4);
+      const timer = hostSetTimeout(() => ctrl.abort(), 1e4);
       timer.unref?.();
       const fetchImpl = wrapFetchWithSocksBridge(opts.fetchImpl ?? fetch);
       try {
@@ -125164,7 +125258,7 @@ async function handleAdminRouteInner(req, opts) {
           target: target2
         });
       } finally {
-        clearTimeout(timer);
+        hostClearTimeout(timer);
       }
     } catch (err) {
       return errorResponse(500, "test_failed", err.message);
@@ -125643,6 +125737,7 @@ var init_api = __esm({
     import_promises3 = require("node:fs/promises");
     import_node_fs6 = require("node:fs");
     import_node_path7 = require("node:path");
+    init_host_timers();
     SEEN_IDS_LIMIT = LOG.SEEN_IDS_LIMIT;
     SEEN_IDS_EVICT_BATCH = LOG.SEEN_IDS_EVICT_BATCH;
     MAX_MODEL_STATS = 100;
@@ -125686,7 +125781,7 @@ var init_api = __esm({
     quotaCacheGenerations = /* @__PURE__ */ new Map();
     quotaCacheEpoch = 0;
     activationProbeInFlight = /* @__PURE__ */ new Map();
-    setInterval(() => {
+    hostSetInterval(() => {
       const cleaned = pruneActiveOAuthFlows();
       if (cleaned > 0) {
         appendLog("debug", `OAuth flow cleanup: removed ${cleaned} expired flow(s)`);
@@ -126206,13 +126301,6 @@ function validate(config) {
   if (config.server.port < 1 || config.server.port > 65535) {
     throw new Error(`server.port ${config.server.port} is out of range (1-65535)`);
   }
-  if (config.auth.proxyApiKey !== void 0 && config.auth.proxyApiKey !== null && config.auth.proxyApiKey !== "") {
-    if (config.auth.proxyApiKey.length < 8) {
-      throw new Error(
-        `auth.proxyApiKey must be at least 8 characters (current: ${config.auth.proxyApiKey.length}). Use a strong random string (32+ chars recommended). Set ZCODE_PROXY_API_KEY to a longer value.`
-      );
-    }
-  }
   if (config.auth.mode === "apikey") {
     const hasGlobal = typeof config.auth.apiKey === "string" && config.auth.apiKey.length > 0;
     const hasProvider = typeof config.providers[config.provider].credential === "string";
@@ -126246,7 +126334,7 @@ function resolveCorsAllowList(raw) {
 }
 
 // config.example.yaml
-var config_example_default = 'server:\n  port: 8080\n  # Host to bind the proxy on.\n  #   "0.0.0.0" = bind on ALL interfaces (LAN/remote clients can connect)\n  #   "127.0.0.1" = bind on localhost ONLY (no remote access)\n  # NOTE: even when bound to 0.0.0.0, you must access the dashboard via\n  #   http://127.0.0.1:8080/admin (or your machine\'s LAN IP) \u2014 opening\n  #   http://0.0.0.0:8080/admin directly does NOT work on Windows / macOS.\n  host: "0.0.0.0"\n\n  # Whether to trust X-Forwarded-For / X-Real-IP headers for client IP\n  # detection (used by the admin dashboard loopback gate when proxyApiKey\n  # is NOT configured).\n  #   false (default) = client IP read from the TCP socket (un-spoofable)\n  #   true             = trust XFF/X-Real-IP (set ONLY when behind a trusted\n  #                      reverse proxy like nginx/Caddy that overwrites them)\n  trustProxy: false\n\n  # Upstream request timeout in milliseconds. Applied to BOTH stream and\n  # batch requests. Set to 0 (or omit) to use the defaults:\n  #   - stream requests: 10 minutes (600000 ms)\n  #   - batch requests:  5 minutes (300000 ms)\n  # Lower this if your network is fast and you want faster failure detection;\n  # raise it if you regularly run very long reasoning chains that exceed 10 min.\n  upstreamTimeoutMs: 0\n\n  # SSE heartbeat interval in milliseconds (v0.2.1.7+).\n  #\n  # When the proxy is behind Cloudflare (or another reverse proxy with a\n  # Proxy Read Timeout \u2014 CF Free/Pro/Business = 100s), long "thinking"\n  # requests where the upstream LLM takes >100s to emit the first byte\n  # will be killed by CF with a 524 error.\n  #\n  # To prevent this, the proxy periodically flushes a no-op SSE comment\n  # line (": keepalive\\n\\n") to the client while waiting for the upstream\'s\n  # first chunk. SSE comment lines are spec-compliant and silently ignored\n  # by all conformant SSE clients (Anthropic SDK, OpenAI SDK, Cherry\n  # Studio, Claude Code, Codex, curl). The bytes keep TCP active and\n  # reset CF\'s idle timer.\n  #\n  # Once the first real chunk arrives, the heartbeat stops immediately\n  # and never re-fires \u2014 zero overhead after TTFB.\n  #\n  # Default: 15000 (15s). Set to 0 to disable. Env var:\n  # ZCODE_PROXY_SSE_HEARTBEAT_MS. Recommended range: 10s-30s.\n  # Below 5s is wasteful; above 60s defeats the purpose if upstream is\n  # behind CF.\n  sseHeartbeatMs: 15000\n\n  # Maximum client request body size in bytes for proxy endpoints.\n  # The proxy must materialize JSON request bodies before translating them,\n  # so this prevents accidental huge payloads from pinning memory. Default:\n  # 67108864 (64 MiB). Set to 0 to disable the guard.\n  # Env var: ZCODE_PROXY_MAX_REQUEST_BODY_BYTES.\n  maxRequestBodyBytes: 67108864\n\n# Optional browser CORS allowlist. When omitted, browser requests with an\n# Origin header receive Access-Control-Allow-Origin: null; server-to-server\n# requests without Origin still receive *.\n# Env var alternative: ZCODE_PROXY_CORS_ALLOWLIST=https://a.com,https://b.com\n# corsAllowList:\n#   - "https://your-dashboard.example.com"\n#   - "http://localhost:3000"\n\nauth:\n  # "apikey" = use a pre-obtained API key directly\n  # "oauth"  = use OAuth login flow (run `zcode-proxy auth login <zai|bigmodel>` first)\n  mode: apikey\n\n  # For apikey mode:\n  #   Z.AI:     "yourApiKey.yourSecretKey"\n  #   Bigmodel: "yourApiKey"\n  apiKey: "YOUR_API_KEY_HERE"\n\n  # Key that clients must provide to use the proxy.\n  # Set to null/omit to disable client auth.\n  proxyApiKey: "your-proxy-secret"\n\n  # For oauth mode (path to stored credentials from login flow):\n  # oauthCredentialsPath: "~/.zcode-proxy/credentials.json"\n\n# Which upstream provider to use: "zai" or "bigmodel"\nprovider: zai\n\n# Which plan tier to use:\n#   "coding-plan" (default) \u2014 direct upstream endpoints, permanent API key\n#   "start-plan"            \u2014 routes through zcode.z.ai with JWT auth (requires `auth login`)\nplan: coding-plan\n\nproviders:\n  zai:\n    anthropicBase: "https://api.z.ai/api/anthropic"\n    openaiBase: "https://api.z.ai/api/coding/paas/v4"\n  bigmodel:\n    anthropicBase: "https://open.bigmodel.cn/api/anthropic"\n    openaiBase: "https://open.bigmodel.cn/api/coding/paas/v4"\n\ndefaultModel: glm-4.6\n\nmodels:\n  - glm-4.5-air\n  - glm-4.6\n  - glm-4.6v\n  - glm-4.7\n  - glm-5\n  - glm-5-turbo\n  - glm-5v-turbo\n  - glm-5.1\n  - glm-5.2\n\n# Identity values used to mimic the ZCode desktop client (v0.3.0: model\n# requests carry the FULL pio header set \u2014 see identity.ts). All optional;\n# env vars override YAML, which overrides defaults.\nidentity:\n  # Mirrors process.env.ZCODE_APP_VERSION in the ZCode bundle.\n  # Must be printable ASCII; non-conforming values fall back to the default.\n  # Default: "3.9.2" (current ZCode release, 2026-08-26). Override to match\n  # your real client \u2014 the start-plan trial-activation gate is version-sensitive.\n  appVersion: "3.9.2"\n  # Release channel header (X-Release-Channel). Default "production".\n  # Env var: ZCODE_RELEASE_CHANNEL.\n  releaseChannel: "production"\n  # Optional X-Device-Mid. If omitted, the proxy tries to read the existing\n  # ZCode telemetry-state.json deviceMid. Env var: ZCODE_DEVICE_MID.\n  # deviceMid: ""\n  # X-Title header suffix. Default "cli".\n  sourceTitle: "cli"\n  # HTTP-Referer URL. Default "https://zcode.z.ai".\n  refererOrigin: "https://zcode.z.ai"\n  # X-ZCode-Agent header for upstream model requests. Default "glm".\n  # Env var: ZCODE_AGENT.\n  zcodeAgent: "glm"\n\n# \u2500\u2500\u2500 v0.3.0 upstream zcode-api v2.6.0 alignment sections \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n# Client-session inference \u2014 replicates ZCode\'s single-user-identity UUID\n# generation so multi-turn conversations reuse the same upstream session id.\nclientIdentity:\n  # "observe" (default): infer + log only. "enforce": forward the inferred\n  # x-session-id upstream. "off": disable inference entirely.\n  mode: observe\n  # In-memory session TTL in seconds (default 900).\n  ttlSeconds: 900\n  # Max inferred sessions retained (default 1024).\n  maxSessions: 1024\n\n# Server-side endpoint routing \u2014 periodically fetches the server-published\n# mapping table (GET zcode.z.ai/api/v1/agent/configs) and remaps coding-plan\n# endpoints (e.g. to the ultra endpoints). Fully fail-open. Env var:\n# ZCODE_ENDPOINT_ROUTING=0/1.\nendpointRouting:\n  enabled: true\n  origin: "https://zcode.z.ai"\n\n# V4 client request signing \u2014 probes the server feature gate and, when the\n# server enables it, signs coding-plan requests (Ed25519 + proof-of-work)\n# exactly like the real client. Fail-open; start-plan is exempt. Env var:\n# ZCODE_CLIENT_SIGNING=0/1.\nclientSigning:\n  enabled: true\n  origin: "https://zcode.z.ai"\n\n# Async (off-peak / \u9519\u5CF0\u7B97\u529B) bridge (v0.3.1, upstream zcode-api 175ff2a).\n# When enabled, exposes three extra endpoints that route through ZCode\'s\n# off-peak ticket queue \u2014 the GLM Coding Plan "\u9519\u5CF0\u65F6\u6BB5 5 \u5C0F\u65F6\u989D\u5EA6\u91CD\u7F6E"\n# benefit (ZCode 3.8.1+):\n#   POST /async/v1/messages          (Anthropic-format clients)\n#   POST /async/v1/chat/completions  (OpenAI-format clients)\n#   GET  /async/v1/health            (probe queue availability)\n# The proxy holds the client connection open with SSE keepalive comments\n# while the ticket is queued, then streams the LLM response once the ticket\n# is ready. Auto-retries (maxRetries) when a ticket expires in queue.\n# Requires the active account to be OAuth / ZCode-imported (needs JWT);\n# apikey-only accounts get 400 async_credentials_unavailable.\n# Env var: ZCODE_ASYNC_ENABLED=1 enables without YAML.\nasync:\n  enabled: false\n  origin: "https://zcode.z.ai"\n  # Ticket-status poll interval in ms.\n  pollIntervalMs: 5000\n  # SSE keepalive comment interval during queue wait, in ms.\n  keepAliveIntervalMs: 3000\n  # Max total wait for a ticket to become ready, in ms. 0 = unlimited.\n  maxWaitMs: 0\n  # Max auto-retry count when a ticket expires in queue.\n  maxRetries: 3\n  # Best-effort settle (close-out) call timeout in ms.\n  settleTimeoutMs: 8000\n  # Control-plane (takeTicket / pollStatus) call timeout in ms.\n  controlTimeoutMs: 15000\n  # Optional model override; empty string uses the request\'s model.\n  defaultModel: ""\n\n# Start-plan captcha behavior (v0.3.0: in-process happy-dom solver + token\n# pool \u2014 no Chrome, no jsdom, no browser dependency):\n# - Tokens are pre-solved into a background pool; each start-plan request\n#   takes an already-solved token in sub-millisecond time.\n# - By default the proxy pre-solves and sends fresh Aliyun runtime captcha\n#   headers before each start-plan model attempt. Set\n#   ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT=0 only if you want diagnostic 3007-only\n#   solving.\n# - Pool sizing: CAPTCHA_POOL_MIN (default 20), CAPTCHA_POOL_MAX (default\n#   max(min*6, 120)). Retries: ZCODE_CAPTCHA_RETRIES (default 4). CPU\n#   throttle: CAPTCHA_CPU_LIMIT_PCT (default 100 = off).\n# - HTTP_PROXY/HTTPS_PROXY route the solver\'s outbound traffic when set.\n\nlogging:\n  level: info\n  # Verbose mode (vceshi0.0.6+): logs the full upstream request headers +\n  # transformed body for every request. Useful for diagnosing 3001 parameter\n  # errors. Env var: ZCODE_PROXY_VERBOSE_LOGGING=1\n  # verbose: false\n  # Debug response logging (ceshi0.1.4+): logs the FULL upstream response\n  # for every request \u2014 status + key headers + body preview (first 1000 chars\n  # for JSON, first 2KB for SSE streams). Shows EXACTLY what 529 / empty 200 /\n  # captcha 403 returned, including the error JSON body. Uses a bounded tee\n  # preview branch so it doesn\'t consume the original response. Env var: ZCODE_PROXY_DEBUG_LOGGING=1\n  # debug: false\n  # Header debug logging (v0.2.0.9+): writes TWO JSON files per request to\n  # ./header-debug/ (or $ZCODE_PROXY_HEADER_DEBUG_DIR):\n  #   {timestamp}_{reqId}_inbound.json   \u2190 \u5BA2\u6237\u7AEF\u53D1\u7ED9\u4EE3\u7406\u7684\u539F\u59CB\u8BF7\u6C42 (\u6536\u5230\u7684)\n  #   {timestamp}_{reqId}_upstream.json  \u2190 \u4EE3\u7406\u7FFB\u8BD1\u540E\u53D1\u7ED9 z.ai \u7684\u8BF7\u6C42\n  # Only the FIRST fetch attempt per request is recorded \u2014 retries and\n  # captcha re-solves are NOT logged, so each request = one pair of files.\n  # Use this to verify the translation pipeline has no header defects:\n  #   diff *_inbound.json *_upstream.json\n  # Auth tokens are masked (first-8...last-4). Clear with `rm -rf header-debug/`\n  # when done. Env var: ZCODE_PROXY_HEADER_DEBUG=1\n  # headerDebug: false\n\n# Retry configuration for upstream requests.\n# When the upstream returns a retryable status code (e.g. 529 site overloaded),\n# the proxy will automatically retry with exponential backoff.\n# All fields are optional; defaults are shown below.\n# Environment variable overrides:\n#   ZCODE_RETRY_MAX                        \u2014 max number of retries\n#   ZCODE_RETRY_INITIAL_DELAY_MS           \u2014 initial delay before first retry (ms)\n#   ZCODE_RETRY_MAX_DELAY_MS               \u2014 maximum delay cap (ms)\n#   ZCODE_RETRY_BACKOFF_FACTOR             \u2014 backoff multiplier per attempt\n#   ZCODE_RETRY_STATUSES                   \u2014 comma-separated retryable status codes (e.g. "529,429,503")\n#   ZCODE_RETRY_CREDENTIAL_SWITCH_THRESHOLD \u2014 consecutive failures before switching credentials\nretry:\n  # Maximum number of retry attempts. Set to 0 to disable retries entirely.\n  # No upper bound \u2014 set as high as needed (e.g. 1000 for very flaky upstreams).\n  maxRetries: 3\n  # Initial delay (ms) before the first retry. Subsequent retries multiply by backoffFactor.\n  initialDelayMs: 1000\n  # Maximum delay cap (ms). Backoff will never exceed this value.\n  maxDelayMs: 8000\n  # Exponential backoff multiplier. 2 = each retry waits ~2x longer.\n  backoffFactor: 2\n  # HTTP status codes that trigger a retry.\n  # Common values: 429 (rate limited / concurrency limit), 503 (service unavailable), 529 (site overloaded).\n  retryableStatuses:\n    - 529\n    - 429\n  # Credential auto-switching: when the SAME credential fails this many times\n  # consecutively (including the initial request), the proxy automatically\n  # switches to another stored credential (if available) and continues retrying.\n  # Already-tried credentials are skipped in the same request to avoid cycling.\n  #\n  # Set to 0 to disable. Default: 2 (v0.1.5+; was 5 \u2014 but 5 > maxRetries=3\n  # made the feature a no-op under default config).\n  #\n  # Only effective when:\n  #   1. More than one credential is stored (add accounts via the dashboard or\n  #      `zcode-proxy auth login`).\n  #   2. maxRetries >= this threshold (otherwise the retry loop exhausts first).\n  credentialSwitchThreshold: 2\n\n# --- Responses thinking override (Codex CLI workaround) ---\n# Codex CLI frequently sends `reasoning: null` in the /v1/responses wire\n# payload (the CLI only populates it when an explicit effort level is forced\n# via local config), so the translator\'s "honor reasoning.effort" branch\n# never fires and the upstream GLM request goes out without `thinking`.\n#\n# This section lets the operator force-enable thinking for specific models\n# regardless of what the client sent. Matching is case-insensitive exact\n# match on the *post-mapping* request model (i.e. the final GLM model id\n# after modelMappings is applied).\n#\n# Empty array / omitted = disabled (default). Two equivalent shapes:\n#\n#   responsesThinking:\n#     models:\n#       - glm-5.2\n#       - glm-4.6\n#\n#   # or shorthand:\n#   responsesThinking:\n#     - glm-5.2\n#     - glm-4.6\n#\n# The dashboard also exposes this as a chip-style multi-select under\n# \u4EE3\u7406\u89C4\u5219 \u2192 Responses \u601D\u8003\u7BA1\u7406.\nresponsesThinking:\n  models: []\n\n# --- Anthropic format options ---\nanthropic:\n  # v0.2.0.4: `forceStream` option removed \u2014 `stream: true` is now forced\n  # unconditionally inside alignZCodeRequestFormat to match the real ZCode\n  # desktop client\'s wire shape. The response path buffers SSE \u2192 batch JSON\n  # for clients that originally requested non-streaming, so this is transparent.\n  #\n  # Align request body structure to match the real ZCode desktop client exactly.\n  # When true:\n  #   1. Top-level field order: model \u2192 max_tokens \u2192 thinking \u2192 output_config\n  #      \u2192 system \u2192 messages \u2192 tools \u2192 tool_choice \u2192 stream\n  #   2. Inject 3 ZCode official system blocks (both coding-plan AND start-plan),\n  #      client\'s original system appended after\n  #   3. Rewrite "You are Claude Code, Anthropic\'s official CLI for Claude."\n  #      \u2192 "You are ZCode model working in Claude Code."\n  #   4. Keep role: "system" inside messages[] (don\'t relocate to top-level system)\n  # Default: false. Env var: ZCODE_PROXY_ALIGN_ZCODE_FORMAT=1\n  alignZCodeFormat: false\n# NOTE: ZCode thinking-format injection (max_tokens=64000 + budget_tokens=32000\n# + output_config.effort=max) is now UNCONDITIONAL default behavior since v0.1.9.\n# Any Anthropic request with thinking.type === "enabled" automatically gets\n# these fields rewritten to match the real ZCode desktop client. No config\n# needed \u2014 this aligns our request body fingerprint with the real client at\n# the WAF body-inspection layer.\n';
+var config_example_default = 'server:\n  port: 8080\n  # Host to bind the proxy on.\n  #   "0.0.0.0" = bind on ALL interfaces (LAN/remote clients can connect)\n  #   "127.0.0.1" = bind on localhost ONLY (no remote access)\n  # NOTE: even when bound to 0.0.0.0, you must access the dashboard via\n  #   http://127.0.0.1:8080/admin (or your machine\'s LAN IP) \u2014 opening\n  #   http://0.0.0.0:8080/admin directly does NOT work on Windows / macOS.\n  host: "0.0.0.0"\n\n  # Whether to trust X-Forwarded-For / X-Real-IP headers for client IP\n  # detection (used by the admin dashboard loopback gate when proxyApiKey\n  # is NOT configured).\n  #   false (default) = client IP read from the TCP socket (un-spoofable)\n  #   true             = trust XFF/X-Real-IP (set ONLY when behind a trusted\n  #                      reverse proxy like nginx/Caddy that overwrites them)\n  trustProxy: false\n\n  # Upstream request timeout in milliseconds. Applied to BOTH stream and\n  # batch requests. Set to 0 (or omit) to use the defaults:\n  #   - stream requests: 10 minutes (600000 ms)\n  #   - batch requests:  5 minutes (300000 ms)\n  # Lower this if your network is fast and you want faster failure detection;\n  # raise it if you regularly run very long reasoning chains that exceed 10 min.\n  upstreamTimeoutMs: 0\n\n  # SSE heartbeat interval in milliseconds (v0.2.1.7+).\n  #\n  # When the proxy is behind Cloudflare (or another reverse proxy with a\n  # Proxy Read Timeout \u2014 CF Free/Pro/Business = 100s), long "thinking"\n  # requests where the upstream LLM takes >100s to emit the first byte\n  # will be killed by CF with a 524 error.\n  #\n  # To prevent this, the proxy periodically flushes a no-op SSE comment\n  # line (": keepalive\\n\\n") to the client while waiting for the upstream\'s\n  # first chunk. SSE comment lines are spec-compliant and silently ignored\n  # by all conformant SSE clients (Anthropic SDK, OpenAI SDK, Cherry\n  # Studio, Claude Code, Codex, curl). The bytes keep TCP active and\n  # reset CF\'s idle timer.\n  #\n  # Once the first real chunk arrives, the heartbeat stops immediately\n  # and never re-fires \u2014 zero overhead after TTFB.\n  #\n  # Default: 15000 (15s). Set to 0 to disable. Env var:\n  # ZCODE_PROXY_SSE_HEARTBEAT_MS. Recommended range: 10s-30s.\n  # Below 5s is wasteful; above 60s defeats the purpose if upstream is\n  # behind CF.\n  sseHeartbeatMs: 15000\n\n  # Maximum client request body size in bytes for proxy endpoints.\n  # The proxy must materialize JSON request bodies before translating them,\n  # so this prevents accidental huge payloads from pinning memory. Default:\n  # 67108864 (64 MiB). Set to 0 to disable the guard.\n  # Env var: ZCODE_PROXY_MAX_REQUEST_BODY_BYTES.\n  maxRequestBodyBytes: 67108864\n\n# Optional browser CORS allowlist. When omitted, browser requests with an\n# Origin header receive Access-Control-Allow-Origin: null; server-to-server\n# requests without Origin still receive *.\n# Env var alternative: ZCODE_PROXY_CORS_ALLOWLIST=https://a.com,https://b.com\n# corsAllowList:\n#   - "https://your-dashboard.example.com"\n#   - "http://localhost:3000"\n\nauth:\n  # "oauth"  = OAuth login flow (DEFAULT \u2014 run `zcode-proxy auth login <zai|bigmodel>`\n  #            first, or start the server and log in from the dashboard at /admin).\n  #            The server starts even before login: API requests return 503\n  #            until a credential is added, and the dashboard offers\n  #            "OAuth \u767B\u5F55" / "\u4ECE ZCode \u5BFC\u5165" buttons \u2014 no restart needed.\n  # "apikey" = use a pre-obtained API key directly (set auth.apiKey below)\n  mode: oauth\n\n  # Only used in apikey mode (ignored in oauth mode):\n  #   Z.AI:     "yourApiKey.yourSecretKey"\n  #   Bigmodel: "yourApiKey"\n  apiKey: "YOUR_API_KEY_HERE"\n\n  # Key that clients must provide to use the proxy (the "admin password" \u2014\n  # it gates both /v1/* API calls and the /admin dashboard).\n  # Set to null/omit to disable client auth (loopback-only mode).\n  # Any length is accepted (v0.3.5.0 removed the old 8-char minimum);\n  # 32+ random chars recommended when binding to 0.0.0.0.\n  proxyApiKey: "your-proxy-secret"\n\n  # For oauth mode (path to stored credentials from login flow):\n  # oauthCredentialsPath: "~/.zcode-proxy/credentials.json"\n\n# Which upstream provider to use: "zai" or "bigmodel"\nprovider: zai\n\n# Which plan tier to use:\n#   "coding-plan" (default) \u2014 direct upstream endpoints, permanent API key\n#   "start-plan"            \u2014 routes through zcode.z.ai with JWT auth (requires `auth login`)\nplan: coding-plan\n\nproviders:\n  zai:\n    anthropicBase: "https://api.z.ai/api/anthropic"\n    openaiBase: "https://api.z.ai/api/coding/paas/v4"\n  bigmodel:\n    anthropicBase: "https://open.bigmodel.cn/api/anthropic"\n    openaiBase: "https://open.bigmodel.cn/api/coding/paas/v4"\n\ndefaultModel: glm-4.6\n\nmodels:\n  - glm-4.5-air\n  - glm-4.6\n  - glm-4.6v\n  - glm-4.7\n  - glm-5\n  - glm-5-turbo\n  - glm-5v-turbo\n  - glm-5.1\n  - glm-5.2\n  - glm-5.3\n\n# Identity values used to mimic the ZCode desktop client (v0.3.0: model\n# requests carry the FULL pio header set \u2014 see identity.ts). All optional;\n# env vars override YAML, which overrides defaults.\nidentity:\n  # Mirrors process.env.ZCODE_APP_VERSION in the ZCode bundle.\n  # Must be printable ASCII; non-conforming values fall back to the default.\n  # Default: "3.9.2" (current ZCode release, 2026-08-26). Override to match\n  # your real client \u2014 the start-plan trial-activation gate is version-sensitive.\n  appVersion: "3.9.2"\n  # Release channel header (X-Release-Channel). Default "production".\n  # Env var: ZCODE_RELEASE_CHANNEL.\n  releaseChannel: "production"\n  # Optional X-Device-Mid. If omitted, the proxy tries to read the existing\n  # ZCode telemetry-state.json deviceMid. Env var: ZCODE_DEVICE_MID.\n  # deviceMid: ""\n  # X-Title header suffix. Default "cli".\n  sourceTitle: "cli"\n  # HTTP-Referer URL. Default "https://zcode.z.ai".\n  refererOrigin: "https://zcode.z.ai"\n  # X-ZCode-Agent header for upstream model requests. Default "glm".\n  # Env var: ZCODE_AGENT.\n  zcodeAgent: "glm"\n\n# \u2500\u2500\u2500 v0.3.0 upstream zcode-api v2.6.0 alignment sections \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n# Client-session inference \u2014 replicates ZCode\'s single-user-identity UUID\n# generation so multi-turn conversations reuse the same upstream session id.\nclientIdentity:\n  # "observe" (default): infer + log only. "enforce": forward the inferred\n  # x-session-id upstream. "off": disable inference entirely.\n  mode: observe\n  # In-memory session TTL in seconds (default 900).\n  ttlSeconds: 900\n  # Max inferred sessions retained (default 1024).\n  maxSessions: 1024\n\n# Server-side endpoint routing \u2014 periodically fetches the server-published\n# mapping table (GET zcode.z.ai/api/v1/agent/configs) and remaps coding-plan\n# endpoints (e.g. to the ultra endpoints). Fully fail-open. Env var:\n# ZCODE_ENDPOINT_ROUTING=0/1.\nendpointRouting:\n  enabled: true\n  origin: "https://zcode.z.ai"\n\n# V4 client request signing \u2014 probes the server feature gate and, when the\n# server enables it, signs coding-plan requests (Ed25519 + proof-of-work)\n# exactly like the real client. Fail-open; start-plan is exempt. Env var:\n# ZCODE_CLIENT_SIGNING=0/1.\nclientSigning:\n  enabled: true\n  origin: "https://zcode.z.ai"\n\n# Async (off-peak / \u9519\u5CF0\u7B97\u529B) bridge (v0.3.1, upstream zcode-api 175ff2a).\n# When enabled, exposes three extra endpoints that route through ZCode\'s\n# off-peak ticket queue \u2014 the GLM Coding Plan "\u9519\u5CF0\u65F6\u6BB5 5 \u5C0F\u65F6\u989D\u5EA6\u91CD\u7F6E"\n# benefit (ZCode 3.8.1+):\n#   POST /async/v1/messages          (Anthropic-format clients)\n#   POST /async/v1/chat/completions  (OpenAI-format clients)\n#   GET  /async/v1/health            (probe queue availability)\n# The proxy holds the client connection open with SSE keepalive comments\n# while the ticket is queued, then streams the LLM response once the ticket\n# is ready. Auto-retries (maxRetries) when a ticket expires in queue.\n# Requires the active account to be OAuth / ZCode-imported (needs JWT);\n# apikey-only accounts get 400 async_credentials_unavailable.\n# Env var: ZCODE_ASYNC_ENABLED=1 enables without YAML.\nasync:\n  enabled: false\n  origin: "https://zcode.z.ai"\n  # Ticket-status poll interval in ms.\n  pollIntervalMs: 5000\n  # SSE keepalive comment interval during queue wait, in ms.\n  keepAliveIntervalMs: 3000\n  # Max total wait for a ticket to become ready, in ms. 0 = unlimited.\n  maxWaitMs: 0\n  # Max auto-retry count when a ticket expires in queue.\n  maxRetries: 3\n  # Best-effort settle (close-out) call timeout in ms.\n  settleTimeoutMs: 8000\n  # Control-plane (takeTicket / pollStatus) call timeout in ms.\n  controlTimeoutMs: 15000\n  # Optional model override; empty string uses the request\'s model.\n  defaultModel: ""\n\n# Start-plan captcha behavior (v0.3.0: in-process happy-dom solver + token\n# pool \u2014 no Chrome, no jsdom, no browser dependency):\n# - Tokens are pre-solved into a background pool; each start-plan request\n#   takes an already-solved token in sub-millisecond time.\n# - By default the proxy pre-solves and sends fresh Aliyun runtime captcha\n#   headers before each start-plan model attempt. Set\n#   ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT=0 only if you want diagnostic 3007-only\n#   solving.\n# - Pool sizing: CAPTCHA_POOL_MIN (default 20), CAPTCHA_POOL_MAX (default\n#   max(min*6, 120)). Retries: ZCODE_CAPTCHA_RETRIES (default 4). CPU\n#   throttle: CAPTCHA_CPU_LIMIT_PCT (default 100 = off).\n# - HTTP_PROXY/HTTPS_PROXY route the solver\'s outbound traffic when set.\n\nlogging:\n  level: info\n  # Verbose mode (vceshi0.0.6+): logs the full upstream request headers +\n  # transformed body for every request. Useful for diagnosing 3001 parameter\n  # errors. Env var: ZCODE_PROXY_VERBOSE_LOGGING=1\n  # verbose: false\n  # Debug response logging (ceshi0.1.4+): logs the FULL upstream response\n  # for every request \u2014 status + key headers + body preview (first 1000 chars\n  # for JSON, first 2KB for SSE streams). Shows EXACTLY what 529 / empty 200 /\n  # captcha 403 returned, including the error JSON body. Uses a bounded tee\n  # preview branch so it doesn\'t consume the original response. Env var: ZCODE_PROXY_DEBUG_LOGGING=1\n  # debug: false\n  # Header debug logging (v0.2.0.9+): writes TWO JSON files per request to\n  # ./header-debug/ (or $ZCODE_PROXY_HEADER_DEBUG_DIR):\n  #   {timestamp}_{reqId}_inbound.json   \u2190 \u5BA2\u6237\u7AEF\u53D1\u7ED9\u4EE3\u7406\u7684\u539F\u59CB\u8BF7\u6C42 (\u6536\u5230\u7684)\n  #   {timestamp}_{reqId}_upstream.json  \u2190 \u4EE3\u7406\u7FFB\u8BD1\u540E\u53D1\u7ED9 z.ai \u7684\u8BF7\u6C42\n  # Only the FIRST fetch attempt per request is recorded \u2014 retries and\n  # captcha re-solves are NOT logged, so each request = one pair of files.\n  # Use this to verify the translation pipeline has no header defects:\n  #   diff *_inbound.json *_upstream.json\n  # Auth tokens are masked (first-8...last-4). Clear with `rm -rf header-debug/`\n  # when done. Env var: ZCODE_PROXY_HEADER_DEBUG=1\n  # headerDebug: false\n\n# Retry configuration for upstream requests.\n# When the upstream returns a retryable status code (e.g. 529 site overloaded),\n# the proxy will automatically retry with exponential backoff.\n# All fields are optional; defaults are shown below.\n# Environment variable overrides:\n#   ZCODE_RETRY_MAX                        \u2014 max number of retries\n#   ZCODE_RETRY_INITIAL_DELAY_MS           \u2014 initial delay before first retry (ms)\n#   ZCODE_RETRY_MAX_DELAY_MS               \u2014 maximum delay cap (ms)\n#   ZCODE_RETRY_BACKOFF_FACTOR             \u2014 backoff multiplier per attempt\n#   ZCODE_RETRY_STATUSES                   \u2014 comma-separated retryable status codes (e.g. "529,429,503")\n#   ZCODE_RETRY_CREDENTIAL_SWITCH_THRESHOLD \u2014 consecutive failures before switching credentials\nretry:\n  # Maximum number of retry attempts. Set to 0 to disable retries entirely.\n  # No upper bound \u2014 set as high as needed (e.g. 1000 for very flaky upstreams).\n  maxRetries: 3\n  # Initial delay (ms) before the first retry. Subsequent retries multiply by backoffFactor.\n  initialDelayMs: 1000\n  # Maximum delay cap (ms). Backoff will never exceed this value.\n  maxDelayMs: 8000\n  # Exponential backoff multiplier. 2 = each retry waits ~2x longer.\n  backoffFactor: 2\n  # HTTP status codes that trigger a retry.\n  # Common values: 429 (rate limited / concurrency limit), 503 (service unavailable), 529 (site overloaded).\n  retryableStatuses:\n    - 529\n    - 429\n  # Credential auto-switching: when the SAME credential fails this many times\n  # consecutively (including the initial request), the proxy automatically\n  # switches to another stored credential (if available) and continues retrying.\n  # Already-tried credentials are skipped in the same request to avoid cycling.\n  #\n  # Set to 0 to disable. Default: 2 (v0.1.5+; was 5 \u2014 but 5 > maxRetries=3\n  # made the feature a no-op under default config).\n  #\n  # Only effective when:\n  #   1. More than one credential is stored (add accounts via the dashboard or\n  #      `zcode-proxy auth login`).\n  #   2. maxRetries >= this threshold (otherwise the retry loop exhausts first).\n  credentialSwitchThreshold: 2\n\n# --- Responses thinking override (Codex CLI workaround) ---\n# Codex CLI frequently sends `reasoning: null` in the /v1/responses wire\n# payload (the CLI only populates it when an explicit effort level is forced\n# via local config), so the translator\'s "honor reasoning.effort" branch\n# never fires and the upstream GLM request goes out without `thinking`.\n#\n# This section lets the operator force-enable thinking for specific models\n# regardless of what the client sent. Matching is case-insensitive exact\n# match on the *post-mapping* request model (i.e. the final GLM model id\n# after modelMappings is applied).\n#\n# Empty array / omitted = disabled (default). Two equivalent shapes:\n#\n#   responsesThinking:\n#     models:\n#       - glm-5.2\n#       - glm-4.6\n#\n#   # or shorthand:\n#   responsesThinking:\n#     - glm-5.2\n#     - glm-4.6\n#\n# The dashboard also exposes this as a chip-style multi-select under\n# \u4EE3\u7406\u89C4\u5219 \u2192 Responses \u601D\u8003\u7BA1\u7406.\nresponsesThinking:\n  models: []\n\n# --- Anthropic format options ---\nanthropic:\n  # v0.2.0.4: `forceStream` option removed \u2014 `stream: true` is now forced\n  # unconditionally inside alignZCodeRequestFormat to match the real ZCode\n  # desktop client\'s wire shape. The response path buffers SSE \u2192 batch JSON\n  # for clients that originally requested non-streaming, so this is transparent.\n  #\n  # Align request body structure to match the real ZCode desktop client exactly.\n  # When true:\n  #   1. Top-level field order: model \u2192 max_tokens \u2192 thinking \u2192 output_config\n  #      \u2192 system \u2192 messages \u2192 tools \u2192 tool_choice \u2192 stream\n  #   2. Inject 3 ZCode official system blocks (both coding-plan AND start-plan),\n  #      client\'s original system appended after\n  #   3. Rewrite "You are Claude Code, Anthropic\'s official CLI for Claude."\n  #      \u2192 "You are ZCode model working in Claude Code."\n  #   4. Keep role: "system" inside messages[] (don\'t relocate to top-level system)\n  # Default: false. Env var: ZCODE_PROXY_ALIGN_ZCODE_FORMAT=1\n  alignZCodeFormat: false\n# NOTE: ZCode thinking-format injection (max_tokens=64000 + budget_tokens=32000\n# + output_config.effort=max) is now UNCONDITIONAL default behavior since v0.1.9.\n# Any Anthropic request with thinking.type === "enabled" automatically gets\n# these fields rewritten to match the real ZCode desktop client. No config\n# needed \u2014 this aligns our request body fingerprint with the real client at\n# the WAF body-inspection layer.\n';
 
 // src/config/template.ts
 var EXAMPLE_CONFIG_YAML = config_example_default;
@@ -126649,7 +126737,7 @@ var ALIYUN_CAPTCHA_HEADERS = /* @__PURE__ */ new Set([
   "x-aliyun-captcha-verify-param",
   "x-aliyun-captcha-verify-region"
 ]);
-var STARTPLAN_OPENAI_BASE = "https://zcode.z.ai/api/v1/zcode-plan";
+var STARTPLAN_ANTHROPIC_BASE = "https://zcode.z.ai/api/v1/zcode-plan/anthropic";
 function normalizeBearerHeader(token) {
   const trimmed = token?.trim();
   if (!trimmed) return void 0;
@@ -126673,7 +126761,7 @@ function clientIp(req, resolveClientIp, trustProxy) {
 }
 function buildUpstreamURL(format, provider, plan = "coding-plan") {
   if (plan === "start-plan") {
-    return `${STARTPLAN_OPENAI_BASE}/chat/completions`;
+    return `${STARTPLAN_ANTHROPIC_BASE}/v1/messages`;
   }
   if (format === "anthropic") {
     return `${provider.anthropicBaseURL}/v1/messages`;
@@ -127949,197 +128037,6 @@ function parseContentBlockIndex(value2, maxIndex) {
 // src/proxy/handler.ts
 init_anthropic_to_responses();
 
-// src/translator/anthropic-to-openai.ts
-function translateRequestAnthropicToOpenAI(req) {
-  const messages = [];
-  if (req.system) {
-    const systemText = typeof req.system === "string" ? req.system : req.system.map((s) => s.text).join("\n");
-    messages.push({ role: "system", content: systemText });
-  }
-  for (const m of req.messages) {
-    messages.push(...translateMessageAnthropicToOpenAI(m));
-  }
-  const result3 = {
-    model: req.model,
-    messages,
-    ...req.temperature !== void 0 ? { temperature: req.temperature } : {},
-    ...req.top_p !== void 0 ? { top_p: req.top_p } : {},
-    ...req.stream !== void 0 ? { stream: req.stream } : {},
-    ...req.max_tokens !== void 0 ? { max_tokens: req.max_tokens } : {}
-  };
-  if (req.stop_sequences?.length) {
-    result3.stop = req.stop_sequences.length === 1 ? req.stop_sequences[0] : req.stop_sequences;
-  }
-  if (req.thinking) {
-    result3.thinking = req.thinking;
-  }
-  if (req.tools?.length) {
-    result3.tools = req.tools.map((t) => ({
-      type: "function",
-      function: {
-        name: t.name,
-        ...t.description ? { description: t.description } : {},
-        ...t.input_schema ? { parameters: t.input_schema } : {}
-      }
-    }));
-  }
-  if (req.tool_choice) {
-    const translated = mapToolChoiceAnthropicToOpenAI(req.tool_choice);
-    if (translated !== void 0) result3.tool_choice = translated;
-  }
-  return result3;
-}
-function mapToolChoiceAnthropicToOpenAI(choice) {
-  switch (choice.type) {
-    case "auto":
-      return "auto";
-    case "any":
-      return "required";
-    case "tool":
-      return { type: "function", function: { name: choice.name } };
-    default:
-      return void 0;
-  }
-}
-function translateResponseOpenAIToAnthropic(resp) {
-  const choice = resp.choices?.[0];
-  const content2 = [];
-  if (choice?.message?.reasoning_content) {
-    content2.push({ type: "thinking", thinking: choice.message.reasoning_content });
-  }
-  if (choice?.message?.content) {
-    const textContent = typeof choice.message.content === "string" ? choice.message.content : Array.isArray(choice.message.content) ? choice.message.content.filter((c) => c.type === "text").map((c) => c.text ?? "").join("") : "";
-    if (textContent) content2.push({ type: "text", text: textContent });
-  }
-  if (choice?.message?.tool_calls) {
-    for (const tc of choice.message.tool_calls) {
-      let input = {};
-      try {
-        input = JSON.parse(tc.function.arguments);
-      } catch {
-        input = {};
-      }
-      content2.push({
-        type: "tool_use",
-        id: tc.id,
-        name: tc.function.name,
-        input
-      });
-    }
-  }
-  const stopReason = mapFinishReasonToStopReason(choice?.finish_reason);
-  return {
-    id: resp.id,
-    type: "message",
-    role: "assistant",
-    content: content2.length > 0 ? content2 : [{ type: "text", text: "" }],
-    model: resp.model,
-    stop_reason: stopReason,
-    stop_sequence: null,
-    usage: openaiUsageToAnthropic(resp.usage)
-  };
-}
-function translateMessageAnthropicToOpenAI(m) {
-  if (typeof m.content === "string") {
-    return [{ role: m.role, content: m.content }];
-  }
-  const result3 = [];
-  const contentParts = [];
-  const toolCalls = [];
-  const reasoningParts = [];
-  for (const block of m.content) {
-    switch (block.type) {
-      case "text": {
-        contentParts.push({ type: "text", text: block.text });
-        break;
-      }
-      case "image": {
-        if (block.source.type === "base64") {
-          contentParts.push({
-            type: "image_url",
-            image_url: { url: `data:${block.source.media_type};base64,${block.source.data}` }
-          });
-        }
-        break;
-      }
-      case "tool_use": {
-        toolCalls.push({
-          id: block.id,
-          type: "function",
-          function: { name: block.name, arguments: JSON.stringify(block.input ?? {}) }
-        });
-        break;
-      }
-      case "tool_result": {
-        result3.push({
-          role: "tool",
-          tool_call_id: block.tool_use_id,
-          content: toolResultContentToOpenAI(block.content, block.is_error === true)
-        });
-        break;
-      }
-      case "thinking": {
-        if (block.thinking.length > 0) reasoningParts.push(block.thinking);
-        break;
-      }
-      default:
-        break;
-    }
-  }
-  const hasReasoning = m.role === "assistant" && reasoningParts.length > 0;
-  if (contentParts.length > 0 || toolCalls.length > 0 || hasReasoning) {
-    const content2 = contentParts.length === 0 ? null : contentParts.length === 1 && contentParts[0].type === "text" ? contentParts[0].text ?? "" : contentParts;
-    result3.push({
-      role: m.role,
-      content: content2,
-      ...hasReasoning ? { reasoning_content: reasoningParts.join("\n") } : {},
-      ...toolCalls.length > 0 ? { tool_calls: toolCalls } : {}
-    });
-  }
-  if (result3.length === 0) {
-    result3.push({ role: m.role, content: null });
-  }
-  return result3;
-}
-function toolResultContentToOpenAI(content2, isError) {
-  const body2 = flattenToolResultContent(content2);
-  return isError && body2.length > 0 ? `[tool_error] ${body2}` : body2;
-}
-function flattenToolResultContent(content2) {
-  if (typeof content2 === "string") return content2;
-  if (!Array.isArray(content2)) return "";
-  const texts = content2.filter((b) => b.type === "text").map((b) => b.text);
-  if (texts.length > 0) return texts.join("");
-  return JSON.stringify(content2);
-}
-function mapFinishReasonToStopReason(finishReason) {
-  switch (finishReason) {
-    case "stop":
-      return "end_turn";
-    case "length":
-      return "max_tokens";
-    case "tool_calls":
-      return "tool_use";
-    case "content_filter":
-      return "end_turn";
-    default:
-      return null;
-  }
-}
-function openaiUsageToAnthropic(usage) {
-  const promptTokens = usage?.prompt_tokens ?? 0;
-  const cacheRead = usage?.cache_read_input_tokens ?? usage?.prompt_tokens_details?.cached_tokens ?? 0;
-  const cacheCreation = usage?.cache_creation_input_tokens ?? 0;
-  const inputTokens = Math.max(0, promptTokens - cacheRead - cacheCreation);
-  const result3 = {
-    input_tokens: inputTokens,
-    output_tokens: usage?.completion_tokens ?? 0
-  };
-  if (cacheRead > 0) result3.cache_read_input_tokens = cacheRead;
-  if (cacheCreation > 0) result3.cache_creation_input_tokens = cacheCreation;
-  return result3;
-}
-
 // src/translator/sse-translator.ts
 init_sse();
 init_constants();
@@ -128416,263 +128313,10 @@ function mapStopReason(stopReason) {
       return "stop";
   }
 }
-function openaiSseToAnthropicSse(upstream, model = "glm-4.6") {
-  const encoder2 = new TextEncoder();
-  const decoder = new TextDecoder();
-  let buffer2 = "";
-  let messageStarted = false;
-  let blockIndex = 0;
-  let activeBlock = null;
-  const toolBlocks = /* @__PURE__ */ new Map();
-  const openToolBlockIndices = [];
-  let outputTokens = 0;
-  let latestUsage;
-  let pendingStopReason = null;
-  let contentClosed = false;
-  let messageDeltaSent = false;
-  let messageStopped = false;
-  const messageId = `msg_${Date.now()}`;
-  return new ReadableStream({
-    async start(controller) {
-      const reader = upstream.getReader();
-      let errored = false;
-      const enqueueAnthropicEvent = (eventType, data2) => {
-        controller.enqueue(encoder2.encode(formatAnthropicSSE(eventType, data2)));
-      };
-      const closeActiveBlock = () => {
-        if (!activeBlock) return;
-        enqueueAnthropicEvent("content_block_stop", {
-          type: "content_block_stop",
-          index: activeBlock.index
-        });
-        activeBlock = null;
-      };
-      const closeToolBlocks = () => {
-        for (const idx of openToolBlockIndices) {
-          enqueueAnthropicEvent("content_block_stop", {
-            type: "content_block_stop",
-            index: idx
-          });
-        }
-        openToolBlockIndices.length = 0;
-      };
-      const ensureActiveBlock = (type2) => {
-        if (activeBlock?.type === type2) return activeBlock.index;
-        closeActiveBlock();
-        const index = blockIndex++;
-        activeBlock = { type: type2, index };
-        enqueueAnthropicEvent("content_block_start", {
-          type: "content_block_start",
-          index,
-          content_block: type2 === "text" ? { type: "text", text: "" } : { type: "thinking", thinking: "", signature: "" }
-        });
-        return index;
-      };
-      const handleToolCalls = (toolCalls) => {
-        closeActiveBlock();
-        for (const tc of toolCalls) {
-          const idx = tc.index ?? 0;
-          let state2 = toolBlocks.get(idx);
-          if (!state2) {
-            state2 = { index: blockIndex++, id: "", name: "", started: false, pendingArgs: "" };
-            toolBlocks.set(idx, state2);
-          }
-          if (tc.id) state2.id = tc.id;
-          if (tc.function?.name) state2.name = tc.function.name;
-          if (!state2.started && state2.id && state2.name) {
-            state2.started = true;
-            enqueueAnthropicEvent("content_block_start", {
-              type: "content_block_start",
-              index: state2.index,
-              content_block: { type: "tool_use", id: state2.id, name: state2.name, input: {} }
-            });
-            openToolBlockIndices.push(state2.index);
-            if (state2.pendingArgs.length > 0) {
-              enqueueAnthropicEvent("content_block_delta", {
-                type: "content_block_delta",
-                index: state2.index,
-                delta: { type: "input_json_delta", partial_json: state2.pendingArgs }
-              });
-              state2.pendingArgs = "";
-            }
-          }
-          const argsDelta = tc.function?.arguments;
-          if (argsDelta) {
-            if (state2.started) {
-              enqueueAnthropicEvent("content_block_delta", {
-                type: "content_block_delta",
-                index: state2.index,
-                delta: { type: "input_json_delta", partial_json: argsDelta }
-              });
-            } else {
-              state2.pendingArgs += argsDelta;
-            }
-          }
-        }
-      };
-      const startPendingToolBlocks = () => {
-        const lateStarts = [];
-        for (const [openaiIdx, state2] of toolBlocks) {
-          if (state2.started) continue;
-          if (!state2.pendingArgs && !state2.id && !state2.name) continue;
-          state2.started = true;
-          lateStarts.push({
-            index: state2.index,
-            id: state2.id || `tool_call_${openaiIdx}`,
-            name: state2.name || "unknown_tool",
-            args: state2.pendingArgs
-          });
-          state2.pendingArgs = "";
-          openToolBlockIndices.push(state2.index);
-        }
-        lateStarts.sort((a, b) => a.index - b.index);
-        for (const ls of lateStarts) {
-          enqueueAnthropicEvent("content_block_start", {
-            type: "content_block_start",
-            index: ls.index,
-            content_block: { type: "tool_use", id: ls.id, name: ls.name, input: {} }
-          });
-          if (ls.args.length > 0) {
-            enqueueAnthropicEvent("content_block_delta", {
-              type: "content_block_delta",
-              index: ls.index,
-              delta: { type: "input_json_delta", partial_json: ls.args }
-            });
-          }
-        }
-      };
-      const closeContent = () => {
-        if (contentClosed) return;
-        contentClosed = true;
-        closeActiveBlock();
-        startPendingToolBlocks();
-        closeToolBlocks();
-      };
-      const finalizeStream = () => {
-        closeContent();
-        if (!messageDeltaSent) {
-          messageDeltaSent = true;
-          const usage = openaiUsageToAnthropic(latestUsage);
-          if (!latestUsage) usage.output_tokens = outputTokens;
-          enqueueAnthropicEvent("message_delta", {
-            type: "message_delta",
-            delta: {
-              stop_reason: pendingStopReason ?? "end_turn",
-              stop_sequence: null
-            },
-            usage
-          });
-        }
-        if (!messageStopped) {
-          messageStopped = true;
-          enqueueAnthropicEvent("message_stop", { type: "message_stop" });
-        }
-      };
-      try {
-        while (true) {
-          const { done, value: value2 } = await reader.read();
-          if (done) break;
-          buffer2 += decoder.decode(value2, { stream: true });
-          const lines = buffer2.split("\n");
-          buffer2 = lines.pop() ?? "";
-          for (const line of lines) {
-            if (!line.startsWith("data: ")) continue;
-            const dataStr = line.slice(6).trim();
-            if (dataStr === "[DONE]") {
-              finalizeStream();
-              continue;
-            }
-            try {
-              const chunk = JSON.parse(dataStr);
-              const choice = chunk.choices?.[0];
-              if (chunk.usage) {
-                latestUsage = chunk.usage;
-                outputTokens = chunk.usage.completion_tokens ?? outputTokens;
-              }
-              if (!messageStarted) {
-                messageStarted = true;
-                const startUsage = openaiUsageToAnthropic(chunk.usage);
-                enqueueAnthropicEvent("message_start", {
-                  type: "message_start",
-                  message: {
-                    id: chunk.id ?? messageId,
-                    type: "message",
-                    role: "assistant",
-                    content: [],
-                    model: chunk.model || model,
-                    stop_reason: null,
-                    stop_sequence: null,
-                    usage: startUsage
-                  }
-                });
-              }
-              if (choice?.delta?.content) {
-                const index = ensureActiveBlock("text");
-                enqueueAnthropicEvent("content_block_delta", {
-                  type: "content_block_delta",
-                  index,
-                  delta: { type: "text_delta", text: choice.delta.content }
-                });
-              }
-              if (choice?.delta?.reasoning_content) {
-                const index = ensureActiveBlock("thinking");
-                enqueueAnthropicEvent("content_block_delta", {
-                  type: "content_block_delta",
-                  index,
-                  delta: { type: "thinking_delta", thinking: choice.delta.reasoning_content }
-                });
-              }
-              if (choice?.delta?.tool_calls?.length) {
-                handleToolCalls(choice.delta.tool_calls);
-              }
-              if (choice?.finish_reason) {
-                pendingStopReason = mapFinishReason(choice.finish_reason);
-                closeContent();
-              }
-            } catch {
-            }
-          }
-        }
-        finalizeStream();
-      } catch (err) {
-        errored = true;
-        try {
-          controller.error(err);
-        } catch {
-        }
-      } finally {
-        if (!errored) {
-          try {
-            controller.close();
-          } catch {
-          }
-        }
-        reader.releaseLock();
-      }
-    }
-  });
-}
-function formatAnthropicSSE(eventType, data2) {
-  return `event: ${eventType}
-data: ${JSON.stringify(data2)}
-
-`;
-}
-function mapFinishReason(finishReason) {
-  switch (finishReason) {
-    case "stop":
-      return "end_turn";
-    case "length":
-      return "max_tokens";
-    case "tool_calls":
-      return "tool_use";
-    default:
-      return "end_turn";
-  }
-}
 
 // src/proxy/client-signing.ts
 init_identity();
+init_host_timers();
 var DEFAULT_ORIGIN = "https://zcode.z.ai";
 var GATE_PATH = "/api/v1/agent/configs";
 var HANDSHAKE_PATH = "/api/paas/c1f3a7e2/v2/client";
@@ -129031,7 +128675,7 @@ ${credential}`;
       Object.entries(buildIdentityHeaders(this.identity)).filter(([name2]) => name2 !== "X-ZCode-Agent" && name2 !== "X-Device-Mid")
     );
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), GATE_TIMEOUT_MS);
+    const timer = hostSetTimeout(() => controller.abort(), GATE_TIMEOUT_MS);
     try {
       const resp = await this.fetchImpl(this.gateUrl, {
         method: "GET",
@@ -129047,7 +128691,7 @@ ${credential}`;
       const signature = data2.codingPlanSignature;
       return signature?.enable === true ? "enabled" : "disabled";
     } finally {
-      clearTimeout(timer);
+      hostClearTimeout(timer);
     }
   }
   async ensurePrivateKey(state2, _stateKey, parsedCred, origin) {
@@ -129077,7 +128721,7 @@ ${ts}
 ${nonce}`
     );
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), HANDSHAKE_TIMEOUT_MS);
+    const timer = hostSetTimeout(() => controller.abort(), HANDSHAKE_TIMEOUT_MS);
     try {
       const resp = await this.fetchImpl(`${origin}${HANDSHAKE_PATH}`, {
         method: "POST",
@@ -129094,7 +128738,7 @@ ${nonce}`
       if (typeof cipher !== "string" || !cipher) throw new Error("handshake_omitted_privateCipher");
       return await decryptSigningPrivateKey(parsedCred.apiKeyId, parsedCred.apiKeySecret, cipher);
     } finally {
-      clearTimeout(timer);
+      hostClearTimeout(timer);
     }
   }
   noteOnce(stateKey, message) {
@@ -129139,6 +128783,7 @@ ${identityCacheKey(config.identity)}`;
 
 // src/proxy/endpoint-routing.ts
 init_identity();
+init_host_timers();
 var DEFAULT_ORIGIN2 = "https://zcode.z.ai";
 var CONFIG_PATH = "/api/v1/agent/configs";
 var SUCCESS_TTL_MS = 3e5;
@@ -129236,7 +128881,7 @@ var EndpointRoutingService = class {
     const key = credential ?? this.credential?.();
     if (key) headers2["x-api-key"] = key;
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.requestTimeoutMs);
+    const timer = hostSetTimeout(() => controller.abort(), this.requestTimeoutMs);
     try {
       const resp = await this.fetchImpl(this.configUrl, {
         method: "GET",
@@ -129269,7 +128914,7 @@ var EndpointRoutingService = class {
     } catch {
       this.retryAfter = this.now() + this.failureCooldownMs;
     } finally {
-      clearTimeout(timer);
+      hostClearTimeout(timer);
     }
   }
 };
@@ -129298,8 +128943,9 @@ init_proxied_fetch();
 init_api();
 
 // src/utils/sleep.ts
+init_host_timers();
 function sleep(ms) {
-  return new Promise((resolve2) => setTimeout(resolve2, ms));
+  return new Promise((resolve2) => hostSetTimeout(resolve2, ms));
 }
 
 // src/proxy/handler.ts
@@ -129502,6 +129148,7 @@ init_types();
 // src/proxy/request-body.ts
 init_retry();
 init_response_body();
+init_host_timers();
 var DEFAULT_MAX_REQUEST_BODY_BYTES = 64 * 1024 * 1024;
 var DEFAULT_REQUEST_BODY_IDLE_TIMEOUT_MS = 3e4;
 var RequestBodyTooLargeError = class extends Error {
@@ -129523,12 +129170,12 @@ async function readRequestBodyChunk2(reader, timeoutMs) {
   const result3 = await Promise.race([
     reader.read(),
     new Promise((resolve2) => {
-      timer = setTimeout(() => resolve2("timeout"), timeout);
+      timer = hostSetTimeout(() => resolve2("timeout"), timeout);
       timer.unref?.();
     })
   ]).finally(() => {
     if (timer) {
-      clearTimeout(timer);
+      hostClearTimeout(timer);
       timer = null;
     }
   });
@@ -129740,6 +129387,7 @@ function lookupModelMapping(clientModel, mappings) {
 
 // src/proxy/sse-heartbeat.ts
 init_constants();
+init_host_timers();
 function withSseHeartbeat(source, intervalMs) {
   if (!intervalMs || intervalMs <= 0) {
     return source;
@@ -129752,7 +129400,7 @@ function withSseHeartbeat(source, intervalMs) {
   let readInFlight = false;
   const stopHeartbeat = () => {
     if (timer) {
-      clearInterval(timer);
+      hostClearInterval(timer);
       timer = null;
     }
   };
@@ -129778,7 +129426,7 @@ function withSseHeartbeat(source, intervalMs) {
   };
   return new ReadableStream({
     start(controller) {
-      timer = setInterval(() => flushHeartbeat(controller), intervalMs);
+      timer = hostSetInterval(() => flushHeartbeat(controller), intervalMs);
       if (timer && typeof timer.unref === "function") timer.unref();
     },
     async pull(controller) {
@@ -130279,6 +129927,7 @@ function startPlanCaptchaPreflightEnabled() {
 // src/proxy/handler.ts
 init_translated_response();
 init_response_body();
+init_host_timers();
 init_retry();
 init_translated_response();
 function responsesCustomToolNames(body2) {
@@ -130294,6 +129943,12 @@ var ERROR_RESPONSE_PREVIEW_BYTES = 64 * 1024;
 var PASSTHROUGH_USAGE_PREVIEW_BYTES = 2 * 1024 * 1024;
 async function proxyRequest(clientReq, format, opts) {
   const { config, auth } = opts;
+  const clientGone = new AbortController();
+  const onClientGone = () => clientGone.abort();
+  if (clientReq.signal) {
+    if (clientReq.signal.aborted) clientGone.abort();
+    else clientReq.signal.addEventListener("abort", onClientGone, { once: true });
+  }
   const fetchImpl = wrapFetchWithSocksBridge(opts.fetchImpl ?? fetch);
   const started = Date.now();
   const reqId = nextReqId();
@@ -130368,7 +130023,7 @@ async function proxyRequest(clientReq, format, opts) {
     proxyLog(`${reqId} plan resolved from active credential: ${config.plan} \u2192 ${currentPlan}`);
   }
   void (format === "openai" || format === "openai-responses");
-  const upstreamFormatForPlan = (plan) => plan === "start-plan" ? "openai" : "anthropic";
+  const upstreamFormatForPlan = (plan) => plan === "start-plan" ? "anthropic" : "anthropic";
   let upstreamFormat = upstreamFormatForPlan(currentPlan);
   const applyModelRewrite = () => {
     if (format === "anthropic" && currentPlan === "coding-plan") return;
@@ -130389,20 +130044,8 @@ async function proxyRequest(clientReq, format, opts) {
     }
   };
   const buildUpstreamBodyObjForPlan = (plan) => {
+    void plan;
     applyModelRewrite();
-    if (plan === "start-plan") {
-      if (format === "anthropic") {
-        const translated2 = translateRequestAnthropicToOpenAI(parsedBody);
-        return { obj: translated2 };
-      }
-      if (format === "openai") {
-        return { obj: structuredClone(parsedBody) };
-      }
-      const forceThinkingModels2 = config.responsesThinking?.models;
-      const anthropicObj = translateClientBodyObj(parsedBody, "openai-responses", forceThinkingModels2 ? { forceThinkingModels: forceThinkingModels2 } : void 0);
-      if (anthropicObj instanceof Response) return { obj: void 0, error: anthropicObj };
-      return { obj: translateRequestAnthropicToOpenAI(anthropicObj) };
-    }
     if (format === "anthropic") return { obj: parsedBody };
     const forceThinkingModels = format === "openai-responses" ? config.responsesThinking?.models : void 0;
     const translated = translateClientBodyObj(parsedBody, format, forceThinkingModels ? { forceThinkingModels } : void 0);
@@ -130565,7 +130208,9 @@ async function proxyRequest(clientReq, format, opts) {
     const defaultTimeout = meta.stream ? DEFAULT_UPSTREAM_TIMEOUT_STREAM_MS : DEFAULT_UPSTREAM_TIMEOUT_BATCH_MS;
     const timeoutMs = normalizeTimerMs3(configuredTimeout > 0 ? configuredTimeout : defaultTimeout, defaultTimeout);
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    if (clientGone.signal.aborted) ctrl.abort();
+    else clientGone.signal.addEventListener("abort", () => ctrl.abort(), { once: true });
+    const timer = hostSetTimeout(() => ctrl.abort(), timeoutMs);
     timer.unref?.();
     const upstreamPassthrough = upstreamFormat === format;
     const fetchOpts = {
@@ -130626,7 +130271,10 @@ async function proxyRequest(clientReq, format, opts) {
             send: sendOnce
           });
         } catch (err) {
-          clearTimeout(timer);
+          hostClearTimeout(timer);
+          if (clientGone.signal.aborted) {
+            throw new Error("client disconnected before upstream response");
+          }
           if (ctrl.signal.aborted) {
             throw new Error(`upstream timeout after ${timeoutMs}ms`);
           }
@@ -130636,7 +130284,10 @@ async function proxyRequest(clientReq, format, opts) {
         resp = await fetchImpl(req, fetchOpts);
       }
     } catch (err) {
-      clearTimeout(timer);
+      hostClearTimeout(timer);
+      if (clientGone.signal.aborted) {
+        throw new Error("client disconnected before upstream response");
+      }
       if (ctrl.signal.aborted) {
         throw new Error(`upstream timeout after ${timeoutMs}ms`);
       }
@@ -130728,6 +130379,11 @@ async function proxyRequest(clientReq, format, opts) {
     }
   } catch (err) {
     const errMsg = err.message ?? String(err);
+    if (clientGone.signal.aborted) {
+      proxyLog(`${reqId} client disconnected during initial fetch \u2014 not retrying`);
+      printRow(reqId, format, meta, 499, started, Date.now(), 0, 0, 0);
+      return errorResponse(499, "client_disconnected", "Client closed the connection before the response completed");
+    }
     if (config.retry.maxRetries <= 0) {
       printRow(reqId, format, meta, 502, started, Date.now(), 0, 0, 0);
       return errorResponse(502, "upstream_unreachable", errMsg);
@@ -130761,6 +130417,10 @@ async function proxyRequest(clientReq, format, opts) {
     let rotated = false;
     if (maxRotations > 0) {
       for (let rot = 0; rot < maxRotations; rot++) {
+        if (clientGone.signal.aborted) {
+          proxyLog(`${reqId} client disconnected during WAF rotation \u2014 surfacing error`);
+          break;
+        }
         if (cred.proxy) break;
         currentRequestProxy = void 0;
         let nextProxy = null;
@@ -130895,6 +130555,11 @@ async function proxyRequest(clientReq, format, opts) {
     );
     const effectiveRetryLimit = () => Math.min(config.retry.maxRetries + extraAttemptsFromSwitches, MAX_TOTAL_ATTEMPTS);
     for (let attempt = 1; attempt <= effectiveRetryLimit(); attempt++) {
+      if (clientGone.signal.aborted) {
+        proxyLog(`${reqId} client disconnected during retry backoff \u2014 aborting retry loop`);
+        printRow(reqId, format, meta, 499, started, Date.now(), 0, 0, 0, hadRetryAttempt, 0, currentCredentialStatsKey(), totalCaptchaMs);
+        return errorResponse(499, "client_disconnected", "Client closed the connection before the response completed");
+      }
       if (attempt > MAX_TOTAL_ATTEMPTS) {
         proxyLog(`${reqId} hit MAX_TOTAL_ATTEMPTS cap (${MAX_TOTAL_ATTEMPTS}) \u2014 stopping retry loop`);
         allCredentialsExhausted = totalAvailableCredentials > 1;
@@ -130907,6 +130572,11 @@ async function proxyRequest(clientReq, format, opts) {
       );
       hadRetryAttempt = true;
       await sleep(delayMs);
+      if (clientGone.signal.aborted) {
+        proxyLog(`${reqId} client disconnected during retry backoff \u2014 aborting retry loop`);
+        printRow(reqId, format, meta, 499, started, Date.now(), 0, 0, 0, hadRetryAttempt, 0, currentCredentialStatsKey(), totalCaptchaMs);
+        return errorResponse(499, "client_disconnected", "Client closed the connection before the response completed");
+      }
       const shouldSwitchForEmptyStream = EMPTY_STREAM_SWITCH_THRESHOLD > 0 && consecutiveEmptyStreams >= EMPTY_STREAM_SWITCH_THRESHOLD;
       if (shouldSwitchForEmptyStream || switchThreshold > 0 && consecutiveCredFailures >= switchThreshold) {
         const failedCount = consecutiveCredFailures;
@@ -131215,88 +130885,6 @@ async function proxyRequest(clientReq, format, opts) {
     }
   }
   const responseNeedsTranslation = upstreamFormat !== format;
-  if (upstreamFormat === "openai" && format !== "openai") {
-    if (!upstreamResp.ok) {
-      const errBody = upstreamErrorPreview ?? await readResponseTextPreview(upstreamResp, {
-        maxBytes: ERROR_RESPONSE_PREVIEW_BYTES,
-        timeoutMs: 3e3
-      }).then((r2) => r2.text).catch(() => "");
-      try {
-        await upstreamResp.body?.cancel();
-      } catch (e) {
-        void e;
-      }
-      printRow(reqId, format, meta, upstreamResp.status, started, headersAt, 0, 0, 0, hadRetryAttempt, 0, currentCredentialStatsKey(), totalCaptchaMs);
-      return errorResponse(upstreamResp.status, "upstream_error", `upstream returned ${upstreamResp.status}: ${errBody.slice(0, 200)}`);
-    }
-    if (format === "anthropic") {
-      if (isSSE && upstreamResp.body) {
-        const translated = openaiSseToAnthropicSse(upstreamResp.body, meta.model);
-        const stats2 = createStatsTransform(reqId, format, meta, upstreamResp.status, started, null, currentCredentialStatsKey(), totalCaptchaMs, hadRetryAttempt);
-        return translatedSseResponse(withSseHeartbeat(observeStatsStream(translated, stats2), config.server.sseHeartbeatMs ?? 0));
-      }
-      try {
-        const openaiJson = await upstreamResp.json();
-        const anthropicMsg = translateResponseOpenAIToAnthropic(openaiJson);
-        const respHeaders = new Headers();
-        for (const h of ["x-request-id"]) {
-          const v = upstreamResp.headers.get(h);
-          if (v) respHeaders.set(h, v);
-        }
-        respHeaders.set("content-type", "application/json");
-        upstreamResp = new Response(JSON.stringify(anthropicMsg), {
-          status: upstreamResp.status,
-          statusText: upstreamResp.statusText,
-          headers: respHeaders
-        });
-        isSSE = false;
-      } catch (err) {
-        proxyLog(`${reqId} OpenAI\u2192Anthropic batch translation failed: ${err.message}`);
-        printRow(reqId, format, meta, 502, started, headersAt, 0, 0, 0, hadRetryAttempt, 0, currentCredentialStatsKey(), totalCaptchaMs);
-        return errorResponse(502, "translation_failed", err.message);
-      }
-    } else {
-      const customToolNames = responsesCustomToolNames(parsedBody);
-      if (isSSE && upstreamResp.body) {
-        const anthropicStream = openaiSseToAnthropicSse(upstreamResp.body, meta.model);
-        const translated = anthropicSseToResponsesSse(anthropicStream, meta.model, { customToolNames });
-        const stats2 = createStatsTransform(reqId, format, meta, upstreamResp.status, started, null, currentCredentialStatsKey(), totalCaptchaMs, hadRetryAttempt);
-        return translatedSseResponse(withSseHeartbeat(observeStatsStream(translated, stats2), config.server.sseHeartbeatMs ?? 0));
-      }
-      try {
-        const openaiJson = await upstreamResp.json();
-        const anthropicMsg = translateResponseOpenAIToAnthropic(openaiJson);
-        const respHeaders = new Headers();
-        respHeaders.set("content-type", "application/json");
-        upstreamResp = new Response(JSON.stringify(anthropicMsg), {
-          status: upstreamResp.status,
-          statusText: upstreamResp.statusText,
-          headers: respHeaders
-        });
-        isSSE = false;
-      } catch (err) {
-        proxyLog(`${reqId} OpenAI\u2192Anthropic batch translation failed: ${err.message}`);
-        printRow(reqId, format, meta, 502, started, headersAt, 0, 0, 0, hadRetryAttempt, 0, currentCredentialStatsKey(), totalCaptchaMs);
-        return errorResponse(502, "translation_failed", err.message);
-      }
-      return await translatedResponsesBatchResponse(
-        clientReq,
-        upstreamResp,
-        meta.model,
-        reqId,
-        format,
-        meta,
-        started,
-        headersAt,
-        parsedBody?.previous_response_id,
-        parsedBody?.input,
-        customToolNames,
-        currentCredentialStatsKey(),
-        totalCaptchaMs,
-        hadRetryAttempt
-      );
-    }
-  }
   if (responseNeedsTranslation && format !== "anthropic" && upstreamFormat === "anthropic") {
     if (!upstreamResp.ok) {
       const errBody = upstreamErrorPreview ?? await readResponseTextPreview(upstreamResp, {
@@ -131533,6 +131121,7 @@ var OffPeakServerError = class extends Error {
 };
 
 // src/async/client.ts
+init_host_timers();
 var DEFAULT_CONTROL_TIMEOUT_MS = 15e3;
 var MAX_BATCH_STATUS = 100;
 function createOffPeakClient(opts) {
@@ -131553,7 +131142,7 @@ function createOffPeakClient(opts) {
   }
   async function request(method2, path2, body2, timeoutMs, externalSignal, isSettle, settleAsSuccess) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const timer = hostSetTimeout(() => controller.abort(), timeoutMs);
     const onExternalAbort = () => controller.abort();
     if (externalSignal) {
       if (externalSignal.aborted) controller.abort();
@@ -131578,7 +131167,7 @@ function createOffPeakClient(opts) {
       }
       raw = await resp.text();
     } finally {
-      clearTimeout(timer);
+      hostClearTimeout(timer);
       externalSignal?.removeEventListener("abort", onExternalAbort);
     }
     if (!resp.ok) {
@@ -131707,6 +131296,7 @@ function createOffPeakClient(opts) {
 }
 
 // src/async/keepalive.ts
+init_host_timers();
 function keepaliveFrame(text = "keepalive") {
   const clean = text.replace(/[\r\n]/g, " ");
   return new TextEncoder().encode(`: ${clean}
@@ -131716,6 +131306,7 @@ function keepaliveFrame(text = "keepalive") {
 
 // src/async/bridge.ts
 init_identity();
+init_host_timers();
 var EXPIRED_MARKER = "off-peak-ticket-expired";
 function runAsyncBridge(opts) {
   const fetchImpl = opts.fetchImpl ?? globalThis.fetch;
@@ -131815,11 +131406,11 @@ data: ${payload}
       let keepAliveTimer;
       function startKeepalive() {
         if (keepAliveTimer) return;
-        keepAliveTimer = setInterval(() => emitKeepalive(controller), opts.keepAliveIntervalMs);
+        keepAliveTimer = hostSetInterval(() => emitKeepalive(controller), opts.keepAliveIntervalMs);
       }
       function stopKeepalive() {
         if (keepAliveTimer) {
-          clearInterval(keepAliveTimer);
+          hostClearInterval(keepAliveTimer);
           keepAliveTimer = void 0;
         }
       }
@@ -132055,12 +131646,12 @@ function sleep2(ms, signal2) {
       resolve2();
       return;
     }
-    const t = setTimeout(() => {
+    const t = hostSetTimeout(() => {
       signal2?.removeEventListener("abort", onAbort);
       resolve2();
     }, ms);
     const onAbort = () => {
-      clearTimeout(t);
+      hostClearTimeout(t);
       resolve2();
     };
     signal2?.addEventListener("abort", onAbort, { once: true });
@@ -132522,6 +132113,57 @@ function createFetchHandler(opts) {
   };
 }
 function startServer(opts) {
+  if (typeof Bun !== "undefined" && typeof Bun.serve === "function") {
+    return startBunServer(opts);
+  }
+  return startNodeServer(opts);
+}
+async function startBunServer(opts) {
+  let server;
+  const resolveClientIp = (req) => {
+    try {
+      return server?.requestIP(req)?.address;
+    } catch {
+      return void 0;
+    }
+  };
+  const adminOpts = {
+    config: opts.config,
+    auth: opts.auth,
+    configPath: opts.configPath ?? "config.yaml",
+    startTime: Date.now(),
+    fetchImpl: opts.fetchImpl,
+    resolveClientIp
+  };
+  const handler = createFetchHandler({ ...opts, adminOpts, resolveClientIp });
+  const { port: requestedPort, host: host2 } = opts.config.server;
+  server = Bun.serve({
+    port: requestedPort,
+    hostname: host2,
+    // 自用代理：禁用空闲超时，避免长 reasoning 的 LLM 请求被杀（v0.3.2 及更早
+    // 桌面版的原行为）。/async/ 错峰排队需要保持连接数小时，同样依赖此设置。
+    idleTimeout: 0,
+    fetch(req) {
+      return handler(req);
+    }
+  });
+  return {
+    hostname: server.hostname ?? host2,
+    port: server.port ?? requestedPort,
+    // Bun.serve#stop(closeActiveConnections): stop() = graceful (in-flight
+    // finish), stop(true) = destroy active connections — exactly the
+    // ProxyServer stop(force) contract.
+    stop: (force = false) => {
+      server?.stop(force);
+      return Promise.resolve();
+    },
+    close: () => {
+      server?.stop(false);
+      return Promise.resolve();
+    }
+  };
+}
+function startNodeServer(opts) {
   const resolveClientIp = (req) => req[CLIENT_IP];
   const adminOpts = {
     config: opts.config,
@@ -132539,6 +132181,8 @@ function startServer(opts) {
       if (!res.writableEnded) abortController.abort();
     };
     res.on("close", onClientClose);
+    req.on("aborted", onClientClose);
+    res.socket?.on("close", onClientClose);
     if ((req.url ?? "").startsWith("/async/")) {
       req.setTimeout(24 * 60 * 60 * 1e3);
     }
@@ -132566,6 +132210,10 @@ function startServer(opts) {
   return new Promise((resolve2, reject) => {
     server.once("error", reject);
     server.listen(requestedPort, host2, () => {
+      server.removeListener("error", reject);
+      server.on("error", (err) => {
+        console.error(`[server] runtime server error: ${err.message}`);
+      });
       const addr = server.address();
       const actualPort = typeof addr === "object" && addr ? addr.port : requestedPort;
       const stop = (force = false) => new Promise((done) => {
@@ -132640,10 +132288,23 @@ async function writeWebResponseToNodeResp(resp, res, abortSignal) {
       const { done, value: value2 } = await reader.read();
       if (done) break;
       if (!res.write(Buffer.from(value2))) {
-        await new Promise((resolve2) => res.once("drain", () => resolve2()));
+        await new Promise((resolve2) => {
+          const finish = () => {
+            res.removeListener("drain", onDrain);
+            res.removeListener("close", onClose);
+            resolve2();
+          };
+          const onDrain = () => finish();
+          const onClose = () => finish();
+          res.once("drain", onDrain);
+          res.once("close", onClose);
+        });
       }
     }
-    res.end();
+    try {
+      res.end();
+    } catch {
+    }
   } catch (err) {
     if (abortSignal?.aborted) {
       try {
@@ -132749,9 +132410,11 @@ var LogBuffer = class {
 };
 function startControlListener(opts) {
   const logBuffer = opts.logBuffer ?? new LogBuffer();
+  const identity = opts.identity ?? defaultControlIdentity();
   const server = (0, import_node_http3.createServer)(async (req, res) => {
     try {
       const result3 = await handleControlRequest(req, opts.state, {
+        identity,
         onStartProxy: opts.onStartProxy,
         onStopProxy: opts.onStopProxy,
         onSetConfig: opts.onSetConfig,
@@ -132802,7 +132465,7 @@ async function dispatch(cmd, state2, ctx) {
       };
     }
     case "startOAuth": {
-      const client = cmd.provider === "bigmodel" ? new BigmodelOAuthClient() : new ZaiOAuthClient();
+      const client = cmd.provider === "bigmodel" ? new BigmodelOAuthClient(void 0, void 0, void 0, void 0, ctx.identity) : new ZaiOAuthClient(void 0, void 0, void 0, void 0, ctx.identity);
       const started = await client.start();
       const callbackUrlObj = new URL(started.callbackUrl);
       const callbackPort = callbackUrlObj.port ? Number(callbackUrlObj.port) : 80;
@@ -132903,6 +132566,19 @@ async function dispatch(cmd, state2, ctx) {
 function isLoopback(addr) {
   return addr === "127.0.0.1" || addr === "::1" || addr === "::ffff:127.0.0.1";
 }
+function defaultControlIdentity() {
+  try {
+    return resolveDefaultIdentity();
+  } catch {
+    return {
+      appVersion: "3.9.2",
+      sourceTitle: "Z Code@cli",
+      refererOrigin: "https://zcode.z.ai",
+      releaseChannel: "production",
+      zcodeAgent: "glm"
+    };
+  }
+}
 function writeJson(res, status, body2) {
   const json = JSON.stringify(body2);
   res.writeHead(status, {
@@ -132911,10 +132587,19 @@ function writeJson(res, status, body2) {
   });
   res.end(json);
 }
-function readBody3(req) {
+function readBody3(req, maxBytes = 1 * 1024 * 1024) {
   return new Promise((resolve2, reject) => {
     const chunks = [];
-    req.on("data", (c) => chunks.push(c));
+    let received = 0;
+    req.on("data", (c) => {
+      received += c.length;
+      if (received > maxBytes) {
+        reject(new Error("control request body too large"));
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
     req.on("end", () => resolve2(Buffer.concat(chunks).toString("utf-8")));
     req.on("error", reject);
   });
@@ -132946,6 +132631,7 @@ var import_node_child_process = require("node:child_process");
 var import_node_fs7 = require("node:fs");
 var import_node_path9 = require("node:path");
 var import_yaml3 = __toESM(require_dist(), 1);
+init_host_timers();
 var LOG_LEVEL_ORDER = { debug: 0, info: 1, warn: 2, error: 3 };
 process.on("uncaughtException", (err) => {
   try {
@@ -133029,7 +132715,7 @@ async function fatalError(err) {
   const msg = err instanceof Error ? err.message : String(err);
   console.error("\n[FATAL] " + msg);
   console.error("\nServer could not start. This window will close in 15 seconds.");
-  await new Promise((r2) => setTimeout(r2, 15e3));
+  await new Promise((r2) => hostSetTimeout(r2, 15e3));
   process.exit(1);
 }
 function printHelp() {
@@ -133153,13 +132839,17 @@ async function runAndroid() {
   const controlListener = await startControlListener({
     port: controlPort,
     state: controlState,
+    // v0.3.4: Android OAuth token exchanges now carry the full real-client
+    // fingerprint (config.yaml identity > env override > built-in defaults)
+    // — previously they went out with Node's bare UA (WAF fingerprint gap).
+    identity: config.identity,
     logBuffer,
     onStartProxy: startProxy,
     onStopProxy: stopProxy,
     onSetConfig: setConfig,
     onShutdown: async () => {
       await serverRef.current?.stop(true);
-      setTimeout(() => process.exit(0), 250).unref?.();
+      hostSetTimeout(() => process.exit(0), 250).unref?.();
     }
   });
   console.log(`control listener: 127.0.0.1:${controlPort}`);
@@ -133177,7 +132867,8 @@ async function serve(configPath) {
   const path2 = configPath ?? process.env.ZCODE_PROXY_CONFIG ?? "config.yaml";
   if (await ensureConfigFile(path2)) {
     console.log(`Created ${path2} from bundled template.`);
-    console.log(`Edit auth.apiKey, or run: zcode-proxy auth login <zai|bigmodel>
+    console.log(`Default mode is OAuth \u2014 run: zcode-proxy auth login <zai|bigmodel>`);
+    console.log(`(or start the server and log in from the dashboard at /admin)
 `);
   }
   const config = loadConfig(path2);
@@ -133321,6 +133012,17 @@ async function serve(configPath) {
     console.warn("  \u26A0  Anyone who can reach this port can use your upstream credentials.");
     console.warn("  \u26A0  Set `auth.proxyApiKey` in config.yaml or env ZCODE_PROXY_API_KEY.");
     console.warn("");
+  } else if (config.auth.proxyApiKey.length < 8) {
+    const exposed = server.hostname === "0.0.0.0" || server.hostname === "::";
+    console.warn("");
+    console.warn(`  \u26A0  NOTE: proxyApiKey is ${config.auth.proxyApiKey.length} chars (short).`);
+    if (exposed) {
+      console.warn("  \u26A0  The proxy is bound on all interfaces \u2014 a short key is brute-forceable.");
+      console.warn("  \u26A0  Consider a longer key (32+ chars) or bind server.host to 127.0.0.1.");
+    } else {
+      console.warn("  \u26A0  Fine for loopback-only use; use a longer key (32+ chars) if you bind 0.0.0.0.");
+    }
+    console.warn("");
   }
   let shuttingDown = false;
   let forceExitScheduled = false;
@@ -133349,7 +133051,7 @@ Received ${signal2}, shutting down gracefully...`);
     };
     Promise.race([
       stopAndFlushLogs(),
-      new Promise((r2) => setTimeout(r2, 3e4))
+      new Promise((r2) => hostSetTimeout(r2, 3e4))
     ]).finally(() => process.exit(0));
   };
   process.on("SIGINT", () => shutdown("SIGINT"));

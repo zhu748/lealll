@@ -14,6 +14,9 @@
  */
 import { writeFile, rename, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
+// v0.3.7.1: host-captured timer — retry delays must not resolve through the
+// captcha window alias during solve epochs.
+import { hostSetTimeout } from "./host-timers.js";
 
 let atomicTmpCounter = 0;
 
@@ -44,7 +47,7 @@ async function safeRename(tmp: string, target: string): Promise<void> {
       // ENOENT: tmp disappeared (shouldn't happen) — retry won't help.
       // EXDEV: cross-device link — retry won't help, fall through.
       if (code === "EPERM" || code === "EBUSY" || code === "EACCES") {
-        await new Promise(r => setTimeout(r, RETRY_DELAY_MS * (attempt + 1)));
+        await new Promise(r => hostSetTimeout(r, RETRY_DELAY_MS * (attempt + 1)));
         continue;
       }
       throw err;

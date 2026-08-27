@@ -1,4 +1,9 @@
 import { SSE_HEARTBEAT as SSE_HEARTBEAT_CONST } from "../utils/constants.js";
+// v0.3.7.1: host-captured timers — SSE heartbeats run concurrent with
+// captcha solve epochs; a bare setInterval would register on the solving
+// window's registry and be cancelled when that window is destroyed, killing
+// the keepalive and stalling client streams.
+import { hostSetInterval, hostClearInterval } from "../utils/host-timers.js";
 
 /**
  * SSE heartbeat transform — keeps the client connection alive while the
@@ -25,7 +30,7 @@ export function withSseHeartbeat(source: ReadableStream<Uint8Array>, intervalMs:
 
   const stopHeartbeat = (): void => {
     if (timer) {
-      clearInterval(timer);
+      hostClearInterval(timer);
       timer = null;
     }
   };
@@ -53,7 +58,7 @@ export function withSseHeartbeat(source: ReadableStream<Uint8Array>, intervalMs:
       // Kick off the heartbeat immediately. We use setInterval (not
       // setTimeout chain) because it's cheaper and Bun's timer impl
       // doesn't drift under load the way recursive setTimeout can.
-      timer = setInterval(() => flushHeartbeat(controller), intervalMs);
+      timer = hostSetInterval(() => flushHeartbeat(controller), intervalMs);
       // Don't keep the event loop alive solely for heartbeat — if the
       // only thing pending is our timer, the process should be able to
       // exit. The real request pipeline (fetch response body) holds the

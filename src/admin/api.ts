@@ -619,7 +619,7 @@ export function _quotaCacheStateForTesting(): { cached: number; inFlight: number
 function withActivationProbeHardTimeout<T>(task: Promise<T>, onTimeout?: () => void): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | null = null;
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => {
+    timer = hostSetTimeout(() => {
       try { onTimeout?.(); } catch {}
       reject(new Error(`activation probe timeout after ${ACTIVATION_PROBE_HARD_TIMEOUT_MS}ms`));
     }, ACTIVATION_PROBE_HARD_TIMEOUT_MS);
@@ -627,7 +627,7 @@ function withActivationProbeHardTimeout<T>(task: Promise<T>, onTimeout?: () => v
   });
   return Promise.race([task, timeout]).finally(() => {
     if (timer) {
-      clearTimeout(timer);
+      hostClearTimeout(timer);
       timer = null;
     }
   });
@@ -760,7 +760,7 @@ export function _probeStartPlanActivationForTesting(
  * sensitive-ish. Runs every 5 minutes; flows expire 5 minutes after their
  * expiresAt timestamp to give in-flight poll requests a chance to drain.
  */
-setInterval(() => {
+hostSetInterval(() => {
   const cleaned = pruneActiveOAuthFlows();
   if (cleaned > 0) {
     appendLog("debug", `OAuth flow cleanup: removed ${cleaned} expired flow(s)`);
@@ -943,6 +943,12 @@ let logFileDropWarnInProgress = false;
 import { appendFile as appendFileAsync } from "node:fs/promises";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+// v0.3.7.1: host-captured timers — dashboard/admin timers (activation
+// probes, log flush, SSE viewers, fetch abort guards) can start or fire while
+// captcha solve epochs shadow the global timer names with the solving
+// window's registry; a bare call would be cancelled on window destruction.
+// See utils/host-timers.ts.
+import { hostSetTimeout, hostSetInterval, hostClearTimeout, hostClearInterval } from "../utils/host-timers.js";
 
 let appendLogFile = appendFileAsync;
 
@@ -1041,7 +1047,7 @@ export function setLogFilePath(path: string | undefined): void {
   }
   // Clear any existing interval before switching.
   if (logFileFlushInterval) {
-    clearInterval(logFileFlushInterval);
+    hostClearInterval(logFileFlushInterval);
     logFileFlushInterval = null;
   }
   logFilePath = path;
@@ -1055,7 +1061,7 @@ export function setLogFilePath(path: string | undefined): void {
     // Start the async flush interval — every LOG.FILE_FLUSH_INTERVAL_MS, drain the buffer.
     // This replaces the per-log appendFileSync which was blocking the event
     // loop on Windows (each sync write = 5-50ms with AV interference).
-    logFileFlushInterval = setInterval(flushLogFile, LOG_CONST.FILE_FLUSH_INTERVAL_MS);
+    logFileFlushInterval = hostSetInterval(flushLogFile, LOG_CONST.FILE_FLUSH_INTERVAL_MS);
     // Don't keep the process alive just for this interval — it should only
     // fire while the server is running for other reasons.
     if (typeof logFileFlushInterval.unref === "function") {
@@ -1093,7 +1099,7 @@ export function _setLogStreamBackpressureLimitForTesting(chunks?: number): void 
 
 export function _resetLogFileForTesting(): void {
   if (logFileFlushInterval) {
-    clearInterval(logFileFlushInterval);
+    hostClearInterval(logFileFlushInterval);
     logFileFlushInterval = null;
   }
   logFilePath = undefined;
@@ -2007,7 +2013,7 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
 
       const started = Date.now();
       const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 10_000);
+      const timer = hostSetTimeout(() => ctrl.abort(), 10_000);
       timer.unref?.();
       // Use injected fetchImpl if provided (for tests); fall back to global.
       // wrapFetchWithSocksBridge transparently routes SOCKS proxies through
@@ -2047,7 +2053,7 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
           target,
         });
       } finally {
-        clearTimeout(timer);
+        hostClearTimeout(timer);
       }
     } catch (err) {
       return errorResponse(500, "test_failed", (err as Error).message);
@@ -3204,9 +3210,9 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
 
         const doCleanup = () => {
           closed = true;
-          if (interval) clearInterval(interval);
-          if (heartbeat) clearInterval(heartbeat);
-          if (maxTimeout) clearTimeout(maxTimeout);
+          if (interval) hostClearInterval(interval);
+          if (heartbeat) hostClearInterval(heartbeat);
+          if (maxTimeout) hostClearTimeout(maxTimeout);
           const idx = logWaiters.indexOf(waiter);
           if (idx >= 0) logWaiters.splice(idx, 1);
         };
@@ -3216,7 +3222,7 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
         // rare race where appendLog fires between the buffer-scan above and
         // the logWaiters.push() above. Slow enough to be cheap on idle
         // systems; fast enough that the race window is negligible.
-        interval = setInterval(() => {
+        interval = hostSetInterval(() => {
           if (closed) return;
           flushNew();
         }, 2000);
@@ -3234,7 +3240,7 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
         //      balancers that close idle connections after 60s.
         // The SSE comment line (starting with ":") is ignored by the
         // browser's EventSource API — it doesn't trigger any message event.
-        heartbeat = setInterval(() => {
+        heartbeat = hostSetInterval(() => {
           if (closed) return;
           if (!sendPayload(`: heartbeat\n\n`)) {
             // enqueue failed — client is gone. Trigger cleanup.
@@ -3255,7 +3261,7 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
         // auto-reconnects via EventSource's built-in retry after we close.
         // Even with 10 leaked waiters, the worst-case iteration cost in
         // appendLog drops from 10min × N to 2min × N — a 5x improvement.
-        maxTimeout = setTimeout(() => {
+        maxTimeout = hostSetTimeout(() => {
           doCleanup();
           try { controller.close(); } catch { /* already closed */ }
         }, LOG_CONST.MAX_CONNECTION_MS);
@@ -3527,7 +3533,7 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
 
       const started = Date.now();
       const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 10_000);
+      const timer = hostSetTimeout(() => ctrl.abort(), 10_000);
       timer.unref?.();
       // wrapFetchWithSocksBridge transparently routes SOCKS proxies through
       // the local HTTP-CONNECT→SOCKS bridge.
@@ -3562,7 +3568,7 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
           target,
         });
       } finally {
-        clearTimeout(timer);
+        hostClearTimeout(timer);
       }
     } catch (err) {
       return errorResponse(500, "test_failed", (err as Error).message);

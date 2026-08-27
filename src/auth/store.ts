@@ -24,6 +24,9 @@ import { randomBytes, createCipheriv, createDecipheriv, createHash } from "node:
 import { atomicWriteFile, createMutex } from "../utils/fs.js";
 import { runtimeLog, runtimeWarn } from "../utils/log.js";
 import type { Credential } from "./types.js";
+// v0.3.7.1: host-captured timer — store retry backoffs must survive captcha
+// solve epochs (bare global is aliased to the solving window there).
+import { hostSetTimeout } from "../utils/host-timers.js";
 
 /**
  * Store directory.
@@ -737,7 +740,7 @@ async function readStoreUncached(): Promise<StoreV2 | null> {
         // ASYNC sleep — yields to the event loop so other requests aren't
         // blocked during the backoff window. This is the key fix for the
         // "刷新卡顿" symptom on Windows.
-        await new Promise(r => setTimeout(r, 50 * (attempt + 1)));
+        await new Promise(r => hostSetTimeout(r, 50 * (attempt + 1)));
         continue;
       }
       // Other errors (EISDIR, etc.) — don't retry
@@ -1042,7 +1045,7 @@ async function withCrossProcessStoreLock<T>(fn: () => Promise<T>): Promise<T> {
         throw new Error(`Timed out waiting for credential store lock: ${lockDir}`);
       }
       const delay = Math.min(250, 25 * (++attempt));
-      await new Promise(resolve => setTimeout(resolve, delay));
+      await new Promise(resolve => hostSetTimeout(resolve, delay));
     }
   }
 
@@ -1430,7 +1433,7 @@ export async function clearCredentialAsync(): Promise<void> {
         const code = (err as NodeJS.ErrnoException)?.code;
         if (code === "EPERM" || code === "EBUSY" || code === "EACCES") {
           // ASYNC sleep — no event-loop blocking (unlike sync clearCredential).
-          await new Promise(r => setTimeout(r, RETRY_DELAY_MS * (attempt + 1)));
+          await new Promise(r => hostSetTimeout(r, RETRY_DELAY_MS * (attempt + 1)));
           continue;
         }
         // ENOENT (already gone) is fine — treat as success.

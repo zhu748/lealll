@@ -10,6 +10,13 @@ import {
   shutdownCaptchaSolver,
 } from "./captcha-solver.js";
 import { isCaptchaDuplicateError, isCaptchaIpBlockError, parseCertifyId } from "./captcha-token.js";
+// v0.3.7.1 (429-retry permanent hang): the pool's deadline/grace/stagger
+// timers are HOST-side control flow and must survive captcha window
+// destruction — the bare globals get shadowed by the solver's window alias
+// during solve epochs, and timers registered on a window registry are
+// cancelled when that window closes (the take deadline itself was a victim:
+// it never fired, so takeToken hung forever).
+import { hostSetTimeout, hostSetInterval, hostClearInterval } from "../utils/host-timers.js";
 
 export interface CaptchaPoolOptions {
   /** @deprecated Use poolSizeMax — kept as max cap alias. */
@@ -275,7 +282,7 @@ export class CaptchaTokenPool {
     this.stopBackgroundRefill();
     this.governor?.start();
     void this.refill({ urgent: false });
-    this.refillTimer = setInterval(() => {
+    this.refillTimer = hostSetInterval(() => {
       void this.refill({ urgent: false });
     }, this.opts.refillIntervalMs);
   }
@@ -283,7 +290,7 @@ export class CaptchaTokenPool {
   stopBackgroundRefill(): void {
     this.governor?.stop();
     if (this.refillTimer) {
-      clearInterval(this.refillTimer);
+      hostClearInterval(this.refillTimer);
       this.refillTimer = null;
     }
   }
@@ -312,7 +319,7 @@ export class CaptchaTokenPool {
       param = await Promise.race([
         this.solveRaced(cfg),
         new Promise<never>((_, rej) =>
-          setTimeout(
+          hostSetTimeout(
             () => rej(new Error(`captcha take deadline (${raceDeadlineMs}ms)`)),
             Math.max(1_000, raceDeadlineMs),
           ),
@@ -326,7 +333,7 @@ export class CaptchaTokenPool {
       const graceMs = Number(process.env.CAPTCHA_TAKE_GRACE_MS || 10_000);
       const deadline = Date.now() + Math.max(0, graceMs);
       while (Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 400));
+        await new Promise((r) => hostSetTimeout(r, 400));
         const token = this.popFresh();
         if (token) {
           this.markParamIssued(token);
@@ -633,7 +640,7 @@ export class CaptchaTokenPool {
     const elapsed = Date.now() - this.lastSolveAt;
     const wait = this.opts.staggerMs - elapsed;
     if (wait > 0) {
-      await new Promise((r) => setTimeout(r, wait));
+      await new Promise((r) => hostSetTimeout(r, wait));
     }
   }
 

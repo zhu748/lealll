@@ -2,6 +2,66 @@
 
 A reverse proxy for Z.AI / Bigmodel.cn coding-plan APIs that exposes both OpenAI-compatible and Anthropic-format endpoints.
 
+## v0.3.7.1 — 429-retry permanent hang fix (host timer quarantine)
+
+Reported 2026-08-27: a start-plan request hit 429 and the proxy logged
+`upstream returned 429, retry 1/20 in 247ms..` — then hung forever with no
+further output. The client waited indefinitely.
+
+Root cause (empirically reproduced with real happy-dom windows,
+`scripts/probe_timer_cancel.ts`): under Bun, captcha guest scripts run in
+the host realm, so `installGlobalWindowAlias()` shadows the global
+`setTimeout`/`setInterval`/`clearTimeout`/`clearInterval` with the solving
+window's timer registry. While ANY solve epoch is active (background pool
+refill waves run almost continuously under load), host code resolving the
+bare `setTimeout` identifier got the WINDOW's registry instead. Timers
+registered there are silently CANCELLED when the window is closed
+(`happyDOM.close()` aborts its TimerManager). Three host guards died this
+way, so nothing in the chain could ever recover:
+
+1. The retry backoff `sleep(247)` — cancelled mid-sleep → the exact
+   reported hang (log stops right after the retry line).
+2. The token pool's 25s take deadline and 10s grace loop — cancelled →
+   `takeCaptchaToken` never returned.
+3. `solveTraceless`'s own 30s timeout guard and stall detector — registered
+   on a window registry (a SIBLING window's, under concurrent solves — the
+   alias aims at the last-installed window) → cancelled by that window's
+   close → the solve promise never settled.
+
+Fix — host timer quarantine (`src/utils/host-timers.ts`):
+
+- Host code never resolves timers through an aliased globalThis. Each
+  `hostSetTimeout`/`hostSetInterval`/`hostClearTimeout`/`hostClearInterval`
+  call resolves its binding by descriptor shape: ACCESSOR (the only form
+  the alias installs) ⇒ the native binding captured at module load (Bun
+  natives are data properties; the capture is guaranteed pre-alias because
+  captcha-happy.ts — the only alias installer — imports host-timers at its
+  top); DATA (native, or a test stub) ⇒ the current global value. This
+  keeps the existing test suite's `globalThis.setTimeout = wrapper`
+  interception working unchanged.
+- All host-side timer call sites migrated (sleep, retry loop, upstream
+  fetch abort guards, SSE heartbeat + backpressure yields, token pool
+  deadline/grace/stagger/refill, CPU governor, SOCKS bridge, proxy pool,
+  auth timeout guards, admin body/log/SSE timers, boot/exit timers).
+- Guest-facing polyfills (`requestIdleCallback`, `requestAnimationFrame`)
+  and `simulateBehavior` now bind to their OWN window's `w.setTimeout`
+  (previously they resolved through the alias to the LAST-installed
+  window — a sibling's registry — under concurrent solves).
+- Hardened the alias epoch refcount: a double `destroyDom` (reuse path)
+  used to drive it negative, after which the next install ran with an
+  EMPTY descriptor snapshot and the HOST_CRITICAL_GLOBALS check failed
+  open — shadowing `console`/`process`/`fetch`/`crypto` with window
+  getters (server-wide catastrophe; observed as install hangs once the
+  aliased console was used). The refcount now clamps at zero and installs
+  self-heal.
+
+Pinned by 8 unit tests (`host-timers.test.ts` descriptor-resolution rules)
+and 5 real-window regression tests (`captcha-happy.test.ts`: backoff sleep
+survives window destruction, sibling mid-epoch destruction, solve-guard
+survival, double-destroy recovery). Full suite 1251/1251; real-solve E2E
+smoke passes with concurrent host sleep surviving the epoch.
+
+
 ## v0.3.7.0 — start-plan endpoint fixed (zcode.z.ai removed the OpenAI gateway)
 
 Reported against v0.3.6.2: every start-plan request failed with

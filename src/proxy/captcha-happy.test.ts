@@ -245,3 +245,165 @@ describe("guest console-noise filter (v0.3.6.1)", () => {
     }
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// v0.3.7.1 — host timer quarantine during solve epochs (429-retry permanent
+// hang). Empirical failure modes (scripts/probe_timer_cancel.ts, real
+// happy-dom windows): a host timer registered through the aliased global
+// lands on the solving window's registry and is silently CANCELLED when
+// that window is closed. The retry backoff sleep, the pool's 25s take
+// deadline, and solveTraceless's 30s guard all died this way — the request
+// hung forever right after "upstream returned 429, retry 1/20 in 247ms..".
+// These tests use REAL happy-dom windows (their timer registries abort on
+// close, unlike makeFakeWindow's host-delegating stubs).
+// ─────────────────────────────────────────────────────────────────────────────
+describe("host timer quarantine during solve epochs (v0.3.7.1)", () => {
+  async function makeRealWindow(): Promise<{
+    w: Record<string, unknown> & { happyDOM: { close: () => void } };
+    close: () => void;
+  }> {
+    const { GlobalWindow } = await import("happy-dom");
+    const w = new GlobalWindow({ url: "https://zcode.z.ai/" }) as unknown as
+      Record<string, unknown> & { happyDOM: { close: () => void } };
+    return {
+      w,
+      close: () => {
+        try { w.happyDOM.close(); } catch { /* best effort */ }
+      },
+    };
+  }
+
+  it("the alias really does redirect bare setTimeout onto the window registry (hazard precondition)", async () => {
+    const { w, close } = await makeRealWindow();
+    const native = globalThis.setTimeout;
+    installGlobalWindowAlias(globalThis, w);
+    try {
+      // The alias getter is the ONLY thing standing between host code and
+      // the window's registry — this is the precondition for every hang
+      // scenario below, asserted so a future happy-dom or alias refactor
+      // that changes the shape invalidates these tests loudly.
+      const desc = Object.getOwnPropertyDescriptor(globalThis, "setTimeout")!;
+      expect(typeof desc.get).toBe("function");
+      const viaGlobal = (0, eval)("setTimeout");
+      expect(viaGlobal).not.toBe(native);
+    } finally {
+      removeGlobalWindowAlias(globalThis, w);
+      close();
+    }
+    expect(globalThis.setTimeout).toBe(native);
+  });
+
+  it("sleep() registered mid-epoch survives window destruction (THE retry-backoff hang)", async () => {
+    const { sleep } = await import("../utils/sleep.js");
+    const { hostSleep } = await import("../utils/host-timers.js");
+    const { w, close } = await makeRealWindow();
+    installGlobalWindowAlias(globalThis, w);
+    let removed = false;
+    try {
+      let resolved = false;
+      const p = sleep(150).then(() => {
+        resolved = true;
+      });
+      // The solve owning this window finishes while the 150ms backoff is
+      // still pending — destroyDom closes the window mid-sleep.
+      close();
+      removeGlobalWindowAlias(globalThis, w);
+      removed = true;
+      const outcome = await Promise.race([
+        p.then(() => "resolved"),
+        hostSleep(900).then(() => (resolved ? "resolved" : "HUNG-FOREVER")),
+      ]);
+      expect(outcome).toBe("resolved");
+    } finally {
+      if (!removed) removeGlobalWindowAlias(globalThis, w);
+      close();
+    }
+  });
+
+  it("host timers keep working after a sibling window is destroyed mid-epoch (concurrent solves)", async () => {
+    const { hostSetTimeout, hostSleep } = await import("../utils/host-timers.js");
+    const s1 = await makeRealWindow();
+    const s2 = await makeRealWindow();
+    installGlobalWindowAlias(globalThis, s1.w);
+    installGlobalWindowAlias(globalThis, s2.w); // alias now aims at s2's registry
+    let s2Removed = false;
+    try {
+      // s2's solve finishes first: refcount 2→1, aliases stay installed but
+      // aimed at a CLOSED window. New host timers must bypass the corpse.
+      s2.close();
+      removeGlobalWindowAlias(globalThis, s2.w);
+      s2Removed = true;
+      let fired = false;
+      hostSetTimeout(() => {
+        fired = true;
+      }, 50);
+      await hostSleep(400);
+      expect(fired).toBe(true);
+    } finally {
+      removeGlobalWindowAlias(globalThis, s1.w);
+      if (!s2Removed) removeGlobalWindowAlias(globalThis, s2.w);
+      s1.close();
+      s2.close();
+    }
+    expect(typeof setTimeout).toBe("function");
+  });
+
+  it("a solveTraceless-style timeout guard survives its own window's destruction (stall path)", async () => {
+    const { hostSetTimeout, hostSleep } = await import("../utils/host-timers.js");
+    const { w, close } = await makeRealWindow();
+    installGlobalWindowAlias(globalThis, w);
+    let removed = false;
+    try {
+      const guard = new Promise<void>((resolve) => {
+        hostSetTimeout(resolve, 120);
+      });
+      // The solve stalls; the caller tears the window down at 40ms — long
+      // before the 120ms guard expires. The guard MUST still fire.
+      await hostSleep(40);
+      close();
+      removeGlobalWindowAlias(globalThis, w);
+      removed = true;
+      const outcome = await Promise.race([
+        guard.then(() => "fired"),
+        hostSleep(900).then(() => "HUNG-FOREVER"),
+      ]);
+      expect(outcome).toBe("fired");
+    } finally {
+      if (!removed) removeGlobalWindowAlias(globalThis, w);
+      close();
+    }
+  });
+
+  it("recovers from a double destroyDom: refcount clamps at zero instead of failing open (host-critical shadowing)", async () => {
+    // v0.3.7.1 hardening: a double remove used to drive the refcount to −1;
+    // the NEXT install then ran with an EMPTY descriptor snapshot and the
+    // HOST_CRITICAL_GLOBALS check failed open — console/process/fetch got
+    // shadowed by window getters (observed as installGlobalWindowAlias
+    // hanging once the aliased console was used). The clamp + self-heal must
+    // keep the snapshot machinery sound.
+    const { w, close } = await makeRealWindow();
+    installGlobalWindowAlias(globalThis, w);
+    removeGlobalWindowAlias(globalThis, w);
+    removeGlobalWindowAlias(globalThis, w); // the double destroy — must clamp
+    close();
+
+    const w2 = await makeRealWindow();
+    installGlobalWindowAlias(globalThis, w2);
+    try {
+      // Host-critical globals must stay protected: console is host-defined,
+      // so the alias must NOT replace it with a window getter.
+      const consoleDesc = Object.getOwnPropertyDescriptor(globalThis, "console")!;
+      expect(typeof consoleDesc.get).toBe("undefined");
+      // And the fresh epoch's timers alias as normal.
+      const timerDesc = Object.getOwnPropertyDescriptor(globalThis, "setTimeout")!;
+      expect(typeof timerDesc.get).toBe("function");
+      // console.log still works through the epoch (it was never shadowed).
+      console.log("[v0.3.7.1 regression] console alive during post-double-destroy epoch");
+    } finally {
+      removeGlobalWindowAlias(globalThis, w2);
+      close();
+    }
+    expect(typeof setTimeout).toBe("function");
+    expect(typeof console.log).toBe("function");
+  });
+});

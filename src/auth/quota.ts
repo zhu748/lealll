@@ -26,6 +26,11 @@ import { credentialString } from "./types.js";
 import { getProvider } from "../provider/providers.js";
 import type { ProxyIdentity } from "../config/types.js";
 import { buildIdentityHeaders } from "../proxy/identity.js";
+// v0.3.7.1: host-captured timers — auth flows (credential rotation
+// during retries, OAuth, quota probes) run concurrent with captcha solve
+// epochs; bare globals resolve through the solver window alias there and are
+// cancelled on window destruction. See utils/host-timers.ts.
+import { hostSetTimeout, hostClearTimeout } from "../utils/host-timers.js";
 
 const ZCODE_PLAN_BASE = "https://zcode.z.ai/api/v1/zcode-plan";
 // MUST match a real ZCode desktop-client version. The billing endpoints use
@@ -105,7 +110,7 @@ function withTimeout(fetchImpl: FetchFn): FetchFn {
       if (upstreamSignal.aborted) onUpstreamAbort();
       else upstreamSignal.addEventListener("abort", onUpstreamAbort, { once: true });
     }
-    const timer = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
+    const timer = hostSetTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
     timer.unref?.();
     try {
       return await fetchImpl(input, { ...init, signal: ctrl.signal });
@@ -115,7 +120,7 @@ function withTimeout(fetchImpl: FetchFn): FetchFn {
       }
       throw err;
     } finally {
-      clearTimeout(timer);
+      hostClearTimeout(timer);
       if (upstreamSignal) upstreamSignal.removeEventListener("abort", onUpstreamAbort);
     }
   }) as FetchFn;
@@ -144,12 +149,12 @@ async function readChunkWithTimeout(
   const result = await Promise.race([
     reader.read(),
     new Promise<"timeout">(resolve => {
-      timer = setTimeout(() => resolve("timeout"), timeoutMs);
+      timer = hostSetTimeout(() => resolve("timeout"), timeoutMs);
       timer.unref?.();
     }),
   ]).finally(() => {
     if (timer) {
-      clearTimeout(timer);
+      hostClearTimeout(timer);
       timer = null;
     }
   });

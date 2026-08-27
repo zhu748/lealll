@@ -1,4 +1,8 @@
 import { errorResponse } from "../proxy/translated-response.js";
+// v0.3.7.1: host-captured timers — runs concurrent with captcha
+// solve epochs; bare globals resolve through the solver window alias there
+// and get cancelled on window destruction. See utils/host-timers.js.
+import { hostClearTimeout, hostSetTimeout } from "../utils/host-timers.js";
 
 export const MAX_ADMIN_BODY_BYTES = 1 * 1024 * 1024;
 export const MAX_ACCOUNT_IMPORT_BODY_BYTES = 3 * 1024 * 1024;
@@ -85,7 +89,7 @@ async function readRequestBodyChunk(
 ): Promise<Awaited<ReturnType<ReadableStreamDefaultReader<Uint8Array>["read"]>>> {
   let timer: ReturnType<typeof setTimeout> | null = null;
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new AdminBodyTimeoutError(timeoutMs)), timeoutMs);
+    timer = hostSetTimeout(() => reject(new AdminBodyTimeoutError(timeoutMs)), timeoutMs);
     timer.unref?.();
   });
   try {
@@ -95,7 +99,7 @@ async function readRequestBodyChunk(
     throw err;
   } finally {
     if (timer) {
-      clearTimeout(timer);
+      hostClearTimeout(timer);
       timer = null;
     }
   }

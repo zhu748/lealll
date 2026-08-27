@@ -43,6 +43,12 @@
  * The bridge is process-local (127.0.0.1) and binds to port 0 (random),
  * so it is never reachable from the network.
  */
+// v0.3.7.1: host-captured timers — these guards/loops run per-request,
+// often concurrent with captcha solve epochs; the bare globals resolve
+// through the solver window alias there and get cancelled on window
+// destruction (the 429-retry permanent hang). See utils/host-timers.ts.
+import { hostClearTimeout, hostSetTimeout } from "../utils/host-timers.js";
+
 
 // -------------------------------------------------------------------------------------------------
 // Types & helpers
@@ -255,7 +261,7 @@ export function getSocksBridge(socksUrl: string): SocksBridgeHandle {
   const existing = bridges.get(key);
   if (existing) {
     if (existing.idleTimer) {
-      clearTimeout(existing.idleTimer);
+      hostClearTimeout(existing.idleTimer);
       existing.idleTimer = null;
     }
     existing.refCount++;
@@ -278,7 +284,7 @@ export function getSocksBridge(socksUrl: string): SocksBridgeHandle {
     socket: {
       open(socket) {
         let state!: ConnState;
-        const handshakeTimer = setTimeout(() => onHandshakeTimeout(state), HANDSHAKE_TIMEOUT_MS);
+        const handshakeTimer = hostSetTimeout(() => onHandshakeTimeout(state), HANDSHAKE_TIMEOUT_MS);
         handshakeTimer.unref?.();
         state = {
           clientSocket: socket,
@@ -373,8 +379,8 @@ function releaseBridge(key: string): void {
   entry.refCount--;
   dbg(`release: ${key} refCount=${entry.refCount}`);
   if (entry.refCount <= 0) {
-    if (entry.idleTimer) clearTimeout(entry.idleTimer);
-    entry.idleTimer = setTimeout(() => {
+    if (entry.idleTimer) hostClearTimeout(entry.idleTimer);
+    entry.idleTimer = hostSetTimeout(() => {
       const e = bridges.get(key);
       if (e && e.refCount <= 0) {
         try { e.server.stop(true); } catch { /* ignore */ }
@@ -389,7 +395,7 @@ function releaseBridge(key: string): void {
 /** Force-close all bridges (used by tests). */
 export function _shutdownAllBridgesForTesting(): void {
   for (const [, entry] of bridges) {
-    if (entry.idleTimer) clearTimeout(entry.idleTimer);
+    if (entry.idleTimer) hostClearTimeout(entry.idleTimer);
     try { entry.server.stop(true); } catch { /* ignore */ }
   }
   bridges.clear();
@@ -800,7 +806,7 @@ function onHandshakeOk(state: ConnState): void {
   // Switch to tunneling — from now on we just pipe bytes both ways.
   state.phase = "tunneling";
   if (state.handshakeTimer) {
-    clearTimeout(state.handshakeTimer);
+    hostClearTimeout(state.handshakeTimer);
     state.handshakeTimer = null;
   }
   dbg(`tunnel established to ${state.targetHost}:${state.targetPort}`);
@@ -841,7 +847,7 @@ function cleanupConn(state: ConnState): void {
   // calling .end() twice on a Bun socket is technically safe but wasteful.
   if (state.phase === "closing" && !state.clientSocket && !state.socksSocket) return;
   if (state.handshakeTimer) {
-    clearTimeout(state.handshakeTimer);
+    hostClearTimeout(state.handshakeTimer);
     state.handshakeTimer = null;
   }
   state.phase = "closing";

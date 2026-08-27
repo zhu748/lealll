@@ -7,6 +7,9 @@
  * JSON) had to be fixed in three places. This module is the single source
  * of truth.
  */
+// v0.3.7.1: host-captured timer — see utils/host-timers.ts (the bare global
+// is shadowed by the captcha solver's window alias during solve epochs).
+import { hostSetTimeout } from "./host-timers.js";
 
 export interface ParsedSSE {
   /** Event type from the `event:` line, or "" if absent. */
@@ -141,7 +144,11 @@ export async function waitForBackpressure(
   const waitMs = Math.max(yieldMs, Math.min(rawWait > 0 ? rawWait : yieldMs, MAX_BACKPRESSURE_WAIT_MS));
   const deadline = Date.now() + waitMs;
   while (controller.desiredSize !== null && controller.desiredSize <= 0) {
-    await new Promise<void>(r => setTimeout(r, yieldMs));
+    // v0.3.7.1: host-captured timer — backpressure yields run during SSE
+    // streaming, concurrent with captcha solve epochs (bare global would
+    // register on the solving window's registry and be cancelled on its
+    // destruction, stalling the stream forever).
+    await new Promise<void>(r => hostSetTimeout(r, yieldMs));
     if (Date.now() >= deadline) break;
   }
 }
