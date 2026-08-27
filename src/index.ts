@@ -6,7 +6,9 @@ import { loadConfig, resolveDefaultIdentity } from "./config/loader.js";
 import type { ProxyIdentity } from "./config/types.js";
 import { EXAMPLE_CONFIG_YAML } from "./config/template.js";
 import { AuthManager } from "./auth/manager.js";
-import { startServer } from "./server/server.js";
+import { startServer, type ProxyServer } from "./server/server.js";
+import { startControlListener, LogBuffer, type ControlState } from "./android/control.js";
+import { ensureNodeFetchNoTimeouts } from "./runtime/node-fetch-compat.js";
 import { initPool } from "./proxy/proxy-pool.js";
 import { loadCredential, saveCredential, clearCredentialAsync, getStorePath, exportAccounts, listAccounts } from "./auth/store.js";
 import { ZaiOAuthClient, BigmodelOAuthClient } from "./auth/oauth.js";
@@ -17,8 +19,9 @@ import type { Credential, PlanId } from "./auth/types.js";
 import type { ProviderId } from "./provider/types.js";
 import { VERSION } from "./version.js";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
+import { parse, stringify } from "yaml";
 
 const LOG_LEVEL_ORDER: Record<string, number> = { debug: 0, info: 1, warn: 2, error: 3 };
 
@@ -57,16 +60,35 @@ process.on("unhandledRejection", (reason) => {
   }
 });
 
-if (import.meta.main) {
+// Entry detection that works in BOTH runtimes:
+//   - Bun (ESM source + compiled binaries): `require.main === module` — Bun
+//     implements the CJS entry check in ESM files too (verified upstream).
+//   - Node CJS bundle (Android, esbuild --format=cjs): `import.meta` is
+//     compiled to an EMPTY object by esbuild, so `import.meta.main` would
+//     silently be false and the bundle would do nothing — `require.main`
+//     is the only reliable check there.
+if (require.main === module) {
   main();
 }
 
 function main(): void {
+  // Node-only global-fetch normalization (no-op under Bun): Node's undici
+  // enforces default 300s headers/body timeouts that kill deep-reasoning
+  // upstream calls on the Android bundle. Fire-and-forget — resolves in a
+  // microtask before any request can hit the listener. See
+  // src/runtime/node-fetch-compat.ts.
+  void ensureNodeFetchNoTimeouts();
+
   const args = process.argv.slice(2);
   const cmd = args[0] ?? "serve";
 
   if (cmd === "auth") {
     authCommand(args.slice(1));
+  } else if (cmd === "android") {
+    // Android entry (Kotlin shell): proxy + localhost control listener.
+    // Env contract set by NodeRunner.kt: ZCODE_CONTROL_PORT,
+    // ZCODE_OAUTH_CALLBACK_PORT, ZCODE_PROXY_CONFIG, ...
+    runAndroid().catch(fatalError);
   } else if (cmd === "serve" || cmd.endsWith(".yaml") || cmd.endsWith(".yml")) {
     // `serve` may be followed by either a positional path or `--config <path>`
     // (or `--config=<path>`). The legacy start.bat/start.sh used `--config`,
@@ -158,6 +180,7 @@ function printHelp(): void {
 
 Usage:
   zcode-proxy serve [config.yaml]   Start the proxy server (default)
+  zcode-proxy android               Android entry: proxy + localhost control listener
   zcode-proxy auth login <provider> Login via OAuth (provider: zai | bigmodel)
   zcode-proxy auth login <provider> --import
                                     Import API key from ~/.zcode/v2/config.json
@@ -180,6 +203,158 @@ Examples:
   zcode-proxy auth export --output cred.b64
                                     Write blob to cred.b64 (0600) — avoids scrollback/CI log leaks
 `);
+}
+
+// ---------------------------------------------------------------------------
+// Android entry (Kotlin shell) — ported from upstream zcode-api v2.6.0
+// ---------------------------------------------------------------------------
+
+/**
+ * Pin identity env defaults for the Android runtime, using `??` so explicit
+ * values always win (NodeRunner.kt also sets these — kept for local runs).
+ */
+export function applyAndroidIdentityDefaults(): void {
+  process.env.ZCODE_IDENTITY_PLATFORM = process.env.ZCODE_IDENTITY_PLATFORM ?? "linux";
+  process.env.ZCODE_IDENTITY_ARCH = process.env.ZCODE_IDENTITY_ARCH ?? "x64";
+  process.env.ZCODE_IDENTITY_RELEASE = process.env.ZCODE_IDENTITY_RELEASE ?? "6.8.0-49-generic";
+}
+
+/** Targeted YAML update of top-level `provider` and `plan` keys. */
+function updateConfigYaml(path: string, fields: { provider: ProviderId; plan: "coding-plan" | "start-plan" }): void {
+  const raw = readFileSync(path, "utf-8");
+  const parsed = parse(raw) ?? {};
+  parsed.provider = fields.provider;
+  parsed.plan = fields.plan;
+  writeFileSync(path, stringify(parsed), "utf-8");
+}
+
+/**
+ * Android entry — starts the proxy plus a localhost control listener.
+ * Caller (Kotlin shell, Android-APP/NodeRunner.kt) must set env:
+ * ZCODE_CONTROL_PORT (control listener port), ZCODE_OAUTH_CALLBACK_PORT
+ * (fixed OAuth callback port for the WebView redirect), ZCODE_PROXY_CONFIG.
+ *
+ * The control listener (127.0.0.1-only, see android/control.ts) exposes the
+ * JSON command protocol the Kotlin UI drives: status / startOAuth /
+ * deliverOAuthCode / logout / setConfig / startProxy / stopProxy / getLogs /
+ * shutdown.
+ */
+async function runAndroid(): Promise<void> {
+  applyAndroidIdentityDefaults();
+  const path = process.env.ZCODE_PROXY_CONFIG ?? "config.yaml";
+  if (!existsSync(path)) {
+    writeFileSync(path, EXAMPLE_CONFIG_YAML, "utf-8");
+  }
+  const config = loadConfig(path);
+
+  // Mirror all console output into a bounded ring buffer so the Kotlin UI
+  // can poll logs via the control listener's getLogs command.
+  const logBuffer = new LogBuffer();
+  const origLog = console.log;
+  const origErr = console.error;
+  const origWarn = console.warn;
+  console.log = (...args: unknown[]) => { logBuffer.push(args.join(" ")); origLog(...args); };
+  console.error = (...args: unknown[]) => { logBuffer.push("[error] " + args.join(" ")); origErr(...args); };
+  console.warn = (...args: unknown[]) => { logBuffer.push("[warn] " + args.join(" ")); origWarn(...args); };
+
+  let auth = new AuthManager({
+    mode: config.auth.mode,
+    provider: config.provider,
+    apiKey: config.auth.apiKey ?? config.providers[config.provider].credential,
+  });
+
+  const serverRef: { current: ProxyServer | null } = { current: null };
+
+  async function startProxy(): Promise<{ ok: true; port: number } | { ok: false; error: string }> {
+    if (serverRef.current) return { ok: false, error: "already_running" };
+    if (config.auth.mode === "oauth") {
+      const cred = await loadCredential().catch(() => null);
+      if (!cred) return { ok: false, error: "not_logged_in" };
+      auth.setOAuthCredential(cred);
+    }
+    try {
+      const s = await startServer({ config, auth, configPath: path });
+      serverRef.current = s;
+      console.log(`zcode-proxy listening on http://${s.hostname}:${s.port}`);
+      return { ok: true, port: s.port };
+    } catch (err) {
+      return { ok: false, error: (err as Error).message };
+    }
+  }
+
+  async function stopProxy(): Promise<{ ok: true } | { ok: false; error: string }> {
+    const s = serverRef.current;
+    if (!s) return { ok: false, error: "not_running" };
+    try {
+      await s.stop(false);
+      serverRef.current = null;
+      console.log("zcode-proxy stopped");
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: (err as Error).message };
+    }
+  }
+
+  async function setConfig(changes: {
+    provider?: ProviderId;
+    plan?: "coding-plan" | "start-plan";
+  }): Promise<{ ok: true; provider: ProviderId; plan: "coding-plan" | "start-plan" } | { ok: false; error: string }> {
+    if (serverRef.current) return { ok: false, error: "stop_proxy_first" };
+    if (changes.provider) config.provider = changes.provider;
+    if (changes.plan) config.plan = changes.plan;
+    auth = new AuthManager({
+      mode: config.auth.mode,
+      provider: config.provider,
+      apiKey: config.auth.apiKey ?? config.providers[config.provider].credential,
+    });
+    updateConfigYaml(path, { provider: config.provider, plan: config.plan });
+    console.log(`config updated: provider=${config.provider} plan=${config.plan}`);
+    return { ok: true, provider: config.provider, plan: config.plan };
+  }
+
+  console.log("control listener ready; proxy stopped — use startProxy command to start");
+
+  const controlPort = Number(process.env.ZCODE_CONTROL_PORT ?? 0) || 0;
+  const controlState: ControlState = {
+    provider: config.provider,
+    plan: config.plan,
+    proxyPort: serverRef.current?.port ?? 0,
+  };
+  const controlListener = await startControlListener({
+    port: controlPort,
+    state: controlState,
+    logBuffer,
+    onStartProxy: startProxy,
+    onStopProxy: stopProxy,
+    onSetConfig: setConfig,
+    onShutdown: async () => {
+      await serverRef.current?.stop(true);
+      // Exit AFTER the control listener has flushed the "shuttingDown"
+      // response back to Kotlin: the setTimeout gives the response a
+      // macrotask to write out, then terminates (the control listener
+      // itself keeps the event loop alive, so an immediate return here
+      // would leave the process running forever — the Kotlin shell also
+      // destroy()s the process, this makes shutdown self-contained).
+      setTimeout(() => process.exit(0), 250).unref?.();
+    },
+  });
+
+  console.log(`control listener: 127.0.0.1:${controlPort}`);
+  console.log(`provider: ${config.provider}`);
+  console.log(`plan: ${config.plan}`);
+
+  // No explicit keepalive needed: the listening control server holds the
+  // Node/Bun event loop open until the `shutdown` command (or a signal)
+  // closes it. Mirror upstream's signal handling for local dev runs.
+  const die = (sig: string): void => {
+    console.log(`[${sig}] shutting down`);
+    void controlListener.close()
+      .then(() => serverRef.current?.stop(true))
+      .catch(() => {})
+      .finally(() => process.exit(0));
+  };
+  process.on("SIGINT", () => die("SIGINT"));
+  process.on("SIGTERM", () => die("SIGTERM"));
 }
 
 async function serve(configPath?: string): Promise<void> {
@@ -339,7 +514,7 @@ async function serve(configPath?: string): Promise<void> {
   // ZCODE_PROXY_CORS_ALLOWLIST in loadConfig) and passed through dependency
   // injection — no more globalThis hack.
 
-  const server = startServer({ config, auth, configPath: path });
+  const server = await startServer({ config, auth, configPath: path });
   const url = `http://${server.hostname}:${server.port}`;
   console.log(`zcode-proxy ${VERSION} listening on ${url}`);
   console.log(`  provider: ${config.provider}`);

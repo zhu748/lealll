@@ -4,6 +4,7 @@ import { translateResponseAnthropicToResponses } from "../translator/anthropic-t
 import { saveTurn } from "../translator/responses-store.js";
 import { SSE as SSE_CONST } from "../utils/constants.js";
 import { readResponseTextLimited } from "./response-body.js";
+import { gzipSync } from "node:zlib";
 import { printRow, type RequestMeta } from "./stats.js";
 
 const DEFAULT_TRANSLATED_UPSTREAM_BODY_BYTES = 32 * 1024 * 1024;
@@ -84,7 +85,11 @@ function gzipPayloadStream(payload: Uint8Array): ReadableStream<Uint8Array> {
     });
     return readable.pipeThrough(new CompressionStream("gzip") as unknown as TransformStream<Uint8Array, Uint8Array>);
   } catch {
-    const gz = Bun.gzipSync(payload as Uint8Array<ArrayBuffer>);
+    // CompressionStream is unavailable (very old runtimes): fall back to a
+    // synchronous gzip. zlib.gzipSync works on both Bun and Node — Bun's
+    // node:zlib shim covers it — so the old Bun.gzipSync call is unnecessary
+    // and broke the Android (Node.js) bundle.
+    const gz = gzipSync(payload as Uint8Array<ArrayBuffer>);
     return new ReadableStream<Uint8Array>({
       start(controller) {
         controller.enqueue(gz as Uint8Array);

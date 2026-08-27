@@ -2,6 +2,42 @@
 
 A reverse proxy for Z.AI / Bigmodel.cn coding-plan APIs that exposes both OpenAI-compatible and Anthropic-format endpoints.
 
+## v0.3.3.0 — Android APK Support (upstream parity)
+
+The server core now runs on **both Bun and Node**, unlocking the Android
+build — the last upstream release artifact this fork was missing.
+
+- **`server.ts` migrated from `Bun.serve` to `node:http`** (pattern from
+  upstream): the same code now serves on Bun (dev/compiled binaries) and on
+  Node (Android bundle). Client IP resolution moved from `Bun.serve#requestIP`
+  to the node socket's `remoteAddress` (stashed per-request); idle-timeout
+  semantics preserved (600s request/headers caps, 120s keep-alive, 24h socket
+  timeout for `/async/*` off-peak waits); graceful stop keeps the old
+  `stop(force)` contract. The full admin dashboard, CORS allowlist, async
+  bridge, and per-route behavior are unchanged — 1224/1224 tests green.
+- **Android app ported** (`Android-APP/`, aligned with upstream): Kotlin shell
+  (foreground service + embedded WebView OAuth) launching the server as an
+  esbuild Node CJS bundle on libnode.so (Termux-derived, arm64-v8a). The
+  localhost control listener (`src/android/control.ts`) drives
+  start/stop proxy, OAuth code delivery, config updates, log polling, and
+  shutdown; the OAuth callback port is now fixed via `ZCODE_OAUTH_CALLBACK_PORT`
+  so WebView redirects are predictable.
+- **Node runtime hardening**: `ensureNodeFetchNoTimeouts()` (undici global
+  dispatcher) disables Node fetch's default 300s headers/body timeouts that
+  kill deep-reasoning streams on Android; entry detection switched to
+  `require.main === module` (esbuild compiles `import.meta` to `{}` in CJS
+  output, which silently disabled the bundled entry — caught by the new
+  Node-execution smoke in CI); the gzip fallback path now uses `node:zlib`
+  instead of `Bun.gzipSync`.
+- **Release pipeline**: a new `android` job builds the APK
+  (`zcode-proxy-android-v{V}.apk`) on every release — debug-signed by default,
+  release-signed automatically when the `ANDROID_KEYSTORE_*` secrets exist.
+  CI includes a Node-side bundle-execution smoke before gradle.
+- **Known limitation**: the SOCKS proxy bridge is Bun-only by design; on the
+  Android build a configured `socks://` proxy fails loudly with a clear error
+  (never silently falls back to a direct connection — that would leak the
+  user's real IP). `http(s)://` proxies are unaffected.
+
 ## v0.3.2 — Upstream Re-audit + OAuth Exchange Fingerprint
 
 Full re-audit against upstream `TriDefender/zcode-api` master (32d508d,

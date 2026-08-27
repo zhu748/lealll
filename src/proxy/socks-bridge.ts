@@ -235,8 +235,21 @@ interface ConnState {
 /**
  * Open a SOCKS bridge listener for the given SOCKS URL. Returns a handle whose
  * `httpProxyUrl` should be passed to `fetch(url, { proxy })`.
+ *
+ * Runtime note (v0.3.3.0): the bridge is built on `Bun.listen`/`Bun.connect`
+ * (no Node equivalent is wired). On the Android (Node.js) bundle this throws
+ * a descriptive error instead of crashing with "Bun.listen is not a
+ * function" — failing loudly is deliberate: if a SOCKS proxy is configured,
+ * silently falling back to a DIRECT connection would leak the user's real
+ * IP to the upstream, which is exactly what they configured the proxy to
+ * prevent.
  */
 export function getSocksBridge(socksUrl: string): SocksBridgeHandle {
+  if (typeof Bun === "undefined") {
+    throw new Error(
+      "SOCKS proxy support requires the Bun runtime (desktop/server builds) and is not available in the Android (Node.js) bundle. Remove socks:// entries from proxyPool/proxy config, or use http:// proxies instead.",
+    );
+  }
   // Normalize the URL for cache keying.
   const key = normalizeSocksUrl(socksUrl);
   const existing = bridges.get(key);

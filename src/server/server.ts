@@ -1,8 +1,25 @@
 /**
- * Bun.serve server setup with routing and proxy API key auth.
+ * HTTP server bootstrap with routing and proxy API key auth.
  * Includes admin dashboard routes.
+ *
+ * Runs on `node:http.createServer` (not `Bun.serve`) so the same code works
+ * on Bun (dev mode, source TS, compiled binaries) and on Node (the Android
+ * bundle — libnode via Termux libs). Bun implements `node:http` natively;
+ * Node has no `Bun.serve`, so node:http is the common denominator.
+ *
+ * Migration notes (v0.3.3.0, pattern ported from upstream zcode-api):
+ * - `idleTimeout: 0` (old Bun.serve setting) maps to zeroed/raised Node
+ *   server timeouts — long LLM reasoning calls must not be killed.
+ * - Client IP (previously `Bun.serve#requestIP`) is read from
+ *   `req.socket.remoteAddress` in the node adapter and stashed on the Web
+ *   Request via a symbol; `resolveClientIp` reads it from there.
+ * - `/async/*` routes get a 24h per-request socket timeout (off-peak queue
+ *   waits can exceed Node's defaults).
+ *
  * @see .omo/plans/zcode-proxy.md Task 7
  */
+import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
+import { Readable } from "node:stream";
 import type { ProxyConfig } from "../config/types.js";
 import type { AuthManager } from "../auth/manager.js";
 import { handleChatCompletions, handleListModels } from "./routes-openai.js";
@@ -22,7 +39,7 @@ export interface ServerOptions {
   configPath?: string;
   /**
    * Pre-built admin options. When provided (used by startServer so the
-   * Bun.serve closure can wire resolveClientIp), createFetchHandler uses
+   * node:http closure can wire resolveClientIp), createFetchHandler uses
    * this instance directly instead of building its own. When omitted
    * (used by tests), createFetchHandler builds a fresh AdminOptions with
    * no resolveClientIp — which means loopback detection falls back to
@@ -30,15 +47,33 @@ export interface ServerOptions {
    */
   adminOpts?: AdminOptions;
   /**
-   * Resolve the TCP-remote client IP for a request. Wired to Bun's
-   * `server.requestIP(req)?.address` by startServer; tests omit it.
-   * Used by both the admin loopback gate and the proxy session-fingerprint
+   * Resolve the TCP-remote client IP for a request. Wired by startServer to
+   * the socket remote address captured by the node:http adapter; tests omit
+   * it. Used by both the admin loopback gate and the proxy session-fingerprint
    * cache so neither trusts spoofable X-Forwarded-For headers by default.
    */
   resolveClientIp?: (req: Request) => string | undefined;
 }
 
-/** Create a Bun.serve-compatible fetch handler. */
+/** Minimal server handle: what the caller needs to print URLs and shut down. */
+export interface ProxyServer {
+  hostname: string;
+  port: number;
+  /**
+   * Close the server. `force` (default false) = wait for in-flight requests
+   * to complete, dropping only idle keep-alive connections (matches the old
+   * `Bun.serve#stop(false)` semantics); `force=true` destroys all connections
+   * immediately (old `stop(true)`). Resolves once fully closed.
+   */
+  stop(force?: boolean): Promise<void>;
+  /** Alias for stop() — upstream-compatible name. */
+  close(): Promise<void>;
+}
+
+/** Symbol under which the node:http adapter stashes the TCP peer address. */
+const CLIENT_IP: unique symbol = Symbol("clientIp");
+
+/** Create a runtime-agnostic fetch handler (used by node:http adapter and tests). */
 export function createFetchHandler(opts: ServerOptions): (req: Request) => Promise<Response> {
   const { config, auth } = opts;
   const proxyOpts = { config, auth, fetchImpl: opts.fetchImpl, resolveClientIp: opts.resolveClientIp };
@@ -151,20 +186,22 @@ export function createFetchHandler(opts: ServerOptions): (req: Request) => Promi
   };
 }
 
-/** Start the Bun.serve server. Returns the server instance. */
-export function startServer(opts: ServerOptions): ReturnType<typeof Bun.serve> {
-  // Forward-declare `server` so the resolveClientIp closure can reference it.
-  // The closure is only invoked from inside `fetch(req)`, which only runs
-  // AFTER Bun.serve returns and assigns to `server` — so the closure always
-  // sees a defined value at call time.
-  let server: ReturnType<typeof Bun.serve> | undefined;
-
-  // Wire up the client-IP resolver so admin routes AND the proxy session
-  // fingerprint can read the real TCP peer address (Bun's server.requestIP)
-  // instead of trusting spoofable X-Forwarded-For headers.
-  const resolveClientIp = (req: Request): string | undefined => {
-    try { return server?.requestIP(req)?.address; } catch { return undefined; }
-  };
+/**
+ * Start the HTTP server on node:http. Resolves once the listener is bound.
+ *
+ * Server timeout policy (mirrors the old `Bun.serve({ idleTimeout: 0 })` for
+ * self-hosted long reasoning calls):
+ *   - requestTimeout 600s / headersTimeout 600s — generous caps on receiving
+ *     a request; the response stream is NOT bounded by these.
+ *   - keepAliveTimeout 120s — idle keep-alive sockets close after 2 min.
+ *   - `/async/*` requests additionally get a 24h socket timeout so an
+ *     off-peak queue wait (which can legitimately take hours) survives.
+ */
+export function startServer(opts: ServerOptions): Promise<ProxyServer> {
+  // Client IP: captured per-request from the node socket by the adapter
+  // below (equivalent of Bun.serve's server.requestIP(req)).
+  const resolveClientIp = (req: Request): string | undefined =>
+    (req as { [CLIENT_IP]?: string })[CLIENT_IP];
 
   const adminOpts: AdminOptions = {
     config: opts.config,
@@ -176,19 +213,152 @@ export function startServer(opts: ServerOptions): ReturnType<typeof Bun.serve> {
   };
 
   const handler = createFetchHandler({ ...opts, adminOpts, resolveClientIp });
-  const { port, host } = opts.config.server;
+  const { port: requestedPort, host } = opts.config.server;
 
-  server = Bun.serve({
-    port,
-    hostname: host,
-    idleTimeout: 0, // 自用代理：禁用空闲超时，避免长 reasoning 的 LLM 请求被杀
-    fetch(req) {
-      // CORS headers are already added inside the handler (see
-      // createFetchHandler) — no need to add them again here.
-      return handler(req);
-    },
+  const server: Server = createServer(async (req, res) => {
+    // Abort plumbing: when the client disconnects mid-request/mid-stream,
+    // abort the Web-level signal so upstream fetches get cancelled.
+    const abortController = new AbortController();
+    const onClientClose = (): void => {
+      if (!res.writableEnded) abortController.abort();
+    };
+    res.on("close", onClientClose);
+
+    // Off-peak async routes hold the connection open for minutes-to-hours
+    // while waiting for a ticket. Lift the per-request socket timeout to 24h
+    // (Node's server default would kill it).
+    if ((req.url ?? "").startsWith("/async/")) {
+      req.setTimeout(24 * 60 * 60 * 1000);
+    }
+
+    try {
+      const webReq = nodeReqToWebRequest(req, abortController.signal);
+      // CORS headers are added inside the handler (see createFetchHandler).
+      const resp = await handler(webReq);
+      await writeWebResponseToNodeResp(resp, res, abortController.signal);
+    } catch (err) {
+      if (abortController.signal.aborted) return; // client already gone
+      console.error(`[server] request adapter error: ${(err as Error).message}`);
+      if (!res.headersSent) {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { type: "internal_error", message: (err as Error).message } }));
+      } else {
+        try { res.end(); } catch { /* already destroyed */ }
+      }
+    }
   });
-  return server;
+
+  server.requestTimeout = 600_000;
+  server.keepAliveTimeout = 120_000;
+  server.headersTimeout = 600_000;
+
+  return new Promise<ProxyServer>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(requestedPort, host, () => {
+      const addr = server.address();
+      const actualPort = typeof addr === "object" && addr ? addr.port : requestedPort;
+      const stop = (force = false): Promise<void> => new Promise<void>((done) => {
+        // force: destroy all connections now (old Bun stop(true)).
+        // graceful: drop idle keep-alives, let in-flight finish (old stop(false)).
+        if (force) server.closeAllConnections?.();
+        else server.closeIdleConnections?.();
+        server.close(() => done());
+      });
+      resolve({
+        hostname: host,
+        port: actualPort,
+        stop,
+        close: () => stop(false),
+      });
+    });
+  });
+}
+
+/** Convert a Node.js IncomingMessage to a Web API Request (stashing the TCP peer address). */
+function nodeReqToWebRequest(req: IncomingMessage, signal?: AbortSignal): Request {
+  const headers = new Headers();
+  for (const [key, val] of Object.entries(req.headers)) {
+    if (val == null) continue;
+    if (Array.isArray(val)) {
+      for (const v of val) headers.append(key, v);
+    } else {
+      headers.set(key, val);
+    }
+  }
+  const host = headers.get("host") ?? "localhost";
+  const url = `http://${host}${req.url ?? "/"}`;
+  const method = req.method ?? "GET";
+
+  let webReq: Request;
+  if (method === "GET" || method === "HEAD") {
+    webReq = new Request(url, { method, headers, signal });
+  } else {
+    // Cast: Node's stream type ≠ Web ReadableStream at the type layer, but
+    // Readable.toWeb returns a spec-compliant stream at runtime.
+    const bodyStream = Readable.toWeb(req) as unknown as ReadableStream<Uint8Array>;
+    const init: RequestInit & { duplex?: "half" } = {
+      method,
+      headers,
+      body: bodyStream,
+      duplex: "half",
+      signal,
+    };
+    webReq = new Request(url, init);
+  }
+  // Stash the TCP peer address for resolveClientIp (admin loopback gate +
+  // session fingerprint cache). Symbol-keyed so it never collides with
+  // anything the app layer puts on the Request.
+  (webReq as { [CLIENT_IP]?: string })[CLIENT_IP] = req.socket.remoteAddress;
+  return webReq;
+}
+
+/** Write a Web API Response to a Node.js ServerResponse (stream-aware). */
+async function writeWebResponseToNodeResp(
+  resp: Response,
+  res: ServerResponse,
+  abortSignal?: AbortSignal,
+): Promise<void> {
+  const headers: Record<string, string | string[]> = {};
+  resp.headers.forEach((value, key) => {
+    const existing = headers[key];
+    if (existing === undefined) {
+      headers[key] = value;
+    } else if (typeof existing === "string") {
+      headers[key] = [existing, value];
+    } else {
+      existing.push(value);
+    }
+  });
+
+  res.writeHead(resp.status, resp.statusText, headers);
+
+  if (resp.body == null) {
+    res.end();
+    return;
+  }
+
+  const reader = resp.body.getReader();
+  const onAbort = (): void => { reader.cancel().catch(() => {}); };
+  abortSignal?.addEventListener("abort", onAbort);
+  try {
+    // Backpressure-aware pump: wait for drain when the socket is full.
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!res.write(Buffer.from(value))) {
+        await new Promise<void>((resolve) => res.once("drain", () => resolve()));
+      }
+    }
+    res.end();
+  } catch (err) {
+    if (abortSignal?.aborted) {
+      try { res.end(); } catch { /* client gone */ }
+    } else {
+      try { res.destroy(err as Error); } catch { /* already destroyed */ }
+    }
+  } finally {
+    abortSignal?.removeEventListener("abort", onAbort);
+  }
 }
 
 /**

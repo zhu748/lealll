@@ -22,6 +22,7 @@
 | Linux ARM64 | `zcode-proxy-v{V}-linux-arm64.zip` | `zcode-proxy-linux-arm64`（ELF） | `start.sh` |
 | macOS x64 | `zcode-proxy-v{V}-darwin-x64.zip` | `zcode-proxy-darwin-x64`（Mach-O） | `start.sh` |
 | macOS ARM64 | `zcode-proxy-v{V}-darwin-arm64.zip` | `zcode-proxy-darwin-arm64`（Mach-O） | `start.sh` |
+| Android arm64-v8a | `zcode-proxy-android-v{V}.apk` | 内嵌 Node CJS bundle + libnode.so | Kotlin 壳 App |
 
 每个 zip 内容：平台二进制 + `config.yaml`（由 `config.example.yaml` 复制）+ 启动脚本 + `README.md`（用户手册，`release/README.md`）。
 
@@ -32,19 +33,29 @@
 Docker 镜像（Release 成功后自动构建推送，多架构 linux/amd64 + linux/arm64）：
 `ghcr.io/{owner}/zcode-proxy:{V}` 与 `:latest`。
 
-### Android 状态（暂不构建，与上游的差异说明）
+### Android（v0.3.3.0 起已支持，对齐上游）
 
-上游 [TriDefender/zcode-api](https://github.com/TriDefender/zcode-api) 的 Release 附带安卓 APK：
-其 `Android-APP` 工程（约 211MB，含 libnode.so）把服务端打成 Node bundle 在安卓上跑。
-这要求 server 层是 `node:http` 实现——上游为此已把 `server.ts` 从 `Bun.serve` 迁移到
-`node:createServer`。**本仓库核心仍是 `Bun.serve`（server.ts），且 SOCKS 桥
-（socks-bridge.ts，844 行）依赖 `Bun.listen`/`Bun.connect`，没有 Node 等价物**；
-直接移植安卓工程会在运行时崩溃。补齐路径（未来工作）：
+安卓 APK 的架构（与上游 [TriDefender/zcode-api](https://github.com/TriDefender/zcode-api) 一致）：
 
-1. `server.ts` 迁移 `node:http`（保留 Bun 运行时兼容）
-2. `socks-bridge.ts` 用 `node:net` 重写（或安卓构建禁用 SOCKS 特性）
-3. 移植 `Android-APP` 工程 + esbuild node bundle 脚本 + undici 超时兼容层
-4. 配置安卓签名 keystore secret
+- **运行时**：`Android-APP/app/src/main/jniLibs/arm64-v8a/` 内置 Termux 派生的
+  `libnode.so`（Node 运行时，~60MB）及 ICU/OpenSSL/sqlite 等伴生库；Kotlin 前台服务
+  （`NodeRunner.kt`）以子进程方式启动 `libnode --no-warnings server.cjs android`。
+- **服务端**：`src/index.ts` 编译为 esbuild Node CJS bundle（`bun run
+  build:android-bundle`，产物 4.7MB，无运行时外部依赖）注入 APK assets。
+- **控制协议**：`src/android/control.ts` 提供仅绑定 127.0.0.1 的 HTTP 控制监听器
+  （`POST /control`），Kotlin UI 通过它驱动 status/startOAuth/deliverOAuthCode/logout/
+  setConfig/startProxy/stopProxy/getLogs/shutdown。OAuth 经内嵌 WebView 完成，回调端口
+  固定（`ZCODE_OAUTH_CALLBACK_PORT`，`oauth.ts` 支持）。
+- **server 层**：`src/server/server.ts` 已从 `Bun.serve` 迁移到 `node:http`（v0.3.3.0），
+  Bun 与 Node 双运行时兼容；Node 侧由 `src/runtime/node-fetch-compat.ts` 关闭 undici
+  默认 300s 头/体超时（长 reasoning 必需）。
+- **签名**：未配置 `ANDROID_KEYSTORE_BASE64` 等 secrets 时发布 debug 签名 APK（可直接
+  安装）；配置后自动构建 release 签名 APK。versionCode 从 tag 的 major.minor.patch 推导。
+- **已知限制**：SOCKS 代理桥（`socks-bridge.ts`）依赖 `Bun.listen/connect`，在安卓
+  (Node) 构建下配置 socks:// 代理会返回明确错误（故意不静默直连，避免 IP 泄漏）；
+  http/https 代理不受影响。
+- **本地验证**：`bun run build:android-bundle && node dist/android/server.cjs version`；
+  完整生命周期冒烟见 `scripts/android_smoke.py`（模拟 Kotlin 控制协议全流程）。
 
 ---
 
@@ -97,7 +108,9 @@ git push origin main "v${VERSION}"      # 分支与 tag 一起推
 5 平台交叉编译（`--target=bun-{windows,linux,darwin}-{x64,arm64}`）→
 二进制格式校验（PE32/ELF/Mach-O）→ 原生二进制版本号冒烟 →
 `start.bat` ASCII+CRLF 校验 → `start.sh` bash 语法校验 → 分平台打包 →
-创建 Release 上传 5 个 zip → 构建多架构 Docker 镜像推 GHCR。
+创建 Release 上传 5 个 zip → 构建多架构 Docker 镜像推 GHCR →
+（并行）安卓 APK：esbuild Node bundle（含 Node 执行冒烟）→ 注入 assets →
+gradle assembleDebug（有签名 secrets 时另构建 assembleRelease）→ 上传 APK。
 
 也可以用 `workflow_dispatch`（Actions 页面 "Run workflow"，填版本号）手动触发，
 要求 `package.json` 已先改好版本号。
@@ -175,6 +188,9 @@ bash -n release/start.sh
 | macOS 拦截未签名二进制 | "cannot be opened"/SIGKILL | zip 说明已含 `xattr -d com.apple.quarantine` 提示，start.sh 失败时自动打印 |
 | zip 没含 config.yaml | 用户不知道怎么配置 | workflow 固定从 example 复制 |
 | OAuth 登录未指定 plan | 凭证默认 coding-plan，用户可能要 start-plan | 脚本每项都显式传 `--plan=` |
+| **安卓 bundle 里 `import.meta` 被编成空对象** | APK 内 server 无响应（入口检测永假） | 入口检测用 `require.main === module`（双运行时兼容），CI 有 Node 执行冒烟 |
+| **Node 全局 fetch 默认 300s 超时未关** | 安卓上长 reasoning 请求 502 `UND_ERR_HEADERS_TIMEOUT` | `ensureNodeFetchNoTimeouts()` 在 main() 首行调用（Bun 下 no-op） |
+| **安卓配置了 socks:// 代理** | 报“SOCKS 需要 Bun 运行时”（故意的，不静默直连） | 安卓端移除 socks 条目或换 http 代理 |
 | **无脑复用脚本不检查 CLI 变更** | 脚本命令与实际 CLI 不匹配，用户运行报错 | 每次发版必须执行 Section 4 |
 | **版本号与 tag 不一致就打 tag** | CI 版本校验步直接失败 | Section 1 先改好 package.json |
 | **手动删了 Release 没删 tag** | 重新推同名 tag 后 Release 内容错乱 | 覆盖发版按 Section 3.1 顺序删 tag 重打 |

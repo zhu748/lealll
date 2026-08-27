@@ -305,7 +305,14 @@ class CallbackServer {
       // descriptors. maxConnections=5 is generous enough to tolerate browser
       // favicon/two-redirect bursts while still bounding resource use.
       this.server.maxConnections = 5;
-      this.server.listen(0, "127.0.0.1", () => {
+      // v0.3.3.0: bind port is OS-assigned random (0) unless
+      // ZCODE_OAUTH_CALLBACK_PORT is set, in which case that exact port is
+      // used. The Android entry (NodeRunner.kt) sets the env var so the
+      // WebView redirect URL is predictable across launches (the WebView
+      // intercepts the redirect to 127.0.0.1:<fixed port> before it fails to
+      // connect, so the port must never change).
+      const requestedPort = Number(process.env.ZCODE_OAUTH_CALLBACK_PORT ?? 0) || 0;
+      this.server.listen(requestedPort, "127.0.0.1", () => {
         const addr = this.server.address();
         if (!addr || typeof addr !== "object") {
           reject(new Error("Failed to bind localhost callback server"));

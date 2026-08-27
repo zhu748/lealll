@@ -1,5 +1,21 @@
 # zcode-proxy 使用说明
 
+> **v0.3.3.0 — 安卓 APK 支持（对齐上游全部发布产物）**
+>
+> 服务端核心迁移到 node:http（Bun/Node 双运行时），安卓 APK 从"暂不支持"变为正式发布产物。至此上游全部发布产物（5 平台二进制 + 安卓 APK + Docker 镜像）均已对齐。
+>
+> **本次改动**
+>
+> - **安卓 App 上线**：Release 新增 `zcode-proxy-android-v0.3.3.0.apk`（arm64-v8a）。Kotlin 壳 + 内嵌 Node 运行时（libnode.so），图形界面完成 OAuth 登录（WebView）、启动/停止代理、切换 provider/plan、查看日志；手机上即可跑完整代理（含管理看板）。
+> - **服务端双运行时**：`server.ts` 从 `Bun.serve` 迁移到 `node:http`——桌面二进制（Bun）与安卓（Node）跑同一份代码，行为一致（超时策略、CORS、管理看板、async 桥全部保留）。
+> - **Node 运行时加固**：关闭 Node 全局 fetch 默认 300s 超时（长 reasoning 请求必需）；修复 esbuild CJS 入口检测；gzip 回退路径改用 node:zlib。
+> - **OAuth 回调端口固定**：`ZCODE_OAUTH_CALLBACK_PORT` 支持（安卓 WebView 重定向需要）。
+> - **已知限制**：SOCKS 代理桥为 Bun 专属特性，安卓端配置 socks:// 代理会返回明确错误（不静默直连，避免真实 IP 泄漏）；http/https 代理不受影响。
+>
+> **升级建议**：手机上想跑代理的用户直接下载 APK 安装（需允许安装未知来源应用）；桌面用户按需升级（v0.3.2 已含全部核心功能）。
+
+---
+
 > **v0.3.2.0 — 上游 v2.6.0 全量对齐 + 多平台发布**
 >
 > 本版本完成与上游 TriDefender/zcode-api v2.6.0 的全量对齐（free/start-plan 套餐支持），并首次提供全平台编译产物。

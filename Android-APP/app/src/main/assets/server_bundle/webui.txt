@@ -1,0 +1,1 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>zcode-proxy</title></head><body><p>This fork serves the admin dashboard at <code>/admin</code> instead of /webui.</p></body></html>

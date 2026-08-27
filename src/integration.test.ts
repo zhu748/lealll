@@ -5,7 +5,7 @@
 import { describe, it, expect, beforeAll, afterAll } from "bun:test";
 import { loadConfig } from "./config/loader.js";
 import { AuthManager } from "./auth/manager.js";
-import { startServer } from "./server/server.js";
+import { startServer, type ProxyServer } from "./server/server.js";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -16,7 +16,7 @@ import { join, dirname } from "node:path";
 // with "Config file not found: config.test.yaml".
 const TEST_CONFIG_PATH = join(dirname(import.meta.dir), "config.test.yaml");
 
-let proxyServer: ReturnType<typeof Bun.serve>;
+let proxyServer: ProxyServer;
 let mockUpstreamServer: ReturnType<typeof Bun.serve>;
 let proxyPort: number;
 let mockPort: number;
@@ -25,7 +25,7 @@ let config: ReturnType<typeof loadConfig>;
 // so the test never touches the user's real ~/.zcode-proxy/credentials.json).
 let realHome: string | undefined;
 
-beforeAll(() => {
+beforeAll(async () => {
   // Redirect HOME to a temp directory so the credential store (and any other
   // dotfiles the proxy might write) never touches the user's real $HOME.
   // The previous code shared `~/.zcode-proxy/credentials.json` with the user.
@@ -114,13 +114,13 @@ beforeAll(() => {
     apiKey: "integrationTestKey.integrationTestSecret",
   });
 
-  proxyServer = startServer({ config, auth });
+  proxyServer = await startServer({ config, auth });
   // Read the actual proxy port assigned by the OS.
-  proxyPort = (proxyServer as any).port ?? proxyServer.port;
+  proxyPort = proxyServer.port;
 });
 
-afterAll(() => {
-  proxyServer?.stop(true);
+afterAll(async () => {
+  await proxyServer?.stop(true);
   mockUpstreamServer?.stop(true);
   // Restore HOME so other test files see the real environment.
   if (realHome !== undefined) process.env.HOME = realHome;

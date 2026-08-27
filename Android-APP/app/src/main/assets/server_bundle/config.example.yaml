@@ -1,0 +1,322 @@
+server:
+  port: 8080
+  # Host to bind the proxy on.
+  #   "0.0.0.0" = bind on ALL interfaces (LAN/remote clients can connect)
+  #   "127.0.0.1" = bind on localhost ONLY (no remote access)
+  # NOTE: even when bound to 0.0.0.0, you must access the dashboard via
+  #   http://127.0.0.1:8080/admin (or your machine's LAN IP) — opening
+  #   http://0.0.0.0:8080/admin directly does NOT work on Windows / macOS.
+  host: "0.0.0.0"
+
+  # Whether to trust X-Forwarded-For / X-Real-IP headers for client IP
+  # detection (used by the admin dashboard loopback gate when proxyApiKey
+  # is NOT configured).
+  #   false (default) = client IP read from the TCP socket (un-spoofable)
+  #   true             = trust XFF/X-Real-IP (set ONLY when behind a trusted
+  #                      reverse proxy like nginx/Caddy that overwrites them)
+  trustProxy: false
+
+  # Upstream request timeout in milliseconds. Applied to BOTH stream and
+  # batch requests. Set to 0 (or omit) to use the defaults:
+  #   - stream requests: 10 minutes (600000 ms)
+  #   - batch requests:  5 minutes (300000 ms)
+  # Lower this if your network is fast and you want faster failure detection;
+  # raise it if you regularly run very long reasoning chains that exceed 10 min.
+  upstreamTimeoutMs: 0
+
+  # SSE heartbeat interval in milliseconds (v0.2.1.7+).
+  #
+  # When the proxy is behind Cloudflare (or another reverse proxy with a
+  # Proxy Read Timeout — CF Free/Pro/Business = 100s), long "thinking"
+  # requests where the upstream LLM takes >100s to emit the first byte
+  # will be killed by CF with a 524 error.
+  #
+  # To prevent this, the proxy periodically flushes a no-op SSE comment
+  # line (": keepalive\n\n") to the client while waiting for the upstream's
+  # first chunk. SSE comment lines are spec-compliant and silently ignored
+  # by all conformant SSE clients (Anthropic SDK, OpenAI SDK, Cherry
+  # Studio, Claude Code, Codex, curl). The bytes keep TCP active and
+  # reset CF's idle timer.
+  #
+  # Once the first real chunk arrives, the heartbeat stops immediately
+  # and never re-fires — zero overhead after TTFB.
+  #
+  # Default: 15000 (15s). Set to 0 to disable. Env var:
+  # ZCODE_PROXY_SSE_HEARTBEAT_MS. Recommended range: 10s-30s.
+  # Below 5s is wasteful; above 60s defeats the purpose if upstream is
+  # behind CF.
+  sseHeartbeatMs: 15000
+
+  # Maximum client request body size in bytes for proxy endpoints.
+  # The proxy must materialize JSON request bodies before translating them,
+  # so this prevents accidental huge payloads from pinning memory. Default:
+  # 67108864 (64 MiB). Set to 0 to disable the guard.
+  # Env var: ZCODE_PROXY_MAX_REQUEST_BODY_BYTES.
+  maxRequestBodyBytes: 67108864
+
+# Optional browser CORS allowlist. When omitted, browser requests with an
+# Origin header receive Access-Control-Allow-Origin: null; server-to-server
+# requests without Origin still receive *.
+# Env var alternative: ZCODE_PROXY_CORS_ALLOWLIST=https://a.com,https://b.com
+# corsAllowList:
+#   - "https://your-dashboard.example.com"
+#   - "http://localhost:3000"
+
+auth:
+  # "apikey" = use a pre-obtained API key directly
+  # "oauth"  = use OAuth login flow (run `zcode-proxy auth login <zai|bigmodel>` first)
+  mode: apikey
+
+  # For apikey mode:
+  #   Z.AI:     "yourApiKey.yourSecretKey"
+  #   Bigmodel: "yourApiKey"
+  apiKey: "YOUR_API_KEY_HERE"
+
+  # Key that clients must provide to use the proxy.
+  # Set to null/omit to disable client auth.
+  proxyApiKey: "your-proxy-secret"
+
+  # For oauth mode (path to stored credentials from login flow):
+  # oauthCredentialsPath: "~/.zcode-proxy/credentials.json"
+
+# Which upstream provider to use: "zai" or "bigmodel"
+provider: zai
+
+# Which plan tier to use:
+#   "coding-plan" (default) — direct upstream endpoints, permanent API key
+#   "start-plan"            — routes through zcode.z.ai with JWT auth (requires `auth login`)
+plan: coding-plan
+
+providers:
+  zai:
+    anthropicBase: "https://api.z.ai/api/anthropic"
+    openaiBase: "https://api.z.ai/api/coding/paas/v4"
+  bigmodel:
+    anthropicBase: "https://open.bigmodel.cn/api/anthropic"
+    openaiBase: "https://open.bigmodel.cn/api/coding/paas/v4"
+
+defaultModel: glm-4.6
+
+models:
+  - glm-4.5-air
+  - glm-4.6
+  - glm-4.6v
+  - glm-4.7
+  - glm-5
+  - glm-5-turbo
+  - glm-5v-turbo
+  - glm-5.1
+  - glm-5.2
+
+# Identity values used to mimic the ZCode desktop client (v0.3.0: model
+# requests carry the FULL pio header set — see identity.ts). All optional;
+# env vars override YAML, which overrides defaults.
+identity:
+  # Mirrors process.env.ZCODE_APP_VERSION in the ZCode bundle.
+  # Must be printable ASCII; non-conforming values fall back to the default.
+  # Default: "3.9.2" (current ZCode release, 2026-08-26). Override to match
+  # your real client — the start-plan trial-activation gate is version-sensitive.
+  appVersion: "3.9.2"
+  # Release channel header (X-Release-Channel). Default "production".
+  # Env var: ZCODE_RELEASE_CHANNEL.
+  releaseChannel: "production"
+  # Optional X-Device-Mid. If omitted, the proxy tries to read the existing
+  # ZCode telemetry-state.json deviceMid. Env var: ZCODE_DEVICE_MID.
+  # deviceMid: ""
+  # X-Title header suffix. Default "cli".
+  sourceTitle: "cli"
+  # HTTP-Referer URL. Default "https://zcode.z.ai".
+  refererOrigin: "https://zcode.z.ai"
+  # X-ZCode-Agent header for upstream model requests. Default "glm".
+  # Env var: ZCODE_AGENT.
+  zcodeAgent: "glm"
+
+# ─── v0.3.0 upstream zcode-api v2.6.0 alignment sections ────────────────────
+
+# Client-session inference — replicates ZCode's single-user-identity UUID
+# generation so multi-turn conversations reuse the same upstream session id.
+clientIdentity:
+  # "observe" (default): infer + log only. "enforce": forward the inferred
+  # x-session-id upstream. "off": disable inference entirely.
+  mode: observe
+  # In-memory session TTL in seconds (default 900).
+  ttlSeconds: 900
+  # Max inferred sessions retained (default 1024).
+  maxSessions: 1024
+
+# Server-side endpoint routing — periodically fetches the server-published
+# mapping table (GET zcode.z.ai/api/v1/agent/configs) and remaps coding-plan
+# endpoints (e.g. to the ultra endpoints). Fully fail-open. Env var:
+# ZCODE_ENDPOINT_ROUTING=0/1.
+endpointRouting:
+  enabled: true
+  origin: "https://zcode.z.ai"
+
+# V4 client request signing — probes the server feature gate and, when the
+# server enables it, signs coding-plan requests (Ed25519 + proof-of-work)
+# exactly like the real client. Fail-open; start-plan is exempt. Env var:
+# ZCODE_CLIENT_SIGNING=0/1.
+clientSigning:
+  enabled: true
+  origin: "https://zcode.z.ai"
+
+# Async (off-peak / 错峰算力) bridge (v0.3.1, upstream zcode-api 175ff2a).
+# When enabled, exposes three extra endpoints that route through ZCode's
+# off-peak ticket queue — the GLM Coding Plan "错峰时段 5 小时额度重置"
+# benefit (ZCode 3.8.1+):
+#   POST /async/v1/messages          (Anthropic-format clients)
+#   POST /async/v1/chat/completions  (OpenAI-format clients)
+#   GET  /async/v1/health            (probe queue availability)
+# The proxy holds the client connection open with SSE keepalive comments
+# while the ticket is queued, then streams the LLM response once the ticket
+# is ready. Auto-retries (maxRetries) when a ticket expires in queue.
+# Requires the active account to be OAuth / ZCode-imported (needs JWT);
+# apikey-only accounts get 400 async_credentials_unavailable.
+# Env var: ZCODE_ASYNC_ENABLED=1 enables without YAML.
+async:
+  enabled: false
+  origin: "https://zcode.z.ai"
+  # Ticket-status poll interval in ms.
+  pollIntervalMs: 5000
+  # SSE keepalive comment interval during queue wait, in ms.
+  keepAliveIntervalMs: 3000
+  # Max total wait for a ticket to become ready, in ms. 0 = unlimited.
+  maxWaitMs: 0
+  # Max auto-retry count when a ticket expires in queue.
+  maxRetries: 3
+  # Best-effort settle (close-out) call timeout in ms.
+  settleTimeoutMs: 8000
+  # Control-plane (takeTicket / pollStatus) call timeout in ms.
+  controlTimeoutMs: 15000
+  # Optional model override; empty string uses the request's model.
+  defaultModel: ""
+
+# Start-plan captcha behavior (v0.3.0: in-process happy-dom solver + token
+# pool — no Chrome, no jsdom, no browser dependency):
+# - Tokens are pre-solved into a background pool; each start-plan request
+#   takes an already-solved token in sub-millisecond time.
+# - By default the proxy pre-solves and sends fresh Aliyun runtime captcha
+#   headers before each start-plan model attempt. Set
+#   ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT=0 only if you want diagnostic 3007-only
+#   solving.
+# - Pool sizing: CAPTCHA_POOL_MIN (default 20), CAPTCHA_POOL_MAX (default
+#   max(min*6, 120)). Retries: ZCODE_CAPTCHA_RETRIES (default 4). CPU
+#   throttle: CAPTCHA_CPU_LIMIT_PCT (default 100 = off).
+# - HTTP_PROXY/HTTPS_PROXY route the solver's outbound traffic when set.
+
+logging:
+  level: info
+  # Verbose mode (vceshi0.0.6+): logs the full upstream request headers +
+  # transformed body for every request. Useful for diagnosing 3001 parameter
+  # errors. Env var: ZCODE_PROXY_VERBOSE_LOGGING=1
+  # verbose: false
+  # Debug response logging (ceshi0.1.4+): logs the FULL upstream response
+  # for every request — status + key headers + body preview (first 1000 chars
+  # for JSON, first 2KB for SSE streams). Shows EXACTLY what 529 / empty 200 /
+  # captcha 403 returned, including the error JSON body. Uses a bounded tee
+  # preview branch so it doesn't consume the original response. Env var: ZCODE_PROXY_DEBUG_LOGGING=1
+  # debug: false
+  # Header debug logging (v0.2.0.9+): writes TWO JSON files per request to
+  # ./header-debug/ (or $ZCODE_PROXY_HEADER_DEBUG_DIR):
+  #   {timestamp}_{reqId}_inbound.json   ← 客户端发给代理的原始请求 (收到的)
+  #   {timestamp}_{reqId}_upstream.json  ← 代理翻译后发给 z.ai 的请求
+  # Only the FIRST fetch attempt per request is recorded — retries and
+  # captcha re-solves are NOT logged, so each request = one pair of files.
+  # Use this to verify the translation pipeline has no header defects:
+  #   diff *_inbound.json *_upstream.json
+  # Auth tokens are masked (first-8...last-4). Clear with `rm -rf header-debug/`
+  # when done. Env var: ZCODE_PROXY_HEADER_DEBUG=1
+  # headerDebug: false
+
+# Retry configuration for upstream requests.
+# When the upstream returns a retryable status code (e.g. 529 site overloaded),
+# the proxy will automatically retry with exponential backoff.
+# All fields are optional; defaults are shown below.
+# Environment variable overrides:
+#   ZCODE_RETRY_MAX                        — max number of retries
+#   ZCODE_RETRY_INITIAL_DELAY_MS           — initial delay before first retry (ms)
+#   ZCODE_RETRY_MAX_DELAY_MS               — maximum delay cap (ms)
+#   ZCODE_RETRY_BACKOFF_FACTOR             — backoff multiplier per attempt
+#   ZCODE_RETRY_STATUSES                   — comma-separated retryable status codes (e.g. "529,429,503")
+#   ZCODE_RETRY_CREDENTIAL_SWITCH_THRESHOLD — consecutive failures before switching credentials
+retry:
+  # Maximum number of retry attempts. Set to 0 to disable retries entirely.
+  # No upper bound — set as high as needed (e.g. 1000 for very flaky upstreams).
+  maxRetries: 3
+  # Initial delay (ms) before the first retry. Subsequent retries multiply by backoffFactor.
+  initialDelayMs: 1000
+  # Maximum delay cap (ms). Backoff will never exceed this value.
+  maxDelayMs: 8000
+  # Exponential backoff multiplier. 2 = each retry waits ~2x longer.
+  backoffFactor: 2
+  # HTTP status codes that trigger a retry.
+  # Common values: 429 (rate limited / concurrency limit), 503 (service unavailable), 529 (site overloaded).
+  retryableStatuses:
+    - 529
+    - 429
+  # Credential auto-switching: when the SAME credential fails this many times
+  # consecutively (including the initial request), the proxy automatically
+  # switches to another stored credential (if available) and continues retrying.
+  # Already-tried credentials are skipped in the same request to avoid cycling.
+  #
+  # Set to 0 to disable. Default: 2 (v0.1.5+; was 5 — but 5 > maxRetries=3
+  # made the feature a no-op under default config).
+  #
+  # Only effective when:
+  #   1. More than one credential is stored (add accounts via the dashboard or
+  #      `zcode-proxy auth login`).
+  #   2. maxRetries >= this threshold (otherwise the retry loop exhausts first).
+  credentialSwitchThreshold: 2
+
+# --- Responses thinking override (Codex CLI workaround) ---
+# Codex CLI frequently sends `reasoning: null` in the /v1/responses wire
+# payload (the CLI only populates it when an explicit effort level is forced
+# via local config), so the translator's "honor reasoning.effort" branch
+# never fires and the upstream GLM request goes out without `thinking`.
+#
+# This section lets the operator force-enable thinking for specific models
+# regardless of what the client sent. Matching is case-insensitive exact
+# match on the *post-mapping* request model (i.e. the final GLM model id
+# after modelMappings is applied).
+#
+# Empty array / omitted = disabled (default). Two equivalent shapes:
+#
+#   responsesThinking:
+#     models:
+#       - glm-5.2
+#       - glm-4.6
+#
+#   # or shorthand:
+#   responsesThinking:
+#     - glm-5.2
+#     - glm-4.6
+#
+# The dashboard also exposes this as a chip-style multi-select under
+# 代理规则 → Responses 思考管理.
+responsesThinking:
+  models: []
+
+# --- Anthropic format options ---
+anthropic:
+  # v0.2.0.4: `forceStream` option removed — `stream: true` is now forced
+  # unconditionally inside alignZCodeRequestFormat to match the real ZCode
+  # desktop client's wire shape. The response path buffers SSE → batch JSON
+  # for clients that originally requested non-streaming, so this is transparent.
+  #
+  # Align request body structure to match the real ZCode desktop client exactly.
+  # When true:
+  #   1. Top-level field order: model → max_tokens → thinking → output_config
+  #      → system → messages → tools → tool_choice → stream
+  #   2. Inject 3 ZCode official system blocks (both coding-plan AND start-plan),
+  #      client's original system appended after
+  #   3. Rewrite "You are Claude Code, Anthropic's official CLI for Claude."
+  #      → "You are ZCode model working in Claude Code."
+  #   4. Keep role: "system" inside messages[] (don't relocate to top-level system)
+  # Default: false. Env var: ZCODE_PROXY_ALIGN_ZCODE_FORMAT=1
+  alignZCodeFormat: false
+# NOTE: ZCode thinking-format injection (max_tokens=64000 + budget_tokens=32000
+# + output_config.effort=max) is now UNCONDITIONAL default behavior since v0.1.9.
+# Any Anthropic request with thinking.type === "enabled" automatically gets
+# these fields rewritten to match the real ZCode desktop client. No config
+# needed — this aligns our request body fingerprint with the real client at
+# the WAF body-inspection layer.
