@@ -22,6 +22,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { Worker } from "node:worker_threads";
+import { noteGuestError, peekGuestErrorNotes } from "./captcha-guest-rejections.js";
 
 // ── Blocking fetch for sync XHR (self-contained builds) ────────────────────
 // happy-dom implements sync XHR by spawning `process.argv[0] -e <script>`,
@@ -630,6 +631,13 @@ function installNativeToString(w) {
         try {
           const v = desc.get.call(obj);
           if (typeof v === "function") mask(v);
+          // v0.3.6.1: stream-reader/writer `closed`/`ready` getters brand-check
+          // `this` by REJECTING a promise (not throwing sync) — the returned
+          // rejected promise, dropped unhandled here, surfaced as four
+          // "[unhandledRejection] TypeError: ... can only be used on
+          // instances of ReadableStreamBYOBReader/..." lines per solve at
+          // host level. Attach a no-op catch so probing never leaks.
+          else if (v && typeof v.catch === "function") v.catch(() => {});
         } catch (_) {}
       }
       if (depth < 3) {
@@ -1619,6 +1627,10 @@ async function createDom(region, prefix) {
     // exception observer (or Bun's default) terminates the whole proxy —
     // a single bad pe version must only fail that one solve, not the server.
     process.on("uncaughtException", (err) => {
+      // v0.3.6.1: guest-origin sync errors (alicdn stack frames) go to the
+      // shared silent collector — index.ts's twin handler already did the
+      // same, so this would otherwise double-print. Still never crashes.
+      if (noteGuestError(err)) return;
       try {
         const msg = err && err.message ? err.message : String(err);
         process.stderr.write(`[captcha-guest-uncaught] ${msg}\n`);
@@ -1884,6 +1896,75 @@ function installGlobalWindowAlias(g, w) {
   // only exist on the prototype (moveBy, scrollTo, ...) or lands mid-solve on
   // new props. Proxy fallback for any still-missing global property.
   gDefine("__capWindowFor", { get() { return w; }, configurable: true });
+
+  // v0.3.6.1: guest console-noise filter (Bun-only epoch, installed once per
+  // alias epoch like the descriptor snapshot). Under Bun guest scripts run in
+  // the HOST realm and `console` is host-critical (never aliased to the
+  // window's noop console), so FeiLin's invisible-text fingerprint probes —
+  // console.log('%c%d font-size:0;color:transparent', ...) — printed ~8 stray
+  // lines (NaN / %c%d / undefined) per solve straight to the user's terminal.
+  // While the epoch is live, globalThis.console is swapped for a delegating
+  // wrapper that DROPS calls whose immediate caller frame is an alicdn.com
+  // guest chunk; every host call passes through to the original method (the
+  // dashboard's LogBuffer interceptor, installed on the original object in
+  // serve(), keeps capturing host logs untouched). Wrapped methods are masked
+  // as [native code] so a console.log.toString() fingerprint probe (a known
+  // headless tell) sees the same shape as the original. The epoch snapshot
+  // restores the true console when the last window is destroyed.
+  if (firstInstaller) {
+    try {
+      const origConsole = g.console;
+      if (origConsole && typeof origConsole.log === "function") {
+        const wrapConsoleMethod = (method) => {
+          const origFn = origConsole[method];
+          if (typeof origFn !== "function") return null;
+          const fn = function __capConsoleFilter(...args) {
+            try {
+              // FeiLin invokes console.log both directly AND via native
+              // machinery (e.g. [].forEach(console.log) — seen live: the
+              // immediate caller frame was `at forEach (native)` with the
+              // feilin chunk one frame deeper). So classify by ANY alicdn
+              // frame in the top of the stack, not just the first caller:
+              // a host log never has guest frames below it, and a
+              // guest-driven call always does.
+              const st = new Error().stack || "";
+              let checked = 0;
+              for (const line of st.split("\n")) {
+                if (!/^\s*at/.test(line)) continue;
+                if (/alicdn\.com\//i.test(line)) return undefined;
+                if (++checked >= 10) break;
+              }
+            } catch (_) {}
+            return origFn.apply(origConsole, args);
+          };
+          try {
+            Object.defineProperty(fn, "toString", {
+              value: () => `function ${method}() { [native code] }`,
+              configurable: true,
+              writable: true,
+            });
+          } catch (_) {}
+          return fn;
+        };
+        const filtered = Object.create(origConsole);
+        // FeiLin probes the WHOLE console surface (seen live:
+        // [log, dir, dirxml, table, count, ...].forEach(fn => fn(...)) at
+        // feilin149.js:1:421938 — a headless-detection fingerprint), so every
+        // output method must be wrapped, not just log/warn/error. Class-like
+        // props (Console) and non-functions are left on the prototype.
+        for (const m of Object.getOwnPropertyNames(origConsole)) {
+          if (/^[A-Z]/.test(m)) continue; // Console class etc.
+          const f = wrapConsoleMethod(m);
+          if (f) {
+            try {
+              Object.defineProperty(filtered, m, { value: f, configurable: true, writable: true });
+            } catch (_) {}
+          }
+        }
+        gDefine("console", { value: filtered, configurable: true, writable: true });
+      }
+    } catch (_) {}
+  }
 }
 function removeGlobalWindowAlias(g, w) {
   _aliasRefCount -= 1;
@@ -2128,12 +2209,24 @@ async function solveTraceless(opts) {
     // GUEST_EVAL_PATCH hooks) to the failure — a failed solve becomes
     // self-diagnosing while successful solves stay quiet. Read BEFORE the
     // finally-block destroys the window.
+    // v0.3.6.1: also append the HOST-side collector tail (FeiLin async
+    // collectors that rejected at process level — "L[$] is not a function",
+    // post-destroy `window` refs, ... — captured by index.ts's gated
+    // unhandledRejection handler via noteGuestError).
     let out = err;
     try {
       const guestErrs = w.__capGuestErrors;
+      const hostNotes = peekGuestErrorNotes(4);
+      const parts: string[] = [];
       if (Array.isArray(guestErrs) && guestErrs.length > 0) {
         const tail = guestErrs.slice(-6).map((s) => String(s).slice(0, 160)).join(" ;; ");
-        const suffix = ` | guestErrors[${guestErrs.length}]: ${tail}`.slice(0, 1200);
+        parts.push(`guestErrors[${guestErrs.length}]: ${tail}`);
+      }
+      if (hostNotes.length > 0) {
+        parts.push(`hostUH[${hostNotes.length}]: ${hostNotes.join(" ;; ").slice(0, 600)}`);
+      }
+      if (parts.length > 0) {
+        const suffix = ` | ${parts.join(" | ")}`.slice(0, 1200);
         if (err instanceof Error) {
           err.message += suffix;
         } else {

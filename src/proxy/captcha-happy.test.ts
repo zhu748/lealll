@@ -178,3 +178,70 @@ describe("GUEST_EVAL_PATCH guest-error collection (v0.3.6.0)", () => {
     }
   });
 });
+
+describe("guest console-noise filter (v0.3.6.1)", () => {
+  // FeiLin probes the whole console surface from guest frames:
+  //   [log, dir, dirxml, table, count, ...].forEach(fn => fn(...))
+  // which printed stray "%c%d" / NaN / undefined lines to the user's terminal
+  // (bare `console` under Bun resolves to the HOST console). The alias epoch
+  // swaps globalThis.console for a delegating wrapper that drops guest-frame
+  // calls and passes host calls through, restoring the original at epoch end.
+  it("drops guest-frame console calls and passes host calls through during the epoch", () => {
+    const w = makeFakeWindow();
+    const realConsole = console;
+    const calls: string[] = [];
+    // Spy BEFORE the epoch: the wrapper captures origFn at install time.
+    const origLog = console.log;
+    (console as { log: (...a: unknown[]) => void }).log = (...a: unknown[]) => {
+      calls.push(a.map(String).join(" "));
+    };
+    try {
+      installGlobalWindowAlias(globalThis, w);
+      // console is swapped for a delegating wrapper (prototype = original).
+      expect(globalThis.console).not.toBe(realConsole);
+      expect(Object.getPrototypeOf(globalThis.console)).toBe(realConsole);
+      // Host-frame call passes through to the ORIGINAL log (the spy).
+      console.log("host-line");
+      expect(calls).toEqual(["host-line"]);
+      // Wrapped methods present as native (console.log.toString() is a known
+      // headless fingerprint probe).
+      expect(String(console.log)).toContain("[native code]");
+      // Guest-frame call (alicdn URL in the caller stack) is DROPPED: use
+      // Error.prepareStackTrace to fabricate the guest caller frame exactly
+      // like a feilin chunk would produce.
+      const prevPrepare = Error.prepareStackTrace;
+      Error.prepareStackTrace = () =>
+        "Error: x\n    at __capConsoleFilter (captcha-happy.ts:1:1)\n    at <anonymous> (https://g.alicdn.com/captcha-frontend/FeiLin/1.5.1/feilin149.js:1:421938)";
+      try {
+        console.log("%c%d font-size:0;color:transparent", "Error");
+        console.dir({ probe: 1 });
+      } finally {
+        Error.prepareStackTrace = prevPrepare;
+      }
+      // Neither probe reached the original console.
+      expect(calls).toEqual(["host-line"]);
+    } finally {
+      removeGlobalWindowAlias(globalThis, w);
+      (console as { log: (...a: unknown[]) => void }).log = origLog;
+    }
+    // Epoch end restores the true console object.
+    expect(globalThis.console).toBe(realConsole);
+  });
+
+  it("wraps the full console output surface, not just log/warn/error (FeiLin probes dir/table/count)", () => {
+    const w = makeFakeWindow();
+    installGlobalWindowAlias(globalThis, w);
+    try {
+      const c = globalThis.console as unknown as Record<string, unknown>;
+      for (const m of ["log", "warn", "error", "info", "debug", "trace", "dir", "dirxml", "table", "count"]) {
+        expect(typeof c[m]).toBe("function");
+        // Own wrapped prop (not prototype-delegated) for every output method.
+        expect(Object.prototype.hasOwnProperty.call(c, m)).toBe(true);
+      }
+      // Class-like props stay on the prototype untouched.
+      expect(Object.prototype.hasOwnProperty.call(c, "Console")).toBe(false);
+    } finally {
+      removeGlobalWindowAlias(globalThis, w);
+    }
+  });
+});

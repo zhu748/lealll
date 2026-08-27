@@ -10,6 +10,7 @@ import { startServer, type ProxyServer } from "./server/server.js";
 import { startControlListener, LogBuffer, type ControlState } from "./android/control.js";
 import { ensureNodeFetchNoTimeouts } from "./runtime/node-fetch-compat.js";
 import { initPool } from "./proxy/proxy-pool.js";
+import { noteGuestError } from "./proxy/captcha-guest-rejections.js";
 import { loadCredential, saveCredential, clearCredentialAsync, getStorePath, exportAccounts, listAccounts } from "./auth/store.js";
 import { ZaiOAuthClient, BigmodelOAuthClient } from "./auth/oauth.js";
 import { KeyResolver } from "./auth/resolver.js";
@@ -42,6 +43,10 @@ const LOG_LEVEL_ORDER: Record<string, number> = { debug: 0, info: 1, warn: 2, er
 // handlers are the safety net for errors that escape THAT catch.
 // ---------------------------------------------------------------------------
 process.on("uncaughtException", (err) => {
+  // v0.3.6.1: guest-realm (alicdn-hosted FeiLin/pe scripts) sync errors are
+  // routed to the solver's silent collector instead of the terminal — same
+  // policy as unhandledRejection below. They still never crash the process.
+  if (noteGuestError(err)) return;
   // Bun's default behavior is to print + exit. We override to print + continue.
   // The error is logged to stderr (visible in the dashboard log panel via the
   // console.error interceptor installed in serve()).
@@ -53,6 +58,11 @@ process.on("uncaughtException", (err) => {
   }
 });
 process.on("unhandledRejection", (reason) => {
+  // v0.3.6.1: FeiLin's async fingerprint collectors reject with no catch
+  // handler (best-effort probes). Their stacks point at g.alicdn.com guest
+  // chunks — classify those, collect silently, and only surface them when a
+  // captcha solve actually fails. Genuine host rejections keep printing.
+  if (noteGuestError(reason)) return;
   try {
     console.error("[unhandledRejection]", reason instanceof Error ? reason.stack ?? reason : String(reason));
   } catch {

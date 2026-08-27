@@ -2,6 +2,50 @@
 
 A reverse proxy for Z.AI / Bigmodel.cn coding-plan APIs that exposes both OpenAI-compatible and Anthropic-format endpoints.
 
+## v0.3.6.1 — Zero-Spam Startup (guest rejection routing, console probe filter)
+
+Reported against the v0.3.6.0 Windows exe: opening the app still flooded
+the terminal with `[unhandledRejection] TypeError: L[$] is not a function`
+stacks from the FeiLin captcha chunk (`getUniversalCombatFeature`), plus
+stray `%c%d` / `NaN` / `undefined` lines. Root-caused to THREE leak paths
+that all bypass the v0.3.6.0 guest-window collectors — every one reproduced
+locally (the user's exact feilin149.js:1:220532 stack fires in a parallel
+solve wave), every one fixed with regression tests (1251/1251 green, +13):
+
+- **Guest-origin rejections escaped to the process level**. FeiLin races
+  dozens of best-effort async fingerprint collectors inside promises with
+  NO catch handlers. Under Bun the guest scripts run in the host realm, so
+  their rejections reached the generic `[unhandledRejection]` printer in
+  index.ts. New conservative classifier (`captcha-guest-rejections.ts`): a
+  rejection is guest-origin only if a **stack frame** (never the message)
+  points at an alicdn.com guest chunk — a host `fetch()` failure that
+  merely mentions an alicdn URL in its message still prints. Guest
+  rejections are collected into a bounded ring (40, tail-kept) and surface
+  ONLY when a solve FAILS (attached as `hostUH[…]` next to `guestErrors[…]`
+  — self-diagnosing failures, quiet successes).
+- **Getter-probe promise leak in `installNativeToString`**. The
+  fingerprint-masking sweep probes every getter with the target as
+  receiver; stream reader/writer `closed` / `ready` getters brand-check
+  `this` by REJECTING a promise (not throwing), so each sweep leaked four
+  more `[unhandledRejection] TypeError: The ReadableStreamBYOBReader.closed
+  getter …` lines. Probes now attach a no-op catch to whatever the getter
+  returns.
+- **FeiLin's console-surface probe printed through the host console**. The
+  SDK iterates `[log, dir, dirxml, table, count, …].forEach(fn => fn(…))`
+  from guest frames (a headless-detection fingerprint), and under Bun bare
+  `console` resolves to the HOST console — hence the stray `%c%d` /
+  `NaN` / `undefined` lines per solve. During a solve epoch
+  `globalThis.console` is now swapped for a delegating wrapper that drops
+  calls with an alicdn frame in the top of the stack; host logging passes
+  through untouched (the dashboard LogBuffer interceptor keeps capturing
+  it), wrapped methods are masked as `[native code]` (so a
+  `console.log.toString()` probe still sees a native shape), and the true
+  console is restored when the last concurrent window is destroyed.
+
+Validated end-to-end: a parallel solve wave + sequential refills all mint
+valid 280-char verify params with a **completely clean terminal** — zero
+`[unhandledRejection]`, zero `[WINDOW-ERROR]`, zero console noise.
+
 ## v0.3.6.0 — Captcha Solver Fixes (print alias, host-timer survival, quiet solves)
 
 Reported against the v0.3.5.0 Windows exe: opening the app with a

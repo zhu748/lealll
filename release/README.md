@@ -1,5 +1,21 @@
 # zcode-proxy 使用说明
 
+> **v0.3.6.1 — 启动零刷屏（guest 拒绝路由 + console 探测过滤）**
+>
+> 针对 v0.3.6.0 Windows 包"打开仍是一堆 `[unhandledRejection] TypeError: L[$] is not a function` 报错 + `%c%d`/`NaN` 杂音"的反馈，定位到三条全部绕过 v0.3.6.0 guest 收集器的泄漏路径——每一条都在本地复现（用户报错的 feilin149.js:1:220532 堆栈在并行求解波次下 100% 重现），全部修复并加回归测试（1251/1251 通过，+13）。
+>
+> **本次改动**
+>
+> - **guest 来源的 Promise 拒绝逃逸到进程层（用户所见问题）**：FeiLin 在几十个"尽力而为"的异步指纹采集器（`getUniversalCombatFeature` 等）里裸跑 Promise、不挂 catch。Bun 下 guest 脚本跑在宿主 realm，拒绝直接落到 index.ts 的通用 `[unhandledRejection]` 打印器。新增保守分类器（`captcha-guest-rejections.ts`）：只有**堆栈帧**（绝不看消息文本）指向 alicdn.com 的 guest 脚本才算 guest 来源——宿主 `fetch()` 失败时消息里带 alicdn URL 的照常打印。guest 拒绝静默收集（保留最近 40 条），仅当求解**失败**时附加到错误消息（`hostUH[…]` 与 `guestErrors[…]` 并列——成功安静、失败自诊断）。
+> - **修复指纹伪装扫描的 getter 探测泄漏**：`installNativeToString` 会以目标为 receiver 探测每个 getter；stream 读写器的 `closed`/`ready` getter 做 brand check 时**返回 rejected promise 而非同步抛错**，被丢弃的 promise 每次扫描泄漏四条 `[unhandledRejection] TypeError: The ReadableStreamBYOBReader.closed getter …`。探测现在对 getter 返回值挂 no-op catch。
+> - **FeiLin 的 console 全表面探测穿透到宿主 console**：SDK 在 guest 帧里执行 `[log, dir, dirxml, table, count, …].forEach(fn => fn(…))`（无头检测指纹手法），Bun 下裸 `console` 解析到**宿主** console——每次求解漏出若干 `%c%d`/`NaN`/`undefined` 杂音行。求解 epoch 期间 `globalThis.console` 换成委托 wrapper：调用栈顶部含 alicdn 帧的调用被丢弃；宿主日志原样透传（dashboard 的 LogBuffer 拦截器继续工作）；包装方法伪装成 `[native code]`（`console.log.toString()` 指纹探测看到的形状不变）；最后一个并发窗口销毁时恢复真实 console。
+>
+> **验证**：并行求解波次 + 顺序补池全部铸出 280 字符合法 verify param，终端**完全干净**——零 `[unhandledRejection]`、零 `[WINDOW-ERROR]`、零 console 杂音。
+>
+> **升级建议**：所有 free/start-plan 用户建议升级。这些报错虽不阻断求解（服务可正常工作），但每次启动/求解都会刷屏；且失败诊断信息现在更完整（宿主侧拒绝也会附加到失败原因里）。
+
+---
+
 > **v0.3.6.0 — 验证码求解器修复（print 报错、宿主定时器保护、静默求解）**
 >
 > 针对 v0.3.5.0 Windows 包"打开一堆 `[WINDOW-ERROR] print is not defined` 报错"的反馈，根因定位到 happy-dom 全局别名机制（上游同款代码同样存在），修复了两个真实 bug 并加了回归测试。
