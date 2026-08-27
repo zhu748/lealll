@@ -2477,7 +2477,11 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
       const oauthPlan = (body.plan ?? "coding-plan") as "coding-plan" | "start-plan";
 
       if (provider === "bigmodel") {
-        const oauth = new BigmodelOAuthClient();
+        // v0.3.2: attach the configured client identity (UA / app-version /
+        // platform headers) to the token exchange — same hardening as the
+        // quota requests (v0.3.1). A bare Bun UA is a non-official-client
+        // fingerprint the Aliyun WAF in front of zcode.z.ai can key on.
+        const oauth = new BigmodelOAuthClient(undefined, undefined, undefined, undefined, opts.config.identity);
         const { authorizeUrl, callbackUrl, state } = await oauth.start();
         // Store flow info for polling
         const flowId = `bm_${state.slice(0, 16)}`;
@@ -2549,7 +2553,7 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
       // Z.AI OAuth — same auth-code/callback shape as bigmodel above.
       // start() spins up the localhost callback server and returns the
       // authorize URL (flowId == state doubles as the CSRF token + flow key).
-      const oauth = new ZaiOAuthClient();
+      const oauth = new ZaiOAuthClient(undefined, undefined, undefined, undefined, opts.config.identity);
       const init = await oauth.start();
       rememberActiveOAuthFlow(init.flowId, {
         provider,
@@ -2662,7 +2666,7 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
       // we exchange it via the zcode.z.ai proxy using the localhost
       // callback URL + state recorded on the flow at start() time.
       if (flow.provider === "zai") {
-        const oauth = new ZaiOAuthClient();
+        const oauth = new ZaiOAuthClient(undefined, undefined, undefined, undefined, opts.config.identity);
         const storedCallbackUrl = (flow as any).callbackUrl;
         if (!storedCallbackUrl) {
           return errorResponse(500, "missing_callback", "Original localhost callback URL not found. Please restart the login.");
@@ -2702,7 +2706,7 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
       // zcode.z.ai proxy. Extract the code and call exchangeCode with the original
       // callback URL stored on the flow.
       if (flow.provider === "bigmodel") {
-        const oauth = new BigmodelOAuthClient();
+        const oauth = new BigmodelOAuthClient(undefined, undefined, undefined, undefined, opts.config.identity);
         // The original callbackUrl stored on the flow is the localhost URL we
         // registered at start() time — we need it for the token exchange.
         const storedCallbackUrl = (flow as any).callbackUrl;

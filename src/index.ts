@@ -2,7 +2,8 @@
  * Entry point — load config, create auth manager, start proxy server.
  * @see .omo/plans/zcode-proxy.md Task 7
  */
-import { loadConfig } from "./config/loader.js";
+import { loadConfig, resolveDefaultIdentity } from "./config/loader.js";
+import type { ProxyIdentity } from "./config/types.js";
 import { EXAMPLE_CONFIG_YAML } from "./config/template.js";
 import { AuthManager } from "./auth/manager.js";
 import { startServer } from "./server/server.js";
@@ -735,8 +736,19 @@ async function authExport(args: string[]): Promise<void> {
 }
 
 async function runOAuth(provider: ProviderId): Promise<{ accessToken: string; userId?: string; jwt?: string; email?: string }> {
+  // v0.3.2: attach the real-client identity headers (UA / app-version /
+  // platform) to the zcode.z.ai token exchange — same hardening as the quota
+  // requests (v0.3.1) and the admin-dashboard OAuth flows. Prefer the loaded
+  // config's identity (env > YAML); when no config.yaml exists fall back to
+  // env + built-in defaults so the UA is never a bare `Bun/x`.
+  let identity: ProxyIdentity;
+  try {
+    identity = loadConfig(process.env.ZCODE_PROXY_CONFIG ?? "config.yaml").identity;
+  } catch {
+    identity = resolveDefaultIdentity();
+  }
   if (provider === "bigmodel") {
-    const oauth = new BigmodelOAuthClient();
+    const oauth = new BigmodelOAuthClient(undefined, undefined, undefined, undefined, identity);
     const result = await oauth.authorize((url) => {
       console.log("Open this URL to authorize:\n");
       console.log(`  ${url}\n`);
@@ -749,7 +761,7 @@ async function runOAuth(provider: ProviderId): Promise<{ accessToken: string; us
   // Z.AI uses the same auth-code/callback loop as bigmodel (localhost server
   // + zcode.z.ai token proxy). This loop is what activates the start-plan
   // trial on a fresh account. See src/auth/oauth.ts and test-zai-oauth.cjs.
-  const oauth = new ZaiOAuthClient();
+  const oauth = new ZaiOAuthClient(undefined, undefined, undefined, undefined, identity);
   const result = await oauth.authorize((url) => {
     console.log("Open this URL to authorize:\n");
     console.log(`  ${url}\n`);

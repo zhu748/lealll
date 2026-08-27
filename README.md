@@ -2,6 +2,31 @@
 
 A reverse proxy for Z.AI / Bigmodel.cn coding-plan APIs that exposes both OpenAI-compatible and Anthropic-format endpoints.
 
+## v0.3.2 — Upstream Re-audit + OAuth Exchange Fingerprint
+
+Full re-audit against upstream `TriDefender/zcode-api` master (32d508d,
+2026-08-24 — no new upstream commits since the v0.3.1 alignment):
+OAuth protocol constants, identity header sequence, all routes, the async
+bridge semantics, and zcode_system.json are all confirmed aligned; upstream's
+remaining modules (MCP, Android, node-fetch-compat, webui) stay deliberately
+unported (dormant / N/A / superseded by the admin dashboard).
+
+- **New model: `glm-5.3`** (1M context, 128K output) added to the pinned
+  catalog — the only real upstream gap found in the re-audit. The admin
+  dashboard's model datalist picks it up automatically.
+- **OAuth token-exchange requests now carry the real-client identity
+  headers** (`User-Agent: ZCode/<ver>`, `X-ZCode-App-Version`, `X-Title`,
+  `X-ZCode-Agent: glm`, platform headers, …). Previously the exchange POST
+  to `zcode.z.ai/api/v1/oauth/token` went out with a bare `Bun/x` UA — the
+  same non-official-client fingerprint the v0.3.1 quota fix removed. The
+  identity comes from the loaded config (env > YAML > defaults); the CLI
+  `auth login` flow gets a new `resolveDefaultIdentity()` fallback so it
+  stays fingerprinted even without a config.yaml. Both providers (zai /
+  bigmodel), all three flows (dashboard poll, dashboard manual callback,
+  CLI) are covered.
+- Backward compatible: constructing an OAuth client without an identity
+  keeps the old header shape (tests pin both behaviors).
+
 ## v0.3.1 — ZCode 3.9.2 + Off-Peak (错峰) Async Bridge
 
 - **appVersion default 3.9.1 → 3.9.2** (ZCode release 2026-08-26). The
@@ -775,6 +800,7 @@ The proxy lists these models on `GET /v1/models` (pinned to the GLM coding-plan 
 | `glm-5v-turbo` | 200K | 128K |
 | `glm-5.1` | 200K | 128K |
 | `glm-5.2` | 1M | 128K |
+| `glm-5.3` | 1M | 128K |
 
 Requests for models not in this list are still forwarded upstream — the listing is informational, not a gate.
 

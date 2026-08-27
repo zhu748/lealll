@@ -20,6 +20,8 @@
  * @see test-zai-oauth.cjs for the standalone replication that proved the loop.
  */
 import type { ProviderId } from "../provider/types.js";
+import type { ProxyIdentity } from "../config/types.js";
+import { buildIdentityHeaders } from "../proxy/identity.js";
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
 // IncomingMessage and ServerResponse are used by the CallbackServer class below.
 import type { Socket } from "node:net";
@@ -426,6 +428,14 @@ export class ZaiOAuthClient {
     private authorizeUrl: string = ZAI_AUTHORIZE_URL,
     private clientId: string = ZAI_CLIENT_ID,
     private requestTimeoutMs: number = DEFAULT_OAUTH_TOKEN_TIMEOUT_MS,
+    /**
+     * Optional client identity (UA / app-version / platform headers) attached
+     * to the zcode.z.ai token-exchange request. The real ZCode client sends
+     * its full identity set on every zcode.z.ai call; a bare `Bun/x` UA is a
+     * non-official-client fingerprint the Aliyun WAF can key on. Mirrors the
+     * v0.3.1 quota-request hardening (src/auth/quota.ts).
+     */
+    private identity?: ProxyIdentity,
   ) {}
 
   /**
@@ -479,7 +489,10 @@ export class ZaiOAuthClient {
   ): Promise<{ accessToken: string; userId?: string; jwt?: string; email?: string }> {
     const resp = await fetchWithTimeout(this.fetchImpl, `${ZCODE_OAUTH_BASE}/oauth/token`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        ...(this.identity ? buildIdentityHeaders(this.identity) : {}),
+        "content-type": "application/json",
+      },
       body: JSON.stringify({
         provider: "zai",
         code: authCode,
@@ -573,6 +586,8 @@ export class BigmodelOAuthClient {
     private host: string = BIGMODEL_HOST,
     private appId: string = BIGMODEL_APP_ID,
     private requestTimeoutMs: number = DEFAULT_OAUTH_TOKEN_TIMEOUT_MS,
+    /** Optional client identity headers for the token-exchange request (see ZaiOAuthClient). */
+    private identity?: ProxyIdentity,
   ) {}
 
   /**
@@ -618,7 +633,10 @@ export class BigmodelOAuthClient {
   ): Promise<{ accessToken: string; userId?: string; jwt?: string; email?: string }> {
     const resp = await fetchWithTimeout(this.fetchImpl, ZCODE_TOKEN_ENDPOINT, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        ...(this.identity ? buildIdentityHeaders(this.identity) : {}),
+        "content-type": "application/json",
+      },
       body: JSON.stringify({
         provider: "bigmodel",
         code: authCode,

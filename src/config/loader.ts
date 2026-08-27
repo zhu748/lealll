@@ -372,6 +372,24 @@ function resolveIdentity(inp: IdentityInputs): ProxyIdentity {
   return { appVersion, sourceTitle, refererOrigin, releaseChannel, deviceMid, zcodeAgent };
 }
 
+/**
+ * Resolve the client identity from env vars + built-in defaults — no config
+ * file required. Used by code paths that run outside `serve` (e.g. the
+ * `auth login` CLI OAuth flow, which may run on a host without config.yaml
+ * but still needs the real-client identity headers on the token exchange).
+ * Env > defaults, exactly like the YAML path inside loadConfig().
+ */
+export function resolveDefaultIdentity(): ProxyIdentity {
+  return resolveIdentity({
+    appVersionEnv: process.env[ENV.APP_VERSION],
+    sourceTitleEnv: process.env[ENV.SOURCE_TITLE],
+    refererEnv: process.env[ENV.REFERER_ORIGIN],
+    releaseChannelEnv: process.env[ENV.RELEASE_CHANNEL],
+    deviceMidEnv: process.env[ENV.DEVICE_MID],
+    zcodeAgentEnv: process.env[ENV.ZCODE_AGENT],
+  });
+}
+
 function readExistingZCodeDeviceMid(): string | undefined {
   for (const path of zcodeTelemetryStateCandidates()) {
     try {

@@ -8,7 +8,7 @@
  * zcode.z.ai token exchange.
  */
 import { describe, it, expect } from "bun:test";
-import { ZaiOAuthClient, normalizeCallbackWaitTimeoutMs } from "./oauth.js";
+import { ZaiOAuthClient, BigmodelOAuthClient, normalizeCallbackWaitTimeoutMs } from "./oauth.js";
 import { once } from "node:events";
 import { connect } from "node:net";
 
@@ -109,6 +109,95 @@ describe("ZaiOAuthClient", () => {
     expect(result.accessToken).toBe("zai_access_123");
     expect(result.jwt).toBe("zcode_jwt_xyz");
     expect(result.userId).toBe("u1");
+  });
+
+  it("exchangeCode() attaches real-client identity headers when an identity is provided (v0.3.2)", async () => {
+    let seenHeaders: Record<string, string> | null = null;
+    const mock = tokenExchangeMock(() => {
+      return new Response(zaiEnvelope({ zai: { access_token: "zai_access_123" } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    // Wrap the mock to capture headers (tokenExchangeMock only sees the body).
+    const headerCapturingMock = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      if (typeof input === "string" && input.includes("/oauth/token") && init?.method === "POST") {
+        seenHeaders = Object.fromEntries(
+          new Headers(init.headers as HeadersInit).entries(),
+        ) as Record<string, string>;
+      }
+      return mock(input as any, init);
+    }) as typeof fetch;
+
+    const client = new ZaiOAuthClient(
+      headerCapturingMock,
+      undefined,
+      undefined,
+      undefined,
+      // Minimal identity like the CLI/admin fallbacks build.
+      { appVersion: "3.9.2", sourceTitle: "cli", refererOrigin: "https://zcode.z.ai" },
+    );
+    await client.exchangeCode("auth_code_abc", "http://127.0.0.1:1/oauth/callback/zai", "state_hex");
+
+    // Real ZCode client fingerprint on the token exchange — not a bare Bun UA.
+    expect(seenHeaders!["user-agent"]).toBe("ZCode/3.9.2");
+    expect(seenHeaders!["x-zcode-app-version"]).toBe("3.9.2");
+    expect(seenHeaders!["x-title"]).toBe("Z Code@cli");
+    expect(seenHeaders!["x-zcode-agent"]).toBe("glm");
+    expect(seenHeaders!["content-type"]).toBe("application/json");
+    // HTTP-Referer from the identity's refererOrigin.
+    expect(seenHeaders!["http-referer"]).toBe("https://zcode.z.ai");
+  });
+
+  it("exchangeCode() omits identity headers when no identity is provided (backward compat)", async () => {
+    let seenHeaders: Record<string, string> | null = null;
+    const headerCapturingMock = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      if (typeof input === "string" && input.includes("/oauth/token") && init?.method === "POST") {
+        seenHeaders = Object.fromEntries(
+          new Headers(init.headers as HeadersInit).entries(),
+        ) as Record<string, string>;
+        return new Response(zaiEnvelope({ zai: { access_token: "t" } }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return fetch(input as any, init);
+    }) as typeof fetch;
+
+    const client = new ZaiOAuthClient(headerCapturingMock);
+    await client.exchangeCode("c", "http://127.0.0.1:1/oauth/callback/zai", "s");
+    expect(seenHeaders!["x-zcode-app-version"]).toBeUndefined();
+    expect(seenHeaders!["x-title"]).toBeUndefined();
+    expect(seenHeaders!["content-type"]).toBe("application/json");
+  });
+
+  it("BigmodelOAuthClient.exchangeCode() attaches identity headers when provided (v0.3.2)", async () => {
+    let seenHeaders: Record<string, string> | null = null;
+    const headerCapturingMock = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      if (typeof input === "string" && input.includes("/oauth/token") && init?.method === "POST") {
+        seenHeaders = Object.fromEntries(
+          new Headers(init.headers as HeadersInit).entries(),
+        ) as Record<string, string>;
+        return new Response(JSON.stringify({
+          code: 0,
+          data: { bigmodel: { access_token: "bm_token" }, token: "bm_jwt" },
+          msg: "success",
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return fetch(input as any, init);
+    }) as typeof fetch;
+
+    const client = new BigmodelOAuthClient(
+      headerCapturingMock,
+      undefined,
+      undefined,
+      undefined,
+      { appVersion: "3.9.2", sourceTitle: "cli", refererOrigin: "https://zcode.z.ai" },
+    );
+    await client.exchangeCode("c", "http://127.0.0.1:1/oauth/callback/bigmodel", "s");
+    expect(seenHeaders!["user-agent"]).toBe("ZCode/3.9.2");
+    expect(seenHeaders!["x-zcode-app-version"]).toBe("3.9.2");
+    expect(seenHeaders!["x-zcode-agent"]).toBe("glm");
   });
 
   it("exchangeCode() unrefs the token request timeout timer", async () => {

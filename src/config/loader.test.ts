@@ -6,7 +6,7 @@ import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 import { writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { loadConfig } from "./loader.js";
+import { loadConfig, resolveDefaultIdentity } from "./loader.js";
 
 const TMP = join(tmpdir(), `zcode-proxy-test-${Date.now()}`);
 
@@ -700,5 +700,25 @@ auth:
   apiKey: "abc"
 `);
     expect(() => loadConfig(path)).toThrow("corsAllowList");
+  });
+});
+
+describe("resolveDefaultIdentity", () => {
+  it("returns the built-in default identity without a config file (v0.3.2)", () => {
+    const identity = resolveDefaultIdentity();
+    // Same defaults the YAML path lands on when nothing is set.
+    expect(identity.appVersion).toBe("3.9.2");
+    expect(identity.sourceTitle).toBe("cli");
+    expect(identity.refererOrigin).toBe("https://zcode.z.ai");
+    expect(identity.zcodeAgent).toBe("glm");
+  });
+
+  it("ZCODE_APP_VERSION env overrides the default appVersion", () => {
+    process.env.ZCODE_APP_VERSION = "9.9.9";
+    try {
+      expect(resolveDefaultIdentity().appVersion).toBe("9.9.9");
+    } finally {
+      delete process.env.ZCODE_APP_VERSION;
+    }
   });
 });
