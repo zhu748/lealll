@@ -3,6 +3,7 @@
  * @see _reverse/NOTEPAD.md "How Credential is Used for LLM Calls"
  */
 import { describe, it, expect } from "bun:test";
+import { ZCODE_SYSTEM_BLOCKS, buildStartPlanSystem } from "./system-prompt.js";
 import { transformRequestBody } from "./body-transformer.js";
 
 describe("transformRequestBody — general", () => {
@@ -874,10 +875,11 @@ describe("transformRequestBody — alignZCodeFormat (ZCode wire format alignment
     });
     const out = transformRequestBody(body, { format: "anthropic" });
     const parsed = JSON.parse(out as string);
-    // 2 ZCode blocks + 1 client block = 3
-    expect(parsed.system.length).toBe(3);
+    // v0.3.0: 3 ZCode official blocks + 1 dynamic model line + 1 client block = 5
+    expect(parsed.system.length).toBe(5);
     expect(parsed.system[0].text).toBe("You are ZCode, an interactive coding agent");
-    expect(parsed.system[2].text).toBe("Custom client instructions");
+    expect(parsed.system[4].text).toBe("Custom client instructions");
+    expect(parsed.system[3].text).toBe("- You are powered by the model named glm-5.2.");
   });
 
   it("rewrites 'You are Claude Code' → 'You are ZCode model working in Claude Code'", () => {
@@ -1179,11 +1181,12 @@ describe("transformRequestBody — alignZCodeFormat (field fill + drop, v0.2.0+)
     // 7. output_config injected
     expect(parsed.output_config).toEqual({ effort: "max" });
 
-    // 8. system starts with 2 ZCode blocks, then client's (rewritten) block
-    expect(parsed.system.length).toBe(3);
+    // 8. v0.3.0: system = 3 ZCode official blocks + model line + client's (rewritten) block
+    expect(parsed.system.length).toBe(5);
     expect(parsed.system[0].text).toBe("You are ZCode, an interactive coding agent");
-    expect(parsed.system[2].text).toContain("You are ZCode model working in Claude Code");
-    expect(parsed.system[2].text).not.toContain("You are Claude Code, Anthropic's official CLI for Claude.");
+    expect(parsed.system[4].text).toContain("You are ZCode model working in Claude Code");
+    expect(parsed.system[4].text).not.toContain("You are Claude Code, Anthropic's official CLI for Claude.");
+    expect(parsed.system[3].text).toBe("- You are powered by the model named glm5.1.");
 
     // 9. v0.2.0.5: last system block carries cache_control (mirrors real ZCode
     // client's prompt-cache breakpoint — without this, the wire shape is
@@ -1208,13 +1211,15 @@ describe("transformRequestBody — alignZCodeFormat (field fill + drop, v0.2.0+)
     const out = transformRequestBody(body, { format: "anthropic" });
     const parsed = JSON.parse(out as string);
 
-    // 3 blocks: 2 official ZCode + 1 user-provided (the Codex instructions)
-    expect(parsed.system.length).toBe(3);
+    // v0.3.0: 5 blocks = 3 official ZCode + model line + 1 user-provided (the Codex instructions)
+    expect(parsed.system.length).toBe(5);
     expect(parsed.system[0].cache_control).toEqual({ type: "ephemeral" }); // official
     expect(parsed.system[1].cache_control).toEqual({ type: "ephemeral" }); // official
+    expect(parsed.system[2].cache_control).toEqual({ type: "ephemeral" }); // official env block
+    expect(parsed.system[3].cache_control).toEqual({ type: "ephemeral" }); // model line
     // v0.2.0.5: last block now carries cache_control (was missing before)
-    expect(parsed.system[2].cache_control).toEqual({ type: "ephemeral" });
-    expect(parsed.system[2].text).toBe("You are Codex, an elite System Architect...");
+    expect(parsed.system[4].cache_control).toEqual({ type: "ephemeral" });
+    expect(parsed.system[4].text).toBe("You are Codex, an elite System Architect...");
   });
 
   it("v0.2.0.5: does NOT overwrite existing cache_control on last system block", () => {
@@ -1231,7 +1236,7 @@ describe("transformRequestBody — alignZCodeFormat (field fill + drop, v0.2.0+)
     const out = transformRequestBody(body, { format: "anthropic" });
     const parsed = JSON.parse(out as string);
     // Last block (user-provided) should still have its cache_control unchanged
-    expect(parsed.system[2].cache_control).toEqual(existingCc);
+    expect(parsed.system[4].cache_control).toEqual(existingCc);
   });
 
   it("v0.2.0.5: when no user-provided system blocks, last official block keeps its cc", () => {
@@ -1246,9 +1251,11 @@ describe("transformRequestBody — alignZCodeFormat (field fill + drop, v0.2.0+)
     });
     const out = transformRequestBody(body, { format: "anthropic" });
     const parsed = JSON.parse(out as string);
-    expect(parsed.system.length).toBe(2); // 2 official only
+    expect(parsed.system.length).toBe(4); // v0.3.0: 3 official + model line
     expect(parsed.system[0].cache_control).toEqual({ type: "ephemeral" });
     expect(parsed.system[1].cache_control).toEqual({ type: "ephemeral" });
+    expect(parsed.system[2].cache_control).toEqual({ type: "ephemeral" });
+    expect(parsed.system[3].cache_control).toEqual({ type: "ephemeral" });
   });
 });
 
@@ -1365,26 +1372,26 @@ describe("transformRequestBody — alignZCodeFormat (message body fingerprint al
     //
     // Use the EXACT official block texts (a real retry would carry the exact
     // bytes injected by a prior transform — partial matches don't happen).
-    const zcodeBlock0 = "You are ZCode, an interactive coding agent";
-    const zcodeBlock1 = "\nYou are an interactive ZCode agent that helps users with software engineering tasks.\n\nIMPORTANT: Assist with authorized security testing, defensive security, CTF challenges, and educational contexts. Refuse requests for destructive techniques, DoS attacks, mass targeting, supply chain compromise, or detection evasion for malicious purposes. Dual-use security tools (C2 frameworks, credential testing, exploit development) require clear authorization context: pentesting engagements, CTF competitions, security research, or defensive use cases.\n\n# Harness\n- Text you output outside of tool use is displayed to the user as Github-flavored markdown in a terminal.\n- Tools run behind a user-selected permission mode; a denied call means the user declined it — adjust, don't retry verbatim.\n- `<system-reminder>` tags in messages and tool results are injected by the harness, not the user. Hooks may intercept tool calls; treat hook output as user feedback.\n- Prefer the dedicated file/search tools over shell commands when one fits. Independent tool calls can run in parallel in one response.\n- Reference code as `file_path:line_number` — it's clickable.";
+    // v0.3.0: build the fixture from the CURRENT official blocks so this test
+    // stays in sync with zcode_system.json (3 official + model line + client).
+    const preInjected = buildStartPlanSystem(
+      [{ type: "text", text: "client instructions" }],
+      "glm-5.2",
+    );
     const body = JSON.stringify({
       model: "glm-5.2",
       max_tokens: 1000,
       thinking: { type: "enabled" },
       messages: [{ role: "user", content: "hi" }],
-      // System already has 2 ZCode blocks + 1 client block (from a prior transform)
-      system: [
-        { type: "text", text: zcodeBlock0, cache_control: { type: "ephemeral" } },
-        { type: "text", text: zcodeBlock1, cache_control: { type: "ephemeral" } },
-        { type: "text", text: "client instructions" },
-      ],
+      // System already has the full prior-transform shape (retry scenario)
+      system: preInjected,
     });
     const out = transformRequestBody(body, { format: "anthropic", startPlan: true });
     const parsed = JSON.parse(out as string);
-    // Should be 3 blocks (2 ZCode + 1 client), NOT 5
-    expect(parsed.system.length).toBe(3);
-    expect(parsed.system[0].text).toBe(zcodeBlock0);
-    expect(parsed.system[2].text).toBe("client instructions");
+    // v0.3.0: 5 blocks (3 ZCode official + model line + client), NOT re-injected
+    expect(parsed.system.length).toBe(5);
+    expect(parsed.system[0].text).toBe(ZCODE_SYSTEM_BLOCKS[0].text);
+    expect(parsed.system[4].text).toBe("client instructions");
   });
 
   it("full alignment: ClaudeCode long-task body matches real ZCode wire format", () => {
@@ -1452,10 +1459,10 @@ describe("transformRequestBody — alignZCodeFormat (message body fingerprint al
     // 6. metadata dropped (real ZCode never sends it)
     expect(parsed.metadata).toBeUndefined();
 
-    // 7. system: 2 ZCode blocks + client block (with identity rewritten)
-    expect(parsed.system.length).toBe(3);
+    // 7. v0.3.0: system = 3 ZCode official blocks + model line + client block (identity rewritten)
+    expect(parsed.system.length).toBe(5);
     expect(parsed.system[0].text).toBe("You are ZCode, an interactive coding agent");
-    expect(parsed.system[2].text).toContain("You are ZCode model working in Claude Code");
+    expect(parsed.system[4].text).toContain("You are ZCode model working in Claude Code");
 
     // 8. thinking simplified + budget injected; max_tokens=64000; output_config injected
     expect(parsed.thinking).toEqual({ type: "enabled", budget_tokens: 32000 });

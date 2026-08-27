@@ -11,9 +11,6 @@ import {
   buildUpstreamURL,
   buildAuthHeaders,
   buildUpstreamHeaders,
-  createStartPlanRequestAttributionContext,
-  _clearStartPlanAttributionContextsForTesting,
-  _startPlanAttributionContextCountForTesting,
 } from "./upstream.js";
 import { proxyRequest, errorResponse, startPlanCaptchaPreflightEnabled, _readResponseTextPreviewForTesting, _setRequestBodyIdleTimeoutForTesting } from "./handler.js";
 import { importFromText, updatePoolConfig, _resetForTesting as resetProxyPoolForTesting } from "./proxy-pool.js";
@@ -153,50 +150,45 @@ describe("buildAuthHeaders", () => {
     expect(h["authorization"]).toBe("Bearer bmkey");
   });
 
-  it("injects the ZCode GLM agent model-provider identity header set", () => {
-    // Model requests use the GLM agent provider headers from zcode.cjs
-    // ($yo + WOr), not the desktop host's full source-header set.
+  it("injects the full pio identity header set (upstream v2.6.0 alignment)", () => {
+    // v0.3.0: model requests carry the FULL `pio` header set — the June-2026
+    // narrow agent split is obsolete (refreshed 2026-08 bundle RE).
     const h = buildAuthHeaders("anthropic", ZAI_CRED, IDENTITY);
-    expect(h["user-agent"]).toBe("ZCode/test-1.0.0 ai-sdk/provider-utils/4.0.27 runtime/node.js/24");
-    expect(h["x-zcode-app-version"]).toBe("test-1.0.0");
-    expect(h["x-title"]).toBe("Z Code@cli");
-    expect(h["x-zcode-agent"]).toBe("glm");
-    expect(h["http-referer"]).toBe("https://zcode.z.ai");
-    expect(h["x-platform"]).toMatch(/^[a-z0-9]+-[a-z0-9]+$/i);
-    expect(h["x-client-language"]).toBeUndefined();
-    expect(h["x-client-timezone"]).toBeUndefined();
-    expect(h["x-release-channel"]).toBeUndefined();
-    expect(h["x-device-mid"]).toBeUndefined();
+    expect(h["User-Agent"]).toBe("ZCode/test-1.0.0");
+    expect(h["X-ZCode-App-Version"]).toBe("test-1.0.0");
+    expect(h["X-Title"]).toBe("Z Code@cli");
+    expect(h["X-ZCode-Agent"]).toBe("glm");
+    expect(h["HTTP-Referer"]).toBe("https://zcode.z.ai");
+    expect(h["X-Platform"]).toMatch(/^[a-z0-9]+-[a-z0-9]+$/i);
+    expect(h["X-Release-Channel"]).toBe("production");
+    expect(typeof h["X-Client-Language"]).toBe("string");
+    expect(typeof h["X-Client-Timezone"]).toBe("string");
 
-    // Verify wire order: auth FIRST, then anthropic-version, THEN identity
-    // block.
+    // Trace/attribution headers are part of the auth-header assembly now
+    // (coding-plan synthetic path: request-id + session-type + trace-id +
+    // query-id + session-id).
+    expect(typeof h["x-request-id"]).toBe("string");
+    expect(h["x-zcode-session-type"]).toBe("main");
+    expect(typeof h["x-zcode-trace-id"]).toBe("string");
+    expect(typeof h["x-query-id"]).toBe("string");
+    expect(typeof h["x-session-id"]).toBe("string");
+
+    // pio wire order: HTTP-Referer → User-Agent → [App-Version] → X-Title →
+    // X-ZCode-Agent → X-Platform → … → auth last.
     const keys = Object.keys(h);
+    const refererIdx = keys.indexOf("HTTP-Referer");
+    const uaIdx = keys.indexOf("User-Agent");
+    const appVerIdx = keys.indexOf("X-ZCode-App-Version");
+    const titleIdx = keys.indexOf("X-Title");
+    const agentIdx = keys.indexOf("X-ZCode-Agent");
+    const platformIdx = keys.indexOf("X-Platform");
     const authIdx = keys.indexOf("x-api-key");
-    const versionIdx = keys.indexOf("anthropic-version");
-    const refererIdx = keys.indexOf("http-referer");
-    expect(authIdx).toBeLessThan(versionIdx);
-    expect(versionIdx).toBeLessThan(refererIdx);
-
-    // Agent identity block internal order mirrors zcode.cjs $yo + WOr.
-    const uaIdx = keys.indexOf("user-agent");
-    const appVerIdx = keys.indexOf("x-zcode-app-version");
-    const titleIdx = keys.indexOf("x-title");
-    const agentIdx = keys.indexOf("x-zcode-agent");
-    const platformIdx = keys.indexOf("x-platform");
-    const osCatIdx = keys.indexOf("x-os-category");
     expect(refererIdx).toBeLessThan(uaIdx);
     expect(uaIdx).toBeLessThan(appVerIdx);
     expect(appVerIdx).toBeLessThan(titleIdx);
     expect(titleIdx).toBeLessThan(agentIdx);
     expect(agentIdx).toBeLessThan(platformIdx);
-    expect(platformIdx).toBeLessThan(osCatIdx);
-  });
-
-  it("does NOT include dynamic attribution headers in the legacy auth-only helper", () => {
-    const h = buildAuthHeaders("anthropic", ZAI_CRED, IDENTITY) as unknown as Record<string, string | undefined>;
-    expect(h["x-session-id"]).toBeUndefined();
-    expect(h["x-query-id"]).toBeUndefined();
-    expect(h["x-zcode-trace-id"]).toBeUndefined();
+    expect(platformIdx).toBeLessThan(authIdx);
   });
 
   it("does NOT emit Accept header (v0.2.3+: real ZCode client never sends it on /v1/messages)", () => {
@@ -230,20 +222,20 @@ describe("buildUpstreamRequest", () => {
     expect(upstream.headers.get("x-api-key")).toBe("testkey.testsecret");
     expect(upstream.headers.get("anthropic-version")).toBe("2023-06-01");
     expect(upstream.headers.get("content-type")).toBe("application/json");
-    expect(upstream.headers.get("user-agent")).toBe("ZCode/test-1.0.0 ai-sdk/provider-utils/4.0.27 runtime/node.js/24");
+    expect(upstream.headers.get("user-agent")).toBe("ZCode/test-1.0.0");
     expect(upstream.headers.get("x-zcode-app-version")).toBe("test-1.0.0");
     expect(upstream.headers.get("x-title")).toBe("Z Code@cli");
     expect(upstream.headers.get("x-zcode-agent")).toBe("glm");
     expect(upstream.headers.get("http-referer")).toBe("https://zcode.z.ai");
+    // v0.3.0: coding-plan now emits the full synthetic attribution set
+    // (x-request-id / x-zcode-session-type / x-zcode-trace-id / x-query-id /
+    // x-session-id) — ZCode 3.9.1 attributes every model request.
+    expect(upstream.headers.get("x-zcode-session-type")).toBe("main");
+    expect(typeof upstream.headers.get("x-session-id")).toBe("string");
+    expect(typeof upstream.headers.get("x-query-id")).toBe("string");
+    expect(typeof upstream.headers.get("x-zcode-trace-id")).toBe("string");
     // v0.2.3+: real ZCode client does NOT send `accept` on /v1/messages.
     expect(upstream.headers.get("accept")).toBeNull();
-    // v0.2.3+: accept-encoding is auto-added by fetch (not set by us).
-    // It may or may not appear depending on Bun's Headers behavior, but we
-    // never set it to "gzip" anymore.
-    // Coding-plan does not get start-plan attribution headers.
-    expect(upstream.headers.get("x-session-id")).toBeNull();
-    expect(upstream.headers.get("x-query-id")).toBeNull();
-    expect(upstream.headers.get("x-zcode-trace-id")).toBeNull();
 
     const body = await upstream.text();
     expect(body).toBe('{"model":"glm-4.6","messages":[]}');
@@ -311,11 +303,14 @@ describe("buildUpstreamRequest", () => {
     });
     const resolver = () => "198.51.100.1";
     const upstream = buildUpstreamRequest(clientReq, "anthropic", ZAI_PROVIDER, ZAI_CRED, "{}", IDENTITY, "coding-plan", undefined, resolver, false);
-    expect(upstream.headers.get("x-session-id")).toBeNull();
-    expect(upstream.headers.get("x-query-id")).toBeNull();
-    expect(upstream.headers.get("x-zcode-trace-id")).toBeNull();
+    // v0.3.0: coding-plan emits the synthetic attribution set (not derived
+    // from client IP — random UUIDs). The resolver args remain accepted for
+    // API stability but never influence header values.
+    expect(typeof upstream.headers.get("x-session-id")).toBe("string");
+    expect(typeof upstream.headers.get("x-query-id")).toBe("string");
+    expect(typeof upstream.headers.get("x-zcode-trace-id")).toBe("string");
     // Identity headers still present.
-    expect(upstream.headers.get("user-agent")).toBe("ZCode/test-1.0.0 ai-sdk/provider-utils/4.0.27 runtime/node.js/24");
+    expect(upstream.headers.get("user-agent")).toBe("ZCode/test-1.0.0");
   });
 
   // v0.2.1+: Claude Code CLI / Anthropic TypeScript SDK fingerprint headers
@@ -355,7 +350,7 @@ describe("buildUpstreamRequest", () => {
 
     // Identity headers still win — we replaced the SDK fingerprint with the
     // real ZCode client's identity set.
-    expect(upstream.headers.get("user-agent")).toBe("ZCode/test-1.0.0 ai-sdk/provider-utils/4.0.27 runtime/node.js/24");
+    expect(upstream.headers.get("user-agent")).toBe("ZCode/test-1.0.0");
     expect(upstream.headers.get("x-zcode-app-version")).toBe("test-1.0.0");
   });
 
@@ -430,7 +425,7 @@ describe("buildUpstreamRequest", () => {
     // Plus transport-level (auto-added by fetch/HTTP):
     //   host, content-length, accept-encoding
     const EXPECTED_HEADERS = new Set([
-      // Whitelist (explicit)
+      // Whitelist (explicit) — v0.3.0 full pio set + synthetic attribution
       "content-type",
       "x-api-key",            // anthropic coding-plan uses x-api-key
       "anthropic-beta",
@@ -441,9 +436,16 @@ describe("buildUpstreamRequest", () => {
       "x-title",
       "x-zcode-agent",
       "x-platform",
+      "x-release-channel",
+      "x-client-language",
+      "x-client-timezone",
       "x-os-category",
       "x-os-version",
       "x-request-id",
+      "x-zcode-session-type",
+      "x-zcode-trace-id",
+      "x-query-id",
+      "x-session-id",
       // Transport (auto-added by Bun's fetch / Headers)
       "host",
       "content-length",
@@ -464,7 +466,7 @@ describe("buildUpstreamRequest", () => {
     expect(leaked).toEqual([]);
 
     // === Verify whitelist values are correct (not the client's) ===
-    expect(upstream.headers.get("user-agent")).toBe("ZCode/test-1.0.0 ai-sdk/provider-utils/4.0.27 runtime/node.js/24");    // not FakeClient/9.9
+    expect(upstream.headers.get("user-agent")).toBe("ZCode/test-1.0.0");    // not FakeClient/9.9
     expect(upstream.headers.get("accept")).toBeNull();                      // not explicitly set
     expect(upstream.headers.get("content-type")).toBe("application/json");  // not text/plain
     expect(upstream.headers.get("x-api-key")).toBe("testkey.testsecret");   // not client-key
@@ -538,67 +540,84 @@ describe("buildUpstreamRequest", () => {
   // of app.asar Mf() at offset 886853 + SDK literal at 1085109 + yU at 887429).
   //
   // Real client wire order:
-  it("emits GLM agent model-provider headers in stable construction order (coding-plan)", () => {
+  it("emits the full header set in stable construction order (coding-plan)", () => {
     const h = buildUpstreamHeaders("anthropic", ZAI_CRED, IDENTITY);
 
+    // v0.3.0 order: content-type → [accept-encoding] → anthropic-beta →
+    // identity (pio) → trace (synthetic) → anthropic-version → auth.
+    // buildUpstreamHeaders (record form) synthesizes a bare request so
+    // accept-encoding falls back to "gzip".
     const expectedOrder = [
       "content-type",
-      "x-api-key",
+      "accept-encoding",
       "anthropic-beta",
-      "anthropic-version",
-      "http-referer",
-      "user-agent",
-      "x-zcode-app-version",
-      "x-title",
-      "x-zcode-agent",
-      "x-platform",
-      "x-os-category",
-      "x-os-version",
+      "HTTP-Referer",
+      "User-Agent",
+      "X-ZCode-App-Version",
+      "X-Title",
+      "X-ZCode-Agent",
+      "X-Platform",
+      "X-Release-Channel",
+      "X-Client-Language",
+      "X-Client-Timezone",
+      "X-Os-Category",
+      "X-Os-Version",
       "x-request-id",
+      "x-zcode-session-type",
+      "x-zcode-trace-id",
+      "x-query-id",
+      "x-session-id",
+      "x-api-key",
+      "anthropic-version",
     ];
 
     expect(Object.keys(h)).toEqual(expectedOrder);
-    expect(h["user-agent"]).toBe("ZCode/test-1.0.0 ai-sdk/provider-utils/4.0.27 runtime/node.js/24");
-    expect(h["x-title"]).toBe("Z Code@cli");
-    expect(h["x-zcode-agent"]).toBe("glm");
+    expect(h["User-Agent"]).toBe("ZCode/test-1.0.0");
+    expect(h["X-Title"]).toBe("Z Code@cli");
+    expect(h["X-ZCode-Agent"]).toBe("glm");
   });
 
-  it("does not send host-only source headers on model requests", () => {
+  it("emits host source headers on model requests (v0.3.0 full pio set)", () => {
+    // v0.3.0: the refreshed bundle RE (2026-08) shows model requests carry the
+    // FULL pio set — language/timezone/channel are no longer host-only.
     const h = buildUpstreamHeaders("anthropic", ZAI_CRED, {
       ...IDENTITY,
       releaseChannel: "stable",
       deviceMid: "device-mid-test",
     });
 
-    expect(h["x-release-channel"]).toBeUndefined();
-    expect(h["x-client-language"]).toBeUndefined();
-    expect(h["x-client-timezone"]).toBeUndefined();
-    expect(h["x-device-mid"]).toBeUndefined();
+    expect(h["X-Release-Channel"]).toBe("stable");
+    expect(typeof h["X-Client-Language"]).toBe("string");
+    expect(typeof h["X-Client-Timezone"]).toBe("string");
+    expect(h["X-Device-Mid"]).toBe("device-mid-test");
   });
 
-  it("emits GLM agent model-provider headers in stable construction order (start-plan with JWT)", () => {
-    // Start-plan uses authorization: Bearer <jwt> instead of x-api-key.
-    // Verify the wire order is the same except slot 2 swaps to authorization.
+  it("emits headers in stable construction order (start-plan with JWT, OpenAI upstream)", () => {
+    // v0.3.0: start-plan routes through the zcode.z.ai OpenAI gateway —
+    // authorization: Bearer <jwt>, NO anthropic-beta/anthropic-version.
+    // The trace block uses the exact path (ZCode attribution): without a
+    // client session it carries request-id / session-type / trace-id only.
     const jwtCred: Credential = { apiKey: "k", secret: "s", jwt: "jwt-token-xyz", provider: "zai" };
-    const h = buildUpstreamHeaders("anthropic", jwtCred, IDENTITY, "start-plan");
+    const h = buildUpstreamHeaders("openai", jwtCred, IDENTITY, "start-plan");
 
     const expectedOrder = [
       "content-type",
-      "authorization",       // start-plan with jwt uses Bearer
-      "anthropic-beta",
-      "anthropic-version",
-      "http-referer",
-      "user-agent",
-      "x-zcode-app-version",
-      "x-title",
-      "x-zcode-agent",
-      "x-platform",
-      "x-os-category",
-      "x-os-version",
+      "accept-encoding",
+      "HTTP-Referer",
+      "User-Agent",
+      "X-ZCode-App-Version",
+      "X-Title",
+      "X-ZCode-Agent",
+      "X-Platform",
+      "X-Release-Channel",
+      "X-Client-Language",
+      "X-Client-Timezone",
+      "X-Os-Category",
+      "X-Os-Version",
       "x-request-id",
+      "x-zcode-session-type",
       "x-zcode-trace-id",
-      "x-query-id",
-      "x-session-id",
+      "authorization",
     ];
 
     const actualOrder = Object.keys(h);
@@ -606,101 +625,13 @@ describe("buildUpstreamRequest", () => {
 
     // Verify the JWT auth value.
     expect(h["authorization"]).toBe("Bearer jwt-token-xyz");
-    expect(h["x-zcode-agent"]).toBe("glm");
+    expect(h["X-ZCode-Agent"]).toBe("glm");
     expect(h["x-request-id"]).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
     expect(h["x-zcode-trace-id"]).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
-    expect(h["x-query-id"]).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
-    expect(h["x-session-id"]).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
-    // x-api-key must NOT be present in start-plan+jwt mode.
+    // x-api-key / anthropic-* must NOT be present on the OpenAI gateway path.
     expect(h["x-api-key"]).toBeUndefined();
-  });
-
-  it("keeps start-plan session and trace stable per credential while query/request ids are fresh", () => {
-    // Real ZCode creates a stable `sess_${uuid}` session and trace context for
-    // the runtime session, then sends the prefix-stripped values as headers.
-    // A new user query gets a fresh query id.
-    const jwtCred: Credential = {
-      apiKey: "k-stable",
-      secret: "s",
-      jwt: "jwt-stable-token",
-      provider: "zai",
-      userId: "user-stable",
-    };
-    const h1 = buildUpstreamHeaders("anthropic", jwtCred, IDENTITY, "start-plan");
-    const h2 = buildUpstreamHeaders("anthropic", jwtCred, IDENTITY, "start-plan");
-
-    expect(h1["x-session-id"]).toBe(h2["x-session-id"]);
-    expect(h1["x-zcode-trace-id"]).toBe(h2["x-zcode-trace-id"]);
-    expect(h1["x-query-id"]).not.toBe(h2["x-query-id"]);
-    expect(h1["x-request-id"]).not.toBe(h2["x-request-id"]);
-  });
-
-  it("keeps start-plan query id stable across attempts when a request context is supplied", () => {
-    // Real ZCode creates a status context once for the user query. Retry
-    // attempts call Fde(baseContext, attempt), which refreshes requestId only.
-    const jwtCred: Credential = {
-      apiKey: "k-attempt",
-      secret: "s",
-      jwt: "jwt-attempt-token",
-      provider: "zai",
-      userId: "user-attempt",
-    };
-    const requestContext = createStartPlanRequestAttributionContext();
-    const h1 = buildUpstreamHeaders("anthropic", jwtCred, IDENTITY, "start-plan", undefined, requestContext);
-    const h2 = buildUpstreamHeaders("anthropic", jwtCred, IDENTITY, "start-plan", undefined, requestContext);
-
-    expect(h1["x-session-id"]).toBe(h2["x-session-id"]);
-    expect(h1["x-zcode-trace-id"]).toBe(h2["x-zcode-trace-id"]);
-    expect(h1["x-query-id"]).toBe(h2["x-query-id"]);
-    expect(h1["x-request-id"]).not.toBe(h2["x-request-id"]);
-  });
-
-  it("bounds start-plan attribution contexts with LRU eviction", () => {
-    _clearStartPlanAttributionContextsForTesting();
-    try {
-      let h0: Record<string, string> | null = null;
-      let h1: Record<string, string> | null = null;
-      for (let i = 0; i < 512; i++) {
-        const h = buildUpstreamHeaders(
-          "anthropic",
-          { apiKey: `k-${i}`, secret: "s", jwt: `jwt-${i}`, provider: "zai", userId: `user-${i}` },
-          IDENTITY,
-          "start-plan",
-        );
-        if (i === 0) h0 = h;
-        if (i === 1) h1 = h;
-      }
-
-      expect(_startPlanAttributionContextCountForTesting()).toBe(512);
-
-      const h0Recent = buildUpstreamHeaders(
-        "anthropic",
-        { apiKey: "k-0", secret: "s", jwt: "jwt-0", provider: "zai", userId: "user-0" },
-        IDENTITY,
-        "start-plan",
-      );
-      expect(h0Recent["x-session-id"]).toBe(h0!["x-session-id"]);
-      expect(h0Recent["x-zcode-trace-id"]).toBe(h0!["x-zcode-trace-id"]);
-
-      buildUpstreamHeaders(
-        "anthropic",
-        { apiKey: "k-512", secret: "s", jwt: "jwt-512", provider: "zai", userId: "user-512" },
-        IDENTITY,
-        "start-plan",
-      );
-      expect(_startPlanAttributionContextCountForTesting()).toBe(512);
-
-      const h1AfterEviction = buildUpstreamHeaders(
-        "anthropic",
-        { apiKey: "k-1", secret: "s", jwt: "jwt-1", provider: "zai", userId: "user-1" },
-        IDENTITY,
-        "start-plan",
-      );
-      expect(h1AfterEviction["x-session-id"]).not.toBe(h1!["x-session-id"]);
-      expect(_startPlanAttributionContextCountForTesting()).toBe(512);
-    } finally {
-      _clearStartPlanAttributionContextsForTesting();
-    }
+    expect(h["anthropic-version"]).toBeUndefined();
+    expect(h["anthropic-beta"]).toBeUndefined();
   });
 
   it("uses start-plan apiKey as Bearer auth when jwt field is absent", () => {
@@ -715,7 +646,7 @@ describe("buildUpstreamRequest", () => {
     );
 
     expect(h["authorization"]).toBe("Bearer jwt-from-api-key");
-    expect(h["x-zcode-agent"]).toBe("glm");
+    expect(h["X-ZCode-Agent"]).toBe("glm");
     expect(h["x-zcode-trace-id"]).toBeTruthy();
     expect(h["x-api-key"]).toBeUndefined();
   });
@@ -729,40 +660,48 @@ describe("buildUpstreamRequest", () => {
     );
 
     expect(h["authorization"]).toBe("Bearer jwt-already-prefixed");
-    expect(h["x-zcode-agent"]).toBe("glm");
+    expect(h["X-ZCode-Agent"]).toBe("glm");
     expect(h["x-zcode-trace-id"]).toBeTruthy();
     expect(h["x-api-key"]).toBeUndefined();
   });
 
-  it("emits GLM agent model-provider headers in stable construction order (OpenAI format)", () => {
-    // OpenAI upstream: auth via Bearer, NO anthropic-version.
+  it("emits headers in stable construction order (OpenAI format)", () => {
+    // v0.3.0: OpenAI upstream — identity block first, then trace, then
+    // authorization Bearer. NO anthropic-version/beta.
     const h = buildUpstreamHeaders("openai", ZAI_CRED, IDENTITY);
 
     const expectedOrder = [
       "content-type",
-      "authorization",       // OpenAI uses Bearer
-      // NO anthropic-version for OpenAI upstream
-      "http-referer",
-      "user-agent",
-      "x-zcode-app-version",
-      "x-title",
-      "x-zcode-agent",
-      "x-platform",
-      "x-os-category",
-      "x-os-version",
+      "accept-encoding",
+      "HTTP-Referer",
+      "User-Agent",
+      "X-ZCode-App-Version",
+      "X-Title",
+      "X-ZCode-Agent",
+      "X-Platform",
+      "X-Release-Channel",
+      "X-Client-Language",
+      "X-Client-Timezone",
+      "X-Os-Category",
+      "X-Os-Version",
       "x-request-id",
+      "x-zcode-session-type",
+      "x-zcode-trace-id",
+      "x-query-id",
+      "x-session-id",
+      "authorization",
     ];
-
-    const actualOrder = Object.keys(h);
-    expect(actualOrder).toEqual(expectedOrder);
+    expect(Object.keys(h)).toEqual(expectedOrder);
+    expect(h["authorization"]).toBe("Bearer testkey.testsecret");
   });
 
-  // v0.2.3: accept-encoding must NOT be hardcoded to "gzip" — the real
-  // client lets fetch auto-add it (which picks `gzip, deflate, br` based
-  // on runtime support). Hardcoding was a fingerprint mismatch.
-  it("does NOT hardcode accept-encoding (v0.2.3+: let fetch auto-add it)", () => {
+  // v0.3.0 (upstream v2.6.0): accept-encoding is forwarded from the CLIENT
+  // so the upstream compresses only when the client can decode it (fixes
+  // Tauri builds that send `accept-encoding: identity`). Default "gzip"
+  // when the client sent nothing. Never hardcoded to a fixed value.
+  it("forwards the client's accept-encoding (v0.3.0+), defaulting to gzip", () => {
     const h = buildUpstreamHeaders("anthropic", ZAI_CRED, IDENTITY);
-    expect(h["accept-encoding"]).toBeUndefined();
+    expect(h["accept-encoding"]).toBe("gzip");
   });
 
   // v0.2.3: accept header must NOT be sent at all on /v1/messages traffic.
@@ -786,7 +725,10 @@ describe("proxyRequest", () => {
     },
     defaultModel: "glm-4.6",
     models: ["glm-4.6"],
-    identity: IDENTITY,
+    identity: IDENTITY,    clientIdentity: { mode: "off", ttlSeconds: 900, maxSessions: 1024 },
+    endpointRouting: { enabled: false, origin: "https://zcode.z.ai" },
+    clientSigning: { enabled: false, origin: "https://zcode.z.ai" },
+
     logging: { level: "info" },
     retry: { maxRetries: 0, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3 },
   };
@@ -1182,7 +1124,10 @@ describe("proxyRequest — OpenAI translation mode (coding-plan)", () => {
     },
     defaultModel: "glm-4.6",
     models: ["glm-4.6"],
-    identity: IDENTITY,
+    identity: IDENTITY,    clientIdentity: { mode: "off", ttlSeconds: 900, maxSessions: 1024 },
+    endpointRouting: { enabled: false, origin: "https://zcode.z.ai" },
+    clientSigning: { enabled: false, origin: "https://zcode.z.ai" },
+
     logging: { level: "info" },
     retry: { maxRetries: 0, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3 },
   };
@@ -1572,7 +1517,10 @@ describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
     },
     defaultModel: "glm-4.6",
     models: ["glm-4.6"],
-    identity: IDENTITY,
+    identity: IDENTITY,    clientIdentity: { mode: "off", ttlSeconds: 900, maxSessions: 1024 },
+    endpointRouting: { enabled: false, origin: "https://zcode.z.ai" },
+    clientSigning: { enabled: false, origin: "https://zcode.z.ai" },
+
     logging: { level: "info" },
     retry: { maxRetries: 0, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3 },
   };
@@ -1594,7 +1542,7 @@ describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
     expect(resp.headers.get("content-encoding")).toBe("gzip");
   });
 
-  it("start-plan OpenAI request translates through zcode.z.ai gateway", async () => {
+  it("start-plan OpenAI request routes through the zcode.z.ai OpenAI gateway", async () => {
     const startPlanConfig: ProxyConfig = {
       ...testConfig,
       plan: "start-plan",
@@ -1607,29 +1555,28 @@ describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
 
     try {
       const fetchMock = mock(async (req: Request): Promise<Response> => {
-        expect(req.url).toBe("https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages");
+        // v0.3.0: start-plan now hits the OpenAI gateway (chat/completions).
+        expect(req.url).toBe("https://zcode.z.ai/api/v1/zcode-plan/chat/completions");
         expect(req.headers.get("authorization")).toBe("Bearer jwt-mock");
         expect(req.headers.get("x-zcode-trace-id")).toMatch(/^[0-9a-f-]{36}$/i);
-        expect(req.headers.get("x-query-id")).toMatch(/^[0-9a-f-]{36}$/i);
-        expect(req.headers.get("x-session-id")).toMatch(/^[0-9a-f-]{36}$/i);
+        expect(req.headers.get("x-zcode-session-type")).toBe("main");
         expect(req.headers.get("x-aliyun-captcha-verify-param")).toBe("fresh-preflight-param");
         expect(req.headers.get("x-aliyun-captcha-verify-region")).toBe("cn-shanghai");
         const reqBody = JSON.parse(await req.text());
         expect(reqBody.messages).toBeDefined();
-        // vceshi0.1.7+: injectZCodeThinkingFormat forces max_tokens=64000
-        // on all Anthropic-format requests (matches ZCode's wire shape,
-        // regardless of thinking on/off). The OpenAI→Anthropic translator
-        // originally sets 4096, but the body-transformer overrides it.
-        expect(reqBody.max_tokens).toBe(64000);
+        // Gateway system blocks are injected as leading system messages.
+        expect(reqBody.messages[0].role).toBe("system");
+        expect(reqBody.messages[0].content).toContain("You are ZCode");
+        // stream passthrough: client sent no stream field → not forced on the
+        // OpenAI gateway path (upstream v2.6.0 behavior).
+        expect(reqBody.stream).toBeUndefined();
         return new Response(JSON.stringify({
-          id: "msg_sp",
-          type: "message",
-          role: "assistant",
-          content: [{ type: "text", text: "start-plan reply" }],
+          id: "chatcmpl-sp",
+          object: "chat.completion",
+          created: 1750000000,
           model: "glm-4.6",
-          stop_reason: "end_turn",
-          stop_sequence: null,
-          usage: { input_tokens: 5, output_tokens: 3 },
+          choices: [{ index: 0, message: { role: "assistant", content: "start-plan reply" }, finish_reason: "stop" }],
+          usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
         }), { status: 200, headers: { "content-type": "application/json" } });
       });
 
@@ -1660,10 +1607,17 @@ describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
     }
   });
 
-  it("keeps start-plan query/session/trace stable across retry attempts", async () => {
+  it("keeps the explicit client session id stable across start-plan retry attempts", async () => {
+    // v0.3.0 (upstream v2.6.0 session-context): when the client identifies its
+    // session (Claude Code's x-claude-code-session-id), the proxy reuses the
+    // SAME upstream session id across retry attempts — replicating ZCode's
+    // single-user-identity UUID generation. Without an explicit session every
+    // attempt gets fresh synthetic ids.
     const startPlanConfig: ProxyConfig = {
       ...testConfig,
       plan: "start-plan",
+      // Session inference must be ON for the explicit-session path.
+      clientIdentity: { mode: "observe", ttlSeconds: 900, maxSessions: 1024 },
       retry: {
         ...testConfig.retry,
         maxRetries: 1,
@@ -1675,19 +1629,16 @@ describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
     const originalPreflight = process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
     process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = "0";
     const successBody = JSON.stringify({
-      id: "msg_sp_retry",
-      type: "message",
-      role: "assistant",
-      content: [{ type: "text", text: "ok after retry" }],
+      id: "chatcmpl-sp-retry",
+      object: "chat.completion",
+      created: 1750000000,
       model: "glm-4.6",
-      stop_reason: "end_turn",
-      stop_sequence: null,
-      usage: { input_tokens: 5, output_tokens: 3 },
+      choices: [{ index: 0, message: { role: "assistant", content: "ok after retry" }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
     });
     const seen: Array<{
       requestId: string | null;
       traceId: string | null;
-      queryId: string | null;
       sessionId: string | null;
     }> = [];
 
@@ -1696,7 +1647,6 @@ describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
         seen.push({
           requestId: req.headers.get("x-request-id"),
           traceId: req.headers.get("x-zcode-trace-id"),
-          queryId: req.headers.get("x-query-id"),
           sessionId: req.headers.get("x-session-id"),
         });
         await req.text();
@@ -1713,7 +1663,7 @@ describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
       auth.setOAuthCredential({ apiKey: "dummy", provider: "zai", plan: "start-plan", jwt: "jwt-mock" });
       const clientReq = new Request("http://localhost:8080/v1/chat/completions", {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", "x-claude-code-session-id": "3aeca633-bcc3-48be-b175-49cc0a4fad1e" },
         body: '{"model":"glm-4.6","messages":[{"role":"user","content":"hi"}]}',
       });
 
@@ -1725,12 +1675,15 @@ describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
 
       expect(resp.status).toBe(200);
       expect(fetchMock).toHaveBeenCalledTimes(2);
+      // Both attempts carry a UUID request id; retry gets a FRESH one.
       expect(seen[0].requestId).toMatch(/^[0-9a-f-]{36}$/i);
       expect(seen[1].requestId).toMatch(/^[0-9a-f-]{36}$/i);
       expect(seen[0].requestId).not.toBe(seen[1].requestId);
-      expect(seen[0].traceId).toBe(seen[1].traceId);
-      expect(seen[0].queryId).toBe(seen[1].queryId);
+      // Explicit client session → the SAME upstream session id on both attempts.
+      expect(seen[0].sessionId).toBeTruthy();
       expect(seen[0].sessionId).toBe(seen[1].sessionId);
+      const body = await resp.json();
+      expect(body.choices[0].message.content).toBe("ok after retry");
     } finally {
       if (originalPreflight === undefined) delete process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
       else process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = originalPreflight;
@@ -1949,8 +1902,8 @@ describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
           headers: { "content-type": "application/json" },
         });
       });
-      const captchaTokenProvider = mock(async (_reqId: string | undefined, opts?: { solver?: string }) => {
-        expect(opts?.solver).toBe("chrome");
+      const captchaTokenProvider = mock(async (_reqId: string | undefined, _opts?: { solver?: string }) => {
+        // v0.3.0: pool-based take — no solver strategy parameter anymore.
         return { verifyParam: "fake-captcha-param", region: "cn-shanghai", solveMs: 7 };
       });
 
@@ -1996,15 +1949,15 @@ describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
     const tempStoreDir = mkdtempSync(join(tmpdir(), "zcode-proxy-upstream-pool-"));
     const wafHtml = '<html><body><img src="https://errors.aliyun.com/error.png">blocked</body></html>';
     const captchaFailurePayload = JSON.stringify({ code: 3007, msg: "captcha verify failed" });
+    // v0.3.0: start-plan upstream is the OpenAI gateway — success body is a
+    // chat.completion, translated back to the OpenAI client verbatim.
     const successBody = JSON.stringify({
-      id: "msg_rotated",
-      type: "message",
-      role: "assistant",
-      content: [{ type: "text", text: "ok after third proxy" }],
+      id: "chatcmpl-rotated",
+      object: "chat.completion",
+      created: 1750000000,
       model: "glm-5.2",
-      stop_reason: "end_turn",
-      stop_sequence: null,
-      usage: { input_tokens: 5, output_tokens: 4 },
+      choices: [{ index: 0, message: { role: "assistant", content: "ok after third proxy" }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 5, completion_tokens: 4, total_tokens: 9 },
     });
     const seenProxies: Array<string | undefined> = [];
     const seenCaptchaHeaders: Array<string | null> = [];
@@ -2091,20 +2044,22 @@ describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
     };
 
     const fetchMock = mock(async (req: Request): Promise<Response> => {
-      expect(req.url).toBe("https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages");
+      // v0.3.0: start-plan routes through the zcode.z.ai OpenAI gateway.
+      expect(req.url).toBe("https://zcode.z.ai/api/v1/zcode-plan/chat/completions");
       expect(req.headers.get("authorization")).toBe("Bearer jwt-from-active-account");
       expect(req.headers.get("x-api-key")).toBeNull();
       const reqBody = JSON.parse(await req.text());
-      expect(reqBody.max_tokens).toBe(64000);
+      // Gateway system blocks are injected as leading system messages.
+      expect(Array.isArray(reqBody.messages)).toBe(true);
+      expect(reqBody.messages[0].role).toBe("system");
+      expect(reqBody.messages[0].content).toContain("You are ZCode");
       return new Response(JSON.stringify({
-        id: "msg_sp_plan",
-        type: "message",
-        role: "assistant",
-        content: [{ type: "text", text: "credential plan wins" }],
+        id: "chatcmpl-plan",
+        object: "chat.completion",
+        created: 1750000000,
         model: "glm-4.6",
-        stop_reason: "end_turn",
-        stop_sequence: null,
-        usage: { input_tokens: 5, output_tokens: 3 },
+        choices: [{ index: 0, message: { role: "assistant", content: "credential plan wins" }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
       }), { status: 200, headers: { "content-type": "application/json" } });
     });
 
@@ -2146,7 +2101,10 @@ describe("proxyRequest — per-account outbound proxy (v2.1.4.1test5)", () => {
     },
     defaultModel: "glm-4.6",
     models: ["glm-4.6"],
-    identity: IDENTITY,
+    identity: IDENTITY,    clientIdentity: { mode: "off", ttlSeconds: 900, maxSessions: 1024 },
+    endpointRouting: { enabled: false, origin: "https://zcode.z.ai" },
+    clientSigning: { enabled: false, origin: "https://zcode.z.ai" },
+
     logging: { level: "info" },
     retry: { maxRetries: 0, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3 },
   };

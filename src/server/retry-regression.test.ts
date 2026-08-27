@@ -34,7 +34,10 @@ function makeRetryConfig(): ProxyConfig {
     },
     defaultModel: "glm-4.6",
     models: ["glm-4.6"],
-    identity: { appVersion: "test-1.0.0", sourceTitle: "cli", refererOrigin: "https://zcode.z.ai" },
+    identity: { appVersion: "test-1.0.0", sourceTitle: "cli", refererOrigin: "https://zcode.z.ai" },    clientIdentity: { mode: "off", ttlSeconds: 900, maxSessions: 1024 },
+    endpointRouting: { enabled: false, origin: "https://zcode.z.ai" },
+    clientSigning: { enabled: false, origin: "https://zcode.z.ai" },
+
     logging: { level: "info" },
     // Enable retries: 529 is retryable, use short delays for fast tests
     retry: { maxRetries: 3, initialDelayMs: 10, maxDelayMs: 50, backoffFactor: 2, retryableStatuses: [529, 502], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3 },

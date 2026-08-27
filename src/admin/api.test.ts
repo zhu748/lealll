@@ -60,7 +60,10 @@ function makeConfig(overrides: Partial<ProxyConfig> = {}): ProxyConfig {
     },
     defaultModel: "glm-4.6",
     models: ["glm-4.6"],
-    identity: { appVersion: "test-1.0.0", sourceTitle: "cli", refererOrigin: "https://zcode.z.ai" },
+    identity: { appVersion: "test-1.0.0", sourceTitle: "cli", refererOrigin: "https://zcode.z.ai" },    clientIdentity: { mode: "off", ttlSeconds: 900, maxSessions: 1024 },
+    endpointRouting: { enabled: false, origin: "https://zcode.z.ai" },
+    clientSigning: { enabled: false, origin: "https://zcode.z.ai" },
+
     logging: { level: "info" },
     retry: { maxRetries: 0, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3 },
     ...overrides,
@@ -634,25 +637,21 @@ describe("recordStat — captchaMs field (G4)", () => {
   });
 });
 
-describe("/admin/api/captcha-helper — Chrome helper status", () => {
-  it("returns helper status without launching Chrome", async () => {
+describe("/admin/api/captcha-helper — token pool status", () => {
+  it("returns pool status (v0.3.0 happy-pool backend)", async () => {
     const opts = makeAdminOpts();
     const resp = await callAdmin(authedReq("/admin/api/captcha-helper"), opts);
     expect(resp!.status).toBe(200);
     const body = await resp!.json();
+    // v0.3.0: the Chrome CDP renderer is replaced by the in-process happy-dom
+    // pre-solved token pool — the status endpoint now reports pool metrics.
     expect(body).toMatchObject({
-      keepAlive: true,
+      backend: "happy-pool",
       running: false,
-      mode: "persistent",
-      ephemeral: false,
-      busy: false,
-      sdkReady: false,
-      sdkPreloadError: null,
-      port: null,
-      pageUrl: null,
     });
-    expect(typeof body.userDataDir).toBe("string");
-    expect(typeof body.idleTimeoutMs).toBe("number");
+    expect(typeof body.ready).toBe("number");
+    expect(typeof body.target).toBe("number");
+    expect(typeof body.activeSolves).toBe("number");
   });
 
   it("stop endpoint is idempotent", async () => {

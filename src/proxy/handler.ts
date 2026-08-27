@@ -3,24 +3,40 @@
  *
  * **Translation mode** (OpenAI clients): the proxy translates OpenAI requests
  * to Anthropic format, forwards to the Anthropic upstream (provider's
- * anthropic endpoint in coding-plan, or zcode.z.ai gateway in start-plan),
- * then translates the response back to OpenAI format. Anthropic clients
- * pass through unchanged in both plans.
+ * anthropic endpoint in coding-plan), then translates the response back to
+ * OpenAI format. Anthropic clients pass through unchanged in coding-plan.
+ *
+ * **v0.3.0 (upstream zcode-api v2.6.0 alignment)**: start-plan now routes
+ * through the zcode.z.ai OpenAI gateway (`/api/v1/zcode-plan/chat/completions`).
+ * The upstream format is plan-dependent:
+ *   - coding-plan → Anthropic upstream (existing wire-shape-aligned path)
+ *   - start-plan  → OpenAI upstream; Anthropic-format clients are translated
+ *                   Anthropic→OpenAI on the request and OpenAI→Anthropic on
+ *                   the response (sse + batch)
+ *
+ * Also integrated from upstream v2.6.0: session-context (stable per-
+ * conversation upstream session UUIDs + x-zcode-session-type attribution),
+ * endpoint-routing (server-published URL remapping, fail-open), and V4 client
+ * signing (Ed25519 + PoW, gate-driven, fail-open, coding-plan only).
  *
  * @see .omo/plans/zcode-proxy.md Task 6
  */
-import type { Format, OpenAIResponseRequest } from "../translator/types.js";
+import type { Format, OpenAIResponseRequest, AnthropicMessagesRequest, OpenAIChatResponse } from "../translator/types.js";
 import type { ProxyConfig } from "../config/types.js";
 import type { AuthManager } from "../auth/manager.js";
 import type { Credential } from "../auth/types.js";
 import { getProvider } from "../provider/providers.js";
-import { buildUpstreamRequest, createStartPlanRequestAttributionContext } from "./upstream.js";
-import { getCaptchaToken, RETRY_HEADERS } from "./captcha.js";
+import { buildUpstreamRequest, type UpstreamHeaderPair } from "./upstream.js";
+import { getCaptchaToken, RETRY_HEADERS, urgentCaptcha, detectCaptchaChallenge } from "./captcha.js";
 import { transformRequestBodyObj } from "./body-transformer.js";
 import { detectSseErrorAndConvert } from "./sse-error-detector.js";
 import { anthropicSseToBatchMessage } from "./sse-to-batch.js";
 import { anthropicSseToResponsesSse } from "../translator/anthropic-to-responses.js";
-import { anthropicSseToOpenaiSse } from "../translator/sse-translator.js";
+import { anthropicSseToOpenaiSse, openaiSseToAnthropicSse } from "../translator/sse-translator.js";
+import { translateRequestAnthropicToOpenAI, translateResponseOpenAIToAnthropic } from "../translator/anthropic-to-openai.js";
+import { resolveSessionContext } from "./session-context.js";
+import { getDefaultClientSigning, sendWithClientSigning } from "./client-signing.js";
+import { getDefaultEndpointRouting } from "./endpoint-routing.js";
 import { pickProxy, markProxyFailed, getMaxRotations, getCurrentWorkingProxy, setCurrentWorkingProxy } from "./proxy-pool.js";
 import { wrapFetchWithSocksBridge } from "./proxied-fetch.js";
 import { recordDebugDump, appendLog } from "../admin/api.js";
@@ -30,6 +46,7 @@ import { recordHeaders } from "../utils/header-debug.js";
 import { runtimeError } from "../utils/log.js";
 import { RETRY as RETRY_CONST, PROXY_POOL as PROXY_POOL_CONST } from "../utils/constants.js";
 import { computeRetryDelayMs, normalizeTimerMs } from "./retry.js";
+import { credentialString } from "../auth/types.js";
 import {
   DEFAULT_MAX_REQUEST_BODY_BYTES,
   RequestBodyTimeoutError,
@@ -293,85 +310,6 @@ export async function proxyRequest(
     return errorResponse(503, "credential_unavailable", (err as Error).message);
   }
 
-  // Translation mode: OpenAI client formats are routed through the Anthropic
-  // upstream (provider's anthropic endpoint in coding-plan, or zcode.z.ai
-  // gateway in start-plan). The request body is translated OpenAI→Anthropic,
-  // and the response is translated back Anthropic→OpenAI.
-  //
-  // "openai"           → Chat Completions format
-  // "openai-responses" → Responses API format (used by Codex CLI)
-  const translateMode = format === "openai" || format === "openai-responses";
-  const upstreamFormat: Format = translateMode ? "anthropic" : format;
-
-  // Model rewrite for translation modes:
-  //   1. If client-sent model matches a modelMappings entry (case-insensitive),
-  //      rewrite to the mapped target.
-  //   2. Else if the model is not a known GLM model (e.g. Codex CLI's "gpt-5.5"),
-  //      fall back to config.defaultModel so GLM upstream doesn't 400.
-  // Original model is preserved in the response echo for client compatibility.
-  //
-  // This is only applied in translation mode because passthrough mode lets the
-  // upstream decide (matches the original proxy semantics — see README: "the
-  // listing is informational, not a gate").
-  if (translateMode && parsedBody && typeof parsedBody === "object") {
-    const bodyObj = parsedBody as Record<string, unknown>;
-    const clientModel = typeof bodyObj.model === "string" ? bodyObj.model : "";
-    if (clientModel) {
-      const mapped = lookupModelMapping(clientModel, config.modelMappings);
-      if (mapped) {
-        proxyLog(`${reqId} model mapping: ${clientModel} → ${mapped} (configured)`);
-        bodyObj.model = mapped;
-        meta.model = mapped;
-      } else if (!isKnownGlmModel(clientModel)) {
-        const fallback = config.defaultModel || "glm-4.6";
-        proxyLog(`${reqId} model fallback: ${clientModel} → ${fallback} (non-GLM model not accepted upstream)`);
-        bodyObj.model = fallback;
-        meta.model = fallback;
-      }
-    }
-  }
-
-  // =====================================================================
-  //  FORMAT CONVERSION ORCHESTRATION (Claude Code + Codex → ZCode upstream)
-  // =====================================================================
-  //  Two client paths converge here before forwarding to z.ai upstream:
-  //
-  //    Claude Code (anthropic)  ─→  NO translation needed (already Anthropic)
-  //                                 ↓
-  //                                 body-transformer.alignZCodeRequestFormat
-  //                                 ↓
-  //                                 upstream
-  //
-  //    Codex      (responses)  ─→  responses-to-anthropic.translateRequest...
-  //                                 ↓
-  //                                 body-transformer.alignZCodeRequestFormat
-  //                                 ↓
-  //                                 upstream
-  //
-  //    OpenAI     (openai)     ─→  openai-to-anthropic.translateRequest...
-  //                                 ↓
-  //                                 body-transformer.alignZCodeRequestFormat
-  //                                 ↓
-  //                                 upstream
-  //
-  //  Both translators + alignZCodeRequestFormat are MARKED as format conversion
-  //  boundaries — see the doc comments in those files. Do NOT casually modify
-  //  them; run the alignment test scripts first if you must.
-  //
-  //  Verification scripts:
-  //    /home/z/my-project/scripts/test_alignment.ts            (Claude Code)
-  //    /home/z/my-project/scripts/test_responses_alignment.ts  (Codex)
-  // =====================================================================
-  let upstreamBodyObj: unknown = parsedBody;
-  if (translateMode) {
-    const forceThinkingModels = format === "openai-responses"
-      ? config.responsesThinking?.models
-      : undefined;
-    const translated = translateClientBodyObj(parsedBody, format, forceThinkingModels ? { forceThinkingModels } : undefined);
-    if (translated instanceof Response) return translated;
-    upstreamBodyObj = translated;
-  }
-
   // currentPlan tracks the effective plan for the CURRENT credential. The
   // credential must win over config.yaml in OAuth/store mode: if a start-plan
   // account is active but config.yaml still says coding-plan, sending it to the
@@ -379,6 +317,12 @@ export async function proxyRequest(
   // upstream 403/3007 errors. In API-key mode, config.plan remains authoritative
   // because the static credential object is created with a backward-compatible
   // default plan of coding-plan.
+  //
+  // v0.3.0: currentPlan is resolved BEFORE the translation pipeline because the
+  // upstream format is now plan-dependent (start-plan → OpenAI gateway,
+  // coding-plan → Anthropic upstream). A mid-retry credential switch may flip
+  // the plan; the pipeline below is a pure function of the plan so it can be
+  // re-run safely.
   const effectivePlanForCred = (c: Credential): "coding-plan" | "start-plan" => {
     if (auth.getMode() === "apikey") return config.plan;
     if (c.plan === "start-plan" || c.plan === "coding-plan") return c.plan;
@@ -390,6 +334,115 @@ export async function proxyRequest(
   if (currentPlan !== config.plan) {
     proxyLog(`${reqId} plan resolved from active credential: ${config.plan} → ${currentPlan}`);
   }
+
+  // Translation mode: the client's inbound format differs from the upstream
+  // wire format. "openai" → Chat Completions format; "openai-responses" →
+  // Responses API format (used by Codex CLI).
+  void (format === "openai" || format === "openai-responses"); // translateMode superseded by plan-aware upstreamFormat (v0.3.0)
+
+  // v0.3.0: the UPSTREAM format is plan-dependent (ZCode 3.8.1+ alignment):
+  //   - coding-plan → Anthropic upstream (api.z.ai/api/anthropic, wire-shape
+  //     aligned — unchanged from v0.2.x)
+  //   - start-plan  → OpenAI upstream (zcode.z.ai/api/v1/zcode-plan/chat/
+  //     completions); Anthropic-format clients are translated both ways.
+  const upstreamFormatForPlan = (plan: "coding-plan" | "start-plan"): Format =>
+    plan === "start-plan" ? "openai" : "anthropic";
+  let upstreamFormat: Format = upstreamFormatForPlan(currentPlan);
+
+  // Model rewrite for translation / gateway modes:
+  //   1. If client-sent model matches a modelMappings entry (case-insensitive),
+  //      rewrite to the mapped target.
+  //   2. Else if the model is not a known GLM model (e.g. Codex CLI's "gpt-5.5"),
+  //      fall back to config.defaultModel so GLM upstream doesn't 400.
+  // Original model is preserved in the response echo for client compatibility.
+  //
+  // Applied for every path EXCEPT the anthropic+coding-plan passthrough
+  // (upstream decides there, matching the original proxy semantics — see
+  // README: "the listing is informational, not a gate"). The rewrite is
+  // idempotent, so re-running the pipeline after a mid-retry plan switch is
+  // safe.
+  const applyModelRewrite = (): void => {
+    if (format === "anthropic" && currentPlan === "coding-plan") return;
+    if (!parsedBody || typeof parsedBody !== "object") return;
+    const bodyObj = parsedBody as Record<string, unknown>;
+    const clientModel = typeof bodyObj.model === "string" ? bodyObj.model : "";
+    if (!clientModel) return;
+    const mapped = lookupModelMapping(clientModel, config.modelMappings);
+    if (mapped && mapped !== clientModel) {
+      proxyLog(`${reqId} model mapping: ${clientModel} → ${mapped} (configured)`);
+      bodyObj.model = mapped;
+      if (meta.model === clientModel) meta.model = mapped;
+    } else if (!isKnownGlmModel(clientModel)) {
+      const fallback = config.defaultModel || "glm-4.6";
+      proxyLog(`${reqId} model fallback: ${clientModel} → ${fallback} (non-GLM model not accepted upstream)`);
+      bodyObj.model = fallback;
+      if (meta.model === clientModel) meta.model = fallback;
+    }
+  };
+
+  // =====================================================================
+  //  FORMAT CONVERSION ORCHESTRATION (Claude Code + Codex → ZCode upstream)
+  // =====================================================================
+  //  v0.3.0: the pipeline is a pure function of the plan, so a mid-retry
+  //  credential switch (which may flip coding-plan ↔ start-plan) can re-run
+  //  it from the pristine parsedBody:
+  //
+  //    coding-plan (Anthropic upstream — v0.2.x behavior, unchanged):
+  //      Claude Code (anthropic)  ─→ alignZCodeRequestFormat ─→ upstream
+  //      OpenAI     (openai)      ─→ openai-to-anthropic ─→ align ─→ upstream
+  //      Codex      (responses)   ─→ responses-to-anthropic ─→ align ─→ upstream
+  //
+  //    start-plan (OpenAI gateway — upstream v2.6.0 alignment):
+  //      Claude Code (anthropic)  ─→ anthropic-to-openai ─→ gateway-system ─→ upstream
+  //      OpenAI     (openai)      ─→ gateway-system ─→ upstream (same format)
+  //      Codex      (responses)   ─→ responses-to-anthropic ─→ anthropic-to-openai
+  //                                  ─→ gateway-system ─→ upstream
+  //
+  //  Both translators + alignZCodeRequestFormat are MARKED as format conversion
+  //  boundaries — see the doc comments in those files. Do NOT casually modify
+  //  them; run the alignment test scripts first if you must.
+  //
+  //  Verification scripts:
+  //    scripts/test_alignment.ts            (Claude Code)
+  //    scripts/test_responses_alignment.ts  (Codex)
+  // =====================================================================
+  const buildUpstreamBodyObjForPlan = (plan: "coding-plan" | "start-plan"): { obj: unknown; error?: Response } => {
+    applyModelRewrite();
+
+    if (plan === "start-plan") {
+      // OpenAI upstream via the zcode.z.ai gateway.
+      if (format === "anthropic") {
+        const translated = translateRequestAnthropicToOpenAI(parsedBody as AnthropicMessagesRequest);
+        return { obj: translated as unknown as Record<string, unknown> };
+      }
+      if (format === "openai") {
+        // Same format — the body-transformer injects the gateway-required
+        // ZCode system messages. Clone so the in-place transform never
+        // aliases the pristine parsedBody (a later plan switch back to
+        // coding-plan re-translates from parsedBody).
+        return { obj: structuredClone(parsedBody) };
+      }
+      // openai-responses: double hop responses→anthropic→openai. Both hops
+      // are battle-tested pure translators (Codex path + gateway path).
+      const forceThinkingModels = config.responsesThinking?.models;
+      const anthropicObj = translateClientBodyObj(parsedBody, "openai-responses", forceThinkingModels ? { forceThinkingModels } : undefined);
+      if (anthropicObj instanceof Response) return { obj: undefined, error: anthropicObj };
+      return { obj: translateRequestAnthropicToOpenAI(anthropicObj as AnthropicMessagesRequest) as unknown as Record<string, unknown> };
+    }
+
+    // coding-plan: Anthropic upstream (existing wire-shape-aligned path).
+    if (format === "anthropic") return { obj: parsedBody };
+    const forceThinkingModels = format === "openai-responses"
+      ? config.responsesThinking?.models
+      : undefined;
+    const translated = translateClientBodyObj(parsedBody, format, forceThinkingModels ? { forceThinkingModels } : undefined);
+    if (translated instanceof Response) return { obj: undefined, error: translated };
+    return { obj: translated };
+  };
+
+  const initialPipeline = buildUpstreamBodyObjForPlan(currentPlan);
+  if (initialPipeline.error) return initialPipeline.error;
+  let upstreamBodyObj: unknown = initialPipeline.obj;
 
   let transformedObj = transformRequestBodyObj(upstreamBodyObj, { format: upstreamFormat, userId: cred.userId, startPlan: currentPlan === "start-plan", thinkingLevel: config.thinkingLevel === "high" ? "high" : "max" });
 
@@ -413,10 +466,12 @@ export async function proxyRequest(
     transformedCache.set(transformedCacheKey, { obj: transformedObj, body: transformedBody });
   }
   /**
-   * Re-run the transform only when (userId|plan|thinkingLevel) actually
-   * changed. Returns the cached values otherwise. Safe to call after a
-   * credential switch — the closure captures `upstreamBodyObj` and
-   * `upstreamFormat` which never change within a single request.
+   * Re-run the translation + transform pipeline only when
+   * (userId|plan|thinkingLevel) actually changed. Returns the cached values
+   * otherwise. Safe to call after a credential switch — the full pipeline
+   * re-runs from the pristine parsedBody when the PLAN flipped (the
+   * translation direction changes with it), or re-uses the cached transform
+   * when only the userId changed within the same plan.
    */
   const rebuildTransformedBody = (newUserId: string | undefined, newPlan: "coding-plan" | "start-plan"): void => {
     const newKey = `${newUserId ?? ""}|${newPlan}|${config.thinkingLevel ?? ""}`;
@@ -431,8 +486,16 @@ export async function proxyRequest(
       transformedCacheKey = newKey;
       return;
     }
-    // Cache miss — actually run the transform.
-    transformedObj = transformRequestBodyObj(upstreamBodyObj, {
+    // Cache miss — re-run the FULL pipeline (plan may have flipped, changing
+    // the translation direction + upstream format), then the transform.
+    const pipeline = buildUpstreamBodyObjForPlan(newPlan);
+    if (pipeline.error) {
+      // Translation rejected the body — keep the previous transform; the
+      // retry will surface the upstream error for this credential anyway.
+      return;
+    }
+    upstreamFormat = upstreamFormatForPlan(newPlan);
+    transformedObj = transformRequestBodyObj(pipeline.obj, {
       format: upstreamFormat,
       userId: newUserId,
       startPlan: newPlan === "start-plan",
@@ -477,10 +540,25 @@ export async function proxyRequest(
   let totalCaptchaMs = 0;
   let captchaRetryHeaders: Record<string, string> | undefined;
   let hadRetryAttempt = false;
-  const startPlanRequestAttributionContext = createStartPlanRequestAttributionContext();
+
+  // v0.3.0 (upstream v2.6.0): session-context resolution — replicates ZCode's
+  // single-user-identity UUID generation. The resolver maps this request to a
+  // stable upstream session via explicit client headers (x-claude-code-
+  // session-id / x-opencode-session / …) or conversation-lineage hashing, and
+  // the resulting session feeds the exact-path trace headers (x-request-id /
+  // x-zcode-session-type / x-zcode-trace-id / x-query-id / x-session-id).
+  // Replaces the v0.2.x per-credential attribution cache.
+  let clientSession: ReturnType<typeof resolveSessionContext> = undefined;
+  try {
+    clientSession = resolveSessionContext({ clientReq, body, upstreamFormat, model: meta.model, config });
+  } catch { /* session inference must never break the request */ }
 
   const checkCaptchaVerifyFailed = async (resp: Response): Promise<{ failed: boolean; response: Response }> => {
     if (currentPlan !== "start-plan" || resp.status !== 403) return { failed: false, response: resp };
+    // v0.3.0: header-based challenge detection (upstream v2.6.0) — a non-empty
+    // x-aliyun-captcha-verify-param RESPONSE header means the gateway wants a
+    // fresh token, even when the body doesn't carry the 3007 JSON.
+    if (detectCaptchaChallenge(resp)) return { failed: true, response: resp };
     try {
       const split = splitResponseForPreview(resp);
       const previewResp = split?.preview ?? resp;
@@ -498,14 +576,15 @@ export async function proxyRequest(
     }
   };
 
-  const refreshCaptchaHeaders = async (solver?: "chrome"): Promise<Record<string, string>> => {
+  const refreshCaptchaHeaders = async (_solver?: "chrome"): Promise<Record<string, string>> => {
+    // v0.3.0: pool-based token take (sub-ms warm). The `solver` parameter is
+    // retained for API compatibility — the happy backend serves every solve.
     const solved = await (opts.captchaTokenProvider ?? getCaptchaToken)(reqId, {
       appVersion: config.identity.appVersion,
       sourceTitle: config.identity.sourceTitle,
       refererOrigin: config.identity.refererOrigin,
       releaseChannel: config.identity.releaseChannel,
       deviceMid: config.identity.deviceMid,
-      solver,
     });
     totalCaptchaMs += solved.solveMs;
     return {
@@ -548,7 +627,7 @@ export async function proxyRequest(
       extraHeaders,
       opts.resolveClientIp,
       config.server.trustProxy,
-      startPlanRequestAttributionContext,
+      clientSession ?? undefined,
     );
 
   // Track the last anthropic-beta header actually sent upstream. We send the
@@ -660,8 +739,14 @@ export async function proxyRequest(
     // Bun's native fetch accepts `{ proxy: "http://..." }` / `socks5://...`
     // Cast through `any` because the option is Bun-specific and not in the
     // standard TypeScript DOM RequestInit type.
+    //
+    // v0.3.0: decompress:false only when the response is passed through
+    // BYTE-IDENTICAL to the client (same wire format — anthropic+coding-plan
+    // or openai+start-plan). Any translation path lets Bun auto-decompress so
+    // the translators see plaintext.
+    const upstreamPassthrough = upstreamFormat === format;
     const fetchOpts: any = {
-      ...(translateMode ? {} : { decompress: false }),
+      ...(upstreamPassthrough ? { decompress: false } : {}),
       signal: ctrl.signal,
     };
     // === Proxy resolution (v0.2.2+ global pool) ===
@@ -699,7 +784,56 @@ export async function proxyRequest(
     }
     let resp: Response;
     try {
-      resp = await fetchImpl(req, fetchOpts);
+      // v0.3.0 (upstream v2.6.0): coding-plan dispatch adds endpoint-routing
+      // (server-published URL remap — e.g. the ultra endpoint) and V4 client
+      // signing (Ed25519 + PoW, gate-driven, fail-open ladder). start-plan is
+      // exempt from both: its gateway URL is fixed and the path is unsigned.
+      //
+      // Signing decisions (exempt-path checks, bypass keying) run against the
+      // PRE-routing provider URL, mirroring the real client whose signer wraps
+      // the routing transport.
+      if (currentPlan !== "start-plan") {
+        const basePairs = [...req.headers.entries()] as UpstreamHeaderPair[];
+        let sendUrl = req.url;
+        const routing = getDefaultEndpointRouting(config);
+        if (routing) {
+          try {
+            const routed = await routing.resolve(req.url, credentialString(cred));
+            if (routed.routed) {
+              sendUrl = routed.url;
+              proxyLog(`${reqId} endpoint routing: ${req.url} -> ${routed.url}`);
+            }
+          } catch { /* fail-open: keep original URL */ }
+        }
+        const signer = getDefaultClientSigning(config);
+        const sendOnce = async (pairs: UpstreamHeaderPair[]): Promise<Response> => {
+          const sendReq = sendUrl === req.url && pairs === basePairs
+            ? req
+            : new Request(sendUrl, {
+              method: "POST",
+              headers: Object.fromEntries(pairs),
+              body: transformedBody,
+            });
+          return fetchImpl(sendReq, fetchOpts);
+        };
+        try {
+          resp = await sendWithClientSigning(signer, {
+            url: req.url,
+            headerPairs: basePairs,
+            credential: credentialString(cred),
+            appVersion: config.identity.appVersion,
+            send: sendOnce,
+          });
+        } catch (err) {
+          clearTimeout(timer);
+          if (ctrl.signal.aborted) {
+            throw new Error(`upstream timeout after ${timeoutMs}ms`);
+          }
+          throw err;
+        }
+      } else {
+        resp = await fetchImpl(req, fetchOpts);
+      }
     } catch (err) {
       clearTimeout(timer);
       // Distinguish abort (timeout) from real network errors so the error
@@ -771,10 +905,13 @@ export async function proxyRequest(
     if (!captchaCheck.failed) return { response: checkedResp, retried: false };
 
     await cancelResponseBody(checkedResp);
-    proxyLog(`${reqId} start-plan captcha verify failed${context}; solving Aliyun captcha with Chrome and retrying once...`);
+    proxyLog(`${reqId} start-plan captcha verify failed${context}; taking a fresh pool token and retrying once...`);
     hadRetryAttempt = true;
+    // v0.3.0: request an urgent pool refill so the challenge doesn't drain
+    // the pre-solved tokens (upstream v2.6.0 behavior).
+    urgentCaptcha();
     try {
-      captchaRetryHeaders = await refreshCaptchaHeaders("chrome");
+      captchaRetryHeaders = await refreshCaptchaHeaders();
       const retryResp = await fetchUpstreamDetected(captchaRetryHeaders);
       if (!startPlanCaptchaPreflightEnabled()) captchaRetryHeaders = undefined;
       const retryCheck = await checkCaptchaVerifyFailed(retryResp);
@@ -1610,6 +1747,11 @@ export async function proxyRequest(
   // format it expects. This makes the wire-shape alignment transparent to
   // non-stream clients (Claude Code, SDK calls, integration tests, etc.).
   //
+  // v0.3.0: this reassembly is ANTHROPIC-upstream only — the coding-plan path
+  // forces stream:true, so non-stream clients need the SSE→batch buffer. The
+  // start-plan OpenAI path does NOT force stream (upstream v2.6.0 behavior):
+  // the upstream honors the client's stream preference directly.
+  //
   // Both passthrough AND translation paths benefit (translatedBatchResponse /
   // translatedResponsesBatchResponse both expect a JSON body — the synthetic
   // JSON response flows through them naturally).
@@ -1617,7 +1759,7 @@ export async function proxyRequest(
   // Runs only on 2xx SSE responses (4xx/5xx are handled by the diagnostic
   // peek below; the SSE error detector converts errored/empty SSE to non-2xx
   // JSON before we reach here, so isSSE=false for those).
-  if (isSSE && upstreamResp.ok && !meta.stream && upstreamResp.body) {
+  if (isSSE && upstreamResp.ok && !meta.stream && upstreamResp.body && upstreamFormat === "anthropic") {
     const result = await anthropicSseToBatchMessage(upstreamResp.body, meta.model, {
       maxBytes: sseToBatchBodyLimitBytes(),
     });
@@ -1687,7 +1829,106 @@ export async function proxyRequest(
     }
   }
 
-  if (translateMode) {
+  // =====================================================================
+  //  v0.3.0 RESPONSE TRANSLATION (plan-aware)
+  //
+  //  coding-plan (Anthropic upstream — unchanged v0.2.x behavior):
+  //    anthropic client        → passthrough (bottom branches)
+  //    openai / responses      → Anthropic→client translation (translateMode)
+  //
+  //  start-plan (OpenAI upstream — new):
+  //    openai client           → passthrough (bottom branches, format-aware
+  //                              stats already parse OpenAI chunks)
+  //    anthropic client        → OpenAI→Anthropic translation (sse + batch)
+  //    responses client        → OpenAI→Anthropic→Responses double translation
+  // =====================================================================
+  const responseNeedsTranslation = upstreamFormat !== format;
+
+  if (upstreamFormat === "openai" && format !== "openai") {
+    // start-plan with an Anthropic-format or Responses-format client: the
+    // upstream spoke OpenAI — translate the response back.
+    if (!upstreamResp.ok) {
+      const errBody = upstreamErrorPreview ?? (await readResponseTextPreview(upstreamResp, {
+        maxBytes: ERROR_RESPONSE_PREVIEW_BYTES,
+        timeoutMs: 3_000,
+      }).then(r => r.text).catch(() => ""));
+      try { await upstreamResp.body?.cancel(); } catch (e) { void e; }
+      printRow(reqId, format, meta, upstreamResp.status, started, headersAt, 0, 0, 0, hadRetryAttempt, 0, currentCredentialStatsKey(), totalCaptchaMs);
+      return errorResponse(upstreamResp.status, "upstream_error", `upstream returned ${upstreamResp.status}: ${errBody.slice(0, 200)}`);
+    }
+
+    if (format === "anthropic") {
+      // OpenAI → Anthropic.
+      if (isSSE && upstreamResp.body) {
+        const translated = openaiSseToAnthropicSse(upstreamResp.body, meta.model);
+        const stats = createStatsTransform(reqId, format, meta, upstreamResp.status, started, null, currentCredentialStatsKey(), totalCaptchaMs, hadRetryAttempt);
+        return translatedSseResponse(withSseHeartbeat(observeStatsStream(translated, stats), config.server.sseHeartbeatMs ?? 0));
+      }
+      // Batch: translate the OpenAI JSON into an Anthropic message, then flow
+      // into the non-streaming anthropic passthrough branch below (usage
+      // extraction + passthroughResponse) by swapping the response object.
+      try {
+        const openaiJson = (await upstreamResp.json()) as OpenAIChatResponse;
+        const anthropicMsg = translateResponseOpenAIToAnthropic(openaiJson);
+        const respHeaders = new Headers();
+        for (const h of ["x-request-id"]) {
+          const v = upstreamResp.headers.get(h);
+          if (v) respHeaders.set(h, v);
+        }
+        respHeaders.set("content-type", "application/json");
+        upstreamResp = new Response(JSON.stringify(anthropicMsg), {
+          status: upstreamResp.status,
+          statusText: upstreamResp.statusText,
+          headers: respHeaders,
+        });
+        isSSE = false;
+      } catch (err) {
+        proxyLog(`${reqId} OpenAI→Anthropic batch translation failed: ${(err as Error).message}`);
+        printRow(reqId, format, meta, 502, started, headersAt, 0, 0, 0, hadRetryAttempt, 0, currentCredentialStatsKey(), totalCaptchaMs);
+        return errorResponse(502, "translation_failed", (err as Error).message);
+      }
+    } else {
+      // format === "openai-responses": OpenAI → Anthropic → Responses.
+      const customToolNames = responsesCustomToolNames(parsedBody);
+      if (isSSE && upstreamResp.body) {
+        // Chain the two SSE translators: OpenAI SSE → Anthropic SSE → Responses SSE.
+        const anthropicStream = openaiSseToAnthropicSse(upstreamResp.body, meta.model);
+        const translated = anthropicSseToResponsesSse(anthropicStream, meta.model, { customToolNames });
+        const stats = createStatsTransform(reqId, format, meta, upstreamResp.status, started, null, currentCredentialStatsKey(), totalCaptchaMs, hadRetryAttempt);
+        return translatedSseResponse(withSseHeartbeat(observeStatsStream(translated, stats), config.server.sseHeartbeatMs ?? 0));
+      }
+      // Batch: OpenAI JSON → Anthropic message JSON → Responses batch.
+      try {
+        const openaiJson = (await upstreamResp.json()) as OpenAIChatResponse;
+        const anthropicMsg = translateResponseOpenAIToAnthropic(openaiJson);
+        const respHeaders = new Headers();
+        respHeaders.set("content-type", "application/json");
+        upstreamResp = new Response(JSON.stringify(anthropicMsg), {
+          status: upstreamResp.status,
+          statusText: upstreamResp.statusText,
+          headers: respHeaders,
+        });
+        isSSE = false;
+      } catch (err) {
+        proxyLog(`${reqId} OpenAI→Anthropic batch translation failed: ${(err as Error).message}`);
+        printRow(reqId, format, meta, 502, started, headersAt, 0, 0, 0, hadRetryAttempt, 0, currentCredentialStatsKey(), totalCaptchaMs);
+        return errorResponse(502, "translation_failed", (err as Error).message);
+      }
+      return await translatedResponsesBatchResponse(
+        clientReq, upstreamResp, meta.model, reqId, format, meta, started, headersAt,
+        (parsedBody as OpenAIResponseRequest | undefined)?.previous_response_id,
+        (parsedBody as OpenAIResponseRequest | undefined)?.input,
+        customToolNames,
+        currentCredentialStatsKey(),
+        totalCaptchaMs,
+        hadRetryAttempt,
+      );
+    }
+  }
+
+  if (responseNeedsTranslation && format !== "anthropic" && upstreamFormat === "anthropic") {
+    // coding-plan translation mode (OpenAI-family clients): the upstream
+    // spoke Anthropic — translate the response back to the client format.
     if (!upstreamResp.ok) {
       const errBody = upstreamErrorPreview ?? (await readResponseTextPreview(upstreamResp, {
         maxBytes: ERROR_RESPONSE_PREVIEW_BYTES,

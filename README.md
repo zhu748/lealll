@@ -2,6 +2,48 @@
 
 A reverse proxy for Z.AI / Bigmodel.cn coding-plan APIs that exposes both OpenAI-compatible and Anthropic-format endpoints.
 
+## v0.3.0 — Upstream zcode-api v2.6.0 Alignment (free/start-plan tier support)
+
+This release aligns the fork with the actively-maintained upstream
+[TriDefender/zcode-api](https://github.com/TriDefender/zcode-api) (v2.6.0,
+2026-08) while keeping every fork-exclusive feature. The headline change:
+**the free start-plan tier now works** — the upstream gateway requires an
+Aliyun captcha token on every request, and the old jsdom/Chrome-CDP solver
+was detectable by the risk engine. Replaced by the upstream battle-tested
+in-process **happy-dom solver + pre-solved token pool**.
+
+What's new (from upstream):
+
+- **Captcha token pool** — tokens are pre-solved in the background (happy-dom
+  in-process solver, deterministic fingerprints, no browser/jsdom dependency);
+  each start-plan request takes an already-solved token in sub-millisecond
+  time. CPU-governed, demand-driven pool sizing, F008 duplicate protection.
+- **start-plan routes through the zcode.z.ai OpenAI gateway**
+  (`/api/v1/zcode-plan/chat/completions`, ZCode 3.8.1+ wire shape) —
+  Anthropic-format clients (Claude Code) are translated both ways.
+- **Session-context inference** — replicates ZCode's single-user-identity
+  UUID generation: multi-turn conversations reuse the same upstream
+  `x-session-id` (explicit client headers or conversation-lineage hashing),
+  plus `x-zcode-session-type` attribution on every model request.
+- **V4 client request signing** — Ed25519 + proof-of-work signing for
+  coding-plan requests when the server-side feature gate enables it
+  (fail-open ladder, start-plan exempt).
+- **Server-side endpoint routing** — remaps coding-plan endpoints per the
+  server-published mapping table (ultra endpoints), fully fail-open.
+- **Refreshed identity headers** — the full `pio` header set (X-Release-Channel /
+  X-Client-Language / X-Client-Timezone / X-Os-* / X-Device-Mid) on model
+  requests, refreshed against the 2026-08 bundle RE; appVersion default
+  3.2.5 → 3.9.1.
+- **Updated ZCode gateway system blocks** — new harness text, Environment
+  Info block, and the dynamic `- You are powered by the model named X.` line
+  (the gateway's content check rejects requests without them, 3012).
+
+Fork-exclusive features kept intact: multi-account credential pool with
+automatic switching, admin dashboard (40 endpoints), global proxy pool +
+SOCKS bridge, WAF detection with proxy rotation, SSE heartbeat / error
+detection / batch reassembly, retry engine with empty-stream switching,
+model routing/mappings, quota queries, and ZCode desktop credential import.
+
 ## Quick Start
 
 ```bash

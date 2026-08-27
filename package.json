@@ -1,6 +1,6 @@
 {
   "name": "zcode-proxy",
-  "version": "0.2.2.5",
+  "version": "0.3.0.0",
   "type": "module",
   "scripts": {
     "dev": "bun run src/index.ts",
@@ -10,12 +10,12 @@
     "build": "bun build --compile --define \"require.resolve=undefined\" --target=bun-windows-x64 src/index.ts --outfile zcode-proxy.exe"
   },
   "dependencies": {
-    "jsdom": "^25.0.0",
+    "happy-dom": "^20.11.6",
+    "undici": "^8.10.0",
     "yaml": "^2.9.0"
   },
   "devDependencies": {
     "@types/bun": "^1.2.0",
-    "@types/jsdom": "^28.0.3",
     "typescript": "^5.5.0"
   }
 }

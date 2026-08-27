@@ -354,6 +354,34 @@ async function serve(configPath?: string): Promise<void> {
   } catch (e) {
     console.warn(`[proxy-pool] init failed (non-fatal): ${(e as Error).message}`);
   }
+
+  // v0.3.0 (upstream v2.6.0): start the captcha token pool pre-solver when
+  // start-plan is (or may be) in play. The happy-dom solver mints tokens into
+  // a background pool so start-plan requests take an already-solved token in
+  // sub-millisecond time. Start when:
+  //   - config.plan is start-plan, OR
+  //   - any STORED credential is a start-plan account (multi-account mode:
+  //     the retry engine may switch to it mid-request).
+  // Lazy-loaded so coding-plan-only processes never pay the solver's startup
+  // cost.
+  const anyStartPlanCredential = await (async () => {
+    try {
+      const accounts = await exportAccounts();
+      return accounts.some(a => a.credential?.plan === "start-plan" || Boolean(a.credential?.jwt));
+    } catch {
+      return false;
+    }
+  })();
+  if (config.plan === "start-plan" || anyStartPlanCredential) {
+    try {
+      const { startCaptchaPool } = await import("./proxy/captcha.js");
+      await startCaptchaPool(config.identity.appVersion);
+      console.log("  captcha: token pool pre-solver started (start-plan)");
+    } catch (e) {
+      // Non-fatal: requests fall back to on-demand solving at take-time.
+      console.warn(`[captcha] pool warmup failed (non-fatal): ${(e as Error).message}`);
+    }
+  }
   // Helpful access hint: when bound to 0.0.0.0, the user must use 127.0.0.1
   // (or localhost, or the machine's LAN IP) to reach the proxy. Browsers on
   // Windows especially refuse to connect to http://0.0.0.0:port — this is

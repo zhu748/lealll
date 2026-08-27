@@ -156,7 +156,7 @@ function translateToolOpenAIToAnthropic(tool: OpenAIToolDefinition): AnthropicTo
  * This function must never receive "none".
  */
 function translateToolChoiceOpenAIToAnthropic(
-  toolChoice: string | { type: "function"; function: { name: string } },
+  toolChoice: string | { type: "function"; function: { name: string | undefined } },
 ): { type: "auto" | "any" | "tool"; name?: string } {
   if (typeof toolChoice === "string") {
     switch (toolChoice) {

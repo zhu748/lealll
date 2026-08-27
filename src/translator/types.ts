@@ -47,6 +47,8 @@ export interface OpenAIMessage {
   name?: string;
   tool_call_id?: string;
   tool_calls?: OpenAIToolCall[];
+  /** Reasoning / chain-of-thought content (GLM, DeepSeek-R1, o1-style models). */
+  reasoning_content?: string;
 }
 
 /** Multi-modal content part (OpenAI format). */
@@ -88,9 +90,12 @@ export interface OpenAIChatRequest {
   logit_bias?: Record<string, number>;
   user?: string;
   tools?: OpenAIToolDefinition[];
-  tool_choice?: "none" | "auto" | "required" | { type: "function"; function: { name: string } };
+  tool_choice?: "none" | "auto" | "required" | { type: "function"; function: { name: string | undefined } };
+  parallel_tool_calls?: boolean;
   response_format?: { type: "text" | "json_object" };
   seed?: number;
+  reasoning_effort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+  thinking?: AnthropicThinkingConfig & { budgetTokens?: number };
 }
 
 /** Non-streaming response. */
@@ -100,11 +105,37 @@ export interface OpenAIChatResponse {
   created: number;
   model: string;
   choices: OpenAIChoice[];
-  usage?: {
-    prompt_tokens: number;
-    completion_tokens: number;
-    total_tokens: number;
-  };
+  usage?: OpenAIUsage;
+  status?: number;
+  statusText?: string;
+  headers?: Record<string, string>;
+}
+
+/**
+ * OpenAI usage block. `prompt_tokens` is *inclusive* of cache hits on most
+ * compatible upstreams, so the Anthropic `input_tokens` (exclusive of cache)
+ * is derived by subtracting the cache buckets — see `openaiUsageToAnthropic`
+ * (aligned with upstream zcode-api v2.6.0).
+ */
+export interface OpenAIUsage {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  /** Standard OpenAI cache breakdown. */
+  prompt_tokens_details?: { cached_tokens?: number };
+  /** Anthropic-style direct cache fields (some compatible upstreams emit these). */
+  cache_read_input_tokens?: number;
+  cache_creation_input_tokens?: number;
+  /** Standard OpenAI reasoning-token breakdown (mirrors `prompt_tokens_details`). */
+  output_tokens_details?: { reasoning_tokens?: number; audio_tokens?: number };
+}
+
+/** Streaming tool-call delta (aligned with upstream zcode-api v2.6.0). */
+export interface OpenAIStreamToolCall {
+  index: number;
+  id?: string;
+  type?: "function";
+  function?: { name?: string; arguments?: string };
 }
 
 /** Choice in a non-streaming response. */
@@ -112,8 +143,10 @@ export interface OpenAIChoice {
   index: number;
   message: {
     role: "assistant";
-    content: string | null;
+    content: string | null | OpenAIContentPart[];
     tool_calls?: OpenAIToolCall[];
+    /** Reasoning / chain-of-thought content (GLM thinking models). */
+    reasoning_content?: string;
   };
   finish_reason: "stop" | "length" | "tool_calls" | "content_filter" | null;
 }
@@ -125,6 +158,8 @@ export interface OpenAIStreamChunk {
   created: number;
   model: string;
   choices: OpenAIStreamChoice[];
+  /** Present on the final chunk when `stream_options.include_usage` is set. */
+  usage?: OpenAIUsage;
 }
 
 /** Choice in a streaming chunk. */
@@ -133,7 +168,9 @@ export interface OpenAIStreamChoice {
   delta: {
     role?: "assistant";
     content?: string;
-    tool_calls?: Partial<OpenAIToolCall>[];
+    /** GLM/OpenAI-compatible reasoning stream field (thinking mode). */
+    reasoning_content?: string;
+    tool_calls?: OpenAIStreamToolCall[];
   };
   finish_reason: "stop" | "length" | "tool_calls" | "content_filter" | null;
 }
@@ -161,7 +198,7 @@ export type AnthropicContentBlock =
   | { type: "text"; text: string }
   | { type: "image"; source: { type: "base64"; media_type: string; data: string } }
   | { type: "tool_use"; id: string; name: string; input: Record<string, unknown> }
-  | { type: "tool_result"; tool_use_id: string; content: string | AnthropicContentBlock[] }
+  | { type: "tool_result"; tool_use_id: string; content: string | AnthropicContentBlock[]; is_error?: boolean }
   // v0.2.0.7: thinking block — returned by GLM when thinking is enabled.
   // `thinking` holds the reasoning text, `signature` is an opaque upstream
   // token (not a real Anthropic cryptographic signature).
@@ -207,19 +244,26 @@ export interface AnthropicMessagesResponse {
   model: string;
   stop_reason: "end_turn" | "max_tokens" | "stop_sequence" | "tool_use" | null;
   stop_sequence: string | null;
-  usage: {
-    input_tokens: number;
-    output_tokens: number;
-    /**
-     * v0.2.0.6: optional cache token fields. Anthropic prompt-caching
-     * extension returns these in `usage` when cache_control breakpoints
-     * are hit. They are optional — most non-cached responses don't have
-     * them. We extract them in handler.ts to show accurate input total
-     * in the dashboard row.
-     */
-    cache_read_input_tokens?: number;
-    cache_creation_input_tokens?: number;
-  };
+  usage: AnthropicUsage;
+}
+
+/** Anthropic usage block (cache buckets are optional — only present when non-zero). */
+export interface AnthropicUsage {
+  input_tokens: number;
+  output_tokens: number;
+  /**
+   * Optional cache token fields (Anthropic prompt-caching extension).
+   * Extracted in handler.ts to show accurate input totals in the dashboard.
+   */
+  cache_read_input_tokens?: number;
+  cache_creation_input_tokens?: number;
+}
+
+/** Anthropic thinking config (aligned with upstream zcode-api v2.6.0). */
+export interface AnthropicThinkingConfig {
+  type: "enabled" | "disabled" | "adaptive";
+  budget_tokens?: number;
+  display?: boolean;
 }
 
 // ─────────────────────────────────────────────

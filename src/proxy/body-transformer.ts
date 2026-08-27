@@ -144,6 +144,12 @@ export function transformRequestBodyObj(parsed: unknown, ctx: TransformContext):
   let modified = false;
 
   if (ctx.format === "openai") {
+    // v0.3.0 (upstream v2.6.0 alignment): start-plan now routes through the
+    // zcode.z.ai OpenAI gateway, whose content check requires the ZCode
+    // identity blocks — prepend them as system-role messages.
+    if (ctx.startPlan) {
+      modified = applyStartPlanOpenAISystem(parsed as Record<string, unknown>) || modified;
+    }
     modified = applyStreamOptionsIncludeUsage(parsed as Record<string, unknown>) || modified;
   }
   if (ctx.format === "anthropic") {
@@ -638,7 +644,15 @@ function alignZCodeRequestFormat(body: Record<string, unknown>): Record<string, 
 
   if (!alreadyInjected) {
     const officialBlocks = ZCODE_OFFICIAL_SYSTEM_BLOCKS.map(b => ({ ...b }));
-    body.system = [...officialBlocks, ...rewrittenClientSystem];
+    // v0.3.0: append the dynamic "You are powered by the model named ${model}."
+    // block after the official blocks — mirrors the current ZCode client's
+    // buildEnvInfoSection (upstream v2.6.0). Matches the wire shape of the
+    // 3.9.x client whose env-info section always carries the current model.
+    const modelStr = typeof body.model === "string" ? body.model.trim() : "";
+    const modelLine: SystemBlock[] = modelStr
+      ? [{ type: "text", text: `- You are powered by the model named ${modelStr}.`, cache_control: { type: "ephemeral" } }]
+      : [];
+    body.system = [...officialBlocks, ...modelLine, ...rewrittenClientSystem];
   } else {
     body.system = rewrittenClientSystem;
   }
@@ -1154,7 +1168,46 @@ function applyStartPlanSystem(body: Record<string, unknown>): boolean {
       return false;
     }
   }
-  const newSystem = buildStartPlanSystem(body.system);
+  // v0.3.0: forward body.model so buildStartPlanSystem can append the dynamic
+  // "You are powered by the model named ${model}." block — mirrors the
+  // current ZCode client's buildEnvInfoSection behavior (upstream v2.6.0).
+  const model = typeof body.model === "string" ? body.model : undefined;
+  const newSystem = buildStartPlanSystem(body.system, model);
   body.system = newSystem;
+  return true;
+}
+
+/**
+ * v0.3.0 (upstream v2.6.0 alignment): start-plan OpenAI-gateway system
+ * injection — prepend the official ZCode gateway blocks (plus the dynamic
+ * model line) as system-role messages. The gateway's content check requires
+ * the ZCode identity; without it the request is rejected with 3012.
+ */
+function applyStartPlanOpenAISystem(body: Record<string, unknown>): boolean {
+  const messages = body.messages;
+  if (!Array.isArray(messages)) return false;
+
+  // Idempotency: skip if the leading messages are already the official
+  // system blocks (retry/replay path).
+  const officialTexts = ZCODE_SYSTEM_BLOCKS.map(b => b.text);
+  if (messages.length >= officialTexts.length) {
+    let alreadyInjected = true;
+    for (let i = 0; i < officialTexts.length; i++) {
+      const m = messages[i] as { role?: string; content?: unknown } | undefined;
+      const text = typeof m?.content === "string" ? m.content : undefined;
+      if (m?.role !== "system" || text !== officialTexts[i]) {
+        alreadyInjected = false;
+        break;
+      }
+    }
+    if (alreadyInjected) return false;
+  }
+
+  const model = typeof body.model === "string" ? body.model : undefined;
+  const official = buildStartPlanSystem(undefined, model).map((block) => ({
+    role: "system",
+    content: typeof block === "object" && block !== null && "text" in block ? String((block as { text: unknown }).text) : "",
+  }));
+  body.messages = [...official, ...messages];
   return true;
 }

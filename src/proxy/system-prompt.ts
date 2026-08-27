@@ -5,8 +5,18 @@
  * blocks in the `system` field, it rejects with 3012 "method not allowed".
  *
  * Block definitions live in zcode_system.json for easy maintenance without
- * code changes. Source: extracted from ZCode Electron app's `orderSectionsForInjection`
- * (CLI Prefix + Agent Identity with Harness).
+ * code changes. Source: extracted from ZCode Electron app's
+ * `buildCliPrefixSection`, `buildIdentitySection`, and `buildEnvInfoSection`
+ * (bundle offsets ~661815 / ~663472 / ~665165). See PROMPT.md for the full
+ * prompt structure.
+ *
+ * v0.3.0 (upstream zcode-api v2.6.0 alignment): the static blocks are
+ * refreshed to the current upstream capture (mid-conversation system-turn
+ * harness rule + Environment Info block with cache_control), and a dynamic
+ * block is appended at runtime when a model name is available — mirrors
+ * bundle 3.3.6 `buildEnvInfoSection` which emits
+ * `- You are powered by the model named ${currentModel}.` as the trailing
+ * line when `envInfo.currentModel` is set.
  *
  * @see zcode_system.json
  * @see PROMPT.md for the full prompt structure
@@ -37,10 +47,22 @@ const OFFICIAL_BLOCKS_FROZEN: readonly SystemBlock[] = Object.freeze(
 
 /**
  * Prepend official ZCode gateway blocks to the request's `system` field.
- * Client system blocks (if any) are preserved after position 1.
+ * Client system blocks (if any) are preserved after the official blocks.
+ *
+ * When `currentModel` is a non-empty string, an additional block
+ * `- You are powered by the model named ${currentModel}.` is appended after
+ * the static official blocks (mirrors ZCode client behavior for
+ * `envInfo.currentModel`).
  */
-export function buildStartPlanSystem(existingSystem: unknown): unknown[] {
+export function buildStartPlanSystem(existingSystem: unknown, currentModel?: string): unknown[] {
   const official: SystemBlock[] = OFFICIAL_BLOCKS_FROZEN.map((b) => ({ ...b }));
+  if (currentModel && currentModel.trim().length > 0) {
+    official.push({
+      type: "text",
+      text: `- You are powered by the model named ${currentModel}.`,
+      cache_control: { type: "ephemeral" },
+    });
+  }
   const userBlocks = normalizeUserSystem(existingSystem);
   return [...official, ...userBlocks];
 }

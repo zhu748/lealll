@@ -108,50 +108,69 @@ models:
   - glm-5.1
   - glm-5.2
 
-# Identity values used to mimic the ZCode desktop client. Source/config calls
-# and model-provider calls use different official header sets. All optional;
+# Identity values used to mimic the ZCode desktop client (v0.3.0: model
+# requests carry the FULL pio header set — see identity.ts). All optional;
 # env vars override YAML, which overrides defaults.
 identity:
   # Mirrors process.env.ZCODE_APP_VERSION in the ZCode bundle.
   # Must be printable ASCII; non-conforming values fall back to the default.
-  # Default: "3.2.5" (current ZCode release). Override to match your real client.
-  appVersion: "3.2.5"
-  # Release channel header. ZCode 3.2.5 production builds send "production".
+  # Default: "3.9.1" (current ZCode release). Override to match your real client.
+  appVersion: "3.9.1"
+  # Release channel header (X-Release-Channel). Default "production".
   # Env var: ZCODE_RELEASE_CHANNEL.
   releaseChannel: "production"
   # Optional X-Device-Mid. If omitted, the proxy tries to read the existing
   # ZCode telemetry-state.json deviceMid. Env var: ZCODE_DEVICE_MID.
   # deviceMid: ""
-  # X-Title header value. Default "Z Code@electron" (what the real client sends).
-  sourceTitle: "Z Code@electron"
+  # X-Title header suffix. Default "cli".
+  sourceTitle: "cli"
   # HTTP-Referer URL. Default "https://zcode.z.ai".
   refererOrigin: "https://zcode.z.ai"
   # X-ZCode-Agent header for upstream model requests. Default "glm".
   # Env var: ZCODE_AGENT.
   zcodeAgent: "glm"
 
-# Start-plan captcha behavior:
+# ─── v0.3.0 upstream zcode-api v2.6.0 alignment sections ────────────────────
+
+# Client-session inference — replicates ZCode's single-user-identity UUID
+# generation so multi-turn conversations reuse the same upstream session id.
+clientIdentity:
+  # "observe" (default): infer + log only. "enforce": forward the inferred
+  # x-session-id upstream. "off": disable inference entirely.
+  mode: observe
+  # In-memory session TTL in seconds (default 900).
+  ttlSeconds: 900
+  # Max inferred sessions retained (default 1024).
+  maxSessions: 1024
+
+# Server-side endpoint routing — periodically fetches the server-published
+# mapping table (GET zcode.z.ai/api/v1/agent/configs) and remaps coding-plan
+# endpoints (e.g. to the ultra endpoints). Fully fail-open. Env var:
+# ZCODE_ENDPOINT_ROUTING=0/1.
+endpointRouting:
+  enabled: true
+  origin: "https://zcode.z.ai"
+
+# V4 client request signing — probes the server feature gate and, when the
+# server enables it, signs coding-plan requests (Ed25519 + proof-of-work)
+# exactly like the real client. Fail-open; start-plan is exempt. Env var:
+# ZCODE_CLIENT_SIGNING=0/1.
+clientSigning:
+  enabled: true
+  origin: "https://zcode.z.ai"
+
+# Start-plan captcha behavior (v0.3.0: in-process happy-dom solver + token
+# pool — no Chrome, no jsdom, no browser dependency):
+# - Tokens are pre-solved into a background pool; each start-plan request
+#   takes an already-solved token in sub-millisecond time.
 # - By default the proxy pre-solves and sends fresh Aliyun runtime captcha
-#   headers before each start-plan model attempt, matching ZCode's pre-send
-#   provider runtime headers path. Set ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT=0
-#   only if you want diagnostic 3007-only solving.
-# - ZCODE_CAPTCHA_SOLVER=auto (default) prefers a real Chrome/Edge CDP page,
-#   matching ZCode's Electron renderer, and falls back to the bundled JSDOM
-#   solver. Use ZCODE_CAPTCHA_SOLVER=jsdom only for no-browser diagnostics.
-#   The proxy starts a temporary 127.0.0.1 no-CSP captcha host page by default;
-#   override it only for debugging with ZCODE_CAPTCHA_CHROME_URL.
-# - Chrome CDP keeps one hidden helper process alive by default, reusing the
-#   same renderer and a persistent profile at ~/.zcode-proxy/captcha-chrome-profile
-#   to keep a stable browser/device state like ZCode's Electron renderer.
-#   Set ZCODE_CAPTCHA_CHROME_KEEPALIVE=0 to go back to launch-per-solve.
-#   Set ZCODE_CAPTCHA_CHROME_IDLE_MS=0 to keep the helper alive until exit;
-#   default idle cleanup is 600000ms. Override the profile with
-#   ZCODE_CAPTCHA_CHROME_USER_DATA_DIR, or set ZCODE_CAPTCHA_CHROME_EPHEMERAL=1
-#   to use one temporary profile per solve.
-# - ZCODE_CAPTCHA_LANGUAGE can force Aliyun's SDK language to "cn" or "en";
-#   when unset, the proxy follows the host locale like the official client.
-# - Set ZCODE_CAPTCHA_CHROME_INTERACTIVE=1 to show that Chrome window when
-#   Aliyun escalates to an interactive challenge.
+#   headers before each start-plan model attempt. Set
+#   ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT=0 only if you want diagnostic 3007-only
+#   solving.
+# - Pool sizing: CAPTCHA_POOL_MIN (default 20), CAPTCHA_POOL_MAX (default
+#   max(min*6, 120)). Retries: ZCODE_CAPTCHA_RETRIES (default 4). CPU
+#   throttle: CAPTCHA_CPU_LIMIT_PCT (default 100 = off).
+# - HTTP_PROXY/HTTPS_PROXY route the solver's outbound traffic when set.
 
 logging:
   level: info

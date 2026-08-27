@@ -6,7 +6,7 @@ import { readFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { parse } from "yaml";
-import type { ProxyConfig, ProviderEndpoints, ProxyIdentity, RetryConfig, RoutingRule, ModelMapping, ResponsesThinkingConfig } from "./types.js";
+import type { ProxyConfig, ProviderEndpoints, ProxyIdentity, RetryConfig, RoutingRule, ModelMapping, ResponsesThinkingConfig, ClientIdentityConfig, EndpointRoutingConfig, ClientSigningConfig } from "./types.js";
 
 /** Environment variable keys that override YAML values. */
 const ENV = {
@@ -32,6 +32,8 @@ const ENV = {
   TRUST_PROXY: "ZCODE_PROXY_TRUST_PROXY",
   SSE_HEARTBEAT_MS: "ZCODE_PROXY_SSE_HEARTBEAT_MS",
   MAX_REQUEST_BODY_BYTES: "ZCODE_PROXY_MAX_REQUEST_BODY_BYTES",
+  ENDPOINT_ROUTING: "ZCODE_ENDPOINT_ROUTING",
+  CLIENT_SIGNING: "ZCODE_CLIENT_SIGNING",
 } as const;
 
 const DEFAULTS = {
@@ -48,8 +50,12 @@ const DEFAULTS = {
   ZAI_OPENAI_BASE: "https://api.z.ai/api/coding/paas/v4",
   BIGMODEL_ANTHROPIC_BASE: "https://open.bigmodel.cn/api/anthropic",
   BIGMODEL_OPENAI_BASE: "https://open.bigmodel.cn/api/coding/paas/v4",
-  APP_VERSION: "3.2.5",
-  SOURCE_TITLE: "Z Code@electron",
+  // v0.3.0 (upstream zcode-api v2.6.0 alignment): appVersion default bumped
+  // 3.2.5 → 3.9.1 — the current ZCode client release. The captcha config
+  // API and identity headers must present a current version or the gateway
+  // treats the traffic as outdated-client.
+  APP_VERSION: "3.9.1",
+  SOURCE_TITLE: "cli",
   REFERER_ORIGIN: "https://zcode.z.ai",
   RELEASE_CHANNEL: "production",
   ZCODE_AGENT: "glm",
@@ -76,6 +82,14 @@ const DEFAULTS = {
   // See src/utils/constants.ts SSE_HEARTBEAT for rationale.
   SSE_HEARTBEAT_MS: 15_000,
   MAX_REQUEST_BODY_BYTES: 64 * 1024 * 1024,
+  // v0.3.0 upstream-alignment defaults
+  CLIENT_IDENTITY_MODE: "observe" as const,
+  CLIENT_IDENTITY_TTL_SECONDS: 900,
+  CLIENT_IDENTITY_MAX_SESSIONS: 1024,
+  ENDPOINT_ROUTING_ENABLED: true,
+  ENDPOINT_ROUTING_ORIGIN: "https://zcode.z.ai",
+  CLIENT_SIGNING_ENABLED: true,
+  CLIENT_SIGNING_ORIGIN: "https://zcode.z.ai",
 };
 
 /** Printable-ASCII gate copied from the ZCode bundle's `rYn` helper. */
@@ -185,6 +199,11 @@ export function loadConfig(path: string): ProxyConfig {
   // --- responses thinking override ---
   const responsesThinking = resolveResponsesThinking(parsed?.responsesThinking);
 
+  // --- v0.3.0 upstream-alignment sections ---
+  const clientIdentity = resolveClientIdentity(parsed?.clientIdentity);
+  const endpointRouting = resolveEndpointRouting(parsed?.endpointRouting);
+  const clientSigning = resolveClientSigning(parsed?.clientSigning);
+
   // vceshi0.0.6+: verbose logging flag. Env var ZCODE_PROXY_VERBOSE_LOGGING=1
   // enables it at startup; YAML `logging.verbose: true` also works. Dashboard
   // can toggle at runtime via PUT /config (the field is hot-swappable).
@@ -249,6 +268,9 @@ export function loadConfig(path: string): ProxyConfig {
     thinkingLevel,
     corsAllowList,
     identity,
+    clientIdentity,
+    endpointRouting,
+    clientSigning,
     logging: { level: logLevel, verbose: verboseLogging, debug: debugLogging, file: logFile, headerDebug },
     retry,
     routingRules,
@@ -534,6 +556,58 @@ function resolveResponsesThinking(raw: unknown): ResponsesThinkingConfig {
     models.push(id);
   }
   return { models };
+}
+
+/** Resolve client-identity (session inference) configuration. */
+function resolveClientIdentity(raw: unknown): ClientIdentityConfig {
+  const obj = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
+  const mode = resolveClientIdentityMode(obj.mode);
+  const ttlSeconds = resolvePositiveInt(obj.ttlSeconds, DEFAULTS.CLIENT_IDENTITY_TTL_SECONDS);
+  const maxSessions = resolvePositiveInt(obj.maxSessions, DEFAULTS.CLIENT_IDENTITY_MAX_SESSIONS);
+  return { mode, ttlSeconds, maxSessions };
+}
+
+function resolveClientIdentityMode(raw: unknown): ClientIdentityConfig["mode"] {
+  if (raw === undefined || raw === null) return DEFAULTS.CLIENT_IDENTITY_MODE;
+  if (raw === "off" || raw === "observe" || raw === "enforce") return raw;
+  throw new Error(`Invalid clientIdentity.mode "${String(raw)}": must be "off", "observe", or "enforce"`);
+}
+
+/** Resolve endpoint-routing configuration. Fail-open feature — invalid
+ * origins fall back to the default rather than rejecting the config. */
+function resolveEndpointRouting(raw: unknown): EndpointRoutingConfig {
+  const obj = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
+  const enabledEnv = process.env[ENV.ENDPOINT_ROUTING];
+  const enabled = enabledEnv !== undefined
+    ? resolveBoolFlag(enabledEnv, DEFAULTS.ENDPOINT_ROUTING_ENABLED)
+    : resolveBoolFlag(obj.enabled, DEFAULTS.ENDPOINT_ROUTING_ENABLED);
+  const origin = (typeof obj.origin === "string" ? obj.origin : DEFAULTS.ENDPOINT_ROUTING_ORIGIN).trim()
+    || DEFAULTS.ENDPOINT_ROUTING_ORIGIN;
+  return { enabled, origin };
+}
+
+/** Resolve client-signing configuration. */
+function resolveClientSigning(raw: unknown): ClientSigningConfig {
+  const obj = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
+  const enabledEnv = process.env[ENV.CLIENT_SIGNING];
+  const enabled = enabledEnv !== undefined
+    ? resolveBoolFlag(enabledEnv, DEFAULTS.CLIENT_SIGNING_ENABLED)
+    : resolveBoolFlag(obj.enabled, DEFAULTS.CLIENT_SIGNING_ENABLED);
+  const origin = (typeof obj.origin === "string" ? obj.origin : DEFAULTS.CLIENT_SIGNING_ORIGIN).trim()
+    || DEFAULTS.CLIENT_SIGNING_ORIGIN;
+  return { enabled, origin };
+}
+
+/** Resolve a boolean from YAML (true/false) or env ("1"/"true"/"0"/"false"). */
+function resolveBoolFlag(raw: unknown, fallback: boolean): boolean {
+  if (raw === undefined || raw === null) return fallback;
+  if (typeof raw === "boolean") return raw;
+  if (typeof raw === "string") {
+    const v = raw.trim().toLowerCase();
+    if (v === "1" || v === "true" || v === "yes" || v === "on") return true;
+    if (v === "0" || v === "false" || v === "no" || v === "off") return false;
+  }
+  return fallback;
 }
 
 /** Cross-field validation after all fields are resolved. */

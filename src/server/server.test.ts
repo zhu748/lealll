@@ -21,7 +21,10 @@ function makeConfig(overrides: Partial<ProxyConfig> = {}): ProxyConfig {
     },
     defaultModel: "glm-4.6",
     models: ["glm-4.6"],
-    identity: { appVersion: "test-1.0.0", sourceTitle: "cli", refererOrigin: "https://zcode.z.ai" },
+    identity: { appVersion: "test-1.0.0", sourceTitle: "cli", refererOrigin: "https://zcode.z.ai" },    clientIdentity: { mode: "off", ttlSeconds: 900, maxSessions: 1024 },
+    endpointRouting: { enabled: false, origin: "https://zcode.z.ai" },
+    clientSigning: { enabled: false, origin: "https://zcode.z.ai" },
+
     logging: { level: "info" },
     retry: { maxRetries: 0, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3 },
     ...overrides,

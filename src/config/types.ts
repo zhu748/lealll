@@ -182,6 +182,55 @@ export interface ResponsesThinkingConfig {
   models: string[];
 }
 
+/**
+ * Client-session inference configuration (upstream zcode-api v2.6.0 alignment).
+ *
+ * Replicates ZCode's single-user-identity UUID generation: the resolver maps
+ * incoming requests to stable upstream sessions via explicit client headers
+ * (x-opencode-session / x-claude-code-session-id / …) or conversation-
+ * lineage hashing, so multi-turn conversations reuse the same upstream
+ * x-session-id exactly like the real client.
+ */
+export interface ClientIdentityConfig {
+  /** "observe" logs/instruments only; "enforce" reuses upstream x-session-id; "off" disables inference. */
+  mode: "off" | "observe" | "enforce";
+  /** In-memory session TTL in seconds. */
+  ttlSeconds: number;
+  /** Maximum number of inferred sessions retained in memory. */
+  maxSessions: number;
+}
+
+/**
+ * Server-side endpoint routing (upstream zcode-api v2.6.0 alignment).
+ *
+ * Mirrors the ZCode client's ProviderEndpointRoutingService: periodically
+ * fetches `GET {origin}/api/v1/agent/configs` and remaps coding-plan
+ * endpoints per the server-published mapping table (e.g. to the ultra
+ * endpoints). Fully fail-open — any error keeps the original URL.
+ */
+export interface EndpointRoutingConfig {
+  /** Enable URL remapping. Env: ZCODE_ENDPOINT_ROUTING. Default true. */
+  enabled: boolean;
+  /** Base origin of the agent/configs endpoint. Default "https://zcode.z.ai". */
+  origin: string;
+}
+
+/**
+ * Client request signing V4 (upstream zcode-api v2.6.0 alignment).
+ *
+ * Probes the same feature gate the client uses
+ * (`GET {origin}/api/v1/agent/configs` → `data.codingPlanSignature.enable`)
+ * and, only if the server turns the feature on, signs coding-plan upstream
+ * requests (handshake + Ed25519 + proof-of-work, with the client's fail-open
+ * retry ladder). Start-plan paths are permanently exempt.
+ */
+export interface ClientSigningConfig {
+  /** Enable gate probing + signing. Default `true`. */
+  enabled: boolean;
+  /** Base origin of the feature-gate endpoint. Default `"https://zcode.z.ai"`. */
+  origin: string;
+}
+
 /** Top-level proxy configuration. */
 export interface ProxyConfig {
   server: {
@@ -277,6 +326,23 @@ export interface ProxyConfig {
    * defaults mirror the production ZCode desktop client.
    */
   identity: ProxyIdentity;
+  /**
+   * Client-session inference (upstream v2.6.0). Default: observe mode.
+   * Replicates ZCode's stable per-conversation upstream session UUIDs.
+   */
+  clientIdentity: ClientIdentityConfig;
+  /**
+   * Server-side endpoint routing (upstream v2.6.0). Default: enabled —
+   * remaps coding-plan endpoints per the server-published mapping table
+   * (e.g. ultra endpoints). Fail-open.
+   */
+  endpointRouting: EndpointRoutingConfig;
+  /**
+   * Client request signing V4 (upstream v2.6.0). Default: enabled — signs
+   * coding-plan requests only when the server-side feature gate is on.
+   * Fail-open. Start-plan is exempt.
+   */
+  clientSigning: ClientSigningConfig;
   logging: {
     level: "debug" | "info" | "warn" | "error";
     /**
