@@ -2,6 +2,51 @@
 
 A reverse proxy for Z.AI / Bigmodel.cn coding-plan APIs that exposes both OpenAI-compatible and Anthropic-format endpoints.
 
+## v0.3.6.2 — OAuth Login Hang Fixed (mint breaker, solve backoff, login-first startup)
+
+Reported against v0.3.6.x: clicking "开始登录" in the dashboard hung at
+"初始化中..." until the 15s frontend timeout. Root cause found by
+instrumenting a live repro: `POST /admin/api/oauth/init` itself is trivial
+(bind a loopback port + build a URL — the handler finishes in ~20ms), but the
+**captcha pre-solver's happy-dom solves starve the shared event loop**. Each
+solve contains multi-hundred-ms synchronous eval chunks; when mints fail
+persistently (flagged IP / WAF degrade / FeiLin fingerprint failures) the
+pool NEVER stops retrying — measured event-loop stalls of **4–5.7 seconds**
+repeating forever. A multi-turn request (body stream read → node:http
+listen → response write) cannot thread through those stalls; the response
+write wedges for 35–90s while single-turn endpoints (status pings) squeak
+through between stalls. On the user's machine the same spiral produced the
+earlier `L[$]` spam — that noise was the audible symptom of failing mints.
+
+Four-layer fix (1258/1258 tests, +7; end-to-end verified on a live server):
+
+- **Mint circuit breaker** (`captcha-pool.ts`): two consecutive all-failed
+  solve waves now park background solving for an escalating cooldown
+  (30s → 60s → 120s → 300s → 600s, any banked token resets the ladder).
+  The startup `prefill` loop also exits when parked — previously a broken
+  mint environment spun failed waves FOREVER at full CPU. On-demand solves
+  for live user requests still run while parked.
+- **Exponential backoff inside a solve retry chain** (500ms → 4s cap):
+  four attempts used to run back-to-back, each burning seconds of
+  synchronous eval. Env-tunable (`CAPTCHA_SOLVE_BACKOFF_BASE_MS/CAP_MS`),
+  0 disables.
+- **Background wave concurrency capped at 2** (urgent waves keep the full
+  governor allowance). A full-throttle 8-wide background fill made the
+  admin API chunky even when mints succeed.
+- **Login-first startup**: fresh oauth installs (zero stored accounts) now
+  DEFER the pre-solver entirely — nothing can consume tokens before the
+  first credential exists, and login runs on an idle loop. The pool starts
+  lazily right after the first start-plan login saves its credential. For
+  configured installs the pre-solver boots after a 10s idle-loop grace
+  (`CAPTCHA_PRESOLVER_DELAY_MS`, 0 = immediate) so the first dashboard
+  interactions stay snappy, and Bun's node:http machinery is pre-warmed at
+  boot (the first `listen()` under load could wedge the in-flight response
+  write for 10–25s — observed, reproduced, closed).
+
+Validated on a live server across the full pool lifecycle (grace window →
+fill → keeper churn → expiry refill): 20/20 oauth/init calls returned in
+11ms–852ms (pre-fix: 6.5s → 35s → 90s+ timeouts).
+
 ## v0.3.6.1 — Zero-Spam Startup (guest rejection routing, console probe filter)
 
 Reported against the v0.3.6.0 Windows exe: opening the app still flooded

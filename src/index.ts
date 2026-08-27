@@ -20,6 +20,7 @@ import type { Credential, PlanId } from "./auth/types.js";
 import type { ProviderId } from "./provider/types.js";
 import { VERSION } from "./version.js";
 import { spawn } from "node:child_process";
+import { createServer as createNodeHttpServer } from "node:http";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { parse, stringify } from "yaml";
@@ -531,6 +532,26 @@ async function serve(configPath?: string): Promise<void> {
 
   const server = await startServer({ config, auth, configPath: path });
   const url = `http://${server.hostname}:${server.port}`;
+
+  // v0.3.6.2: pre-warm Bun's node:http compatibility machinery NOW, while
+  // the event loop is still idle. The OAuth login flow (oauth/init) creates
+  // a node:http callback server per login attempt; on Bun the FIRST listen()
+  // registration lazily initializes internals, and doing that lazy init while
+  // a captcha solve's synchronous eval chunks are running can wedge the
+  // in-flight response write for many seconds (observed: handler done in
+  // 2ms, response stuck 10-25s). Warming it at boot — before any solving —
+  // closes that cold path. ~2ms one-off cost, safe on Node too.
+  try {
+    const warmupServer = createNodeHttpServer((_req, res) => { res.writeHead(200); res.end("ok"); });
+    await new Promise<void>((resolve, reject) => {
+      warmupServer.once("error", reject);
+      warmupServer.listen(0, "127.0.0.1", () => resolve());
+    });
+    warmupServer.close();
+  } catch {
+    // Warm-up is best-effort only — never block startup on it.
+  }
+
   console.log(`zcode-proxy ${VERSION} listening on ${url}`);
   console.log(`  provider: ${config.provider}`);
   console.log(`  plan: ${config.plan}`);
@@ -559,22 +580,46 @@ async function serve(configPath?: string): Promise<void> {
   //     the retry engine may switch to it mid-request).
   // Lazy-loaded so coding-plan-only processes never pay the solver's startup
   // cost.
-  const anyStartPlanCredential = await (async () => {
-    try {
-      const accounts = await exportAccounts();
-      return accounts.some(a => a.credential?.plan === "start-plan" || Boolean(a.credential?.jwt));
-    } catch {
-      return false;
-    }
-  })();
-  if (config.plan === "start-plan" || anyStartPlanCredential) {
-    try {
-      const { startCaptchaPool } = await import("./proxy/captcha.js");
-      await startCaptchaPool(config.identity.appVersion);
-      console.log("  captcha: token pool pre-solver started (start-plan)");
-    } catch (e) {
-      // Non-fatal: requests fall back to on-demand solving at take-time.
-      console.warn(`[captcha] pool warmup failed (non-fatal): ${(e as Error).message}`);
+  //
+  // v0.3.6.2 EXCEPTION: in oauth mode with ZERO stored accounts (fresh
+  // install), skip the pre-solver. Nothing can consume the tokens yet, and a
+  // failing mint environment enters a retry spiral whose synchronous
+  // happy-dom eval stalls the event loop for seconds at a time — which is
+  // exactly when the user is trying to log in via the dashboard
+  // ("oauth login stuck at 初始化 → 15s timeout"). The pool starts lazily
+  // right after the first start-plan credential is saved (see
+  // ensureCaptchaPoolForStartPlan in admin/api.ts).
+  const storedAccounts = await exportAccounts().catch(() => [] as Awaited<ReturnType<typeof exportAccounts>>);
+  const anyStartPlanCredential = storedAccounts.length > 0
+    && storedAccounts.some(a => a.credential?.plan === "start-plan" || Boolean(a.credential?.jwt));
+  const freshOauthInstall = config.auth.mode === "oauth" && storedAccounts.length === 0;
+  if (freshOauthInstall) {
+    console.log("  captcha: pre-solver deferred until first login (no stored credential)");
+  } else if (config.plan === "start-plan" || anyStartPlanCredential) {
+    // v0.3.6.2: kick the pre-solver off after a short grace delay instead of
+    // immediately at boot. The first seconds after launch are exactly when
+    // the user opens the dashboard and clicks "开始登录" — and the fill waves
+    // (even capped at background concurrency) make the shared event loop
+    // chunky on weak machines. Tokens expire after ~95s anyway and requests
+    // fall back to on-demand solving, so a 10s later warm-up costs nothing.
+    // CAPTCHA_PRESOLVER_DELAY_MS=0 restores the old immediate start.
+    const preSolverDelayMs = Math.max(0, Number(process.env.CAPTCHA_PRESOLVER_DELAY_MS ?? 10_000));
+    const startPreSolver = async (): Promise<void> => {
+      try {
+        const { startCaptchaPool } = await import("./proxy/captcha.js");
+        await startCaptchaPool(config.identity.appVersion);
+        console.log("  captcha: token pool pre-solver started (start-plan)");
+      } catch (e) {
+        // Non-fatal: requests fall back to on-demand solving at take-time.
+        console.warn(`[captcha] pool warmup failed (non-fatal): ${(e as Error).message}`);
+      }
+    };
+    if (preSolverDelayMs > 0) {
+      console.log(`  captcha: pre-solver starts in ${Math.round(preSolverDelayMs / 1000)}s (idle-loop grace for login)`);
+      const t = setTimeout(() => void startPreSolver(), preSolverDelayMs);
+      t.unref?.();
+    } else {
+      void startPreSolver();
     }
   }
   // Helpful access hint: when bound to 0.0.0.0, the user must use 127.0.0.1

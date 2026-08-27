@@ -677,6 +677,31 @@ function withLinkedAbortSignal(baseFetch: typeof fetch, signal: AbortSignal): ty
  * clicking the quota button. Only start-plan (has a jwt) is probed; coding-plan
  * has no activation concept.
  */
+/**
+ * v0.3.6.2: lazily start the captcha token pool once a start-plan credential
+ * lands. Fresh oauth installs defer the pre-solver at boot (see index.ts — a
+ * mint-failure retry spiral used to starve the event loop exactly while the
+ * user was trying to log in). This hook closes the loop: the pool comes up
+ * right after the first usable credential is saved, without a restart.
+ *
+ * Fire-and-forget by design: never blocks and never fails the OAuth flow.
+ * Skips when the pool is already running (running === target > 0 or an
+ * in-flight solve — startCaptchaPool restarts the refill timer safely, but
+ * a duplicate prefill on a broken mint environment would just burn CPU).
+ */
+async function ensureCaptchaPoolForStartPlan(cred: AppCredential, appVersion?: string): Promise<void> {
+  if (cred.plan !== "start-plan" && !cred.jwt) return;
+  try {
+    if (getChromeCaptchaHelperStatus().running) return;
+    const { startCaptchaPool } = await import("../proxy/captcha.js");
+    await startCaptchaPool(appVersion || "3.9.1");
+    console.log("  captcha: token pool started (start-plan credential saved)");
+  } catch (e) {
+    // Non-fatal: requests fall back to on-demand solving at take-time.
+    console.warn(`[captcha] pool start after login failed (non-fatal): ${(e as Error).message}`);
+  }
+}
+
 function probeStartPlanActivation(
   cred: AppCredential,
   fetchImpl: typeof fetch,
@@ -2533,6 +2558,10 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
             // Probe start-plan activation in the background (fire-and-forget).
             // See probeStartPlanActivation — non-blocking, never fails the login.
             probeStartPlanActivation(cred, opts.fetchImpl ?? fetch, opts.config.identity?.appVersion, opts.config.identity);
+            // v0.3.6.2: fresh installs defer the captcha pre-solver until the
+            // first credential exists (see index.ts). Start it now that a
+            // start-plan account landed — fire-and-forget, never fails login.
+            void ensureCaptchaPoolForStartPlan(cred, opts.config.identity?.appVersion);
             // Mark flow as ready
             const flow = activeFlows.get(flowId);
             if (flow) { (flow as any).status = "ready"; }
@@ -2585,6 +2614,10 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
           }
           // Probe start-plan activation in the background (fire-and-forget).
           probeStartPlanActivation(cred, opts.fetchImpl ?? fetch, opts.config.identity?.appVersion, opts.config.identity);
+          // v0.3.6.2: fresh installs defer the captcha pre-solver until the
+          // first credential exists (see index.ts). Start it now — fire-and-
+          // forget, never fails login.
+          void ensureCaptchaPoolForStartPlan(cred, opts.config.identity?.appVersion);
           const flow = activeFlows.get(init.flowId);
           if (flow) { (flow as any).status = "ready"; }
         } catch (err) {

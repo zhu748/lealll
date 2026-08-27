@@ -30,6 +30,16 @@ export interface CaptchaPoolOptions {
   solveRetries?: number;
   staggerMs?: number;
   solveConcurrency?: number;
+  /** Base delay (ms) before retry N inside one solveFresh chain (0 = off). */
+  solveBackoffBaseMs?: number;
+  /** Cap (ms) for the exponential retry backoff. */
+  solveBackoffCapMs?: number;
+  /** Concurrency ceiling for background (non-urgent) solve waves (default 2). */
+  bgSolveConcurrency?: number;
+  /** Consecutive all-failed waves before the mint breaker parks solving (default 2). */
+  breakerStreak?: number;
+  /** Escalating cooldowns (ms) once the breaker trips (default 30s→600s). */
+  breakerCooldownsMs?: number[];
   /** Parallel solves raced when a take finds the pool empty (default 2). */
   emptyTakeRace?: number;
   /** Host CPU ceiling for captcha workers (default 100, 0 = off). */
@@ -83,11 +93,34 @@ const DEFAULT_TOKEN_TTL_MS = Number(process.env.CAPTCHA_CACHE_TTL_MS || 95_000);
 const DEFAULT_REFILL_INTERVAL_MS = Number(process.env.CAPTCHA_REFILL_INTERVAL_MS || 1_000);
 const DEFAULT_STAGGER_MS = Number(process.env.CAPTCHA_SOLVE_STAGGER_MS || 0);
 const DEFAULT_SOLVE_CONCURRENCY = Number(
-	process.env.CAPTCHA_SOLVE_CONCURRENCY ||
-		(process.env.ZCODE_CAPTCHA_LOW_CPU === "1" ? 3 : 8),
+        process.env.CAPTCHA_SOLVE_CONCURRENCY ||
+                (process.env.ZCODE_CAPTCHA_LOW_CPU === "1" ? 3 : 8),
 );
 const DEFAULT_SCALE_DOWN_IDLE_MS = Number(process.env.CAPTCHA_POOL_SCALE_DOWN_IDLE_MS || 120_000);
 const DEFAULT_IDLE_FLOOR = Number(process.env.CAPTCHA_POOL_IDLE_FLOOR || 1);
+// Inter-attempt backoff inside one solveFresh retry chain. Without it, a
+// failing mint storm (WAF degrade / F008 duplicates / FeiLin fingerprint
+// failures) hammers Aliyun AND the local event loop back-to-back: each
+// happy-dom solve contains multi-hundred-ms synchronous eval chunks, so 4
+// immediate retries × N concurrent solves starves the admin server (the
+// v0.3.6.1 "oauth login stuck at 初始化 then timeout" bug — measured 4-5s
+// event-loop stalls during a persistent-failure spiral).
+const DEFAULT_SOLVE_BACKOFF_BASE_MS = Number(process.env.CAPTCHA_SOLVE_BACKOFF_BASE_MS || 500);
+const DEFAULT_SOLVE_BACKOFF_CAP_MS = Number(process.env.CAPTCHA_SOLVE_BACKOFF_CAP_MS || 4_000);
+// Background (no client waiting) solve wave concurrency cap. Urgent waves
+// (a live request needs a token) keep the full governor allowance.
+const DEFAULT_BG_SOLVE_CONCURRENCY = Math.max(1, Number(process.env.CAPTCHA_BG_SOLVE_CONCURRENCY || 2));
+// Mint circuit breaker: after this many consecutive ALL-FAILED waves, park
+// background solving for an escalating cooldown. Kills the permanent retry
+// spiral when the environment simply cannot mint (flagged IP, broken FeiLin).
+const DEFAULT_BREAKER_STREAK = Math.max(1, Number(process.env.CAPTCHA_BREAKER_STREAK || 2));
+const DEFAULT_BREAKER_COOLDOWN_SCHEDULE = (process.env.CAPTCHA_BREAKER_COOLDOWN_MS || "")
+  .split(",")
+  .map((v) => Number(v.trim()))
+  .filter((v) => Number.isFinite(v) && v > 0);
+const DEFAULT_BREAKER_COOLDOWNS_MS = DEFAULT_BREAKER_COOLDOWN_SCHEDULE.length > 0
+  ? DEFAULT_BREAKER_COOLDOWN_SCHEDULE
+  : [30_000, 60_000, 120_000, 300_000, 600_000];
 // Zero-traffic beyond this stops background solving entirely (floor 0): no
 // mint churn, near-zero CPU. The next token take restores poolSizeMin.
 const DEFAULT_DEEP_IDLE_AFTER_MS = Number(process.env.CAPTCHA_DEEP_IDLE_AFTER_MS || 900_000);
@@ -110,6 +143,16 @@ type ResolvedPoolOpts = {
   solveRetries: number;
   staggerMs: number;
   solveConcurrency: number;
+  /** Base delay before retry N inside one solveFresh chain (0 = off). */
+  solveBackoffBaseMs: number;
+  /** Cap for the exponential backoff delay. */
+  solveBackoffCapMs: number;
+  /** Concurrency ceiling for background (non-urgent) solve waves. */
+  bgSolveConcurrency: number;
+  /** Consecutive all-failed waves before the breaker parks background solving. */
+  breakerStreak: number;
+  /** Escalating cooldown schedule (ms) once the breaker trips. */
+  breakerCooldownsMs: number[];
   emptyTakeRace: number;
   onCaptchaIpBlock?: (reason: string) => void;
 };
@@ -131,6 +174,13 @@ function resolvePoolOpts(opts: CaptchaPoolOptions): ResolvedPoolOpts {
     solveRetries: opts.solveRetries ?? SOLVE_RETRIES,
     staggerMs: opts.staggerMs ?? DEFAULT_STAGGER_MS,
     solveConcurrency: opts.solveConcurrency ?? DEFAULT_SOLVE_CONCURRENCY,
+    solveBackoffBaseMs: Math.max(0, opts.solveBackoffBaseMs ?? DEFAULT_SOLVE_BACKOFF_BASE_MS),
+    solveBackoffCapMs: Math.max(0, opts.solveBackoffCapMs ?? DEFAULT_SOLVE_BACKOFF_CAP_MS),
+    bgSolveConcurrency: Math.max(1, opts.bgSolveConcurrency ?? DEFAULT_BG_SOLVE_CONCURRENCY),
+    breakerStreak: Math.max(1, opts.breakerStreak ?? DEFAULT_BREAKER_STREAK),
+    breakerCooldownsMs: (opts.breakerCooldownsMs && opts.breakerCooldownsMs.length > 0
+      ? opts.breakerCooldownsMs
+      : DEFAULT_BREAKER_COOLDOWNS_MS).filter((v) => v > 0),
     emptyTakeRace: Math.max(1, opts.emptyTakeRace ?? EMPTY_TAKE_RACE),
     onCaptchaIpBlock: opts.onCaptchaIpBlock,
   };
@@ -156,6 +206,10 @@ export class CaptchaTokenPool {
   private mintFailures: number[] = [];
   private mintSuccesses: number[] = [];
   private lastStormResetAt = 0;
+  // Mint circuit-breaker state: consecutive all-failed solve waves + the
+  // current index into breakerCooldownsMs. Any minted token resets both.
+  private failWaveStreak = 0;
+  private breakerCooldownIdx = 0;
 
   constructor(opts: CaptchaPoolOptions = {}) {
     // The module-level singleton constructs with no opts before config load;
@@ -290,13 +344,28 @@ export class CaptchaTokenPool {
   async prefill(cfg: CaptchaConfig, count?: number): Promise<void> {
     this.cfg = cfg;
     const target = Math.min(count ?? this.effectiveTarget, this.effectiveTarget);
+    let lastReady = -1;
+    let stagnantRounds = 0;
     while (this.tokens.length + this.activeSolves < target) {
+      // Mint breaker parked us (persistent all-failed waves) — stop the
+      // startup prefill instead of spinning failed waves forever. The refill
+      // timer resumes when the cooldown expires, escalating if still broken.
+      if (Date.now() < this.pausedUntil) break;
       const need = target - this.tokens.length - this.activeSolves;
       if (need <= 0) break;
       const concurrency = this.governor?.enabled
-        ? this.governor.backgroundConcurrency(this.tokens.length)
-        : this.opts.solveConcurrency;
+        ? Math.min(this.governor.backgroundConcurrency(this.tokens.length), this.opts.bgSolveConcurrency)
+        : Math.min(this.opts.solveConcurrency, this.opts.bgSolveConcurrency);
       await this.solveBatch(cfg, need, Math.max(1, concurrency));
+      // Safety valve: waves that complete but somehow bank nothing (e.g. an
+      // exotic fulfilled-yet-dropped path) must not loop the startup prefill
+      // forever. Four stagnant rounds with the deficit unchanged → give up;
+      // the refill timer keeps trying in the background.
+      const ready = this.tokens.length;
+      if (ready > lastReady) stagnantRounds = 0;
+      else stagnantRounds += 1;
+      lastReady = ready;
+      if (stagnantRounds >= 4) break;
     }
   }
 
@@ -338,6 +407,10 @@ export class CaptchaTokenPool {
       return;
     }
     this.tokens.push({ param, cachedAt: Date.now(), certifyId });
+    // A minted token is proof the environment can still mint — reset the
+    // breaker streak and its escalating cooldown ladder.
+    this.failWaveStreak = 0;
+    this.breakerCooldownIdx = 0;
   }
 
   private pruneExpired(): void {
@@ -492,7 +565,15 @@ export class CaptchaTokenPool {
 
     this.refillInFlight = true;
     try {
-      await this.solveBatch(this.cfg, need, Math.max(1, concurrency));
+      // Background waves are capped at bgSolveConcurrency: each happy-dom
+      // solve carries multi-hundred-ms synchronous eval chunks on the shared
+      // event loop, so a full-throttle background fill starves the admin API
+      // (v0.3.6.1 oauth login timeout bug). Urgent waves (a client is waiting
+      // on a token) keep the full governor allowance.
+      const waveConcurrency = opts.urgent
+        ? concurrency
+        : Math.min(concurrency, this.opts.bgSolveConcurrency);
+      await this.solveBatch(this.cfg, need, Math.max(1, waveConcurrency));
     } finally {
       this.refillInFlight = false;
     }
@@ -502,22 +583,50 @@ export class CaptchaTokenPool {
   private async solveBatch(cfg: CaptchaConfig, need: number, concurrency = this.opts.solveConcurrency): Promise<void> {
     let remaining = need;
     while (remaining > 0 && this.tokens.length + this.activeSolves < this.effectiveTarget) {
+      if (Date.now() < this.pausedUntil) break; // mint breaker parked — stop waves
       const wave = Math.min(remaining, concurrency, this.deficit());
       if (wave <= 0) break;
       if (this.opts.staggerMs > 0) await this.waitForStagger();
       const results = await Promise.allSettled(
         Array.from({ length: wave }, () => this.solveOne(cfg)),
       );
+      let fulfilled = 0;
       for (const r of results) {
         if (r.status === "fulfilled") {
+          fulfilled += 1;
           this.pushToken(r.value);
         } else {
           console.warn("[captcha-pool] parallel solve failed:", r.reason);
         }
       }
       remaining -= wave;
-      if (results.every((r) => r.status === "rejected")) break;
+      if (fulfilled === 0) {
+        // Whole wave failed — feed the mint breaker. Two consecutive
+        // all-failed waves means the environment cannot mint right now
+        // (flagged IP, WAF degrade, broken FeiLin); parking background
+        // solving for an escalating cooldown stops the CPU spiral that
+        // starves the admin API (oauth login init timeouts).
+        const firstReason = results[0]?.status === "rejected" ? String((results[0] as PromiseRejectedResult).reason) : "unknown";
+        this.noteAllFailedWave(firstReason);
+        break;
+      }
     }
+  }
+
+  /** A solve wave where every solver failed. Trip the breaker past the
+   *  streak threshold: park background solving with an escalating cooldown
+   *  (30s → 60s → 120s → 300s → 600s). Any banked token resets the ladder. */
+  private noteAllFailedWave(latestReason: string): void {
+    this.failWaveStreak += 1;
+    if (this.failWaveStreak < this.opts.breakerStreak) return;
+    const schedule = this.opts.breakerCooldownsMs.length > 0 ? this.opts.breakerCooldownsMs : [30_000];
+    const idx = Math.min(this.breakerCooldownIdx, schedule.length - 1);
+    const cooldown = schedule[idx];
+    this.breakerCooldownIdx = Math.min(this.breakerCooldownIdx + 1, schedule.length - 1);
+    this.pausedUntil = Math.max(this.pausedUntil, Date.now() + cooldown);
+    console.warn(
+      `[captcha-pool] mint breaker tripped (${this.failWaveStreak} consecutive all-failed waves; latest: ${latestReason.slice(0, 120)}) — background solving parked for ${Math.round(cooldown / 1000)}s (on-demand solves for live requests still run)`,
+    );
   }
 
   private async waitForStagger(): Promise<void> {
@@ -570,6 +679,17 @@ export class CaptchaTokenPool {
       let lastErr: string | null = null;
       let sawIpBlock = false;
       for (let attempt = 1; attempt <= this.opts.solveRetries; attempt += 1) {
+        if (attempt > 1 && this.opts.solveBackoffBaseMs > 0) {
+          // Exponential backoff between attempts inside one chain. A failing
+          // environment used to retry 4x back-to-back; each attempt burns
+          // seconds of synchronous happy-dom eval on the shared event loop,
+          // starving the admin API (oauth login 15s timeouts).
+          const backoff = Math.min(
+            this.opts.solveBackoffBaseMs * 2 ** (attempt - 2),
+            Math.max(1, this.opts.solveBackoffCapMs),
+          );
+          await new Promise((r) => setTimeout(r, backoff));
+        }
         try {
           const param = await runCaptchaSolve(cfg.sceneId, cfg.region, cfg.prefix);
           if (!param) {

@@ -325,3 +325,223 @@ describe("CaptchaTokenPool deep idle", () => {
     expect(fired2.length).toBe(0);
   });
 });
+
+describe("CaptchaTokenPool mint breaker + backoff (v0.3.6.2)", () => {
+  beforeEach(() => {
+    process.env.ZCODE_CAPTCHA_SKIP_DEPS = "1";
+    solveMock.mockReset();
+    solveMock.mockImplementation(async () => "x".repeat(64));
+  });
+  afterEach(() => {
+    delete process.env.ZCODE_CAPTCHA_SKIP_DEPS;
+    delete process.env.CAPTCHA_TAKE_GRACE_MS;
+    pool?.stopBackgroundRefill?.();
+  });
+
+  it("parks background solving after consecutive all-failed waves", async () => {
+    pool = new CaptchaTokenPool({
+      poolSizeMin: 4,
+      poolSizeMax: 4,
+      tokenTtlMs: 60_000,
+      refillIntervalMs: 600_000,
+      staggerMs: 0,
+      solveRetries: 1,
+      solveConcurrency: 2,
+      scaleDownIdleMs: 600_000,
+      // Fast-forward the breaker for the test.
+      breakerStreak: 2,
+      breakerCooldownsMs: [5_000, 10_000],
+    });
+    solveMock.mockImplementation(async () => {
+      throw new Error("captcha solve stall pe=pe.099.storm.js");
+    });
+    await pool.prefill(CFG);
+    // Two all-failed waves → breaker trips → prefill exits without spinning.
+    const stats = pool.stats();
+    expect(stats.ready).toBe(0);
+    const p = pool as unknown as { pausedUntil: number };
+    expect(p.pausedUntil).toBeGreaterThan(Date.now());
+    // Wave solve count is bounded: 2 waves × wave size ≤ solveConcurrency×2.
+    expect(solveMock.mock.calls.length).toBeLessThanOrEqual(4);
+  });
+
+  it("stops subsequent waves while parked (refill timer respected)", async () => {
+    pool = new CaptchaTokenPool({
+      poolSizeMin: 2,
+      poolSizeMax: 2,
+      tokenTtlMs: 60_000,
+      refillIntervalMs: 600_000,
+      staggerMs: 0,
+      solveRetries: 1,
+      solveConcurrency: 1,
+      scaleDownIdleMs: 600_000,
+      breakerStreak: 1,
+      breakerCooldownsMs: [60_000],
+    });
+    solveMock.mockImplementation(async () => {
+      throw new Error("mint broken");
+    });
+    await pool.prefill(CFG);
+    solveMock.mockClear();
+    // A background refill tick during the park must not fire any solve.
+    await (pool as unknown as { refill: (o: { urgent: boolean }) => Promise<void> }).refill({ urgent: false });
+    expect(solveMock.mock.calls.length).toBe(0);
+  });
+
+  it("on-demand takeToken still solves while the breaker is parked", async () => {
+    pool = new CaptchaTokenPool({
+      poolSizeMin: 2,
+      poolSizeMax: 2,
+      tokenTtlMs: 60_000,
+      refillIntervalMs: 600_000,
+      staggerMs: 0,
+      solveRetries: 1,
+      solveConcurrency: 1,
+      emptyTakeRace: 1,
+      scaleDownIdleMs: 600_000,
+      breakerStreak: 1,
+      breakerCooldownsMs: [60_000],
+    });
+    let fail = true;
+    solveMock.mockImplementation(async () => {
+      if (fail) throw new Error("mint broken");
+      return "ondemand:" + "y".repeat(56);
+    });
+    await pool.prefill(CFG); // trips the breaker immediately
+    fail = false;
+    // A live user request must still be served by the direct raced solve.
+    const param = await pool.takeToken(CFG);
+    expect(param.startsWith("ondemand:")).toBe(true);
+  });
+
+  it("escalates the cooldown ladder on repeated trips and resets on success", async () => {
+    pool = new CaptchaTokenPool({
+      poolSizeMin: 2,
+      poolSizeMax: 2,
+      tokenTtlMs: 60_000,
+      refillIntervalMs: 600_000,
+      staggerMs: 0,
+      solveRetries: 1,
+      solveConcurrency: 1,
+      scaleDownIdleMs: 600_000,
+      breakerStreak: 1,
+      breakerCooldownsMs: [1_000, 5_000, 9_000],
+    });
+    solveMock.mockImplementation(async () => {
+      throw new Error("mint broken");
+    });
+    const p = pool as unknown as {
+      pausedUntil: number;
+      failWaveStreak: number;
+      breakerCooldownIdx: number;
+      noteAllFailedWave: (r: string) => void;
+      pushToken: (s: string) => void;
+    };
+    const t0 = Date.now();
+    p.noteAllFailedWave("a");
+    expect(p.pausedUntil).toBeGreaterThanOrEqual(t0 + 1_000);
+    expect(p.pausedUntil).toBeLessThan(t0 + 5_000);
+    p.noteAllFailedWave("b");
+    expect(p.pausedUntil).toBeGreaterThanOrEqual(t0 + 5_000);
+    p.noteAllFailedWave("c");
+    expect(p.pausedUntil).toBeGreaterThanOrEqual(t0 + 9_000); // schedule cap
+    p.noteAllFailedWave("d");
+    expect(p.pausedUntil).toBeGreaterThanOrEqual(t0 + 9_000); // stays capped
+    // A banked token resets the ladder for FUTURE trips.
+    p.pushToken(Buffer.from(JSON.stringify({ certifyId: "brk-ok", sceneId: "s", isSign: true, securityToken: "x" })).toString("base64"));
+    expect(p.failWaveStreak).toBe(0);
+    expect(p.breakerCooldownIdx).toBe(0);
+  });
+
+  it("backs off exponentially between solve attempts inside one chain", async () => {
+    process.env.CAPTCHA_TAKE_GRACE_MS = "1"; // skip the 10s empty-pool grace wait
+    pool = new CaptchaTokenPool({
+      poolSizeMin: 1,
+      poolSizeMax: 1,
+      tokenTtlMs: 60_000,
+      refillIntervalMs: 600_000,
+      staggerMs: 0,
+      solveRetries: 3,
+      solveConcurrency: 1,
+      emptyTakeRace: 1,
+      scaleDownIdleMs: 600_000,
+      solveBackoffBaseMs: 60,
+      solveBackoffCapMs: 200,
+      breakerStreak: 99,
+      breakerCooldownsMs: [60_000],
+    });
+    solveMock.mockImplementation(async () => {
+      throw new Error("pe stall");
+    });
+    const t0 = Date.now();
+    await expect(
+      (pool as unknown as { solveFresh: (c: unknown) => Promise<string> }).solveFresh(CFG),
+    ).rejects.toThrow();
+    const elapsed = Date.now() - t0;
+    // 3 attempts → waits of 60ms (attempt 2) + 120ms (attempt 3) ≥ 180ms.
+    expect(elapsed).toBeGreaterThanOrEqual(170);
+    expect(solveMock.mock.calls.length).toBe(3);
+  });
+
+  it("backoff 0 keeps retries immediate (opt-out preserved)", async () => {
+    process.env.CAPTCHA_TAKE_GRACE_MS = "1"; // skip the 10s empty-pool grace wait
+    pool = new CaptchaTokenPool({
+      poolSizeMin: 1,
+      poolSizeMax: 1,
+      tokenTtlMs: 60_000,
+      refillIntervalMs: 600_000,
+      staggerMs: 0,
+      solveRetries: 2,
+      solveConcurrency: 1,
+      emptyTakeRace: 1,
+      scaleDownIdleMs: 600_000,
+      solveBackoffBaseMs: 0,
+      breakerStreak: 99,
+      breakerCooldownsMs: [60_000],
+    });
+    solveMock.mockImplementation(async () => {
+      throw new Error("pe stall");
+    });
+    const t0 = Date.now();
+    await expect(
+      (pool as unknown as { solveFresh: (c: unknown) => Promise<string> }).solveFresh(CFG),
+    ).rejects.toThrow();
+    expect(Date.now() - t0).toBeLessThan(100);
+    expect(solveMock.mock.calls.length).toBe(2);
+  });
+
+  it("caps background wave concurrency at bgSolveConcurrency (urgent waves exempt)", async () => {
+    pool = new CaptchaTokenPool({
+      poolSizeMin: 8,
+      poolSizeMax: 8,
+      tokenTtlMs: 60_000,
+      refillIntervalMs: 600_000,
+      staggerMs: 0,
+      solveRetries: 1,
+      solveConcurrency: 8,
+      bgSolveConcurrency: 2,
+      cpuLimitPercent: 0, // disable the governor so the pool's own caps are observable
+      scaleDownIdleMs: 600_000,
+    });
+    (pool as unknown as { cfg: unknown }).cfg = CFG; // refill() no-ops without a config
+    let inFlight = 0;
+    let maxInFlight = 0;
+    solveMock.mockImplementation(async () => {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((r) => setTimeout(r, 15));
+      inFlight -= 1;
+      return "bg:" + "z".repeat(60);
+    });
+    await (pool as unknown as { refill: (o: { urgent: boolean }) => Promise<void> }).refill({ urgent: false });
+    expect(maxInFlight).toBeLessThanOrEqual(2);
+    expect(pool.stats().ready).toBe(8);
+
+    // Urgent refill keeps the full configured concurrency.
+    (pool as unknown as { tokens: unknown[] }).tokens = [];
+    inFlight = 0;
+    maxInFlight = 0;
+    await (pool as unknown as { refill: (o: { urgent: boolean }) => Promise<void> }).refill({ urgent: true });
+    expect(maxInFlight).toBeGreaterThan(2);
+  });
+});
