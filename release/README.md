@@ -1,5 +1,20 @@
 # zcode-proxy 使用说明
 
+> **v0.3.8.1 — 修复 start-plan token 统计消失（`in:- out:-` 无 tok/s）**
+>
+> 现象：v0.3.7 之后 start-plan 请求全部成功返回,但日志/看板里 token 列全部变成 `in:- out:-`,tok/s 也没有了。
+>
+> 根因（三环相扣）:v0.3.0 起代理把**客户端的** `accept-encoding`(默认 gzip)透传给上游 → v0.3.7 把 start-plan 切到 zcode.z.ai Anthropic 镜像的**字节透传**路径(`decompress: false`)→ zcode.z.ai 在阿里云 ESA CDN 后面,看到 gzip 就对 SSE 响应做动态压缩。于是流经统计观察器的是原始 gzip 字节——而统计解析、SSE 心跳、200 流内错误检测、batch usage 预览对压缩流都会静默自禁用。你的日志就是铁证:TTFB/总时长有值(分块在流、收尾正常)但零个 SSE 事件被解析。
+>
+> **修复(两层)**:
+>
+> - 模型请求改发 `accept-encoding: identity`——这正是真实 ZCode 桌面客户端(Tauri)的取值(上游 zcode-api 抓包注释实锤),所以指纹反而**更像真客户端**。上游不再压缩,统计/心跳/错误检测全部看到明文。逃生舱:`ZCODE_UPSTREAM_ACCEPT_ENCODING=gzip` 可换回压缩省带宽——第二层兜底让统计照样工作。
+> - 防御纵深:任何压缩的透传响应(gzip/deflate/zstd)在 fetch 返回后立即用 `DecompressionStream` 内联解压并剥掉 `content-encoding`/`content-length` 头,stats、心跳、usage 预览、错误预览、验证码挑战检测和客户端拿到的全是明文。仅 `br`(Bun 不支持解压)会禁用统计——但现在会**打警告日志**而不是静默失败。
+>
+> 顺带治愈:v0.3.7 起 SSE 心跳(Cloudflare 524 防护)在压缩透传流上也是死的,同一改动一并恢复。
+>
+> 测试 1283/1283(+6 回归测试,含 gzip SSE → 解压 → 统计行恢复 `in:9 out:4` 的用户场景复现);真实网络验证:identity 请求让条件 gzip 服务器不再压缩;顺带清掉 README 里 8 个早已不在代码中的 Chrome 验证码环境变量死文档。
+
 > **v0.3.7.0 — 修复 start-plan 全部 404（zcode.z.ai 下线了 OpenAI 网关端点）**
 >
 > 针对 v0.3.6.2 "所有请求 `upstream 404 404 page not found`"的反馈。账号、JWT、验证码、身份指纹全部正常——模型请求打的是一个**已被服务端删除的路由**。直接实测 zcode.z.ai 网关：

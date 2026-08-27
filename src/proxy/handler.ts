@@ -92,6 +92,7 @@ import {
   translatedSseResponse,
 } from "./translated-response.js";
 import {
+  decompressPassthroughResponse,
   isCompressedContentEncoding,
   readResponseTextLimited,
   readResponseTextPreview,
@@ -889,6 +890,27 @@ export async function proxyRequest(
       throw err;
     }
     resp = wrapResponseBodyWithUpstreamTimeout(resp, ctrl, timer, timeoutMs);
+    // v0.3.8.1: byte-passthrough responses were fetched with decompress:false —
+    // if the upstream compressed them anyway (e.g. an ESA/CDN edge ignoring our
+    // accept-encoding: identity, or ZCODE_UPSTREAM_ACCEPT_ENCODING=gzip), the
+    // raw gzip/deflate/zstd bytes would silently kill the token-stats
+    // observer, the SSE heartbeat, in-stream error detection, and the batch
+    // usage preview. Decompress in-stream here so every downstream consumer
+    // (stats/heartbeat/passthrough/error preview) sees plaintext and the client
+    // receives decodable bytes (content-encoding/length stripped).
+    //
+    // Only for upstreamPassthrough — auto-decompressed (translation-path)
+    // responses keep the content-encoding header with an already-plaintext
+    // body; decompressing those again would corrupt the stream.
+    if (upstreamPassthrough) {
+      const inflated = decompressPassthroughResponse(resp);
+      if (inflated.decompressed) {
+        proxyLog(`${reqId} decompressed compressed passthrough body (${resp.headers.get("content-encoding")}) — token stats restored`);
+        resp = inflated.response;
+      } else if (inflated.unsupportedEncoding) {
+        proxyLog(`${reqId} WARNING: passthrough body is content-encoding: ${inflated.unsupportedEncoding} (not decompressible in-proxy) — token stats & SSE heartbeat unavailable for this response`);
+      }
+    }
     // vceshi0.0.6+: verbose logging — log the upstream request headers + body
     // when logging.verbose is enabled. Auth tokens are masked to avoid leaking
     // secrets to the dashboard log panel. Truncated to 2000 chars to avoid

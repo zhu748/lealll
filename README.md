@@ -2,6 +2,49 @@
 
 A reverse proxy for Z.AI / Bigmodel.cn coding-plan APIs that exposes both OpenAI-compatible and Anthropic-format endpoints.
 
+## v0.3.8.1 — Token stats fixed for start-plan (compressed passthrough regression)
+
+Symptom: after v0.3.7, every start-plan request logged `in:- out:-` with no
+tok/s — token accounting silently vanished while responses themselves worked
+fine.
+
+Root cause (a chain of three): (1) v0.3.0 forwarded the *client's*
+`accept-encoding` (default `gzip`) to the upstream; (2) v0.3.7 moved
+start-plan onto the zcode.z.ai Anthropic mirror's **byte-passthrough** path
+(`decompress: false`) after the OpenAI gateway was removed server-side; (3)
+zcode.z.ai sits behind Alibaba ESA, which dynamically gzips SSE responses
+whenever the client advertises gzip. The passthrough body was therefore raw
+gzip bytes — and the inline stats observer, the SSE heartbeat, in-stream
+(200-wrapped) error detection, and the batch usage preview all silently
+disable themselves for compressed bodies. Your log rows confirmed it
+mechanically: TTFB and total time populated (chunks flowed, finalize ran)
+while zero SSE events parsed.
+
+Fix (two layers):
+
+- **Request `accept-encoding: identity` on model calls** — the value the
+  real ZCode Tauri client sends (per upstream zcode-api wire captures), so
+  this is a fingerprint *improvement*, not a compromise. The upstream stops
+  compressing; stats, heartbeat, and error detection see plaintext again.
+  Escape hatch: `ZCODE_UPSTREAM_ACCEPT_ENCODING=gzip` restores compression
+  (bandwidth) — the second layer keeps stats working even then.
+- **In-stream decompression of compressed passthrough bodies** (defense in
+  depth): any gzip/deflate/zstd passthrough response is piped through
+  `DecompressionStream` inside `fetchUpstreamDetected`, with
+  `content-encoding`/`content-length` stripped, so every downstream consumer
+  (stats observer, heartbeat injector, batch usage preview, error preview,
+  captcha-challenge detector, and the client itself) receives plaintext
+  regardless of what the edge does. Only `br` (Bun's DecompressionStream
+  doesn't support it) still disables stats — and now **logs a warning**
+  instead of failing silently.
+
+Side heal: SSE heartbeat (Cloudflare 524 protection) was also dead for
+compressed passthrough streams since v0.3.7; it is restored by the same
+change. Tests: +6 regression tests (`response-body-decompress.test.ts`)
+including the exact user scenario (gzip SSE → decompress → row shows
+`in:9 out:4`), two rewritten passthrough tests, and wire-level verification
+that identity stops a conditional-gzip server from compressing.
+
 ## v0.3.8.0 — Dashboard cleanup (legacy captcha page removed, pool health on Overview)
 
 The dashboard still carried a 验证码助手 (Captcha Helper) page — a leftover
@@ -675,21 +718,13 @@ docker run --rm -p 8080:8080 \
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ZCODE_APP_VERSION` | `3.2.5` | `User-Agent: ZCode/{version}` sent to upstream. The start-plan captcha config request also sends this as `app_version`, matching the official client. Must be printable ASCII. |
+| `ZCODE_APP_VERSION` | `3.9.2` | `User-Agent: ZCode/{version}` sent to upstream. The start-plan captcha config request also sends this as `app_version`, matching the official client. Must be printable ASCII. |
 | `ZCODE_SOURCE_TITLE` | `Z Code@electron` | `X-Title` sent to upstream. |
 | `ZCODE_REFERER_ORIGIN` | `https://zcode.z.ai` | `HTTP-Referer` URL sent to upstream. |
 | `ZCODE_AGENT` | `glm` | `X-ZCode-Agent` sent on upstream model requests to mirror the official GLM agent provider. |
 | `ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT` | enabled | Start-plan pre-solves and sends fresh Aliyun captcha runtime headers before each model attempt, matching ZCode. Set to `0`, `false`, `off`, `no`, or `never` to solve only after an explicit `3007` challenge. |
 | `ZCODE_STARTPLAN_UPSTREAM` | `anthropic` | v0.3.7: start-plan upstream wire style. `anthropic` (default) routes through the zcode.z.ai Anthropic mirror (`/api/v1/zcode-plan/anthropic/v1/messages`); `openai` restores the legacy v0.3.0 gateway pipeline (`/api/v1/zcode-plan/chat/completions` — removed server-side 2026-08-27, currently 404). |
-| `ZCODE_CAPTCHA_SOLVER` | `auto` | Captcha solver strategy: `auto` prefers a real Chrome/Edge CDP page (matching ZCode's Electron renderer) and falls back to JSDOM, `chrome` forces Chrome/Edge, `jsdom` forces the single-binary fallback. |
-| `ZCODE_CAPTCHA_LANGUAGE` | host locale | Optional Aliyun SDK language override: `cn` or `en`. When unset, Chinese host locales use `cn`; all others use `en`, matching the official client's locale behavior. |
-| `ZCODE_CAPTCHA_CHROME_INTERACTIVE` | `0` | Set to `1` to show the Chrome captcha fallback window on screen when Aliyun escalates from traceless verification to an interactive challenge. |
-| `ZCODE_CAPTCHA_CHROME_URL` | temporary `127.0.0.1` page | Optional captcha host page for the Chrome solver. Leave unset unless debugging; the proxy starts a local no-CSP page automatically. |
-| `ZCODE_CAPTCHA_CHROME_USER_DATA_DIR` | `~/.zcode-proxy/captcha-chrome-profile` | Persistent Chrome/Edge profile used by the start-plan captcha solver, so the browser/device state is stable like ZCode's Electron renderer. |
-| `ZCODE_CAPTCHA_CHROME_KEEPALIVE` | `1` | Keep one hidden Chrome CDP helper alive and reuse it across start-plan captcha solves. Set to `0`, `false`, `off`, or `never` to restore the old launch-per-solve behavior. |
-| `ZCODE_CAPTCHA_CHROME_IDLE_MS` | `600000` | Idle timeout before the persistent Chrome helper is closed. Set to `0` to keep it alive until process exit or manual stop from the dashboard. |
-| `ZCODE_CAPTCHA_CHROME_STOP_GRACE_MS` | `2000` | Max time to wait for an active Chrome captcha solve when the dashboard stops the helper. Set to `0` to tear it down immediately. |
-| `ZCODE_CAPTCHA_CHROME_EPHEMERAL` | `0` | Set to `1` to use one temporary Chrome profile per captcha solve. This is less ZCode-like and may trigger more checks. |
+| `ZCODE_UPSTREAM_ACCEPT_ENCODING` | `identity` | v0.3.8.1: accept-encoding advertised to model-call upstreams. `identity` (default) matches the real ZCode Tauri client and keeps SSE responses uncompressed so token stats and the heartbeat work. Override to `gzip` to save proxy↔upstream bandwidth — compressed responses are decompressed in-proxy (stats keep working); only `br` would disable them. |
 
 #### Retry policy (optional)
 

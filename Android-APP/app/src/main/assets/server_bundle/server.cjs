@@ -115924,6 +115924,38 @@ function parseContentLength6(headers2) {
 function isCompressedContentEncoding2(value2) {
   return !!value2 && value2.trim().toLowerCase() !== "identity";
 }
+function decompressPassthroughResponse(resp) {
+  const rawEncoding = resp.headers.get("content-encoding");
+  const encoding = rawEncoding?.trim().toLowerCase() ?? "";
+  if (!encoding || encoding === "identity" || !resp.body) {
+    return { response: resp, decompressed: false, unsupportedEncoding: null };
+  }
+  if (!DECOMPRESSIBLE_CONTENT_ENCODINGS.has(encoding)) {
+    return { response: resp, decompressed: false, unsupportedEncoding: encoding };
+  }
+  let decoded;
+  try {
+    const ds = new DecompressionStream(encoding);
+    decoded = resp.body.pipeThrough(ds);
+  } catch {
+    return { response: resp, decompressed: false, unsupportedEncoding: encoding };
+  }
+  const headers2 = new Headers();
+  for (const [k, v] of resp.headers.entries()) {
+    const lower = k.toLowerCase();
+    if (lower === "content-encoding" || lower === "content-length") continue;
+    headers2.set(k, v);
+  }
+  return {
+    response: new Response(decoded, {
+      status: resp.status,
+      statusText: resp.statusText,
+      headers: headers2
+    }),
+    decompressed: true,
+    unsupportedEncoding: null
+  };
+}
 function utf8ByteLength4(value2) {
   return utf8ByteLengthEncoder.encode(value2).byteLength;
 }
@@ -116210,7 +116242,7 @@ function splitResponseForPreview(resp) {
     return null;
   }
 }
-var ResponseBodyTooLargeError, utf8ByteLengthEncoder, utf8LogPreviewDecoder;
+var ResponseBodyTooLargeError, DECOMPRESSIBLE_CONTENT_ENCODINGS, utf8ByteLengthEncoder, utf8LogPreviewDecoder;
 var init_response_body = __esm({
   "src/proxy/response-body.ts"() {
     "use strict";
@@ -116222,6 +116254,7 @@ var init_response_body = __esm({
         this.name = "ResponseBodyTooLargeError";
       }
     };
+    DECOMPRESSIBLE_CONTENT_ENCODINGS = /* @__PURE__ */ new Set(["gzip", "deflate", "zstd"]);
     utf8ByteLengthEncoder = new TextEncoder();
     utf8LogPreviewDecoder = new TextDecoder();
   }
@@ -122664,7 +122697,7 @@ var init_package = __esm({
   "package.json"() {
     package_default = {
       name: "zcode-proxy",
-      version: "0.3.8.0",
+      version: "0.3.8.1",
       type: "module",
       scripts: {
         dev: "bun run src/index.ts",
@@ -126728,6 +126761,10 @@ function startPlanUpstreamStyle() {
   const raw = process.env.ZCODE_STARTPLAN_UPSTREAM?.trim().toLowerCase();
   return raw === "openai" || raw === "gateway" ? "openai" : "anthropic";
 }
+function upstreamAcceptEncoding() {
+  const raw = process.env.ZCODE_UPSTREAM_ACCEPT_ENCODING?.trim();
+  return raw && raw.length > 0 ? raw : "identity";
+}
 
 // src/proxy/upstream.ts
 var ANTHROPIC_VERSION = "2023-06-01";
@@ -126809,10 +126846,10 @@ function buildAuthHeaders(format, cred, identity, plan = "coding-plan", clientSe
   return headers2;
 }
 function buildUpstreamHeaderPairs(clientReq, format, cred, identity, plan = "coding-plan", extraHeaders, clientSession) {
-  const clientAcceptEncoding = clientReq.headers.get("accept-encoding") ?? "gzip";
+  void clientReq;
   const pairs = [
     ["content-type", "application/json"],
-    ["accept-encoding", clientAcceptEncoding]
+    ["accept-encoding", upstreamAcceptEncoding()]
   ];
   if (format === "anthropic") {
     pairs.push(["anthropic-beta", ANTHROPIC_BETA]);
@@ -130739,6 +130776,15 @@ async function proxyRequest(clientReq, format, opts) {
       throw err;
     }
     resp = wrapResponseBodyWithUpstreamTimeout(resp, ctrl, timer, timeoutMs);
+    if (upstreamPassthrough) {
+      const inflated = decompressPassthroughResponse(resp);
+      if (inflated.decompressed) {
+        proxyLog(`${reqId} decompressed compressed passthrough body (${resp.headers.get("content-encoding")}) \u2014 token stats restored`);
+        resp = inflated.response;
+      } else if (inflated.unsupportedEncoding) {
+        proxyLog(`${reqId} WARNING: passthrough body is content-encoding: ${inflated.unsupportedEncoding} (not decompressible in-proxy) \u2014 token stats & SSE heartbeat unavailable for this response`);
+      }
+    }
     if (config.logging?.verbose) {
       try {
         const headerSummary = {};

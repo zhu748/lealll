@@ -4,6 +4,7 @@
  */
 import { describe, it, expect, mock } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
+import { gzipSync } from "node:zlib";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -380,8 +381,9 @@ describe("buildUpstreamRequest", () => {
   //
   // v0.2.3+: whitelist updated to match the 2026-06-28 unpacking of app.asar
   // Mf() at offset 886853. `accept` is no longer in the whitelist (the real
-  // ZCode client never sends it on /v1/messages). `accept-encoding` is auto-
-  // added by fetch (we no longer hardcode "gzip").
+  // ZCode client never sends it on /v1/messages). `accept-encoding` is the
+  // proxy's own value (v0.3.8.1: identity default — matches the real client;
+  // the client's value is never forwarded).
   it("emits ONLY the whitelisted ZCode headers — no client header ever leaks (v0.2.3+ strict whitelist)", () => {
     // Throw every weird header we can think of at the proxy — including ones
     // with no fingerprint prefix that would have leaked through the old
@@ -545,8 +547,8 @@ describe("buildUpstreamRequest", () => {
 
     // v0.3.0 order: content-type → [accept-encoding] → anthropic-beta →
     // identity (pio) → trace (synthetic) → anthropic-version → auth.
-    // buildUpstreamHeaders (record form) synthesizes a bare request so
-    // accept-encoding falls back to "gzip".
+    // v0.3.8.1: accept-encoding is now the proxy's own value (identity
+    // default — the real ZCode Tauri client's encoding), not a client value.
     const expectedOrder = [
       "content-type",
       "accept-encoding",
@@ -740,13 +742,33 @@ describe("buildUpstreamRequest", () => {
     expect(h["authorization"]).toBe("Bearer testkey.testsecret");
   });
 
-  // v0.3.0 (upstream v2.6.0): accept-encoding is forwarded from the CLIENT
-  // so the upstream compresses only when the client can decode it (fixes
-  // Tauri builds that send `accept-encoding: identity`). Default "gzip"
-  // when the client sent nothing. Never hardcoded to a fixed value.
-  it("forwards the client's accept-encoding (v0.3.0+), defaulting to gzip", () => {
+  // v0.3.8.1: accept-encoding is the proxy's OWN fingerprint decision — the
+  // real ZCode Tauri client sends `accept-encoding: identity` (upstream
+  // zcode-api wire captures), and forwarding client gzip values made the
+  // zcode.z.ai ESA edge compress SSE passthrough bodies, silently killing
+  // token stats / heartbeat (the "in:- out:-" regression). Env escape hatch:
+  // ZCODE_UPSTREAM_ACCEPT_ENCODING.
+  it("advertises identity by default (v0.3.8.1+: real ZCode Tauri client value)", () => {
     const h = buildUpstreamHeaders("anthropic", ZAI_CRED, IDENTITY);
-    expect(h["accept-encoding"]).toBe("gzip");
+    expect(h["accept-encoding"]).toBe("identity");
+  });
+
+  it("does NOT forward the client's accept-encoding (v0.3.8.1+)", () => {
+    const clientReq = makeClientReq("{}", { "accept-encoding": "gzip, deflate, br, zstd" });
+    const upstream = buildUpstreamRequest(clientReq, "anthropic", ZAI_PROVIDER, ZAI_CRED, "{}", IDENTITY);
+    expect(upstream.headers.get("accept-encoding")).toBe("identity");
+  });
+
+  it("ZCODE_UPSTREAM_ACCEPT_ENCODING overrides the advertised value", () => {
+    const original = process.env.ZCODE_UPSTREAM_ACCEPT_ENCODING;
+    try {
+      process.env.ZCODE_UPSTREAM_ACCEPT_ENCODING = "gzip";
+      const h = buildUpstreamHeaders("anthropic", ZAI_CRED, IDENTITY);
+      expect(h["accept-encoding"]).toBe("gzip");
+    } finally {
+      if (original === undefined) delete process.env.ZCODE_UPSTREAM_ACCEPT_ENCODING;
+      else process.env.ZCODE_UPSTREAM_ACCEPT_ENCODING = original;
+    }
   });
 
   // v0.2.3: accept header must NOT be sent at all on /v1/messages traffic.
@@ -981,10 +1003,16 @@ describe("proxyRequest", () => {
     expect(calls).toBe(1);
   });
 
-  it("forwards content-encoding from upstream response (decompress: false passthrough)", async () => {
+  it("decompresses gzip passthrough bodies and strips the encoding header (v0.3.8.1)", async () => {
+    // v0.3.7 forwarded the raw gzip bytes + content-encoding header, which
+    // silently killed the token-stats observer ("in:- out:-" regression).
+    // v0.3.8.1 decompresses in-stream: the client receives plaintext and the
+    // stale content-encoding/content-length headers are stripped.
+    const payload = '{"id":"msg_1","usage":{"input_tokens":11,"output_tokens":7},"content":[{"text":"Hello"}]}';
+    const gz = gzipSync(Buffer.from(payload, "utf-8")) as unknown as Uint8Array;
     const fetchMock = mock(async (_req: Request, init?: RequestInit & { decompress?: boolean }): Promise<Response> => {
       expect(init?.decompress).toBe(false);
-      return new Response('{"id":"msg_1","content":[{"text":"Hello"}]}', {
+      return new Response(gz as Uint8Array<ArrayBuffer>, {
         status: 200,
         headers: {
           "content-type": "application/json",
@@ -1000,7 +1028,8 @@ describe("proxyRequest", () => {
 
     expect(resp.status).toBe(200);
     expect(resp.headers.get("content-type")).toBe("application/json");
-    expect(resp.headers.get("content-encoding")).toBe("gzip");
+    expect(resp.headers.get("content-encoding")).toBeNull();
+    expect(await resp.text()).toBe(payload);
   });
 
   it("returns 502 when upstream is unreachable", async () => {
@@ -1648,10 +1677,12 @@ describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
     retry: { maxRetries: 0, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3 },
   };
 
-  it("Anthropic client request uses decompress:false passthrough", async () => {
+  it("Anthropic client request uses decompress:false passthrough and inflates compressed bodies", async () => {
+    const payload = '{"id":"msg_1","content":[{"type":"text","text":"Hi"}]}';
+    const gz = gzipSync(Buffer.from(payload, "utf-8")) as unknown as Uint8Array;
     const fetchMock = mock(async (_req: Request, init?: RequestInit & { decompress?: boolean }): Promise<Response> => {
       expect(init?.decompress).toBe(false);
-      return new Response('{"id":"msg_1","content":[{"type":"text","text":"Hi"}]}', {
+      return new Response(gz as Uint8Array<ArrayBuffer>, {
         status: 200,
         headers: { "content-type": "application/json", "content-encoding": "gzip" },
       });
@@ -1662,7 +1693,8 @@ describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
 
     const resp = await proxyRequest(clientReq, "anthropic", { config: testConfig, auth, fetchImpl: fetchMock as any });
     expect(resp.status).toBe(200);
-    expect(resp.headers.get("content-encoding")).toBe("gzip");
+    expect(resp.headers.get("content-encoding")).toBeNull();
+    expect(await resp.text()).toBe(payload);
   });
 
   it("start-plan request routes through the zcode.z.ai Anthropic mirror (v0.3.7)", async () => {

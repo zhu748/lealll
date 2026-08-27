@@ -25,6 +25,77 @@ export function isCompressedContentEncoding(value: string | null): boolean {
   return !!value && value.trim().toLowerCase() !== "identity";
 }
 
+/**
+ * Content codings Bun's DecompressionStream can inflate. NOTE: "br" is
+ * deliberately absent — Bun 1.3's DecompressionStream rejects it, so brotli
+ * passthrough bodies stay compressed (stats observer off) and the caller
+ * logs that token stats are unavailable.
+ */
+const DECOMPRESSIBLE_CONTENT_ENCODINGS = new Set(["gzip", "deflate", "zstd"]);
+
+export interface DecompressedPassthrough {
+  response: Response;
+  /** True when the body was piped through DecompressionStream and the
+   *  content-encoding/content-length headers were stripped. */
+  decompressed: boolean;
+  /** Raw content-encoding token when the body is compressed but NOT
+   *  decompressible (e.g. "br") — caller logs a diagnosable warning. */
+  unsupportedEncoding: string | null;
+}
+
+/**
+ * v0.3.8.1: decompress a BYTE-PASSTHROUGH upstream response in-stream.
+ *
+ * Only call this on responses fetched with `decompress: false` (raw bytes).
+ * Bun auto-decompressed responses (no decompress:false) keep the
+ * content-encoding HEADER even though the body is already plaintext —
+ * decompressing those again would corrupt the stream.
+ *
+ * gzip/deflate/zstd bodies are piped through DecompressionStream — the
+ * decompressed stream is what stats observe, what the heartbeat can safely
+ * inject comment lines into, and what the client receives (with
+ * content-encoding/content-length stripped, since they no longer describe
+ * the body). Streaming: no buffering beyond the codec's internal window.
+ *
+ * identity/absent → unchanged. br (unsupported by Bun) → unchanged with
+ * unsupportedEncoding set so the caller can warn that token stats and the
+ * SSE heartbeat are disabled for this response.
+ */
+export function decompressPassthroughResponse(resp: Response): DecompressedPassthrough {
+  const rawEncoding = resp.headers.get("content-encoding");
+  const encoding = rawEncoding?.trim().toLowerCase() ?? "";
+  if (!encoding || encoding === "identity" || !resp.body) {
+    return { response: resp, decompressed: false, unsupportedEncoding: null };
+  }
+  if (!DECOMPRESSIBLE_CONTENT_ENCODINGS.has(encoding)) {
+    return { response: resp, decompressed: false, unsupportedEncoding: encoding };
+  }
+  let decoded: ReadableStream<Uint8Array>;
+  try {
+    const ds = new DecompressionStream(encoding as CompressionFormat);
+    decoded = resp.body.pipeThrough(ds as unknown as TransformStream<Uint8Array, Uint8Array>);
+  } catch {
+    // Runtime without DecompressionStream (or codec init failure): pass the
+    // raw bytes through untouched — same behavior as v0.3.7.
+    return { response: resp, decompressed: false, unsupportedEncoding: encoding };
+  }
+  const headers = new Headers();
+  for (const [k, v] of resp.headers.entries()) {
+    const lower = k.toLowerCase();
+    if (lower === "content-encoding" || lower === "content-length") continue;
+    headers.set(k, v);
+  }
+  return {
+    response: new Response(decoded, {
+      status: resp.status,
+      statusText: resp.statusText,
+      headers,
+    }),
+    decompressed: true,
+    unsupportedEncoding: null,
+  };
+}
+
 const utf8ByteLengthEncoder = new TextEncoder();
 const utf8LogPreviewDecoder = new TextDecoder();
 

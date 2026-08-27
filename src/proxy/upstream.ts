@@ -33,10 +33,13 @@
  *      trace-headers.ts) which replicates ZCode's single-user-identity UUID
  *      generation and emits `x-zcode-session-type` on every model request.
  *
- *   4. ACCEPT-ENCODING: forwarded from the client (v2.6.0 upstream fix) so
- *      the upstream compresses only when the client can decode it — some
- *      Tauri builds send `accept-encoding: identity` and cannot
- *      auto-decompress. Default "gzip" when the client sent nothing.
+ *   4. ACCEPT-ENCODING: v0.3.8.1 — model requests advertise `identity`
+ *      (the real ZCode Tauri client's value, per upstream wire captures)
+ *      instead of forwarding the client's value. Forwarding gzip made the
+ *      zcode.z.ai ESA edge compress SSE passthrough bodies, silently killing
+ *      the token-stats observer, the SSE heartbeat, and in-stream error
+ *      detection (see runtime-options.ts upstreamAcceptEncoding). Env
+ *      escape hatch: ZCODE_UPSTREAM_ACCEPT_ENCODING.
  *
  * === HEADER WHITELIST (local fork policy, kept from v0.2.3+) ===
  *
@@ -51,7 +54,7 @@
  * the actual wire):
  *
  *   1.  content-type             : application/json
- *   2.  accept-encoding          : <client value, default gzip>
+ *   2.  accept-encoding          : identity (ZCODE_UPSTREAM_ACCEPT_ENCODING override)
  *   3.  anthropic-beta           : mid-conversation-system-2026-04-07 (Anthropic upstream only, fixed ZCode value)
  *   4.  anthropic-version        : 2023-06-01                       (Anthropic upstream only)
  *   5.  x-api-key | authorization: <upstream credential>            (format/plan dependent)
@@ -86,7 +89,7 @@ import { credentialString } from "../auth/types.js";
 import { buildIdentityHeaders } from "./identity.js";
 import { buildZcodeTraceHeaders } from "./trace-headers.js";
 import { sessionIdForHeader, shouldUseExactTraceHeaders, type SessionHeaderContext } from "./session-context.js";
-import { startPlanUpstreamStyle } from "./runtime-options.js";
+import { startPlanUpstreamStyle, upstreamAcceptEncoding } from "./runtime-options.js";
 
 export interface UpstreamClientSession {
   source?: "none" | "explicit" | "lineage";
@@ -254,9 +257,11 @@ export function buildAuthHeaders(
 /**
  * Build the COMPLETE upstream header set as ordered pairs.
  *
- * This is a strict whitelist — no client header is read except
- * `accept-encoding` (forwarded so the upstream compresses only when the
- * client can decode it; default "gzip").
+ * This is a strict whitelist — no client header is read at all. In
+ * particular `accept-encoding` is NOT forwarded from the client: the value
+ * sent upstream is the proxy's own fingerprint decision (identity by
+ * default — matches the real ZCode desktop client; see
+ * runtime-options.ts upstreamAcceptEncoding).
  *
  * `extraHeaders` is layered LAST so trusted internal subsystems can override
  * transport headers if needed; it is never used for client passthrough.
@@ -270,10 +275,10 @@ export function buildUpstreamHeaderPairs(
   extraHeaders?: Record<string, string>,
   clientSession?: UpstreamClientSession,
 ): UpstreamHeaderPair[] {
-  const clientAcceptEncoding = clientReq.headers.get("accept-encoding") ?? "gzip";
+  void clientReq; // kept in the signature for call-site stability
   const pairs: UpstreamHeaderPair[] = [
     ["content-type", "application/json"],
-    ["accept-encoding", clientAcceptEncoding],
+    ["accept-encoding", upstreamAcceptEncoding()],
   ];
 
   // Fixed ZCode beta flag on Anthropic upstream only. Never pass through
