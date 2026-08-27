@@ -97,6 +97,8 @@
 import type { Format } from "../translator/types.js";
 import { buildStartPlanSystem, ZCODE_SYSTEM_BLOCKS } from "./system-prompt.js";
 import type { SystemBlock } from "./system-prompt.js";
+import { getThinkingSpec, normalizeTier, TIER_BUDGETS } from "./thinking-specs.js";
+import type { ThinkingTier } from "./thinking-specs.js";
 
 export interface TransformContext {
   format: Format;
@@ -105,13 +107,16 @@ export interface TransformContext {
   /** When true (start-plan), prepend ZCode gateway system blocks. */
   startPlan?: boolean;
   /**
-   * ZCode thinking tier — controls the budget_tokens + effort injected when
-   * the client sends `thinking.type=enabled`.
-   *   - "max"  (default): budget_tokens=32000, effort="max"
-   *   - "high"          : budget_tokens=16000, effort="high"
-   *   - "low"           : budget_tokens=8000,  effort="low"
-   * When the client does NOT send `thinking`, only max_tokens=128000 is
-   * injected (ZCode "no thinking" wire shape) — thinking is never forced on.
+   * ZCode thinking tier — the REQUESTED tier, normalized per model at
+   * injection time (v0.3.10.0). The per-model spec table decides which
+   * tiers exist for the request's model and which max_tokens is forced:
+   *   - glm-5.3 / glm-5.3-flash: low(8000)/high(16000)/max(32000),
+   *     max_tokens=128000, thinking always on
+   *   - glm-5.2: high(16000)/max(32000) + nothink, max_tokens=64000
+   *     (selected "low" maps up to "high" per official Coding-Plan mapping)
+   *   - glm-5-turbo / glm-4.7 / unknown: on/off thinking only,
+   *     max_tokens=64000, no effort injection
+   * @see thinking-specs.ts
    */
   thinkingLevel?: "low" | "high" | "max";
 }
@@ -167,11 +172,11 @@ export function transformRequestBodyObj(parsed: unknown, ctx: TransformContext):
     // simplified `thinking: { type: "enabled" }` shape. Must run BEFORE
     // any transform that might strip output_config.
     //
-    // v0.1.9+: thinkingLevel controls the tier (low/high/max). When client doesn't
-    // send `thinking`, only max_tokens=128000 is injected (ZCode "no thinking"
-    // mode) — thinking is NOT forced on.
-    // v0.3.9: zcode client now exposes THREE tiers and bumped max_tokens
-    // 64000 → 128000 (captured 2026-08).
+    // v0.1.9+: thinkingLevel controls the requested tier. v0.3.10.0: injection
+    // is PER MODEL (tiers, budgets, max_tokens, forced thinking) via the spec
+    // table in thinking-specs.ts. When client doesn't send `thinking` (and the
+    // model allows it), only max_tokens is injected (Zcode "不思考" mode) —
+    // thinking is NOT forced on.
     modified = injectZCodeThinkingFormat(obj, ctx.thinkingLevel ?? "max") || modified;
     // v0.1.9+: alignZCodeFormat is the DEFAULT (and only) behavior. We no longer
     // relocate role:"system" from messages[] to top-level system — real ZCode
@@ -448,55 +453,80 @@ function transformUnsupportedAnthropicFields(body: Record<string, unknown>): boo
 }
 
 /**
- * Inject the EXACT thinking-format fields the real ZCode desktop client sends.
+ * Inject the EXACT thinking-format fields the real ZCode desktop client sends
+ * — PER MODEL (v0.3.10.0).
  *
- * Runs UNCONDITIONALLY on every Anthropic request. Behavior depends on whether
- * the client sent a `thinking` field and which `thinkingLevel` tier is selected:
+ * Runs UNCONDITIONALLY on every Anthropic request. The injected shape comes
+ * from the per-model spec table (@see thinking-specs.ts), which combines
+ * real zcode client captures (2026-06 glm-5.2, 2026-08 glm-5.3) with the
+ * official zcode tier-mapping table and docs.z.ai thinking parameter matrix.
  *
- *   1. Client sent `thinking.type === "enabled"`:
- *      Inject the tier-specific values:
- *        - "max"  (default): max_tokens=128000, budget_tokens=32000, effort="max"
- *        - "high"          : max_tokens=128000, budget_tokens=16000, effort="high"
- *        - "low"           : max_tokens=128000, budget_tokens=8000,  effort="low"
- *      These match the three thinking tiers the real ZCode desktop client
- *      offers to users (最高 / 高 / 低).
+ * Behavior matrix (spec = getThinkingSpec(body.model)):
  *
- *   2. Client did NOT send `thinking`, or sent `thinking.type !== "enabled"`
- *      (e.g. "disabled"):
- *      Only force `max_tokens=128000`. Do NOT add `thinking` or `output_config`.
- *      This mirrors ZCode's "不思考" wire shape — the client never sends a
- *      thinking field at all in that mode.
+ *   1. max_tokens is ALWAYS forced to spec.maxTokens:
+ *        glm-5.3 / glm-5.3-flash → 128000 (captured 2026-08)
+ *        everything else          → 64000  (captured 2026-06; gateway-accepted
+ *                                            for every model since v0.1.9)
  *
- *      We DO NOT force thinking on. If the user wants thinking, they enable it
- *      on the client side (Claude Code, Cherry Studio, etc.) — the dashboard
- *      tier selector only controls low/high/max intensity, not on/off.
+ *   2. spec.forcedThinking (glm-5.3 family — the API REJECTS thinking off,
+ *      so the real client always sends the full thinking shape):
+ *        - no `thinking` field   → INJECT thinking{enabled} + budget + effort
+ *          (selected tier; the real client's default tier is max)
+ *        - thinking.type=disabled → CONVERT to enabled + LOW tier (official
+ *          docs.z.ai migration guidance for the 5.3 family)
+ *        - thinking.type=enabled  → inject budget + effort as below
  *
- * Source: reverse-engineered from real ZCode client traffic.
- * 2026-06 capture (max_tokens=64000, two tiers) — superseded 2026-08 by the
- * three-tier shape below (zcode client update: added a 低 tier and bumped
- * max_tokens to 128000):
- *   - max tier:    { max_tokens: 128000, thinking: { type: "enabled", budget_tokens: 32000 }, output_config: { effort: "max" } }
- *   - high tier:   { max_tokens: 128000, thinking: { type: "enabled", budget_tokens: 16000 }, output_config: { effort: "high" } }
- *   - low tier:    { max_tokens: 128000, thinking: { type: "enabled", budget_tokens: 8000 },  output_config: { effort: "low" } }
- *   - no thinking: { max_tokens: 128000 }   (no thinking field, no output_config field;
- *                                             assumed to follow the same max_tokens bump —
- *                                             all three captured thinking tiers use 128000)
+ *   3. spec.effort (glm-5.2 and above — reasoning_effort-capable) with
+ *      thinking.type === "enabled":
+ *        - inject thinking.budget_tokens = TIER_BUDGETS[normalizedTier]
+ *        - inject output_config.effort = normalizedTier
+ *        - tier normalization per official Coding-Plan mapping: e.g. selected
+ *          "low" on glm-5.2 (no low support) maps up to "high".
  *
- * Runs AFTER transformUnsupportedAnthropicFields so we can detect the simplified
- * `thinking: { type: "enabled" }` shape. Must run BEFORE any transform that
- * might strip output_config.
+ *   4. !spec.effort (glm-5-turbo / glm-4.7 / unknown — zcode "开启/关闭"):
+ *        thinking.type=enabled → keep {type:"enabled"} BARE: no budget_tokens,
+ *        no output_config (this is the pre-v0.1.9 gateway-accepted shape and
+ *        our best reading of zcode's on/off wire for effort-less models).
+ *
+ *   5. !spec.forcedThinking and client sent NO thinking field (or disabled):
+ *        only max_tokens is forced — the ZCode "不思考" wire shape (the real
+ *        client sends no thinking field at all in that mode). We never force
+ *        thinking ON for these models.
+ *
+ * Runs AFTER transformUnsupportedAnthropicFields (which strips budget_tokens
+ * and output_config) so we re-inject exactly the per-model shape. Must run
+ * BEFORE any transform that might strip output_config.
  */
 function injectZCodeThinkingFormat(body: Record<string, unknown>, level: "low" | "high" | "max" = "max"): boolean {
+  const spec = getThinkingSpec(body.model);
   const thinking = body.thinking;
   const isThinkingEnabled = isPlainObject(thinking) && (thinking as Record<string, unknown>).type === "enabled";
+  const hasThinkingField = "thinking" in body && isPlainObject(body.thinking);
+  const isExplicitlyDisabled = hasThinkingField && (thinking as Record<string, unknown>).type === "disabled";
 
   let changed = false;
 
-  // === Always force max_tokens=128000 (matches all 4 ZCode wire shapes) ===
-  // v0.3.9: 64000 → 128000 (zcode client bump, captured 2026-08).
-  if (body.max_tokens !== 128000) {
-    body.max_tokens = 128000;
+  // === Always force max_tokens to the model's spec value ===
+  if (body.max_tokens !== spec.maxTokens) {
+    body.max_tokens = spec.maxTokens;
     changed = true;
+  }
+
+  // === GLM-5.3 family: thinking is ALWAYS on (API rejects disabled) ===
+  // The real zcode client never emits a thinking-off request for these models.
+  if (spec.forcedThinking) {
+    // Official migration guidance: disabled → enabled + low (closest to off).
+    const tier: ThinkingTier = isExplicitlyDisabled ? "low" : normalizeTier(spec, level);
+    const budgetTokens = TIER_BUDGETS[tier];
+    if (!hasThinkingField || !isThinkingEnabled || (thinking as Record<string, unknown>).budget_tokens !== budgetTokens) {
+      body.thinking = { type: "enabled", budget_tokens: budgetTokens };
+      changed = true;
+    }
+    if (!isPlainObject(body.output_config) || (body.output_config as Record<string, unknown>).effort !== tier) {
+      body.output_config = { effort: tier };
+      changed = true;
+    }
+    return changed;
   }
 
   if (!isThinkingEnabled) {
@@ -511,11 +541,27 @@ function injectZCodeThinkingFormat(body: Record<string, unknown>, level: "low" |
     return changed;
   }
 
-  // === Thinking enabled: inject tier-specific values ===
+  // === Thinking enabled on a non-forced model ===
   const t = thinking as Record<string, unknown>;
-  // v0.3.9: three tiers (zcode client 低/高/最高). Unknown values fall back to max.
-  const budgetTokens = level === "low" ? 8000 : level === "high" ? 16000 : 32000;
-  const effort = level === "low" ? "low" : level === "high" ? "high" : "max";
+
+  if (!spec.effort) {
+    // glm-5-turbo / glm-4.7 / unknown: zcode「开启/关闭」models — no
+    // reasoning_effort support. Keep {type:"enabled"} bare: no budget,
+    // no output_config. (transformUnsupportedAnthropicFields already
+    // stripped budget_tokens; ensure no output_config re-appears.)
+    if ("output_config" in body) {
+      delete body.output_config;
+      changed = true;
+    }
+    return changed;
+  }
+
+  // === Effort-capable model (glm-5.2 / 5.3 family without forced flag): ===
+  // normalize the selected tier against the model's tiers (official mapping:
+  // e.g. low on glm-5.2 → high), then inject budget + effort.
+  const tier = normalizeTier(spec, level);
+  const budgetTokens = TIER_BUDGETS[tier];
+  const effort = tier;
 
   // 1. Force thinking.budget_tokens to the tier value.
   //    transformUnsupportedAnthropicFields strips budget_tokens (GLM "doesn't

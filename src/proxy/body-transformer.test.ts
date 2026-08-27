@@ -67,9 +67,9 @@ describe("transformRequestBody — stream_options.include_usage (OpenAI)", () =>
     const parsed = JSON.parse(out as string);
     // stream_options should NOT be injected (Anthropic API has no such field)
     expect(parsed.stream_options).toBeUndefined();
-    // vceshi0.1.7+: injectZCodeThinkingFormat now forces max_tokens=128000
-    // unconditionally on Anthropic requests (matches ZCode's wire shape).
-    expect(parsed.max_tokens).toBe(128000);
+    // vceshi0.1.7+: injectZCodeThinkingFormat forces max_tokens per model spec
+    // (v0.3.10.0: unknown model → default spec 64000).
+    expect(parsed.max_tokens).toBe(64000);
   });
 });
 
@@ -144,8 +144,8 @@ describe("transformRequestBody — cache_control (Anthropic)", () => {
     const parsed = JSON.parse(out as string);
     // messages stays empty (no cache_control added, no relocation)
     expect(parsed.messages).toEqual([]);
-    // vceshi0.1.7+: max_tokens=128000 still injected unconditionally
-    expect(parsed.max_tokens).toBe(128000);
+    // vceshi0.1.7+: max_tokens injected per model spec (default spec → 64000)
+    expect(parsed.max_tokens).toBe(64000);
   });
 
   it("keeps system-only messages in messages[] (v0.1.9+: no relocation)", () => {
@@ -174,8 +174,8 @@ describe("transformRequestBody — cache_control (Anthropic)", () => {
     const parsed = JSON.parse(out as string);
     // No crash, no messages field added
     expect(parsed.messages).toBeUndefined();
-    // vceshi0.1.7+: max_tokens=128000 still injected unconditionally
-    expect(parsed.max_tokens).toBe(128000);
+    // vceshi0.1.7+: max_tokens injected per model spec (glm-4.6 → default 64000)
+    expect(parsed.max_tokens).toBe(64000);
   });
 });
 
@@ -202,22 +202,24 @@ describe("transformRequestBody — transform unsupported fields (Anthropic)", ()
     });
     const out = transformRequestBody(body, { format: "anthropic" });
     const parsed = JSON.parse(out as string);
-    // adaptive → enabled (by transformUnsupportedAnthropicFields), then
-    // injectZCodeThinkingFormat re-adds budget_tokens=32000 (default since v0.1.9)
+    // adaptive → enabled (by transformUnsupportedAnthropicFields). glm-4.6 has
+    // no effort support (v0.3.10.0) → bare {type:enabled}, no budget/effort.
     expect(parsed.thinking.type).toBe("enabled");
-    expect(parsed.thinking.budget_tokens).toBe(32000);
+    expect(parsed.thinking.budget_tokens).toBeUndefined();
+    expect(parsed.output_config).toBeUndefined();
     expect(parsed.model).toBe("glm-4.6");
   });
 
-  it("converts thinking type 'enabled' with budget_tokens to simple 'enabled' for GLM, then re-injects ZCode budget", () => {
+  it("converts thinking type 'enabled' with budget_tokens to simple 'enabled' for GLM, then re-injects ZCode budget (effort models)", () => {
     const body = JSON.stringify({
+      model: "glm-5.2",
       messages: [{ role: "user", content: "hi" }],
       thinking: { type: "enabled", budget_tokens: 10000 },
     });
     const out = transformRequestBody(body, { format: "anthropic" });
     const parsed = JSON.parse(out as string);
     // Client budget_tokens is stripped by transformUnsupportedAnthropicFields,
-    // then injectZCodeThinkingFormat re-adds the ZCode value (32000).
+    // then injectZCodeThinkingFormat re-adds the ZCode value (32000, max tier).
     expect(parsed.thinking.type).toBe("enabled");
     expect(parsed.thinking.budget_tokens).toBe(32000); // ZCode value, not client's 10000
   });
@@ -445,8 +447,8 @@ describe("transformRequestBody — strip thinking blocks from messages (Anthropi
     const parsed = JSON.parse(out as string);
     // No crash, messages not added
     expect(parsed.messages).toBeUndefined();
-    // vceshi0.1.7+: max_tokens=128000 still injected unconditionally
-    expect(parsed.max_tokens).toBe(128000);
+    // vceshi0.1.7+: max_tokens injected per model spec (glm-5.2 → 64000)
+    expect(parsed.max_tokens).toBe(64000);
   });
 
   it("strips thinking from multi-turn conversation (Claude Code regression case)", () => {
@@ -591,7 +593,9 @@ describe("transformRequestBody — injectZCodeThinkingFormat (WAF fingerprint al
   // enabled. Since v0.1.9, the proxy UNCONDITIONALLY rewrites any Anthropic
   // request with thinking.type === "enabled" to match — no config flag needed.
   // Source: reverse-engineered ZCode Electron client traffic (2026-06).
-  const EXPECTED_MAX_TOKENS = 128000;
+  // v0.3.10.0: per-model specs — glm-5.2 keeps the effort shape but caps
+  // max_tokens at 64000 (June capture). glm-5.3-family uses 128000.
+  const EXPECTED_MAX_TOKENS = 64000;
   const EXPECTED_BUDGET_TOKENS = 32000;
   const EXPECTED_EFFORT = "max";
 
@@ -647,7 +651,8 @@ describe("transformRequestBody — injectZCodeThinkingFormat (WAF fingerprint al
   it("only injects max_tokens when thinking is disabled (ZCode no-thinking mode)", () => {
     // vceshi0.1.7+: when client sends thinking.type=disabled (or doesn't send
     // thinking at all), the proxy mirrors ZCode's "不思考" wire shape — only
-    // max_tokens=128000 is injected, no thinking field is added, no output_config.
+    // max_tokens (per model spec) is injected, no thinking field is added,
+    // no output_config.
     const body = JSON.stringify({
       model: "glm-5.2",
       max_tokens: 1000,
@@ -656,7 +661,7 @@ describe("transformRequestBody — injectZCodeThinkingFormat (WAF fingerprint al
     });
     const out = transformRequestBody(body, { format: "anthropic" });
     const parsed = JSON.parse(out as string);
-    expect(parsed.max_tokens).toBe(128000); // forced to ZCode value
+    expect(parsed.max_tokens).toBe(64000); // forced to glm-5.2 spec value
     expect(parsed.thinking).toEqual({ type: "disabled" }); // preserved as-is
     expect(parsed.output_config).toBeUndefined(); // not injected
   });
@@ -669,7 +674,7 @@ describe("transformRequestBody — injectZCodeThinkingFormat (WAF fingerprint al
     });
     const out = transformRequestBody(body, { format: "anthropic" });
     const parsed = JSON.parse(out as string);
-    expect(parsed.max_tokens).toBe(128000); // forced to ZCode value
+    expect(parsed.max_tokens).toBe(64000); // forced to glm-5.2 spec value
     expect(parsed.thinking).toBeUndefined(); // not added
     expect(parsed.output_config).toBeUndefined(); // not injected
   });
@@ -711,7 +716,7 @@ describe("transformRequestBody — thinkingLevel (tier selector: low / high / ma
     // No thinkingLevel in ctx → defaults to "max"
     const out = transformRequestBody(body, { format: "anthropic" });
     const parsed = JSON.parse(out as string);
-    expect(parsed.max_tokens).toBe(128000);
+    expect(parsed.max_tokens).toBe(64000); // glm-5.2 spec
     expect(parsed.thinking.budget_tokens).toBe(32000);
     expect(parsed.output_config).toEqual({ effort: "max" });
   });
@@ -725,7 +730,7 @@ describe("transformRequestBody — thinkingLevel (tier selector: low / high / ma
     });
     const out = transformRequestBody(body, { format: "anthropic", thinkingLevel: "max" });
     const parsed = JSON.parse(out as string);
-    expect(parsed.max_tokens).toBe(128000);
+    expect(parsed.max_tokens).toBe(64000); // glm-5.2 spec
     expect(parsed.thinking.budget_tokens).toBe(32000); // client's 9999 overwritten
     expect(parsed.output_config).toEqual({ effort: "max" });
   });
@@ -739,7 +744,7 @@ describe("transformRequestBody — thinkingLevel (tier selector: low / high / ma
     });
     const out = transformRequestBody(body, { format: "anthropic", thinkingLevel: "high" });
     const parsed = JSON.parse(out as string);
-    expect(parsed.max_tokens).toBe(128000);
+    expect(parsed.max_tokens).toBe(64000); // glm-5.2 spec
     expect(parsed.thinking.budget_tokens).toBe(16000); // ZCode high tier value
     expect(parsed.output_config).toEqual({ effort: "high" });
   });
@@ -784,7 +789,7 @@ describe("transformRequestBody — thinkingLevel (tier selector: low / high / ma
     });
     const out = transformRequestBody(body, { format: "anthropic", thinkingLevel: "high" });
     const parsed = JSON.parse(out as string);
-    expect(parsed.max_tokens).toBe(128000); // forced
+    expect(parsed.max_tokens).toBe(64000); // forced (glm-5.2 spec)
     expect(parsed.thinking).toBeUndefined(); // NOT added
     expect(parsed.output_config).toBeUndefined(); // NOT added
   });
@@ -798,7 +803,7 @@ describe("transformRequestBody — thinkingLevel (tier selector: low / high / ma
     });
     const out = transformRequestBody(body, { format: "anthropic", thinkingLevel: "high" });
     const parsed = JSON.parse(out as string);
-    expect(parsed.max_tokens).toBe(128000);
+    expect(parsed.max_tokens).toBe(64000); // glm-5.2 spec
     expect(parsed.thinking).toEqual({ type: "disabled" }); // preserved
     expect(parsed.output_config).toBeUndefined(); // NOT injected
   });
@@ -820,6 +825,8 @@ describe("transformRequestBody — thinkingLevel (tier selector: low / high / ma
 
   it("switching tier from max to low updates budget_tokens + effort", () => {
     // Idempotency: first run with max, second run with low — values should update.
+    // glm-5.2 has no low tier (v0.3.10.0): selected low maps UP to high per the
+    // official Coding-Plan effort mapping (low/medium → high).
     const body = JSON.stringify({
       model: "glm-5.2",
       max_tokens: 1000,
@@ -829,8 +836,8 @@ describe("transformRequestBody — thinkingLevel (tier selector: low / high / ma
     const outMax = transformRequestBody(body, { format: "anthropic", thinkingLevel: "max" });
     const outLow = transformRequestBody(outMax as string, { format: "anthropic", thinkingLevel: "low" });
     const parsed = JSON.parse(outLow as string);
-    expect(parsed.thinking.budget_tokens).toBe(8000);
-    expect(parsed.output_config).toEqual({ effort: "low" });
+    expect(parsed.thinking.budget_tokens).toBe(16000); // low → high on glm-5.2
+    expect(parsed.output_config).toEqual({ effort: "high" });
   });
 
   it("thinkingLevel is irrelevant for OpenAI format (no injection)", () => {
@@ -844,6 +851,109 @@ describe("transformRequestBody — thinkingLevel (tier selector: low / high / ma
     const parsed = JSON.parse(out as string);
     expect(parsed.max_tokens).toBe(1000); // unchanged
     expect(parsed.thinking).toBeUndefined();
+  });
+});
+
+describe("transformRequestBody — per-model thinking specs (v0.3.10.0)", () => {
+  // Official zcode tier mapping (zcode.z.ai/docs/configuration) + captures:
+  //   glm-5.3 / glm-5.3-flash: low/high/max, max_tokens=128000, thinking forced
+  //   glm-5.2: high/max (+nothink), max_tokens=64000
+  //   glm-5-turbo / glm-4.7 / unknown: on/off only, max_tokens=64000
+  const mk = (model: string, extra: Record<string, unknown> = {}) =>
+    JSON.stringify({ model, max_tokens: 1000, messages: [{ role: "user", content: "hi" }], ...extra });
+
+  it("glm-5.3: three tiers with budget ladder + max_tokens=128000", () => {
+    const out = transformRequestBody(mk("glm-5.3", { thinking: { type: "enabled" } }), { format: "anthropic", thinkingLevel: "max" });
+    const parsed = JSON.parse(out as string);
+    expect(parsed.max_tokens).toBe(128000);
+    expect(parsed.thinking).toEqual({ type: "enabled", budget_tokens: 32000 });
+    expect(parsed.output_config).toEqual({ effort: "max" });
+
+    const outHigh = transformRequestBody(mk("glm-5.3", { thinking: { type: "enabled" } }), { format: "anthropic", thinkingLevel: "high" });
+    const pHigh = JSON.parse(outHigh as string);
+    expect(pHigh.max_tokens).toBe(128000);
+    expect(pHigh.thinking).toEqual({ type: "enabled", budget_tokens: 16000 });
+    expect(pHigh.output_config).toEqual({ effort: "high" });
+
+    const outLow = transformRequestBody(mk("glm-5.3", { thinking: { type: "enabled" } }), { format: "anthropic", thinkingLevel: "low" });
+    const pLow = JSON.parse(outLow as string);
+    expect(pLow.thinking).toEqual({ type: "enabled", budget_tokens: 8000 });
+    expect(pLow.output_config).toEqual({ effort: "low" });
+  });
+
+  it("glm-5.3: thinking is FORCED on when client sent no thinking field (API rejects disabled)", () => {
+    const out = transformRequestBody(mk("glm-5.3"), { format: "anthropic", thinkingLevel: "max" });
+    const parsed = JSON.parse(out as string);
+    expect(parsed.max_tokens).toBe(128000);
+    // Real zcode client never sends a thinking-off request for 5.3 — inject the
+    // full shape (selected tier; default max matches the real client default).
+    expect(parsed.thinking).toEqual({ type: "enabled", budget_tokens: 32000 });
+    expect(parsed.output_config).toEqual({ effort: "max" });
+  });
+
+  it("glm-5.3: thinking.type=disabled converted to enabled + low (official migration guidance)", () => {
+    const out = transformRequestBody(mk("glm-5.3", { thinking: { type: "disabled" } }), { format: "anthropic", thinkingLevel: "max" });
+    const parsed = JSON.parse(out as string);
+    expect(parsed.thinking).toEqual({ type: "enabled", budget_tokens: 8000 });
+    expect(parsed.output_config).toEqual({ effort: "low" });
+  });
+
+  it("glm-5.3-flash: same spec as glm-5.3 (text parameters consistent, official docs)", () => {
+    const out = transformRequestBody(mk("GLM-5.3-Flash", { thinking: { type: "enabled" } }), { format: "anthropic", thinkingLevel: "low" });
+    const parsed = JSON.parse(out as string);
+    expect(parsed.max_tokens).toBe(128000);
+    expect(parsed.thinking).toEqual({ type: "enabled", budget_tokens: 8000 });
+    expect(parsed.output_config).toEqual({ effort: "low" });
+  });
+
+  it("glm-5.2: two effort tiers, max_tokens=64000 (June capture)", () => {
+    const out = transformRequestBody(mk("glm-5.2", { thinking: { type: "enabled" } }), { format: "anthropic", thinkingLevel: "max" });
+    const parsed = JSON.parse(out as string);
+    expect(parsed.max_tokens).toBe(64000);
+    expect(parsed.thinking).toEqual({ type: "enabled", budget_tokens: 32000 });
+    expect(parsed.output_config).toEqual({ effort: "max" });
+  });
+
+  it("glm-5.2: selected low maps UP to high (official Coding-Plan mapping: low/medium → high)", () => {
+    const out = transformRequestBody(mk("glm-5.2", { thinking: { type: "enabled" } }), { format: "anthropic", thinkingLevel: "low" });
+    const parsed = JSON.parse(out as string);
+    expect(parsed.thinking).toEqual({ type: "enabled", budget_tokens: 16000 });
+    expect(parsed.output_config).toEqual({ effort: "high" });
+  });
+
+  it("glm-5.2: thinking stays optional — absent thinking → no-thinking wire shape", () => {
+    const out = transformRequestBody(mk("glm-5.2"), { format: "anthropic", thinkingLevel: "low" });
+    const parsed = JSON.parse(out as string);
+    expect(parsed.max_tokens).toBe(64000);
+    expect(parsed.thinking).toBeUndefined();
+    expect(parsed.output_config).toBeUndefined();
+  });
+
+  it("glm-5-turbo / glm-4.7: on/off thinking only — bare enabled, no budget, no effort, max_tokens=64000", () => {
+    for (const model of ["glm-5-turbo", "glm-4.7"]) {
+      const out = transformRequestBody(mk(model, { thinking: { type: "enabled", budget_tokens: 5000 } }), { format: "anthropic", thinkingLevel: "max" });
+      const parsed = JSON.parse(out as string);
+      expect(parsed.max_tokens).toBe(64000);
+      // No reasoning_effort support (GLM-5.2+ only) → zcode「开启/关闭」shape:
+      // bare {type:enabled} — client budget stripped, no output_config.
+      expect(parsed.thinking).toEqual({ type: "enabled" });
+      expect(parsed.output_config).toBeUndefined();
+    }
+  });
+
+  it("unknown model: default spec — on/off thinking, max_tokens=64000 (pre-v0.1.9 gateway-accepted shape)", () => {
+    const out = transformRequestBody(mk("glm-4.6", { thinking: { type: "enabled" } }), { format: "anthropic", thinkingLevel: "high" });
+    const parsed = JSON.parse(out as string);
+    expect(parsed.max_tokens).toBe(64000);
+    expect(parsed.thinking).toEqual({ type: "enabled" });
+    expect(parsed.output_config).toBeUndefined();
+  });
+
+  it("per-model injection is idempotent (re-run keeps the same per-model shape)", () => {
+    const body = mk("glm-5.3", { thinking: { type: "enabled" } });
+    const out1 = transformRequestBody(body, { format: "anthropic", thinkingLevel: "low" });
+    const out2 = transformRequestBody(out1 as string, { format: "anthropic", thinkingLevel: "low" });
+    expect(out2).toBe(out1);
   });
 });
 
@@ -1166,7 +1276,7 @@ describe("transformRequestBody — alignZCodeFormat (field fill + drop, v0.2.0+)
     // to match the real ZCode desktop client's wire shape. The test no longer needs
     // to send stream:true explicitly.
     const body = JSON.stringify({
-      model: "glm5.1",
+      model: "glm-5.3",
       messages: [{ role: "user", content: "hi" }],
       system: [
         { type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." },
@@ -1201,7 +1311,7 @@ describe("transformRequestBody — alignZCodeFormat (field fill + drop, v0.2.0+)
     // 4. stream forced to true (v0.2.0.4+: aligns with real ZCode client)
     expect(parsed.stream).toBe(true);
 
-    // 5. max_tokens forced to 128000 (thinking enabled)
+    // 5. max_tokens forced to the model spec value (glm-5.3 → 128000, v0.3.10.0)
     expect(parsed.max_tokens).toBe(128000);
 
     // 6. thinking simplified + budget injected
@@ -1215,7 +1325,7 @@ describe("transformRequestBody — alignZCodeFormat (field fill + drop, v0.2.0+)
     expect(parsed.system[0].text).toBe("You are ZCode, an interactive coding agent");
     expect(parsed.system[4].text).toContain("You are ZCode model working in Claude Code");
     expect(parsed.system[4].text).not.toContain("You are Claude Code, Anthropic's official CLI for Claude.");
-    expect(parsed.system[3].text).toBe("- You are powered by the model named glm5.1.");
+    expect(parsed.system[3].text).toBe("- You are powered by the model named glm-5.3.");
 
     // 9. v0.2.0.5: last system block carries cache_control (mirrors real ZCode
     // client's prompt-cache breakpoint — without this, the wire shape is
@@ -1493,9 +1603,10 @@ describe("transformRequestBody — alignZCodeFormat (message body fingerprint al
     expect(parsed.system[0].text).toBe("You are ZCode, an interactive coding agent");
     expect(parsed.system[4].text).toContain("You are ZCode model working in Claude Code");
 
-    // 8. thinking simplified + budget injected; max_tokens=128000; output_config injected
+    // 8. thinking simplified + budget injected; max_tokens=64000 (glm-5.2 spec);
+    //    output_config injected
     expect(parsed.thinking).toEqual({ type: "enabled", budget_tokens: 32000 });
-    expect(parsed.max_tokens).toBe(128000);
+    expect(parsed.max_tokens).toBe(64000);
     expect(parsed.output_config).toEqual({ effort: "max" });
 
     // 9. tool_choice + stream filled

@@ -2,6 +2,49 @@
 
 A reverse proxy for Z.AI / Bigmodel.cn coding-plan APIs that exposes both OpenAI-compatible and Anthropic-format endpoints.
 
+## v0.3.10.0 — Per-model thinking specs + current zcode model lineup
+
+Follow-up to v0.3.9.0: the thinking tiers are **per model**, not global. The
+official zcode docs (zcode.z.ai/docs/configuration) publish an exact tier
+mapping, and docs.z.ai documents the parameter matrix — both now drive a
+pinned per-model spec table (`src/proxy/thinking-specs.ts`):
+
+| Model | zcode tiers | budget ladder | max_tokens | Thinking off? |
+|-------|------------|---------------|-----------|---------------|
+| glm-5.3 | low / high / max | 8000 / 16000 / 32000 | 128000 | ❌ API rejects `disabled` |
+| glm-5.3-flash | low / high / max | 8000 / 16000 / 32000 | 128000 | ❌ API rejects `disabled` |
+| glm-5.2 | nothink / high / max | — / 16000 / 32000 | 64000 | ✅ |
+| glm-5-turbo | 开启 / 关闭 only | — (no effort) | 64000 | ✅ |
+| glm-4.7 | 开启 / 关闭 only | — (no effort) | 64000 | ✅ |
+| unknown / legacy | 开启 / 关闭 only | — (no effort) | 64000 | ✅ |
+
+This explains the earlier observations: the June capture (glm-5.2) showed two
+tiers + `max_tokens=64000`, the August capture (glm-5.3) showed three tiers +
+`max_tokens=128000` — both correct, per model.
+
+Behavior:
+
+- `injectZCodeThinkingFormat` now resolves the spec from `body.model`:
+  glm-5.3-family requests ALWAYS get the full thinking shape (missing
+  `thinking` → injected with the selected tier; `disabled` → converted to
+  `enabled` + low, per the official migration guidance); glm-5.2 keeps the
+  two-tier injection and its 64000 cap; effort-less models get bare
+  `{type:"enabled"}` with no budget/output_config (the long
+  gateway-accepted on/off shape).
+- Tier normalization follows the official Coding-Plan effort mapping
+  (e.g. selecting 低 for glm-5.2 maps up to 高).
+- The advertised model catalog (`GET /v1/models`, dashboard) is now the five
+  current zcode models incl. the new `glm-5.3-flash` (multimodal, 1M ctx).
+  Legacy ids (glm-4.5-air/4.6/4.6v/5/5v-turbo/5.1) still route fine when
+  requested explicitly. `defaultModel` default: glm-4.6 → glm-5.3.
+- Dashboard tier selector help text now documents the per-model table.
+
+Verification notes: glm-5.3 and glm-5.2 shapes are wire-captured; glm-5.3-flash
+follows the official "text parameters consistent with GLM-5.3" statement;
+glm-5-turbo / glm-4.7 use the documented no-effort shape with the legacy
+client cap. If you can capture zcode traffic for those models, the spec table
+is a one-line-per-model fix.
+
 ## v0.3.9.0 — Thinking tiers aligned with the real zcode client (three tiers, max_tokens 128000)
 
 The real zcode client updated its thinking controls: it now exposes **three**

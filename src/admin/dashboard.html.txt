@@ -1468,7 +1468,7 @@ td input{font-family:var(--font-mono)}
               </div>
               <div class="form-group">
                 <label class="form-label">模型列表（每行一个）</label>
-                <textarea id="cfgModels" rows="8" placeholder="glm-4.5&#10;glm-4.5-air&#10;glm-4.6&#10;..."></textarea>
+                <textarea id="cfgModels" rows="8" placeholder="glm-5.3-flash<textarea id="cfgModels" rows="8" placeholder="glm-4.5&#10;glm-4.5-air&#10;glm-4.6&#10;..."></textarea>#10;glm-5.3<textarea id="cfgModels" rows="8" placeholder="glm-4.5&#10;glm-4.5-air&#10;glm-4.6&#10;..."></textarea>#10;glm-5.2<textarea id="cfgModels" rows="8" placeholder="glm-4.5&#10;glm-4.5-air&#10;glm-4.6&#10;..."></textarea>#10;glm-5-turbo<textarea id="cfgModels" rows="8" placeholder="glm-4.5&#10;glm-4.5-air&#10;glm-4.6&#10;..."></textarea>#10;glm-4.7"></textarea>
                 <div class="form-help">在 <code class="code-inline">/v1/models</code> 接口中返回，并用于路由匹配</div>
               </div>
             </div>
@@ -1560,7 +1560,7 @@ td input{font-family:var(--font-mono)}
                   <option value="high">高（budget_tokens=16000，effort=high）</option>
                   <option value="low">低（budget_tokens=8000，effort=low）</option>
                 </select>
-                <div class="form-help" style="padding-top:6px">控制开启思考时注入的 ZCode 档位。客户端发送 <code class="code-inline">thinking.type=enabled</code> 时按此档位改写：<strong>最高</strong> → max_tokens=128000 / budget_tokens=32000 / effort=max；<strong>高</strong> → max_tokens=128000 / budget_tokens=16000 / effort=high；<strong>低</strong> → max_tokens=128000 / budget_tokens=8000 / effort=low。客户端不发 thinking 字段时只注入 max_tokens=128000，不强制开思考（对应 ZCode「不思考」模式）。默认「最高」（与真实 ZCode 客户端 max 档位一致）。</div>
+                <div class="form-help" style="padding-top:6px">选择<strong>期望档位</strong>，实际注入按请求模型自动归一（v0.3.10.0，对齐官方 zcode 档位映射）：<strong>glm-5.3 / 5.3-flash</strong> → low=budget 8000 / high=16000 / max=32000，max_tokens=128000，<strong>思考恒开</strong>（客户端不发或发 disabled 也会注入 enabled）：<strong>glm-5.2</strong> → high=16000 / max=32000（选 low 自动升到 high），max_tokens=64000，可不思考；<strong>glm-5-turbo / glm-4.7 及其他</strong> → 仅思考开/关，无档位字段，max_tokens=64000。默认「最高」（与真实 zcode 客户端默认档一致）。</div>
               </div>
             </div>
           </div>

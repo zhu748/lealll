@@ -44,28 +44,30 @@ describe("providers", () => {
 });
 
 describe("models", () => {
-  it("MODELS contains exactly the 10 pinned coding-plan models", () => {
-    expect(MODELS).toHaveLength(10);
+  // v0.3.10.0: catalog aligned with the CURRENT zcode lineup (2026-08) —
+  // five models. Legacy ids are no longer advertised but still routable
+  // (any glm-* id is accepted upstream; see model-routing.ts).
+  it("MODELS contains exactly the 5 current zcode models", () => {
+    expect(MODELS).toHaveLength(5);
     const ids = listModelIds();
     expect(ids).toEqual([
-      "glm-4.5-air", "glm-4.6", "glm-4.6v", "glm-4.7",
-      "glm-5", "glm-5-turbo", "glm-5v-turbo", "glm-5.1", "glm-5.2", "glm-5.3",
+      "glm-5.3-flash", "glm-5.3", "glm-5.2", "glm-5-turbo", "glm-4.7",
     ]);
   });
 
-  it("getModel returns known model glm-4.6", () => {
-    const m = getModel("glm-4.6");
+  it("getModel returns known model glm-5.3", () => {
+    const m = getModel("glm-5.3");
     expect(m).toBeDefined();
-    expect(m!.id).toBe("glm-4.6");
-    expect(m!.name).toBe("GLM 4.6");
-    expect(m!.contextWindow).toBe(200_000);
+    expect(m!.id).toBe("glm-5.3");
+    expect(m!.name).toBe("GLM 5.3");
+    expect(m!.contextWindow).toBe(1_000_000);
     expect(m!.maxOutputTokens).toBe(128_000);
   });
 
-  it("getModel returns glm-4.5-air with correct fields", () => {
-    const m = getModel("glm-4.5-air");
+  it("getModel returns glm-5.3-flash with correct fields (multimodal flagship)", () => {
+    const m = getModel("glm-5.3-flash");
     expect(m).toBeDefined();
-    expect(m!.contextWindow).toBe(200_000);
+    expect(m!.contextWindow).toBe(1_000_000);
     expect(m!.maxOutputTokens).toBe(128_000);
   });
 
@@ -84,16 +86,17 @@ describe("models", () => {
     }
   });
 
-  it("all models except glm-5.2/glm-5.3 have 200k context", () => {
+  it("all models except the 5.x flagship trio have 200k context", () => {
     for (const m of MODELS) {
-      if (m.id === "glm-5.2" || m.id === "glm-5.3") continue;
+      if (m.id === "glm-5.2" || m.id === "glm-5.3" || m.id === "glm-5.3-flash") continue;
       expect(m.contextWindow).toBe(200_000);
     }
   });
 
-  it("glm-5.2 and glm-5.3 have 1M context", () => {
+  it("glm-5.2 / glm-5.3 / glm-5.3-flash have 1M context", () => {
     expect(getModel("glm-5.2")!.contextWindow).toBe(1_000_000);
     expect(getModel("glm-5.3")!.contextWindow).toBe(1_000_000);
+    expect(getModel("glm-5.3-flash")!.contextWindow).toBe(1_000_000);
   });
 
   it("listModelIds matches MODELS length", () => {
@@ -102,8 +105,8 @@ describe("models", () => {
 
   it("includes key GLM models", () => {
     const ids = listModelIds();
-    expect(ids).toContain("glm-4.6");
+    expect(ids).toContain("glm-4.7");
     expect(ids).toContain("glm-5.2");
-    expect(ids).toContain("glm-5v-turbo");
+    expect(ids).toContain("glm-5-turbo");
   });
 });

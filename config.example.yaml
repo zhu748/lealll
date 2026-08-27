@@ -102,19 +102,19 @@ providers:
     anthropicBase: "https://open.bigmodel.cn/api/anthropic"
     openaiBase: "https://open.bigmodel.cn/api/coding/paas/v4"
 
-defaultModel: glm-4.6
+defaultModel: glm-5.3
 
+# v0.3.10.0: aligned with the CURRENT zcode model lineup (2026-08) — the
+# zcode client offers exactly these five models. Legacy ids (glm-4.5-air,
+# glm-4.6, glm-4.6v, glm-5, glm-5v-turbo, glm-5.1) still WORK when requested
+# explicitly (any glm-* id is accepted upstream); they are just no longer
+# advertised to clients via GET /v1/models.
 models:
-  - glm-4.5-air
-  - glm-4.6
-  - glm-4.6v
-  - glm-4.7
-  - glm-5
-  - glm-5-turbo
-  - glm-5v-turbo
-  - glm-5.1
-  - glm-5.2
+  - glm-5.3-flash
   - glm-5.3
+  - glm-5.2
+  - glm-5-turbo
+  - glm-4.7
 
 # Identity values used to mimic the ZCode desktop client (v0.3.0: model
 # requests carry the FULL pio header set — see identity.ts). All optional;
@@ -322,23 +322,22 @@ anthropic:
   #   4. Keep role: "system" inside messages[] (don't relocate to top-level system)
   # Default: false. Env var: ZCODE_PROXY_ALIGN_ZCODE_FORMAT=1
   alignZCodeFormat: false
-  # ZCode thinking tier — injected when a client sends thinking.type=enabled.
-  # v0.3.9: three tiers matching the real zcode client (captured 2026-08):
-  #   max  (default): max_tokens=128000, budget_tokens=32000, effort=max
-  #   high          : max_tokens=128000, budget_tokens=16000, effort=high
-  #   low           : max_tokens=128000, budget_tokens=8000,  effort=low
-  # When the client does NOT send `thinking`, only max_tokens=128000 is
-  # injected (ZCode "no thinking" mode) — thinking is never forced on.
-  # Hot-reloadable from the dashboard (代理规则 → ZCode 思考等级).
+  # ZCode thinking tier — the REQUESTED tier, normalized per model at
+  # injection time (v0.3.10.0). Official zcode tier mapping
+  # (zcode.z.ai/docs/configuration):
+  #   glm-5.3 / glm-5.3-flash: low(8000) / high(16000) / max(32000)
+  #     — thinking ALWAYS on (API rejects disabled), max_tokens=128000
+  #   glm-5.2: nothink / high(16000) / max(32000), max_tokens=64000
+  #     — selected "low" maps up to "high" (official Coding-Plan mapping)
+  #   glm-5-turbo / glm-4.7 (and unknown models): on/off thinking only,
+  #     max_tokens=64000, no effort/budget injection
+  # Default: max. Hot-reloadable from the dashboard (代理规则 → ZCode 思考等级).
   # Env var: ZCODE_PROXY_THINKING_LEVEL=low|high|max
   thinkingLevel: max
-# NOTE: ZCode thinking-format injection (max_tokens=128000 + tier-specific
-# budget_tokens + output_config.effort) is now UNCONDITIONAL default behavior
-# since v0.1.9. Any Anthropic request with thinking.type === "enabled"
-# automatically gets these fields rewritten to match the real ZCode desktop
-# client. No config needed — this aligns our request body fingerprint with the
-# real client at the WAF body-inspection layer.
-# v0.3.9: aligned with the real zcode client's THREE thinking tiers
-# (captured 2026-08): max=32000, high=16000, low=8000, all with
-# max_tokens=128000. Configure the tier via anthropic.thinkingLevel
-# (low|high|max) or ZCODE_PROXY_THINKING_LEVEL; default max.
+# NOTE: ZCode thinking-format injection is now UNCONDITIONAL default
+# behavior since v0.1.9. Any Anthropic request automatically gets the
+# per-model thinking shape (max_tokens / budget_tokens / output_config.effort
+# as applicable) matching the real ZCode desktop client — see the
+# anthropic.thinkingLevel docs above and thinking-specs.ts. No config needed —
+# this aligns our request body fingerprint with the real client at the WAF
+# body-inspection layer.

@@ -398,7 +398,7 @@ export async function proxyRequest(
       bodyObj.model = mapped;
       if (meta.model === clientModel) meta.model = mapped;
     } else if (!isKnownGlmModel(clientModel)) {
-      const fallback = config.defaultModel || "glm-4.6";
+      const fallback = config.defaultModel || "glm-5.3";
       proxyLog(`${reqId} model fallback: ${clientModel} → ${fallback} (non-GLM model not accepted upstream)`);
       bodyObj.model = fallback;
       if (meta.model === clientModel) meta.model = fallback;

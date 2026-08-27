@@ -45,7 +45,7 @@ const DEFAULTS = {
   UPSTREAM_TIMEOUT_MS: 0,
   PROVIDER: "zai" as const,
   PLAN: "coding-plan" as const,
-  DEFAULT_MODEL: "glm-4.6",
+  DEFAULT_MODEL: "glm-5.3",
   LOG_LEVEL: "info" as const,
   ZAI_ANTHROPIC_BASE: "https://api.z.ai/api/anthropic",
   ZAI_OPENAI_BASE: "https://api.z.ai/api/coding/paas/v4",

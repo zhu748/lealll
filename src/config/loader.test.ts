@@ -85,7 +85,7 @@ auth:
     expect(cfg.server.port).toBe(8080);
     expect(cfg.server.host).toBe("0.0.0.0");
     expect(cfg.provider).toBe("zai");
-    expect(cfg.defaultModel).toBe("glm-4.6");
+    expect(cfg.defaultModel).toBe("glm-5.3");
     expect(cfg.logging.level).toBe("info");
     expect(cfg.providers.zai.anthropicBase).toBe("https://api.z.ai/api/anthropic");
     expect(cfg.providers.bigmodel.openaiBase).toBe("https://open.bigmodel.cn/api/coding/paas/v4");
@@ -723,13 +723,17 @@ auth:
   // zips as config.yaml) must default to oauth + zai and include glm-5.3.
   // Regression guard for the v0.3.4.0 packaging gap: the example model list
   // was missing glm-5.3, so fresh installs only saw 9 models.
-  it("config.example.yaml: defaults to oauth mode, provider zai, 10 models incl. glm-5.3", () => {
+  it("config.example.yaml: defaults to oauth mode, provider zai, 5 current zcode models incl. glm-5.3", () => {
     const cfg = loadConfig("./config.example.yaml");
     expect(cfg.auth.mode).toBe("oauth");
     expect(cfg.provider).toBe("zai");
-    expect(cfg.models).toHaveLength(10);
+    expect(cfg.models).toHaveLength(5);
     expect(cfg.models).toContain("glm-5.3");
-    expect(cfg.defaultModel).toBe("glm-4.6");
+    expect(cfg.models).toContain("glm-5.3-flash");
+    expect(cfg.models).toContain("glm-5.2");
+    expect(cfg.models).toContain("glm-5-turbo");
+    expect(cfg.models).toContain("glm-4.7");
+    expect(cfg.defaultModel).toBe("glm-5.3");
     // v0.3.9: template ships the three-tier thinkingLevel explicitly.
     expect(cfg.thinkingLevel).toBe("max");
   });
