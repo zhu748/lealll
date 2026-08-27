@@ -9,12 +9,17 @@
 #     Note: bun.lock uses the new JSON lockfile format (lockfileVersion: 1)
 #     introduced in Bun 1.2, so we MUST use Bun >= 1.2 here.
 #
-# v0.2.0.8 hardening:
+# v0.2.0.8 hardening / v0.3.2.0 slim-down:
 #   - Multi-stage build (deps stage cached separately from source).
 #   - `oven/bun:1.3.14-slim` base (smaller than `-debian`).
 #   - `tini` as PID 1 for proper signal forwarding / zombie reaping.
 #   - Non-root `zcode` user (uid 1001) — a container escape can no longer
 #     grant root inside the image.
+#   - Chromium + Xvfb REMOVED: the v0.3.0 captcha rewrite uses the in-process
+#     happy-dom solver (pure JS, no browser). This cuts the image by ~700MB.
+#   - `adduser` is installed explicitly: the oven/bun slim base does not
+#     ship the adduser wrapper script (observed "adduser: not found", exit
+#     127, in the multi-arch GHCR build 2026-08-27).
 
 # --- Stage 1: dependencies (cached layer) -----------------------------------
 FROM oven/bun:1.3.14-slim AS deps
@@ -29,23 +34,17 @@ FROM oven/bun:1.3.14-slim AS runtime
 # tini: minimal init for proper SIGTERM forwarding + zombie reaping.
 # Render sends SIGTERM on scale-down; without tini, Bun might exit uncleanly
 # and lose in-flight SSE responses.
-# Chromium + Xvfb: on-demand start-plan captcha challenges need a real browser
-# runtime. Xvfb lets Chromium run non-headless inside Render's container, which
-# is closer to ZCode Electron than the JSDOM fallback.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
+        adduser \
         ca-certificates \
-        chromium \
-        fonts-liberation \
         tini \
-        xvfb \
     && rm -rf /var/lib/apt/lists/*
 
 # Render injects PORT at runtime. We default to 8080 for local `docker run`.
 ENV ZCODE_PROXY_PORT=8080 \
     ZCODE_PROXY_CONFIG=/data/config.yaml \
     ZCODE_PROXY_STORE_DIR=/data/.zcode-proxy \
-    ZCODE_CAPTCHA_CHROME_PATH=/usr/bin/chromium \
     NODE_ENV=production
 
 # Non-root user. uid 1001 avoids colliding with any host-assigned uid in
