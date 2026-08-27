@@ -8,6 +8,7 @@ import type { AuthManager } from "../auth/manager.js";
 import { handleChatCompletions, handleListModels } from "./routes-openai.js";
 import { handleMessages } from "./routes-anthropic.js";
 import { handleResponses } from "./routes-responses.js";
+import { handleAsyncMessages, handleAsyncChat, handleAsyncHealth } from "../async/handler.js";
 import { errorResponse } from "../proxy/translated-response.js";
 import { handleAdminRoute, type AdminOptions } from "../admin/api.js";
 import { timingSafeEqual } from "../utils/crypto.js";
@@ -112,6 +113,27 @@ export function createFetchHandler(opts: ServerOptions): (req: Request) => Promi
         if (!authHeader || !checkProxyKey(authHeader, config.auth.proxyApiKey)) {
           return addCorsHeaders(errorResponse(401, "authentication_error", "Invalid or missing proxy API key"), req, currentCorsAllow());
         }
+      }
+
+      // --- Async (off-peak) bridge routes (v0.3.1, upstream 175ff2a) ---
+      // "错峰算力" ticket-queue endpoints: the proxy holds the client connection
+      // open (SSE keepalives) until an off-peak ticket is ready, then streams the
+      // LLM response through. Gated LIVE per-request on config.async.enabled so
+      // the dashboard can toggle it without a restart. Requires the active
+      // credential to carry a JWT (OAuth / ZCode-imported) — apikey-only
+      // accounts get a 400 async_credentials_unavailable from the handler.
+      if (config.async.enabled && path.startsWith("/async/")) {
+        const asyncOpts = { config, auth, fetchImpl: opts.fetchImpl, debug: config.logging.debug === true };
+        if (method === "POST" && path === "/async/v1/messages") {
+          return addCorsHeaders(await handleAsyncMessages(req, asyncOpts), req, currentCorsAllow());
+        }
+        if (method === "POST" && path === "/async/v1/chat/completions") {
+          return addCorsHeaders(await handleAsyncChat(req, asyncOpts), req, currentCorsAllow());
+        }
+        if (method === "GET" && path === "/async/v1/health") {
+          return addCorsHeaders(await handleAsyncHealth(req, asyncOpts), req, currentCorsAllow());
+        }
+        return addCorsHeaders(errorResponse(404, "not_found_error", `No async route for ${method} ${path}`), req, currentCorsAllow());
       }
 
       // --- Static route lookup (O(1)) ---

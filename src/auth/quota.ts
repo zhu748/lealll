@@ -24,6 +24,8 @@ import type { ProviderId } from "../provider/types.js";
 import type { FetchFn } from "./oauth.js";
 import { credentialString } from "./types.js";
 import { getProvider } from "../provider/providers.js";
+import type { ProxyIdentity } from "../config/types.js";
+import { buildIdentityHeaders } from "../proxy/identity.js";
 
 const ZCODE_PLAN_BASE = "https://zcode.z.ai/api/v1/zcode-plan";
 // MUST match a real ZCode desktop-client version. The billing endpoints use
@@ -35,7 +37,12 @@ const ZCODE_PLAN_BASE = "https://zcode.z.ai/api/v1/zcode-plan";
 // app_version=3.1.x/3.2.x -> instant activation. Re-checked against ZCode 3.2.5 on
 // 2026-07-04: entitlement is now probed via billing/balance first. Activation
 // is irreversible, so the version only matters on the first successful query.
-const DEFAULT_APP_VERSION = "3.2.5";
+//
+// v0.3.1: kept in lock-step with config/loader.ts DEFAULTS.APP_VERSION (3.9.2,
+// released 2026-08-26). This constant is only the LAST-resort fallback when a
+// caller passes neither a version nor an identity — every production caller
+// threads config.identity through, so the wire value tracks the config default.
+const DEFAULT_APP_VERSION = "3.9.2";
 const REQUEST_TIMEOUT_MS = 15_000;
 const MAX_QUOTA_JSON_BYTES = 2 * 1024 * 1024;
 const MAX_TIMER_MS = 2_147_483_647;
@@ -204,20 +211,38 @@ async function readJsonLimited(resp: Response, maxBytes = MAX_QUOTA_JSON_BYTES, 
  *                   server as the start-plan activation gate — see
  *                   DEFAULT_APP_VERSION). Callers should pass the resolved
  *                   identity.appVersion from config so it matches the real
- *                   client. Defaults to DEFAULT_APP_VERSION ("3.2.5").
+ *                   client. Defaults to DEFAULT_APP_VERSION ("3.9.2").
+ * @param identity  Optional full proxy identity. When provided (or derived
+ *                  from appVersion), every quota request carries the same
+ *                  identity header set the real ZCode desktop client emits
+ *                  (`User-Agent: ZCode/<ver>`, `X-ZCode-App-Version`,
+ *                  `X-Title`, platform headers, …). Without this the billing
+ *                  request used to go out with ONLY an Authorization header —
+ *                  zero User-Agent — which is a fingerprint no real client
+ *                  ever produces and an easy WAF flag on zcode.z.ai.
  */
 export async function queryQuota(
   cred: Credential,
   fetchImpl: FetchFn = fetch,
   appVersion: string = DEFAULT_APP_VERSION,
+  identity?: ProxyIdentity,
 ): Promise<QuotaResult> {
   const fetchWithTimeout = withTimeout(fetchImpl);
   const plan = cred.plan ?? "coding-plan";
+  // Real-client header set: explicit identity wins; otherwise synthesize one
+  // from the appVersion param (with the same defaults config.loader applies)
+  // so even legacy callers send a plausible UA.
+  const effectiveIdentity: ProxyIdentity = identity ?? {
+    appVersion,
+    sourceTitle: "cli",
+    refererOrigin: "https://zcode.z.ai",
+  };
+  const identityHeaders = buildIdentityHeaders(effectiveIdentity);
 
   if (plan === "start-plan" && cred.jwt?.trim()) {
-    return queryStartPlan(cred, fetchWithTimeout, appVersion);
+    return queryStartPlan(cred, fetchWithTimeout, appVersion, identityHeaders);
   }
-  return queryCodingPlan(cred, fetchWithTimeout);
+  return queryCodingPlan(cred, fetchWithTimeout, identityHeaders);
 }
 
 /** start-plan path: billing/balance first, then billing/current as legacy fallback. */
@@ -225,6 +250,7 @@ async function queryStartPlan(
   cred: Credential,
   fetchImpl: FetchFn,
   appVersion: string,
+  identityHeaders: Record<string, string>,
 ): Promise<QuotaResult> {
   const base: QuotaResult = {
     plan: "start-plan",
@@ -235,7 +261,10 @@ async function queryStartPlan(
     limits: [],
   };
 
-  const headers = { Authorization: normalizeBearerHeader(cred.jwt!) };
+  // Full client header set (UA/X-ZCode-App-Version/…) + the plan JWT. The
+  // desktop client's billing calls carry its standard identity headers; a
+  // bare Authorization-only request is a fingerprint mismatch.
+  const headers = { ...identityHeaders, Authorization: normalizeBearerHeader(cred.jwt!) };
 
   // ZCode 3.2.5 probes start-plan entitlement through billing/balance.
   const balanceUrl = `${ZCODE_PLAN_BASE}/billing/balance?app_version=${encodeURIComponent(appVersion)}`;
@@ -304,6 +333,7 @@ async function queryStartPlan(
 async function queryCodingPlan(
   cred: Credential,
   fetchImpl: FetchFn,
+  identityHeaders: Record<string, string>,
 ): Promise<QuotaResult> {
   const base: QuotaResult = {
     plan: "coding-plan",
@@ -320,7 +350,7 @@ async function queryCodingPlan(
 
   let body: any;
   try {
-    body = await fetchJson(fetchImpl, url, { authorization: auth });
+    body = await fetchJson(fetchImpl, url, { ...identityHeaders, authorization: auth });
   } catch {
     return { ...base, unavailableReason: "unavailable" };
   }

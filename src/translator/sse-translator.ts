@@ -8,7 +8,7 @@ import { openaiUsageToAnthropic } from "./anthropic-to-openai.js";
 import { parseSSEChunk, waitForBackpressure, type ParsedSSE } from "../utils/sse.js";
 import { SSE as SSE_CONST } from "../utils/constants.js";
 
-interface TranslationState {
+export interface TranslationState {
   messageId: string;
   model: string;
   roleSent: boolean;
@@ -53,7 +53,7 @@ interface TranslationState {
   finalChunkSent: boolean;
 }
 
-function initState(model: string): TranslationState {
+export function initState(model: string): TranslationState {
   return {
     messageId: "",
     model,
@@ -217,7 +217,7 @@ export function anthropicSseToOpenaiSse(
   });
 }
 
-function translateEvent(state: TranslationState, sse: ParsedSSE): string | null {
+export function translateEvent(state: TranslationState, sse: ParsedSSE): string | null {
   const data = sse.data as AnthropicStreamEvent;
 
   switch (data.type) {

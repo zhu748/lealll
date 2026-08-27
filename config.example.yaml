@@ -114,8 +114,9 @@ models:
 identity:
   # Mirrors process.env.ZCODE_APP_VERSION in the ZCode bundle.
   # Must be printable ASCII; non-conforming values fall back to the default.
-  # Default: "3.9.1" (current ZCode release). Override to match your real client.
-  appVersion: "3.9.1"
+  # Default: "3.9.2" (current ZCode release, 2026-08-26). Override to match
+  # your real client — the start-plan trial-activation gate is version-sensitive.
+  appVersion: "3.9.2"
   # Release channel header (X-Release-Channel). Default "production".
   # Env var: ZCODE_RELEASE_CHANNEL.
   releaseChannel: "production"
@@ -158,6 +159,37 @@ endpointRouting:
 clientSigning:
   enabled: true
   origin: "https://zcode.z.ai"
+
+# Async (off-peak / 错峰算力) bridge (v0.3.1, upstream zcode-api 175ff2a).
+# When enabled, exposes three extra endpoints that route through ZCode's
+# off-peak ticket queue — the GLM Coding Plan "错峰时段 5 小时额度重置"
+# benefit (ZCode 3.8.1+):
+#   POST /async/v1/messages          (Anthropic-format clients)
+#   POST /async/v1/chat/completions  (OpenAI-format clients)
+#   GET  /async/v1/health            (probe queue availability)
+# The proxy holds the client connection open with SSE keepalive comments
+# while the ticket is queued, then streams the LLM response once the ticket
+# is ready. Auto-retries (maxRetries) when a ticket expires in queue.
+# Requires the active account to be OAuth / ZCode-imported (needs JWT);
+# apikey-only accounts get 400 async_credentials_unavailable.
+# Env var: ZCODE_ASYNC_ENABLED=1 enables without YAML.
+async:
+  enabled: false
+  origin: "https://zcode.z.ai"
+  # Ticket-status poll interval in ms.
+  pollIntervalMs: 5000
+  # SSE keepalive comment interval during queue wait, in ms.
+  keepAliveIntervalMs: 3000
+  # Max total wait for a ticket to become ready, in ms. 0 = unlimited.
+  maxWaitMs: 0
+  # Max auto-retry count when a ticket expires in queue.
+  maxRetries: 3
+  # Best-effort settle (close-out) call timeout in ms.
+  settleTimeoutMs: 8000
+  # Control-plane (takeTicket / pollStatus) call timeout in ms.
+  controlTimeoutMs: 15000
+  # Optional model override; empty string uses the request's model.
+  defaultModel: ""
 
 # Start-plan captcha behavior (v0.3.0: in-process happy-dom solver + token
 # pool — no Chrome, no jsdom, no browser dependency):

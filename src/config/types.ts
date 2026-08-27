@@ -231,6 +231,41 @@ export interface ClientSigningConfig {
   origin: string;
 }
 
+/**
+ * Async (off-peak / idle-plan) bridge configuration (upstream zcode-api v2.6.0,
+ * commit 175ff2a). When `enabled`, exposes `/async/v1/messages` and
+ * `/async/v1/chat/completions` that route to ZCode's off-peak ticket-queue
+ * backend — the “错峰算力” feature that grants GLM Coding Plan subscribers a
+ * 5-hour quota reset during off-peak compute hours (ZCode 3.8.1+). The proxy
+ * keeps the client connection alive with SSE comments during ticket-queue
+ * wait, forwards the LLM stream once the ticket is `ready`, and auto-retries
+ * on ticket-expired (up to `maxRetries`).
+ *
+ * Requires the active credential to carry a JWT (OAuth / ZCode-imported
+ * accounts). apikey-only accounts lack the JWT and the route entry returns
+ * 400 `async_credentials_unavailable`.
+ */
+export interface AsyncConfig {
+  /** Enable the `/async/*` routes. Default `false`. */
+  enabled: boolean;
+  /** Base origin for off-peak endpoints. Default `"https://zcode.z.ai"`. */
+  origin: string;
+  /** Ticket-status poll interval in ms. Default `5000`. */
+  pollIntervalMs: number;
+  /** SSE keepalive comment interval during ticket-queue wait, in ms. Default `3000`. */
+  keepAliveIntervalMs: number;
+  /** Maximum total wait time for a ticket to become `ready`, in ms. `0` = unlimited. Default `0`. */
+  maxWaitMs: number;
+  /** Maximum auto-retry count on `off-peak-ticket-expired`. Default `3`. */
+  maxRetries: number;
+  /** Settle call timeout in ms (best-effort close-out on completion/abort). Default `8000`. */
+  settleTimeoutMs: number;
+  /** Control-plane call (takeTicket/pollStatus) timeout in ms. Default `15000`. */
+  controlTimeoutMs: number;
+  /** Optional model override; empty string uses the request's `model`. Default `""`. */
+  defaultModel: string;
+}
+
 /** Top-level proxy configuration. */
 export interface ProxyConfig {
   server: {
@@ -343,6 +378,11 @@ export interface ProxyConfig {
    * Fail-open. Start-plan is exempt.
    */
   clientSigning: ClientSigningConfig;
+  /**
+   * Async (off-peak) bridge (upstream v2.6.0). Default: disabled — opt-in via
+   * `async.enabled: true`. Requires JWT-bearing credentials.
+   */
+  async: AsyncConfig;
   logging: {
     level: "debug" | "info" | "warn" | "error";
     /**

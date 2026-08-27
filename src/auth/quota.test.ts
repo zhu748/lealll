@@ -51,6 +51,50 @@ const BIGMODEL_CODING_CRED: Credential = {
 };
 
 describe("queryQuota — start-plan", () => {
+  it("sends the real-client identity header set (UA + X-ZCode-App-Version) on billing calls", async () => {
+    const captured: { headers: Record<string, string>; url: string }[] = [];
+    const fetchImpl = mockFetch(
+      {
+        "billing/balance": () =>
+          jsonResp({
+            plans: [{ name: "Start Plan", plan_id: "start-plan", status: "active" }],
+            balances: [{ entitlement_id: "ent1", total_units: 10, remaining_units: 5 }],
+          }),
+      },
+      captured,
+    );
+
+    await queryQuota(START_PLAN_CRED, fetchImpl, "3.9.2");
+    expect(captured.length).toBeGreaterThan(0);
+    // v0.3.1: billing requests must never go out bare — the desktop client
+    // always presents its identity headers (anti-WAF fingerprint).
+    expect(captured.every((c) => c.headers["User-Agent"] === "ZCode/3.9.2")).toBe(true);
+    expect(captured.every((c) => c.headers["X-ZCode-App-Version"] === "3.9.2")).toBe(true);
+    expect(captured.every((c) => typeof c.headers["X-Title"] === "string" && c.headers["X-Title"].length > 0)).toBe(true);
+    expect(captured.every((c) => c.headers["Authorization"] === "Bearer theJwtToken")).toBe(true);
+  });
+
+  it("uses the passed identity (not just appVersion) for header construction", async () => {
+    const captured: { headers: Record<string, string>; url: string }[] = [];
+    const fetchImpl = mockFetch(
+      {
+        "billing/balance": () =>
+          jsonResp({
+            plans: [{ name: "Start Plan", plan_id: "start-plan", status: "active" }],
+            balances: [],
+          }),
+      },
+      captured,
+    );
+
+    await queryQuota(START_PLAN_CRED, fetchImpl, "3.9.2", {
+      appVersion: "3.9.2",
+      sourceTitle: "custom-title",
+      refererOrigin: "https://zcode.z.ai",
+    });
+    expect(captured[0].headers["X-Title"]).toBe("Z Code@custom-title");
+  });
+
   it("aggregates remaining + plan name + expiry from the ZCode 3.2.5 billing/balance envelope", async () => {
     const captured: { headers: Record<string, string>; url: string }[] = [];
     const fetchImpl = mockFetch(

@@ -24,6 +24,7 @@ function makeConfig(overrides: Partial<ProxyConfig> = {}): ProxyConfig {
     identity: { appVersion: "test-1.0.0", sourceTitle: "cli", refererOrigin: "https://zcode.z.ai" },    clientIdentity: { mode: "off", ttlSeconds: 900, maxSessions: 1024 },
     endpointRouting: { enabled: false, origin: "https://zcode.z.ai" },
     clientSigning: { enabled: false, origin: "https://zcode.z.ai" },
+    async: { enabled: false, origin: "https://zcode.z.ai", pollIntervalMs: 5000, keepAliveIntervalMs: 3000, maxWaitMs: 0, maxRetries: 3, settleTimeoutMs: 8000, controlTimeoutMs: 15000, defaultModel: "" },
 
     logging: { level: "info" },
     retry: { maxRetries: 0, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3 },
@@ -346,5 +347,73 @@ describe("route handler exports", () => {
 
   it("handleMessages is a function", () => {
     expect(typeof handleMessages).toBe("function");
+  });
+});
+
+describe("async (off-peak) bridge routes", () => {
+  it("returns 404 when async is disabled (default)", async () => {
+    const config = makeConfig();
+    const auth = new AuthManager({ mode: "apikey", provider: "zai", apiKey: "test" });
+    const handler = createFetchHandler({ config, auth, fetchImpl: mockUpstream() });
+
+    const resp = await handler(new Request("http://localhost/async/v1/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "glm-4.6", max_tokens: 10, messages: [{ role: "user", content: "hi" }] }),
+    }));
+    expect(resp.status).toBe(404);
+  });
+
+  it("returns 400 async_credentials_unavailable when the active credential lacks a JWT", async () => {
+    const config = makeConfig();
+    (config.async as any).enabled = true;
+    const auth = new AuthManager({ mode: "apikey", provider: "zai", apiKey: "test" });
+    const handler = createFetchHandler({ config, auth, fetchImpl: mockUpstream() });
+
+    const resp = await handler(new Request("http://localhost/async/v1/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "glm-4.6", max_tokens: 10, messages: [{ role: "user", content: "hi" }] }),
+    }));
+    expect(resp.status).toBe(400);
+    const body = await resp.json() as { error?: { type?: string } };
+    expect(body.error?.type).toBe("async_credentials_unavailable");
+  });
+
+  it("GET /async/v1/health proxies ticket availability with a JWT-bearing credential", async () => {
+    const config = makeConfig();
+    (config.async as any).enabled = true;
+    const auth = new AuthManager({ mode: "oauth", provider: "zai" });
+    auth.setOAuthCredential({
+      apiKey: "ak", secret: "sec", provider: "zai", plan: "coding-plan", userId: "u1",
+      jwt: "the-jwt",
+    });
+
+    // Mock the off-peak control plane: availability probe returns can_take_number.
+    const offPeakFetch = (async (input: RequestInfo | URL): Promise<Response> => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/api/v1/off-peak/ticket/availability")) {
+        return new Response(JSON.stringify({ code: 0, data: { can_take_number: true } }), {
+          status: 200, headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response("not found", { status: 404 });
+    }) as typeof fetch;
+
+    const handler = createFetchHandler({ config, auth, fetchImpl: offPeakFetch });
+    const resp = await handler(new Request("http://localhost/async/v1/health", { method: "GET" }));
+    expect(resp.status).toBe(200);
+    const body = await resp.json() as { canTakeNumber?: boolean };
+    expect(body.canTakeNumber).toBe(true);
+  });
+
+  it("unknown /async/* path returns 404", async () => {
+    const config = makeConfig();
+    (config.async as any).enabled = true;
+    const auth = new AuthManager({ mode: "apikey", provider: "zai", apiKey: "test" });
+    const handler = createFetchHandler({ config, auth, fetchImpl: mockUpstream() });
+
+    const resp = await handler(new Request("http://localhost/async/v1/unknown", { method: "POST" }));
+    expect(resp.status).toBe(404);
   });
 });

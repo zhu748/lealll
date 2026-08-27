@@ -4,7 +4,7 @@
  * All routes require the proxy API key (same key used by API clients).
  * Mounted under /admin/api/* in server.ts.
  */
-import type { ProxyConfig, RoutingRule, ModelMapping, ResponsesThinkingConfig } from "../config/types.js";
+import type { ProxyConfig, RoutingRule, ModelMapping, ResponsesThinkingConfig, ProxyIdentity } from "../config/types.js";
 import type { AuthManager } from "../auth/manager.js";
 import type { Credential as AppCredential } from "../auth/types.js";
 import { loadCredential, saveCredential, clearCredentialAsync, listAccounts, switchAccount, removeAccount, setAccountLabel, setAccountPlan, setAccountProxy, setAccountName, setAccountEmail, setAccountDisabled, exportSingleAccount, exportAccounts, exportStore, importAccounts, maskApiKey, invalidateStoreCache, validateProxyUrl } from "../auth/store.js";
@@ -681,6 +681,7 @@ function probeStartPlanActivation(
   cred: AppCredential,
   fetchImpl: typeof fetch,
   appVersion: string | undefined,
+  identity?: ProxyIdentity,
 ): void {
   if (cred.plan !== "start-plan" || !cred.jwt) return;
   const key = `${cred.provider}:${cred.apiKey}:${cred.jwt.slice(0, 16)}:${cred.proxy ?? ""}:${appVersion ?? ""}`;
@@ -697,7 +698,7 @@ function probeStartPlanActivation(
   const accountFetch = withLinkedAbortSignal(makeProxiedFetcher(cred.proxy, fetchImpl), probeAbort.signal);
   const tag = cred.apiKey.slice(0, 8);
   let entry!: ActivationProbeInFlight;
-  const probe = withActivationProbeHardTimeout(queryQuota(cred, accountFetch, appVersion), abortProbe)
+  const probe = withActivationProbeHardTimeout(queryQuota(cred, accountFetch, appVersion, identity), abortProbe)
     .then((r) => {
       if (activationProbeInFlight.get(key) !== entry) return r;
       const outcome = r.planName ?? r.unavailableReason ?? "ok";
@@ -722,8 +723,9 @@ export function _probeStartPlanActivationForTesting(
   cred: AppCredential,
   fetchImpl: typeof fetch,
   appVersion?: string,
+  identity?: ProxyIdentity,
 ): void {
-  probeStartPlanActivation(cred, fetchImpl, appVersion);
+  probeStartPlanActivation(cred, fetchImpl, appVersion, identity);
 }
 
 /**
@@ -2074,7 +2076,7 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
       const generation = quotaGenerationForAccount(accountId);
       let inFlight = quotaInFlight.get(accountId);
       if (!inFlight) {
-        inFlight = queryQuota(cred, accountFetch, opts.config.identity?.appVersion)
+        inFlight = queryQuota(cred, accountFetch, opts.config.identity?.appVersion, opts.config.identity)
           .finally(() => {
             if (quotaInFlight.get(accountId) === inFlight) quotaInFlight.delete(accountId);
           });
@@ -2526,7 +2528,7 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
             }
             // Probe start-plan activation in the background (fire-and-forget).
             // See probeStartPlanActivation — non-blocking, never fails the login.
-            probeStartPlanActivation(cred, opts.fetchImpl ?? fetch, opts.config.identity?.appVersion);
+            probeStartPlanActivation(cred, opts.fetchImpl ?? fetch, opts.config.identity?.appVersion, opts.config.identity);
             // Mark flow as ready
             const flow = activeFlows.get(flowId);
             if (flow) { (flow as any).status = "ready"; }
@@ -2578,7 +2580,7 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
             opts.auth.setOAuthCredential(existingActive);
           }
           // Probe start-plan activation in the background (fire-and-forget).
-          probeStartPlanActivation(cred, opts.fetchImpl ?? fetch, opts.config.identity?.appVersion);
+          probeStartPlanActivation(cred, opts.fetchImpl ?? fetch, opts.config.identity?.appVersion, opts.config.identity);
           const flow = activeFlows.get(init.flowId);
           if (flow) { (flow as any).status = "ready"; }
         } catch (err) {
@@ -2684,7 +2686,7 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
           opts.auth.setOAuthCredential(existingActive);
         }
         // Probe start-plan activation in the background (fire-and-forget).
-        probeStartPlanActivation(cred, opts.fetchImpl ?? fetch, opts.config.identity?.appVersion);
+        probeStartPlanActivation(cred, opts.fetchImpl ?? fetch, opts.config.identity?.appVersion, opts.config.identity);
 
         deleteActiveOAuthFlow(flowId);
         return jsonResp({
@@ -2727,7 +2729,7 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
           opts.auth.setOAuthCredential(existingActive);
         }
         // Probe start-plan activation in the background (fire-and-forget).
-        probeStartPlanActivation(cred, opts.fetchImpl ?? fetch, opts.config.identity?.appVersion);
+        probeStartPlanActivation(cred, opts.fetchImpl ?? fetch, opts.config.identity?.appVersion, opts.config.identity);
 
         deleteActiveOAuthFlow(flowId);
         return jsonResp({

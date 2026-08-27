@@ -345,6 +345,10 @@ async function serve(configPath?: string): Promise<void> {
   console.log(`  plan: ${config.plan}`);
   console.log(`  auth mode: ${config.auth.mode}`);
   console.log(`  models: ${config.models.length} available`);
+  // v0.3.1: off-peak async bridge routes — only advertised when enabled.
+  if (config.async.enabled) {
+    console.log(`  async (off-peak): ON — /async/v1/messages, /async/v1/chat/completions, /async/v1/health`);
+  }
 
   // Initialize the global proxy pool (reads ~/.zcode-proxy/proxy-pool.json,
   // schedules auto-refresh if URLs are configured + pool is enabled). Best-

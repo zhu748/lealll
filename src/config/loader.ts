@@ -6,7 +6,7 @@ import { readFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { parse } from "yaml";
-import type { ProxyConfig, ProviderEndpoints, ProxyIdentity, RetryConfig, RoutingRule, ModelMapping, ResponsesThinkingConfig, ClientIdentityConfig, EndpointRoutingConfig, ClientSigningConfig } from "./types.js";
+import type { ProxyConfig, ProviderEndpoints, ProxyIdentity, RetryConfig, RoutingRule, ModelMapping, ResponsesThinkingConfig, ClientIdentityConfig, EndpointRoutingConfig, ClientSigningConfig, AsyncConfig } from "./types.js";
 
 /** Environment variable keys that override YAML values. */
 const ENV = {
@@ -34,6 +34,7 @@ const ENV = {
   MAX_REQUEST_BODY_BYTES: "ZCODE_PROXY_MAX_REQUEST_BODY_BYTES",
   ENDPOINT_ROUTING: "ZCODE_ENDPOINT_ROUTING",
   CLIENT_SIGNING: "ZCODE_CLIENT_SIGNING",
+  ASYNC_ENABLED: "ZCODE_ASYNC_ENABLED",
 } as const;
 
 const DEFAULTS = {
@@ -54,7 +55,10 @@ const DEFAULTS = {
   // 3.2.5 → 3.9.1 — the current ZCode client release. The captcha config
   // API and identity headers must present a current version or the gateway
   // treats the traffic as outdated-client.
-  APP_VERSION: "3.9.1",
+  // v0.3.1: 3.9.1 → 3.9.2 (ZCode release 2026-08-26 — client-side computer-
+  // control permission prompts + browser tab fixes; no wire-protocol change,
+  // safe bump). Keep in sync with src/auth/quota.ts DEFAULT_APP_VERSION.
+  APP_VERSION: "3.9.2",
   SOURCE_TITLE: "cli",
   REFERER_ORIGIN: "https://zcode.z.ai",
   RELEASE_CHANNEL: "production",
@@ -90,6 +94,17 @@ const DEFAULTS = {
   ENDPOINT_ROUTING_ORIGIN: "https://zcode.z.ai",
   CLIENT_SIGNING_ENABLED: true,
   CLIENT_SIGNING_ORIGIN: "https://zcode.z.ai",
+  // v0.3.1 (upstream 175ff2a): off-peak async bridge. Off by default —
+  // opt-in via `async.enabled: true` or env ZCODE_ASYNC_ENABLED=1.
+  ASYNC_ENABLED: false,
+  ASYNC_ORIGIN: "https://zcode.z.ai",
+  ASYNC_POLL_INTERVAL_MS: 5_000,
+  ASYNC_KEEPALIVE_INTERVAL_MS: 3_000,
+  ASYNC_MAX_WAIT_MS: 0,
+  ASYNC_MAX_RETRIES: 3,
+  ASYNC_SETTLE_TIMEOUT_MS: 8_000,
+  ASYNC_CONTROL_TIMEOUT_MS: 15_000,
+  ASYNC_DEFAULT_MODEL: "",
 };
 
 /** Printable-ASCII gate copied from the ZCode bundle's `rYn` helper. */
@@ -203,6 +218,7 @@ export function loadConfig(path: string): ProxyConfig {
   const clientIdentity = resolveClientIdentity(parsed?.clientIdentity);
   const endpointRouting = resolveEndpointRouting(parsed?.endpointRouting);
   const clientSigning = resolveClientSigning(parsed?.clientSigning);
+  const asyncConfig = resolveAsyncConfig(parsed?.async);
 
   // vceshi0.0.6+: verbose logging flag. Env var ZCODE_PROXY_VERBOSE_LOGGING=1
   // enables it at startup; YAML `logging.verbose: true` also works. Dashboard
@@ -271,6 +287,7 @@ export function loadConfig(path: string): ProxyConfig {
     clientIdentity,
     endpointRouting,
     clientSigning,
+    async: asyncConfig,
     logging: { level: logLevel, verbose: verboseLogging, debug: debugLogging, file: logFile, headerDebug },
     retry,
     routingRules,
@@ -596,6 +613,37 @@ function resolveClientSigning(raw: unknown): ClientSigningConfig {
   const origin = (typeof obj.origin === "string" ? obj.origin : DEFAULTS.CLIENT_SIGNING_ORIGIN).trim()
     || DEFAULTS.CLIENT_SIGNING_ORIGIN;
   return { enabled, origin };
+}
+
+/**
+ * Resolve the async (off-peak) bridge configuration (v0.3.1, upstream 175ff2a).
+ * Numeric fields clamp defensively: non-finite / negative values fall back to
+ * the default; maxWaitMs and maxRetries additionally accept 0 (unlimited / no
+ * retry). Env override: ZCODE_ASYNC_ENABLED=1|true enables without YAML.
+ */
+function resolveAsyncConfig(raw: unknown): AsyncConfig {
+  const obj = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
+  const enabledEnv = process.env[ENV.ASYNC_ENABLED];
+  const enabled = enabledEnv !== undefined
+    ? resolveBoolFlag(enabledEnv, DEFAULTS.ASYNC_ENABLED)
+    : resolveBoolFlag(obj.enabled, DEFAULTS.ASYNC_ENABLED);
+  const positiveInt = (v: unknown, fallback: number, allowZero = false): number => {
+    const n = typeof v === "string" ? Number(v) : typeof v === "number" ? v : NaN;
+    if (!Number.isFinite(n)) return fallback;
+    if (n === 0 && allowZero) return 0;
+    return n > 0 && Number.isInteger(n) ? Math.floor(n) : fallback;
+  };
+  return {
+    enabled,
+    origin: (typeof obj.origin === "string" ? obj.origin : DEFAULTS.ASYNC_ORIGIN).trim() || DEFAULTS.ASYNC_ORIGIN,
+    pollIntervalMs: positiveInt(obj.pollIntervalMs, DEFAULTS.ASYNC_POLL_INTERVAL_MS),
+    keepAliveIntervalMs: positiveInt(obj.keepAliveIntervalMs, DEFAULTS.ASYNC_KEEPALIVE_INTERVAL_MS),
+    maxWaitMs: positiveInt(obj.maxWaitMs, DEFAULTS.ASYNC_MAX_WAIT_MS, true),
+    maxRetries: positiveInt(obj.maxRetries, DEFAULTS.ASYNC_MAX_RETRIES, true),
+    settleTimeoutMs: positiveInt(obj.settleTimeoutMs, DEFAULTS.ASYNC_SETTLE_TIMEOUT_MS),
+    controlTimeoutMs: positiveInt(obj.controlTimeoutMs, DEFAULTS.ASYNC_CONTROL_TIMEOUT_MS),
+    defaultModel: typeof obj.defaultModel === "string" ? obj.defaultModel.trim() : DEFAULTS.ASYNC_DEFAULT_MODEL,
+  };
 }
 
 /** Resolve a boolean from YAML (true/false) or env ("1"/"true"/"0"/"false"). */

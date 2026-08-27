@@ -2,6 +2,41 @@
 
 A reverse proxy for Z.AI / Bigmodel.cn coding-plan APIs that exposes both OpenAI-compatible and Anthropic-format endpoints.
 
+## v0.3.1 — ZCode 3.9.2 + Off-Peak (错峰) Async Bridge
+
+- **appVersion default 3.9.1 → 3.9.2** (ZCode release 2026-08-26). The
+  billing `app_version` gate for first-time start-plan trial activation is
+  version-sensitive — being even one minor behind can matter on fresh
+  accounts, so the default now tracks the current client release.
+- **Quota/billing requests now carry the full real-client identity header
+  set** (`User-Agent: ZCode/<ver>`, `X-ZCode-App-Version`, `X-Title`, platform
+  headers, …) instead of a bare `Authorization` header. A UA-less billing
+  request is a fingerprint no real ZCode client ever produces and an easy
+  WAF flag on zcode.z.ai. Applies to both the dashboard quota button and
+  the background start-plan activation probe fired right after a credential
+  is saved — “OAuth done = free trial activated” now also looks like a real
+  client doing it.
+- **Off-peak (错峰算力) async bridge** (upstream commit 175ff2a, ZCode 3.8.1+
+  feature: GLM Coding Plan subscribers get a 5-hour quota reset during
+  off-peak compute hours). Opt-in via `async.enabled: true` or
+  `ZCODE_ASYNC_ENABLED=1`, then point clients at:
+  - `POST /async/v1/messages` (Anthropic format)
+  - `POST /async/v1/chat/completions` (OpenAI format)
+  - `GET /async/v1/health` (probe queue availability)
+
+  The proxy takes an off-peak ticket, holds the client connection open with
+  SSE keepalive comments while queued, auto-retries on ticket expiry
+  (default 3), then streams the LLM response through once the ticket is
+  ready. Requires an OAuth / ZCode-imported account (JWT); apikey-only
+  accounts get `400 async_credentials_unavailable`. Non-stream requests are
+  internally forced to stream and re-aggregated into one JSON document with
+  leading whitespace to defeat client TCP idle timeouts.
+- Deliberately NOT ported from upstream: the MCP/GLM-tools module (dormant —
+  not wired into any request path upstream), the Android control entry
+  (Android-only deployment), `runtime/node-fetch-compat` (Node/undici fix —
+  this repo is Bun-only), and `proxy/dump.ts` (superseded by the in-memory
+  admin debug-dumps ring buffer).
+
 ## v0.3.0 — Upstream zcode-api v2.6.0 Alignment (free/start-plan tier support)
 
 This release aligns the fork with the actively-maintained upstream
