@@ -351,24 +351,37 @@ describe("sendWithClientSigning", () => {
   });
 
   it("re-handshakes and retries once after a VERIFY 401", async () => {
-    const fixture = await buildHandshakeFixture();
-    const calls: MockCalls = { gate: 0, handshakes: [] };
-    const manager = new ClientSigningManager({ identity, fetchImpl: signingFetchFixture(fixture, calls) });
-    const sends: UpstreamHeaderPair[][] = [];
-    const resp = await sendWithClientSigning(manager, {
-      url: LLM_URL,
-      headerPairs: BASE_PAIRS,
-      credential: CRED,
-      appVersion: "3.8.1",
-      send: async (pairs) => {
-        sends.push(pairs);
-        return sends.length === 1 ? verify401() : new Response("ok", { status: 200 });
-      },
-    });
-    expect(resp.status).toBe(200);
-    expect(sends.length).toBe(2);
-    expect(pair(sends[0], "X-Client-Ts")).not.toBe(pair(sends[1], "X-Client-Ts"));
-    expect(calls.handshakes.length).toBe(2);
+    // FLAKE FIX (v0.3.6.2): on a fast runner both signs can land on the same
+    // millisecond, making the two X-Client-Ts headers identical and failing
+    // the "different timestamp" assertion below (observed in Release #86 CI:
+    // Expected: not "1787836589507"). Pin Date.now to a strictly increasing
+    // sequence for the duration of this test so the assertion is
+    // deterministic regardless of runner speed.
+    const realNow = Date.now;
+    let fakeTick = 1_787_836_589_000;
+    Date.now = () => ++fakeTick;
+    try {
+      const fixture = await buildHandshakeFixture();
+      const calls: MockCalls = { gate: 0, handshakes: [] };
+      const manager = new ClientSigningManager({ identity, fetchImpl: signingFetchFixture(fixture, calls) });
+      const sends: UpstreamHeaderPair[][] = [];
+      const resp = await sendWithClientSigning(manager, {
+        url: LLM_URL,
+        headerPairs: BASE_PAIRS,
+        credential: CRED,
+        appVersion: "3.8.1",
+        send: async (pairs) => {
+          sends.push(pairs);
+          return sends.length === 1 ? verify401() : new Response("ok", { status: 200 });
+        },
+      });
+      expect(resp.status).toBe(200);
+      expect(sends.length).toBe(2);
+      expect(pair(sends[0], "X-Client-Ts")).not.toBe(pair(sends[1], "X-Client-Ts"));
+      expect(calls.handshakes.length).toBe(2);
+    } finally {
+      Date.now = realNow;
+    }
   });
 
   it("falls back to unsigned after two VERIFY 401s and bypasses future signing", async () => {
