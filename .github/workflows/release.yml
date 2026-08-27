@@ -1,10 +1,24 @@
-# Release builder — produces the Windows zip via Bun cross-compile.
-# Triggered by: pushing a tag named v* (e.g. v2.1.4.1), or the "Run workflow"
-# button (workflow_dispatch). The output zip is byte-for-byte the same set of
-# files as the old manual release.md flow: zcode-proxy.exe + config.yaml +
-# start.bat + start.sh + README.md.
+# Release builder — multi-platform, aligned with upstream TriDefender/zcode-api.
 #
-# See release.md "GitHub Actions 构建流程" for how agents trigger a release.
+# Triggered by: pushing a tag named v* (e.g. v0.3.2.0), or the "Run workflow"
+# button (workflow_dispatch with an explicit version already set in
+# package.json).
+#
+# Artifacts published per release (one zip per platform, each containing the
+# compiled binary + config.yaml + start script + README):
+#   zcode-proxy-v{V}-windows-x64.zip   (zcode-proxy.exe + start.bat + start.sh)
+#   zcode-proxy-v{V}-linux-x64.zip     (zcode-proxy-linux-x64 + start.sh)
+#   zcode-proxy-v{V}-linux-arm64.zip   (zcode-proxy-linux-arm64 + start.sh)
+#   zcode-proxy-v{V}-darwin-x64.zip    (zcode-proxy-darwin-x64 + start.sh)
+#   zcode-proxy-v{V}-darwin-arm64.zip  (zcode-proxy-darwin-arm64 + start.sh)
+# Plus a multi-arch Docker image pushed to ghcr.io/{owner}/zcode-proxy.
+#
+# Android APK is NOT built by this fork: the upstream Android app runs the
+# server on libnode (node:http server layer), while this fork's server core
+# (Bun.serve in server.ts, Bun.listen/connect in socks-bridge.ts) is
+# Bun-only. See release.md "Android 状态" for the migration plan.
+#
+# See release.md for the agent-facing release procedure.
 name: Release
 
 on:
@@ -16,7 +30,7 @@ on:
     # package.json before running.
     inputs:
       version:
-        description: "Version to release (without leading v), e.g. 2.1.4.1"
+        description: "Version to release (without leading v), e.g. 0.3.2.0"
         required: true
         type: string
 
@@ -31,7 +45,7 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -73,25 +87,43 @@ jobs:
           fi
           echo "Version matches."
 
-      - name: Cross-compile Windows executable
+      - name: Cross-compile all platform binaries
         run: |
-          # --target=bun-windows-x64 is mandatory: without it Bun emits a Linux
-          # ELF that Windows rejects as "incompatible 16-bit application".
-          mkdir -p release
-          bun build --compile \
-            --define "require.resolve=undefined" \
-            --target=bun-windows-x64 \
-            src/index.ts \
-            --outfile release/zcode-proxy.exe
+          # --target is mandatory per platform: without it Bun emits a binary
+          # for the BUILD machine (Linux ELF), which Windows rejects as
+          # "incompatible 16-bit application" and macOS rejects as exec format
+          # error. --define "require.resolve=undefined" is required by Bun's
+          # bundler for this codebase.
+          bun build --compile --define "require.resolve=undefined" --target=bun-windows-x64  src/index.ts --outfile zcode-proxy.exe
+          bun build --compile --define "require.resolve=undefined" --target=bun-linux-x64    src/index.ts --outfile zcode-proxy-linux-x64
+          bun build --compile --define "require.resolve=undefined" --target=bun-linux-arm64  src/index.ts --outfile zcode-proxy-linux-arm64
+          bun build --compile --define "require.resolve=undefined" --target=bun-darwin-x64   src/index.ts --outfile zcode-proxy-darwin-x64
+          bun build --compile --define "require.resolve=undefined" --target=bun-darwin-arm64 src/index.ts --outfile zcode-proxy-darwin-arm64
+          ls -lh zcode-proxy*
 
-      - name: Verify exe format (must be PE32+, not ELF)
+      - name: Verify binary formats (PE32 / ELF / Mach-O)
         run: |
-          file release/zcode-proxy.exe
-          file release/zcode-proxy.exe | grep -q "PE32" || { \
-            echo "::error::Compiled binary is not a Windows PE32+ executable. Did you forget --target=bun-windows-x64?"; exit 1; }
+          fail=0
+          check() { # $1=file $2=expected
+            file "$1" | grep -q "$2" || { echo "::error::$1 is not $2"; file "$1"; fail=1; }
+            file "$1"
+          }
+          check zcode-proxy.exe          "PE32"
+          check zcode-proxy-linux-x64    "ELF"
+          check zcode-proxy-linux-arm64  "ELF"
+          check zcode-proxy-darwin-x64   "Mach-O"
+          check zcode-proxy-darwin-arm64 "Mach-O"
+          [ $fail -eq 0 ] && echo "All binary formats OK." || exit 1
 
-      - name: Stage config.yaml from template
-        run: cp config.example.yaml release/config.yaml
+      - name: Verify every binary prints the release version
+        # Only the native linux-x64 binary can execute on the runner — the
+        # other four are cross-compiled foreign-arch/OS binaries.
+        run: |
+          V="${{ steps.ver.outputs.version }}"
+          OUT=$(./zcode-proxy-linux-x64 help | head -1)
+          echo "linux-x64 reports: $OUT"
+          echo "$OUT" | grep -q "zcode-proxy $V" || { \
+            echo "::error::binary version mismatch: expected 'zcode-proxy $V', got '$OUT'"; exit 1; }
 
       - name: Guard start.bat (ASCII + CRLF)
         run: |
@@ -105,29 +137,124 @@ jobs:
           fi
           echo "start.bat OK (ASCII + CRLF)."
 
-      - name: Ensure start.sh is executable
-        run: chmod +x release/start.sh
+      - name: Guard start.sh (bash syntax + executable)
+        run: |
+          chmod +x release/start.sh
+          bash -n release/start.sh && echo "start.sh syntax OK."
 
-      - name: Package zip
+      - name: Stage shared assets
+        run: |
+          # config.yaml in the zip is the documented template the user edits.
+          cp config.example.yaml stage-config.yaml
+
+      - name: Package per-platform zips
         run: |
           V="${{ steps.ver.outputs.version }}"
-          cd release
-          zip -9 "../zcode-proxy-v${V}.zip" \
-            zcode-proxy.exe config.yaml start.bat start.sh README.md
-          cd ..
-          ls -lh "zcode-proxy-v${V}.zip"
 
-      - name: Create GitHub Release and upload zip
+          # Windows: exe + both launchers (start.sh covers WSL/Git-Bash users
+          # running the .exe — it auto-falls back to zcode-proxy.exe).
+          mkdir -p pkg/windows-x64
+          cp zcode-proxy.exe stage-config.yaml release/start.bat release/start.sh release/README.md pkg/windows-x64/
+          mv pkg/windows-x64/stage-config.yaml pkg/windows-x64/config.yaml
+          (cd pkg/windows-x64 && zip -9 "../../zcode-proxy-v${V}-windows-x64.zip" \
+            zcode-proxy.exe config.yaml start.bat start.sh README.md)
+
+          for PLAT in linux-x64 linux-arm64 darwin-x64 darwin-arm64; do
+            mkdir -p "pkg/${PLAT}"
+            cp "zcode-proxy-${PLAT}" stage-config.yaml release/start.sh release/README.md "pkg/${PLAT}/"
+            mv "pkg/${PLAT}/stage-config.yaml" "pkg/${PLAT}/config.yaml"
+            (cd "pkg/${PLAT}" && zip -9 "../../zcode-proxy-v${V}-${PLAT}.zip" \
+              "zcode-proxy-${PLAT}" config.yaml start.sh README.md)
+          done
+
+          ls -lh zcode-proxy-v*.zip
+
+      - name: Create GitHub Release and upload all platform zips
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.ver.outputs.version }}
           name: zcode-proxy v${{ steps.ver.outputs.version }}
-          files: zcode-proxy-v${{ steps.ver.outputs.version }}.zip
+          files: |
+            zcode-proxy-v${{ steps.ver.outputs.version }}-windows-x64.zip
+            zcode-proxy-v${{ steps.ver.outputs.version }}-linux-x64.zip
+            zcode-proxy-v${{ steps.ver.outputs.version }}-linux-arm64.zip
+            zcode-proxy-v${{ steps.ver.outputs.version }}-darwin-x64.zip
+            zcode-proxy-v${{ steps.ver.outputs.version }}-darwin-arm64.zip
           body: |
             ## zcode-proxy v${{ steps.ver.outputs.version }}
 
-            下载下方 `zcode-proxy-v${{ steps.ver.outputs.version }}.zip`，解压后运行 `start.bat`（Windows）或 `start.sh`（macOS/Linux）即可。
+            按平台下载对应 zip，解压后运行 `start.bat`（Windows）或 `start.sh`（Linux / macOS，自动识别二进制）。
 
-            完整使用说明见压缩包内 `README.md`。
+            | 平台 | 文件 |
+            |------|------|
+            | Windows x64 | `zcode-proxy-v${{ steps.ver.outputs.version }}-windows-x64.zip` |
+            | Linux x64 | `zcode-proxy-v${{ steps.ver.outputs.version }}-linux-x64.zip` |
+            | Linux ARM64 | `zcode-proxy-v${{ steps.ver.outputs.version }}-linux-arm64.zip` |
+            | macOS x64 | `zcode-proxy-v${{ steps.ver.outputs.version }}-darwin-x64.zip` |
+            | macOS ARM64 (Apple Silicon) | `zcode-proxy-v${{ steps.ver.outputs.version }}-darwin-arm64.zip` |
+
+            Docker 镜像：`ghcr.io/${{ github.repository_owner }}/zcode-proxy:${{ steps.ver.outputs.version }}`
+
+            首次使用：解压后先编辑 `config.yaml`（或直接运行脚本用 OAuth 登录）。完整说明见压缩包内 `README.md`。
+
+            > macOS 提示：若系统拦截未签名二进制，执行 `xattr -d com.apple.quarantine zcode-proxy-darwin-*` 后重试（start.sh 也会自动给出该提示）。
           draft: false
           prerelease: false
+
+  docker:
+    # Multi-arch Docker image on GHCR — aligned with the upstream release
+    # pipeline. Uses the built-in GITHUB_TOKEN, no extra secrets needed.
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            V="${{ inputs.version }}"
+          else
+            V="${GITHUB_REF_NAME#v}"
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Compute lowercase image name
+        id: img
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER@L}/zcode-proxy" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.img.outputs.name }}
+          flavor: latest=false
+          tags: |
+            type=raw,value=${{ steps.ver.outputs.version }}
+            type=raw,value=latest
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

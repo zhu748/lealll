@@ -1,5 +1,23 @@
 # zcode-proxy 使用说明
 
+> **v0.3.2.0 — 上游 v2.6.0 全量对齐 + 多平台发布**
+>
+> 本版本完成与上游 TriDefender/zcode-api v2.6.0 的全量对齐（free/start-plan 套餐支持），并首次提供全平台编译产物。
+>
+> **本次改动**
+>
+> - **free/start-plan 套餐可用**：内置 happy-dom 进程内验证码求解器 + 预解 token 池，替换旧 jsdom 方案；start-plan 路由切换到 ZCode OpenAI 网关（3.8.1+ 行为）。
+> - **客户端指纹完全对齐**：UA/身份头全面升级到 ZCode 3.9.2，额度/计费/OAuth 换 token 请求全部携带真实客户端完整头序列（`User-Agent: ZCode/3.9.2`、`X-ZCode-App-Version`、`X-Title`、`X-ZCode-Agent: glm`、平台头）。
+> - **新模型**：新增 `glm-5.3`（1M 上下文）、`glm-5.2`（1M 上下文）。
+> - **错峰算力异步桥**（opt-in）：`async.enabled: true` 开启后可使用 `/async/v1/messages`、`/async/v1/chat/completions`、`/async/v1/health`，占用错峰 5 小时额度重置窗口。
+> - **多平台发布**：Release 现提供 Windows x64 / Linux x64 / Linux ARM64 / macOS x64 / macOS ARM64 五个 zip（每个都含二进制 + config.yaml + 启动脚本 + 本手册）+ Docker 镜像 `ghcr.io/zhu748/zcode-proxy`。`start.sh` 自动识别平台选择二进制。
+> - **V4 签名 / 端点路由 / 会话推断**：从上游移植 coding-plan 请求签名与会话稳定性机制，多轮对话上游会话保持一致。
+> - **管理看板**：40+ 管理端点全部保留（多账号池、代理池、WAF 检测、SSE 监控、模型路由、凭证切换、统计看板）。
+>
+> **升级建议**：所有用户建议升级。使用 free/start-plan（免费试用）的用户必须升级——旧版本验证码方案已被风控识别，无法通过网关校验。macOS 用户首次运行若被系统拦截，执行 `xattr -d com.apple.quarantine zcode-proxy-darwin-*`。
+
+---
+
 > **v0.2.2.5 — ZCode GLM agent 模型请求头对齐**
 >
 > 本版本继续对齐真实 ZCode 客户端模型请求路径，重点修正 /v1/messages 使用的 GLM agent provider header 集，减少 start-plan/coding-plan 上游指纹差异。

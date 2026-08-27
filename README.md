@@ -26,6 +26,16 @@ unported (dormant / N/A / superseded by the admin dashboard).
   CLI) are covered.
 - Backward compatible: constructing an OAuth client without an identity
   keeps the old header shape (tests pin both behaviors).
+- **Multi-platform releases (upstream alignment)**: GitHub Actions now
+  cross-compiles and publishes 5 per-platform zips —
+  `windows-x64` / `linux-x64` / `linux-arm64` / `darwin-x64` / `darwin-arm64`,
+  each containing the binary + `config.yaml` + start script + user manual —
+  plus a multi-arch Docker image on `ghcr.io/{owner}/zcode-proxy`.
+  `start.sh` now auto-detects the platform binary (the old version tried to
+  exec the Windows `.exe` on Unix, which never worked outside WSL).
+  The upstream Android APK is not ported yet: it requires the server layer
+  to run on `node:http` (libnode), while this fork's core is `Bun.serve` +
+  a SOCKS bridge on `Bun.listen/connect` — see release.md for the roadmap.
 
 ## v0.3.1 — ZCode 3.9.2 + Off-Peak (错峰) Async Bridge
 
