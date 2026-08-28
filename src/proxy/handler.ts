@@ -451,6 +451,9 @@ export async function proxyRequest(
     deviceMid: config.identity.deviceMid,
     sessionId: metadataSessionId,
     startPlan: currentPlan === "start-plan",
+    // v0.3.10.3: credential flavor selects the model-line provider ref
+    // (builtin:zai-... vs builtin:bigmodel-...) in system block 3.
+    providerFlavor: cred.provider,
     thinkingLevel: config.thinkingLevel === "low" || config.thinkingLevel === "high" ? config.thinkingLevel : "max",
   });
 
@@ -465,7 +468,7 @@ export async function proxyRequest(
   // IMPORTANT: this does NOT touch the ZCode wire-shape transform logic
   // itself — `alignZCodeRequestFormat`, `sanitizeContentBlocks`, etc. all
   // still run; we just don't re-run them when the inputs are unchanged.
-  let transformedCacheKey = `${cred.userId ?? ""}|${currentPlan}|${config.thinkingLevel ?? ""}`;
+  let transformedCacheKey = `${cred.userId ?? ""}|${currentPlan}|${config.thinkingLevel ?? ""}|${cred.provider}`;
   let transformedBody = transformedObj !== undefined ? JSON.stringify(transformedObj) : undefined;
   // Cache the (key → { obj, body }) pair so a credential switch can
   // short-circuit when the new key matches.
@@ -480,8 +483,8 @@ export async function proxyRequest(
    * re-runs from the parsed client body when the plan flips (changing system
    * injection), or reuses the cached transform when inputs match.
    */
-  const rebuildTransformedBody = (newUserId: string | undefined, newPlan: "coding-plan" | "start-plan"): void => {
-    const newKey = `${newUserId ?? ""}|${newPlan}|${config.thinkingLevel ?? ""}`;
+  const rebuildTransformedBody = (newUserId: string | undefined, newPlan: "coding-plan" | "start-plan", newFlavor: "zai" | "bigmodel"): void => {
+    const newKey = `${newUserId ?? ""}|${newPlan}|${config.thinkingLevel ?? ""}|${newFlavor}`;
     if (newKey === transformedCacheKey) {
       // Inputs unchanged — keep existing transformedObj/transformedBody.
       return;
@@ -506,6 +509,7 @@ export async function proxyRequest(
       deviceMid: config.identity.deviceMid,
       sessionId: metadataSessionId,
       startPlan: newPlan === "start-plan",
+      providerFlavor: newFlavor,
       thinkingLevel: config.thinkingLevel === "low" || config.thinkingLevel === "high" ? config.thinkingLevel : "max",
     });
     transformedBody = transformedObj !== undefined ? JSON.stringify(transformedObj) : undefined;
@@ -1404,7 +1408,7 @@ export async function proxyRequest(
           // → coding-plan switches, the userId isn't applied (startPlan=false
           // makes applyAnthropicUserId a no-op) and the transform output is
           // IDENTICAL — re-running it on a 90KB body wastes 5-10ms each time.
-          rebuildTransformedBody(newCred.userId, currentPlan);
+          rebuildTransformedBody(newCred.userId, currentPlan, newCred.provider);
           consecutiveCredFailures = 0;
           consecutiveEmptyStreams = 0; // reset empty-stream counter on switch
           triedApiKeys.add(newCred.apiKey);
@@ -1668,7 +1672,7 @@ export async function proxyRequest(
             currentPlan = newPlan;
           }
           // v0.2.2+ PERF: see rebuildTransformedBody docstring above.
-          rebuildTransformedBody(newCred.userId, currentPlan);
+          rebuildTransformedBody(newCred.userId, currentPlan, newCred.provider);
           consecutiveCredFailures = 0;
           consecutiveEmptyStreams = 0;
           triedApiKeys.add(newCred.apiKey);

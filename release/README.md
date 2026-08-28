@@ -1,5 +1,27 @@
 # zcode-proxy 使用说明
 
+> **v0.3.10.4 — 思考注入对齐官方 SDK + system 注入精简为身份块**
+>
+> 本版包含两块改动，均基于官方 ZCode 3.9.2 桌面客户端解包逆向：
+>
+> **1. 思考注入对齐官方 SDK 行为**（消除指纹泄漏）：
+>
+> - 客户端发 `thinking.type=enabled`（含 glm-5.3 系强制思考）时，**删除 `temperature` / `top_k` / `top_p`** —— 官方 SDK 在思考开启时把这三个字段置 undefined（字段直接消失），此前代理透传这三个字段是明确的"非官方客户端"指纹，且可能引发上游参数错误。
+> - 无档位模型（glm-5-turbo / glm-4.7 / 未知模型）的 enabled 形态从裸 `{type:"enabled"}` 补全为 `{type:"enabled", budget_tokens:1024}` —— 对齐官方映射 + SDK 兜底默认值。
+>
+> **2. system 注入精简为身份块**（省 token，避免与下游工具提示词打架）：
+>
+> - 注入的官方 system 从 3 块（含 Desktop Context、Environment 等）精简为 **2 块纯身份**（`You are ZCode, an interactive coding agent` + Agent Identity 声明，共约 1.2K 字符），身份文本取自最新 3.9.2 官方包。
+> - 桌面端专属的 Desktop Context、Dynamic Behavior、Context Management 等大段说明**不再注入** —— 本代理的前端是 Claude Code / Codex 等自带完整系统提示词的编程工具，重复注入既浪费 prompt 预算又可能干扰工具自身指令。该身份块形态在 2026-06 ~ 2026-07 期间经线上长期验证可正常通过网关 3012 身份检查。
+> - 你的 system 提示词与 messages 内容依旧原样透传，仅保留既有的 "You are Claude Code" → ZCode 身份替换。
+>
+> **3. 其他修复**：
+>
+> - 安卓控制端 `sourceTitle` 兜底值从格式错误的 `Z Code@cli` 改为 `electron`（旧值会产生 `X-Title: Z Code@Z Code@cli` 双前缀头，现与官方 bundle 默认值一致）。
+> - 凭证的 provider 属性（zai/bigmodel）参与请求体转换缓存键，避免切换凭证时复用错误缓存。
+>
+> **升级建议**：所有用户建议升级。若你在意 prompt token 消耗或使用非 ZCode 的编程工具前端，本版收益最直接（system 注入缩减约 84% 体积 + 不再注入无关工具说明）。
+
 > **v0.3.10.1 — 对齐官方 ZCode 3.9.2 模型请求指纹**
 >
 > 本版依据官方 ZCode 3.9.2 桌面客户端解包结果，修正了模型请求的认证、身份标识与 Anthropic 请求体：

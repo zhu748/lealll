@@ -384,7 +384,9 @@ export function defaultControlIdentity(): ProxyIdentity {
   } catch {
     return {
       appVersion: "3.9.2",
-      sourceTitle: "Z Code@cli",
+      // Must match config DEFAULTS.SOURCE_TITLE — the official desktop client
+      // sends X-Title: "Z Code@electron" (bundle ECt: sourceTitle ?? "electron").
+      sourceTitle: "electron",
       refererOrigin: "https://zcode.z.ai",
       releaseChannel: "production",
       zcodeAgent: "glm",

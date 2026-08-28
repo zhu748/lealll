@@ -93,8 +93,12 @@
  * @see _reverse/NOTEPAD.md "How Credential is Used for LLM Calls"
  */
 import type { Format } from "../translator/types.js";
-import { buildStartPlanSystem, ZCODE_SYSTEM_BLOCKS } from "./system-prompt.js";
-import type { SystemBlock } from "./system-prompt.js";
+import {
+  buildOfficialSystemBlocks,
+  buildStartPlanSystem,
+  ZCODE_SYSTEM_BLOCKS,
+} from "./system-prompt.js";
+import type { ProviderFlavor, SystemBlock } from "./system-prompt.js";
 import { getThinkingSpec, normalizeTier, TIER_BUDGETS } from "./thinking-specs.js";
 import type { ThinkingTier } from "./thinking-specs.js";
 import { stripHeaderInternalPrefixes } from "./trace-headers.js";
@@ -109,6 +113,14 @@ export interface TransformContext {
   sessionId?: string;
   /** When true (start-plan), prepend ZCode gateway system blocks. */
   startPlan?: boolean;
+  /**
+   * OAuth provider flavor of the upstream credential ("zai" | "bigmodel").
+   * v0.3.10.4: retained for transform-cache keying and forward-compat;
+   * the minimal identity-only system injection ignores it (no model
+   * line is emitted). Defaults to zai when unknown.
+   * to zai when unknown.
+   */
+  providerFlavor?: ProviderFlavor;
   /**
    * ZCode thinking tier — the REQUESTED tier, normalized per model at
    * injection time (v0.3.10.0). The per-model spec table decides which
@@ -158,7 +170,7 @@ export function transformRequestBodyObj(parsed: unknown, ctx: TransformContext):
   if (ctx.format === "anthropic") {
     const obj = parsed as Record<string, unknown>;
     if (ctx.startPlan) {
-      modified = applyStartPlanSystem(obj) || modified;
+      modified = applyStartPlanSystem(obj, ctx.providerFlavor) || modified;
     }
     modified = transformUnsupportedAnthropicFields(obj) || modified;
     // Inject ZCode thinking format (max_tokens + budget_tokens + output_config)
@@ -199,7 +211,11 @@ export function transformRequestBodyObj(parsed: unknown, ctx: TransformContext):
     // injects ZCode system blocks (both coding-plan AND start-plan), and
     // rewrites "You are Claude Code" → "You are ZCode model working in Claude Code".
     // v0.1.9+: this is now the default and only path.
-    const aligned = alignZCodeRequestFormat(obj);
+    // v0.3.10.4: alignZCodeFormat injects the minimal 2-block identity
+    // system shape (cli_prefix + identity; Desktop Context / Dynamic
+    // Behavior / Context Management stripped per operator preference —
+    // see system-prompt.ts file header).
+    const aligned = alignZCodeRequestFormat(obj, ctx.providerFlavor, ctx.startPlan ? "start-plan" : "coding-plan");
     if (aligned) {
       // alignZCodeRequestFormat rebuilds the object with correct key order.
       // We need to replace parsed's keys in place — clear and re-assign.
@@ -457,6 +473,23 @@ function transformUnsupportedAnthropicFields(body: Record<string, unknown>): boo
  * Inject the EXACT thinking-format fields the real ZCode desktop client sends
  * — PER MODEL (v0.3.10.0).
  *
+ * v0.3.10.2 updates from the unpacked official ZCode 3.9.2 client
+ * (`resources/glm/zcode.cjs`, @ai-sdk/anthropic request builder):
+ *
+ *   - When thinking.type === "enabled", the official SDK NULLS OUT
+ *     `temperature` / `top_k` / `top_p` (the fields vanish from the serialized
+ *     JSON). GLM's thinking mode does not accept sampling parameters, and the
+ *     real client NEVER sends them on a thinking request. We now delete them
+ *     on every thinking-enabled request (client-sent values are a wire-shape
+ *     fingerprint mismatch and a potential upstream parameter rejection).
+ *
+ *   - Effort-less models (zcode「开启/关闭」: glm-5-turbo / glm-4.7 / legacy):
+ *     the official capability mapping (bundle `N2o`/`YE`, `zdr=1024`) sends
+ *     `thinking:{type:"enabled",budget_tokens:1024}` — NOT a bare
+ *     `{type:"enabled"}`. The SDK also defaults a missing budget to 1024
+ *     ("using default budget of 1024 tokens"). We inject budget_tokens:1024
+ *     to match the official wire shape.
+ *
  * Runs UNCONDITIONALLY on every Anthropic request. The injected shape comes
  * from the per-model spec table (@see thinking-specs.ts), which combines
  * real zcode client captures (2026-06 glm-5.2, 2026-08 glm-5.3) with the
@@ -485,19 +518,28 @@ function transformUnsupportedAnthropicFields(body: Record<string, unknown>): boo
  *          "low" on glm-5.2 (no low support) maps up to "high".
  *
  *   4. !spec.effort (glm-5-turbo / glm-4.7 / unknown — zcode "开启/关闭"):
- *        thinking.type=enabled → keep {type:"enabled"} BARE: no budget_tokens,
- *        no output_config (this is the pre-v0.1.9 gateway-accepted shape and
- *        our best reading of zcode's on/off wire for effort-less models).
+ *        thinking.type=enabled → {type:"enabled", budget_tokens:1024} —
+ *        the official on/off wire shape (bundle N2o: enabled carries a 1024
+ *        budget; SDK default-missing-budget is also 1024).
  *
  *   5. !spec.forcedThinking and client sent NO thinking field (or disabled):
  *        only max_tokens is forced — the ZCode "不思考" wire shape (the real
- *        client sends no thinking field at all in that mode). We never force
- *        thinking ON for these models.
+ *        client sends {type:"disabled"} explicitly when the nothink tier is
+ *        selected, and no thinking field at all when the request simply has
+ *        no thinking concept). We never force thinking ON for these models.
  *
  * Runs AFTER transformUnsupportedAnthropicFields (which strips budget_tokens
  * and output_config) so we re-inject exactly the per-model shape. Must run
  * BEFORE any transform that might strip output_config.
  */
+/**
+ * Official ZCode 3.9.2 on/off-thinking budget (bundle `zdr` = 1024, used by
+ * the `N2o` capability mapping for effort-less models and by the SDK's
+ * "budget is required when thinking is enabled. using default budget of 1024
+ * tokens." fallback).
+ */
+const ZCODE_ON_OFF_THINKING_BUDGET_TOKENS = 1024;
+
 function injectZCodeThinkingFormat(body: Record<string, unknown>, level: "low" | "high" | "max" = "max"): boolean {
   const spec = getThinkingSpec(body.model);
   const thinking = body.thinking;
@@ -506,6 +548,22 @@ function injectZCodeThinkingFormat(body: Record<string, unknown>, level: "low" |
   const isExplicitlyDisabled = hasThinkingField && (thinking as Record<string, unknown>).type === "disabled";
 
   let changed = false;
+
+  // === v0.3.10.2: strip sampling params on thinking-enabled requests ===
+  // Official ZCode 3.9.2 (unpacked @ai-sdk/anthropic builder) nulls out
+  // temperature / top_k / top_p whenever thinking is enabled — GLM's thinking
+  // mode does not accept sampling parameters, so the real client NEVER sends
+  // them in a thinking request. forcedThinking models (glm-5.3 family) always
+  // end up enabled, so they are stripped too. Disabled/no-thinking requests
+  // keep sampling params (official SDK leaves them in place).
+  if (isThinkingEnabled || spec.forcedThinking) {
+    for (const key of ["temperature", "top_k", "top_p"] as const) {
+      if (key in body) {
+        delete body[key];
+        changed = true;
+      }
+    }
+  }
 
   // === Always force max_tokens to the model's spec value ===
   if (body.max_tokens !== spec.maxTokens) {
@@ -547,9 +605,14 @@ function injectZCodeThinkingFormat(body: Record<string, unknown>, level: "low" |
 
   if (!spec.effort) {
     // glm-5-turbo / glm-4.7 / unknown: zcode「开启/关闭」models — no
-    // reasoning_effort support. Keep {type:"enabled"} bare: no budget,
-    // no output_config. (transformUnsupportedAnthropicFields already
-    // stripped budget_tokens; ensure no output_config re-appears.)
+    // reasoning_effort support. Official wire shape (bundle N2o, zdr=1024):
+    // enabled carries budget_tokens: 1024, no output_config.
+    // (transformUnsupportedAnthropicFields already stripped budget_tokens;
+    // ensure no output_config re-appears.)
+    if (t.budget_tokens !== ZCODE_ON_OFF_THINKING_BUDGET_TOKENS) {
+      t.budget_tokens = ZCODE_ON_OFF_THINKING_BUDGET_TOKENS;
+      changed = true;
+    }
     if ("output_config" in body) {
       delete body.output_config;
       changed = true;
@@ -599,7 +662,7 @@ function injectZCodeThinkingFormat(body: Record<string, unknown>, level: "low" |
  *                   ├─→ body-transformer.alignZCodeRequestFormat  ─→ upstream
  *    - Codex        ─┘   (Responses→Anthropic translation upstream)
  *
- *  Status: VERIFIED ALIGNED (2026-06-27)
+ *  Status: VERIFIED ALIGNED (2026-06-27; system shape refreshed 3.9.2 2026-08-28)
  *    - Top-level field order: model → max_tokens → thinking → output_config
  *                             → system → messages → tools → tool_choice → stream
  *    - thinking: {type:enabled, budget_tokens:32000}
@@ -607,7 +670,10 @@ function injectZCodeThinkingFormat(body: Record<string, unknown>, level: "low" |
  *    - max_tokens: 128000
  *    - stream: true (unconditional)
  *    - tool_choice: {type:auto} (when tools present)
- *    - system: [ZCode official +cc, ZCode official +cc, user blocks +cc on last]
+ *    - system: EXACTLY 2 identity blocks, all +cc (v0.3.10.4 minimal):
+ *        [1] cli_prefix
+ *        [2] Agent Identity
+ *        then client blocks appended (+cc on last)
  *    - metadata replaced with ZCode attribution; context_management / billing-header stripped
  *    - document / thinking blocks in messages: stripped
  *    - string content → array form
@@ -628,14 +694,15 @@ function injectZCodeThinkingFormat(body: Record<string, unknown>, level: "low" |
  * Triggered only when `ctx.alignZCodeFormat === true`. Performs these transformations:
  *
  * 1. **Inject ZCode system blocks** (both coding-plan AND start-plan):
- *    - Prepend 2 official ZCode identity blocks from zcode_system.json
+ *    - Prepend the 2 identity-only ZCode blocks from buildOfficialSystemBlocks
+ *      (cli_prefix / identity — v0.3.10.4 minimal mode)
  *    - Each official block carries `cache_control: { type: "ephemeral" }`
  *    - Client's original system blocks (if any) appended AFTER the ZCode blocks
  *    - Critical for start-plan: gateway does content inspection and rejects
  *      requests missing the ZCode identity blocks
  *
  * 1b. **Mark last system block with cache_control** (v0.2.0.5):
- *    - Real ZCode client puts cc on its last (own #3) system block as a
+ *    - Real ZCode client puts cc on its last system block as a
  *      prompt-cache breakpoint. We mirror this by adding cc to the last
  *      block of our injected system array (idempotent — won't overwrite
  *      existing cc).
@@ -669,9 +736,7 @@ function injectZCodeThinkingFormat(body: Record<string, unknown>, level: "low" |
  *
  * @see _reverse/NOTEPAD.md "Real ZCode Request Structure (2026-06)"
  */
-const ZCODE_OFFICIAL_SYSTEM_BLOCKS: ReadonlyArray<{ type: "text"; text: string; cache_control?: { type: "ephemeral" } }> = Object.freeze(
-  (ZCODE_SYSTEM_BLOCKS as SystemBlock[]).map(b => Object.freeze({ ...b })),
-);
+const ZCODE_OFFICIAL_SYSTEM_BLOCKS: ReadonlyArray<{ type: "text"; text: string; cache_control?: { type: "ephemeral" } }> = ZCODE_SYSTEM_BLOCKS;
 
 /**
  * Claude Code's identity pattern — matches both known variants and rewrites
@@ -682,17 +747,25 @@ const ZCODE_OFFICIAL_SYSTEM_BLOCKS: ReadonlyArray<{ type: "text"; text: string; 
 const CLAUDE_CODE_IDENTITY_RE = /You are Claude Code, Anthropic's official CLI for Claude(?:, running within the Claude Agent SDK)?\./;
 const ZCODE_IDENTITY_REPLACEMENT = "You are ZCode model working in Claude Code.";
 
-function alignZCodeRequestFormat(body: Record<string, unknown>): Record<string, unknown> | null {
+function alignZCodeRequestFormat(
+  body: Record<string, unknown>,
+  providerFlavor?: ProviderFlavor,
+  plan: "start-plan" | "coding-plan" = "start-plan",
+): Record<string, unknown> | null {
   let changed = false;
 
   // === Step 1: Inject ZCode system blocks (always, both plans) ===
-  // Prepend official ZCode identity blocks. Client's existing system blocks
-  // are appended after (with identity rewrite applied — see Step 2).
+  // v0.3.10.4: MINIMAL identity-only mode — inject the 2-block shape from
+  // buildOfficialSystemBlocks — [cli_prefix, identity]. The desktop-context /
+  // dynamic-behavior / context-management sections are NOT sent (downstream
+  // coding tools bring their own system prompts; the identity-only shape is
+  // empirically gateway-accepted since vceshi0.1.2). The client's existing
+  // system blocks are appended after (with identity rewrite applied — Step 2).
   //
   // IDEMPOTENCY: if the request has already been aligned (e.g. on retry), the
-  // system field already starts with the 3 ZCode official blocks. We detect
-  // this by checking if the first block's text matches the first ZCode block,
-  // and if so, DON'T re-inject (just rewrite identity + reorder keys).
+  // system field already starts with the official blocks. We detect this by
+  // checking if the first block's text matches the official cli_prefix, and
+  // if so, DON'T re-inject (just rewrite identity + reorder keys).
   const clientSystem = normalizeSystemToArray(body.system);
   const alreadyInjected = clientSystem.length > 0
     && clientSystem[0].text === ZCODE_OFFICIAL_SYSTEM_BLOCKS[0].text;
@@ -701,16 +774,9 @@ function alignZCodeRequestFormat(body: Record<string, unknown>): Record<string, 
   if (rewrittenClientSystem !== clientSystem) changed = true;
 
   if (!alreadyInjected) {
-    const officialBlocks = ZCODE_OFFICIAL_SYSTEM_BLOCKS.map(b => ({ ...b }));
-    // v0.3.0: append the dynamic "You are powered by the model named ${model}."
-    // block after the official blocks — mirrors the current ZCode client's
-    // buildEnvInfoSection (upstream v2.6.0). Matches the wire shape of the
-    // 3.9.x client whose env-info section always carries the current model.
     const modelStr = typeof body.model === "string" ? body.model.trim() : "";
-    const modelLine: SystemBlock[] = modelStr
-      ? [{ type: "text", text: `- You are powered by the model named ${modelStr}.`, cache_control: { type: "ephemeral" } }]
-      : [];
-    body.system = [...officialBlocks, ...modelLine, ...rewrittenClientSystem];
+    const officialBlocks = buildOfficialSystemBlocks(modelStr || undefined, providerFlavor, plan);
+    body.system = [...officialBlocks, ...rewrittenClientSystem];
   } else {
     body.system = rewrittenClientSystem;
   }
@@ -1192,23 +1258,24 @@ function normalizeAllMessageContent(body: Record<string, unknown>): boolean {
  * the body already had the official blocks in the right position, saving
  * ~5ms on a 90KB body for the common case of repeated identical requests.
  */
-function applyStartPlanSystem(body: Record<string, unknown>): boolean {
+function applyStartPlanSystem(body: Record<string, unknown>, providerFlavor?: ProviderFlavor): boolean {
   // Idempotency check: if `body.system` already starts with the official
   // ZCode blocks (e.g. on retry/replay where a previous transform already
   // injected them), DON'T re-inject. buildStartPlanSystem() would otherwise
   // concatenate official blocks + the user blocks (which themselves now
-  // contain the official blocks), producing [official, official, client...]
-  // — a 5-block system instead of 3-block.
+  // contain the official blocks), producing duplicated blocks.
   //
-  // Detection: walk the first N=official_blocks positions of cur and check
-  // each text matches. If all match, the official prefix is already there.
+  // v0.3.10.4: the injected shape is the minimal 2-block identity array
+  // (cli_prefix + identity — model/flavor-independent), so the comparison
+  // target is a plain exact-text match on both blocks.
+  const model = typeof body.model === "string" ? body.model : undefined;
+  const target = buildOfficialSystemBlocks(model, providerFlavor, "start-plan");
   const cur = body.system;
-  const officialTexts = ZCODE_SYSTEM_BLOCKS.map(b => b.text);
-  if (Array.isArray(cur) && cur.length >= officialTexts.length) {
+  if (Array.isArray(cur) && cur.length >= target.length) {
     let alreadyInjected = true;
-    for (let i = 0; i < officialTexts.length; i++) {
+    for (let i = 0; i < target.length; i++) {
       const c = cur[i] as { text?: string } | undefined;
-      if (!c || c.text !== officialTexts[i]) {
+      if (!c || c.text !== target[i].text) {
         alreadyInjected = false;
         break;
       }
@@ -1217,11 +1284,7 @@ function applyStartPlanSystem(body: Record<string, unknown>): boolean {
       return false;
     }
   }
-  // v0.3.0: forward body.model so buildStartPlanSystem can append the dynamic
-  // "You are powered by the model named ${model}." block — mirrors the
-  // current ZCode client's buildEnvInfoSection behavior (upstream v2.6.0).
-  const model = typeof body.model === "string" ? body.model : undefined;
-  const newSystem = buildStartPlanSystem(body.system, model);
+  const newSystem = buildStartPlanSystem(body.system, model, providerFlavor);
   body.system = newSystem;
   return true;
 }

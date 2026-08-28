@@ -275,7 +275,9 @@ describe("control identity (v0.3.4 — Android OAuth fingerprint)", () => {
     // Shape must match ProxyIdentity — a bare Node UA here was the v0.3.2
     // desktop bug this closes for the Android bundle.
     expect(identity.appVersion).toBe("3.9.2");
-    expect(identity.sourceTitle).toBe("cli");
+    // Official desktop fingerprint: X-Title = "Z Code@electron" (bundle ECt:
+    // sourceTitle ?? "electron"). Stale "cli" expectation removed v0.3.10.3.
+    expect(identity.sourceTitle).toBe("electron");
     expect(identity.refererOrigin).toContain("z.ai");
     expect(identity.zcodeAgent).toBe("glm");
   });

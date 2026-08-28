@@ -203,9 +203,10 @@ describe("transformRequestBody — transform unsupported fields (Anthropic)", ()
     const out = transformRequestBody(body, { format: "anthropic" });
     const parsed = JSON.parse(out as string);
     // adaptive → enabled (by transformUnsupportedAnthropicFields). glm-4.6 has
-    // no effort support (v0.3.10.0) → bare {type:enabled}, no budget/effort.
+    // no effort support (v0.3.10.0) → on/off shape with the official 1024
+    // default budget (v0.3.10.2, bundle N2o/zdr=1024), no effort/output_config.
     expect(parsed.thinking.type).toBe("enabled");
-    expect(parsed.thinking.budget_tokens).toBeUndefined();
+    expect(parsed.thinking.budget_tokens).toBe(1024);
     expect(parsed.output_config).toBeUndefined();
     expect(parsed.model).toBe("glm-4.6");
   });
@@ -891,6 +892,53 @@ describe("transformRequestBody — per-model thinking specs (v0.3.10.0)", () => 
     expect(parsed.output_config).toEqual({ effort: "max" });
   });
 
+  it("v0.3.10.2: strips temperature/top_k/top_p when thinking is enabled (official SDK behavior)", () => {
+    // Official ZCode 3.9.2 (unpacked @ai-sdk/anthropic builder) nulls out
+    // sampling params on every thinking-enabled request — GLM's thinking mode
+    // does not accept them, so the real client NEVER sends them.
+    const out = transformRequestBody(
+      mk("glm-5.2", { thinking: { type: "enabled" }, temperature: 0.7, top_k: 40, top_p: 0.9 }),
+      { format: "anthropic", thinkingLevel: "max" },
+    );
+    const parsed = JSON.parse(out as string);
+    expect(parsed.temperature).toBeUndefined();
+    expect(parsed.top_k).toBeUndefined();
+    expect(parsed.top_p).toBeUndefined();
+    expect(parsed.thinking).toEqual({ type: "enabled", budget_tokens: 32000 });
+
+    // glm-5.3 forced-thinking path strips them too (even with no thinking field).
+    const out53 = transformRequestBody(
+      mk("glm-5.3", { temperature: 1.0, top_p: 0.95 }),
+      { format: "anthropic", thinkingLevel: "max" },
+    );
+    const p53 = JSON.parse(out53 as string);
+    expect(p53.temperature).toBeUndefined();
+    expect(p53.top_p).toBeUndefined();
+    expect(p53.thinking).toEqual({ type: "enabled", budget_tokens: 32000 });
+  });
+
+  it("v0.3.10.2: keeps temperature/top_k/top_p when thinking is disabled or absent", () => {
+    // Official SDK only nulls sampling params when thinking is ENABLED —
+    // disabled/no-thinking requests forward them untouched.
+    const outOff = transformRequestBody(
+      mk("glm-5.2", { thinking: { type: "disabled" }, temperature: 0.7, top_k: 40 }),
+      { format: "anthropic", thinkingLevel: "max" },
+    );
+    const pOff = JSON.parse(outOff as string);
+    expect(pOff.temperature).toBe(0.7);
+    expect(pOff.top_k).toBe(40);
+    expect(pOff.thinking).toEqual({ type: "disabled" });
+
+    const outNone = transformRequestBody(
+      mk("glm-5.2", { temperature: 0.3, top_p: 0.8 }),
+      { format: "anthropic", thinkingLevel: "max" },
+    );
+    const pNone = JSON.parse(outNone as string);
+    expect(pNone.temperature).toBe(0.3);
+    expect(pNone.top_p).toBe(0.8);
+    expect(pNone.thinking).toBeUndefined();
+  });
+
   it("glm-5.3: thinking.type=disabled converted to enabled + low (official migration guidance)", () => {
     const out = transformRequestBody(mk("glm-5.3", { thinking: { type: "disabled" } }), { format: "anthropic", thinkingLevel: "max" });
     const parsed = JSON.parse(out as string);
@@ -929,23 +977,26 @@ describe("transformRequestBody — per-model thinking specs (v0.3.10.0)", () => 
     expect(parsed.output_config).toBeUndefined();
   });
 
-  it("glm-5-turbo / glm-4.7: on/off thinking only — bare enabled, no budget, no effort, max_tokens=64000", () => {
+  it("glm-5-turbo / glm-4.7: on/off thinking only — enabled + official 1024 budget, no effort, max_tokens=64000", () => {
     for (const model of ["glm-5-turbo", "glm-4.7"]) {
       const out = transformRequestBody(mk(model, { thinking: { type: "enabled", budget_tokens: 5000 } }), { format: "anthropic", thinkingLevel: "max" });
       const parsed = JSON.parse(out as string);
       expect(parsed.max_tokens).toBe(64000);
       // No reasoning_effort support (GLM-5.2+ only) → zcode「开启/关闭」shape:
-      // bare {type:enabled} — client budget stripped, no output_config.
-      expect(parsed.thinking).toEqual({ type: "enabled" });
+      // {type:enabled, budget_tokens:1024} — the official on/off wire shape
+      // (v0.3.10.2, unpacked bundle N2o mapping with zdr=1024), no output_config.
+      expect(parsed.thinking).toEqual({ type: "enabled", budget_tokens: 1024 });
       expect(parsed.output_config).toBeUndefined();
     }
   });
 
-  it("unknown model: default spec — on/off thinking, max_tokens=64000 (pre-v0.1.9 gateway-accepted shape)", () => {
+  it("unknown model: default spec — on/off thinking with official 1024 budget, max_tokens=64000", () => {
     const out = transformRequestBody(mk("glm-4.6", { thinking: { type: "enabled" } }), { format: "anthropic", thinkingLevel: "high" });
     const parsed = JSON.parse(out as string);
     expect(parsed.max_tokens).toBe(64000);
-    expect(parsed.thinking).toEqual({ type: "enabled" });
+    // v0.3.10.2: official on/off wire shape carries budget_tokens:1024
+    // (unpacked bundle N2o mapping + SDK missing-budget default).
+    expect(parsed.thinking).toEqual({ type: "enabled", budget_tokens: 1024 });
     expect(parsed.output_config).toBeUndefined();
   });
 
@@ -1002,6 +1053,58 @@ describe("transformRequestBody — alignZCodeFormat (ZCode wire format alignment
     expect(parsedStart.system[0].text).toBe("You are ZCode, an interactive coding agent");
   });
 
+  it("minimal mode: no model line / no flavor-dependent sections (v0.3.10.4)", () => {
+    const mkBody = () => JSON.stringify({
+      model: "glm-5.2",
+      messages: [{ role: "user", content: "hi" }],
+      max_tokens: 1000,
+      thinking: { type: "enabled" },
+    });
+    // All four plan × flavor combinations produce the IDENTICAL minimal
+    // 2-block system — no model line, no Desktop Context, no Dynamic
+    // Behavior, no Context Management.
+    const variants = [
+      transformRequestBody(mkBody(), { format: "anthropic", startPlan: true }),
+      transformRequestBody(mkBody(), { format: "anthropic", startPlan: true, providerFlavor: "bigmodel" }),
+      transformRequestBody(mkBody(), { format: "anthropic", startPlan: false }),
+      transformRequestBody(mkBody(), { format: "anthropic", startPlan: false, providerFlavor: "bigmodel" }),
+    ];
+    const first = JSON.parse(variants[0] as string).system;
+    expect(first.length).toBe(2);
+    for (const v of variants) {
+      const sys = JSON.parse(v as string).system;
+      expect(sys).toEqual(first);
+      // none of the full-mode sections leak through
+      const joined = sys.map((b: any) => b.text).join("\n");
+      expect(joined).not.toContain("You are powered by the model named");
+      expect(joined).not.toContain("# ZCode Desktop Context");
+      expect(joined).not.toContain("# Communicating with the user");
+      expect(joined).not.toContain("# Context management");
+    }
+  });
+
+  it("minimal 2-block identity shape (v0.3.10.4): cli_prefix + identity only", () => {
+    const body = JSON.stringify({
+      model: "glm-5.2",
+      messages: [{ role: "user", content: "hi" }],
+      max_tokens: 1000,
+      thinking: { type: "enabled" },
+    });
+    const out = transformRequestBody(body, { format: "anthropic", startPlan: true });
+    const parsed = JSON.parse(out as string);
+    expect(parsed.system.length).toBe(2);
+    // block 1 — cli_prefix, exact official text
+    expect(parsed.system[0].text).toBe("You are ZCode, an interactive coding agent");
+    // block 2 — Agent Identity section (latest 3.9.2 text), NO Desktop Context tail
+    expect(parsed.system[1].text.startsWith("\nYou are an interactive ZCode agent")).toBe(true);
+    expect(parsed.system[1].text).toContain("# Harness");
+    expect(parsed.system[1].text).toContain("file_path:line_number");
+    expect(parsed.system[1].text).not.toContain("# ZCode Desktop Context");
+    // both blocks carry cache_control (official Dst on every system message)
+    expect(parsed.system[0].cache_control).toEqual({ type: "ephemeral" });
+    expect(parsed.system[1].cache_control).toEqual({ type: "ephemeral" });
+  });
+
   it("appends client's original system blocks AFTER the ZCode blocks", () => {
     const body = JSON.stringify({
       model: "glm-5.2",
@@ -1014,11 +1117,13 @@ describe("transformRequestBody — alignZCodeFormat (ZCode wire format alignment
     });
     const out = transformRequestBody(body, { format: "anthropic" });
     const parsed = JSON.parse(out as string);
-    // v0.3.0: 3 ZCode official blocks + 1 dynamic model line + 1 client block = 5
-    expect(parsed.system.length).toBe(5);
+    // v0.3.10.4: minimal 2 identity blocks + 1 client block = 3
+    expect(parsed.system.length).toBe(3);
     expect(parsed.system[0].text).toBe("You are ZCode, an interactive coding agent");
-    expect(parsed.system[4].text).toBe("Custom client instructions");
-    expect(parsed.system[3].text).toBe("- You are powered by the model named glm-5.2.");
+    expect(parsed.system[2].text).toBe("Custom client instructions");
+    // block 2 = Agent Identity only (no Desktop Context in minimal mode)
+    expect(parsed.system[1].text).toContain("You are an interactive ZCode agent");
+    expect(parsed.system[1].text).not.toContain("# ZCode Desktop Context");
   });
 
   it("rewrites 'You are Claude Code' → 'You are ZCode model working in Claude Code'", () => {
@@ -1323,16 +1428,14 @@ describe("transformRequestBody — alignZCodeFormat (field fill + drop, v0.2.0+)
     // 7. output_config injected
     expect(parsed.output_config).toEqual({ effort: "max" });
 
-    // 8. v0.3.0: system = 3 ZCode official blocks + model line + client's (rewritten) block
-    expect(parsed.system.length).toBe(5);
+    // 8. v0.3.10.4: system = minimal 2 identity blocks + client's (rewritten) block
+    expect(parsed.system.length).toBe(3);
     expect(parsed.system[0].text).toBe("You are ZCode, an interactive coding agent");
-    expect(parsed.system[4].text).toContain("You are ZCode model working in Claude Code");
-    expect(parsed.system[4].text).not.toContain("You are Claude Code, Anthropic's official CLI for Claude.");
-    expect(parsed.system[3].text).toBe("- You are powered by the model named glm-5.3.");
+    expect(parsed.system[2].text).toContain("You are ZCode model working in Claude Code");
+    expect(parsed.system[2].text).not.toContain("You are Claude Code, Anthropic's official CLI for Claude.");
 
     // 9. v0.2.0.5: last system block carries cache_control (mirrors real ZCode
-    // client's prompt-cache breakpoint — without this, the wire shape is
-    // [cc, cc, no-cc] vs real ZCode's [cc, cc, cc]).
+    // client's prompt-cache breakpoint).
     expect(parsed.system[0].cache_control).toEqual({ type: "ephemeral" });
     expect(parsed.system[1].cache_control).toEqual({ type: "ephemeral" });
     expect(parsed.system[2].cache_control).toEqual({ type: "ephemeral" });
@@ -1353,15 +1456,14 @@ describe("transformRequestBody — alignZCodeFormat (field fill + drop, v0.2.0+)
     const out = transformRequestBody(body, { format: "anthropic" });
     const parsed = JSON.parse(out as string);
 
-    // v0.3.0: 5 blocks = 3 official ZCode + model line + 1 user-provided (the Codex instructions)
-    expect(parsed.system.length).toBe(5);
+    // v0.3.10.4: 3 blocks = 2 identity ZCode blocks + 1 user-provided
+    // (the Codex instructions)
+    expect(parsed.system.length).toBe(3);
     expect(parsed.system[0].cache_control).toEqual({ type: "ephemeral" }); // official
     expect(parsed.system[1].cache_control).toEqual({ type: "ephemeral" }); // official
-    expect(parsed.system[2].cache_control).toEqual({ type: "ephemeral" }); // official env block
-    expect(parsed.system[3].cache_control).toEqual({ type: "ephemeral" }); // model line
     // v0.2.0.5: last block now carries cache_control (was missing before)
-    expect(parsed.system[4].cache_control).toEqual({ type: "ephemeral" });
-    expect(parsed.system[4].text).toBe("You are Codex, an elite System Architect...");
+    expect(parsed.system[2].cache_control).toEqual({ type: "ephemeral" });
+    expect(parsed.system[2].text).toBe("You are Codex, an elite System Architect...");
   });
 
   it("v0.2.0.5: does NOT overwrite existing cache_control on last system block", () => {
@@ -1378,13 +1480,15 @@ describe("transformRequestBody — alignZCodeFormat (field fill + drop, v0.2.0+)
     const out = transformRequestBody(body, { format: "anthropic" });
     const parsed = JSON.parse(out as string);
     // Last block (user-provided) should still have its cache_control unchanged
-    expect(parsed.system[4].cache_control).toEqual(existingCc);
+    expect(parsed.system.length).toBe(3); // 2 identity + 1 user-provided
+    expect(parsed.system[2].cache_control).toEqual(existingCc);
   });
 
   it("v0.2.0.5: when no user-provided system blocks, last official block keeps its cc", () => {
     // Edge case: client didn't send any system text. The result is just the 2
-    // official ZCode blocks. The last one already has cc (from zcode_system.json),
-    // and Step 1b should be a no-op (idempotent check finds cc already present).
+    // identity ZCode blocks. The last one already has cc (all official blocks
+    // carry cc), and Step 1b should be a no-op (idempotent check finds cc
+    // already present).
     const body = JSON.stringify({
       model: "glm-5.2",
       messages: [{ role: "user", content: "hi" }],
@@ -1393,11 +1497,9 @@ describe("transformRequestBody — alignZCodeFormat (field fill + drop, v0.2.0+)
     });
     const out = transformRequestBody(body, { format: "anthropic" });
     const parsed = JSON.parse(out as string);
-    expect(parsed.system.length).toBe(4); // v0.3.0: 3 official + model line
+    expect(parsed.system.length).toBe(2); // v0.3.10.4: 2 identity blocks
     expect(parsed.system[0].cache_control).toEqual({ type: "ephemeral" });
     expect(parsed.system[1].cache_control).toEqual({ type: "ephemeral" });
-    expect(parsed.system[2].cache_control).toEqual({ type: "ephemeral" });
-    expect(parsed.system[3].cache_control).toEqual({ type: "ephemeral" });
   });
 });
 
@@ -1509,13 +1611,12 @@ describe("transformRequestBody — alignZCodeFormat (message body fingerprint al
   it("applyStartPlanSystem is idempotent (no double-injection)", () => {
     // Reproduces the vceshi0.1.5 bug: when startPlan is on AND the body
     // already has ZCode blocks in system (e.g. retry), applyStartPlanSystem
-    // used to inject another copy, producing 5 blocks
-    // instead of 3 (ZCode, ZCode, ZCode, ZCode, client).
+    // used to inject another copy, producing duplicated blocks.
     //
     // Use the EXACT official block texts (a real retry would carry the exact
     // bytes injected by a prior transform — partial matches don't happen).
-    // v0.3.0: build the fixture from the CURRENT official blocks so this test
-    // stays in sync with zcode_system.json (3 official + model line + client).
+    // v0.3.10.4: build the fixture from the CURRENT identity blocks so this
+    // test stays in sync with zcode_system.json (2 identity blocks + client).
     const preInjected = buildStartPlanSystem(
       [{ type: "text", text: "client instructions" }],
       "glm-5.2",
@@ -1530,10 +1631,11 @@ describe("transformRequestBody — alignZCodeFormat (message body fingerprint al
     });
     const out = transformRequestBody(body, { format: "anthropic", startPlan: true });
     const parsed = JSON.parse(out as string);
-    // v0.3.0: 5 blocks (3 ZCode official + model line + client), NOT re-injected
-    expect(parsed.system.length).toBe(5);
+    // v0.3.10.4: 3 blocks (2 identity + client), NOT re-injected
+    expect(parsed.system.length).toBe(3);
     expect(parsed.system[0].text).toBe(ZCODE_SYSTEM_BLOCKS[0].text);
-    expect(parsed.system[4].text).toBe("client instructions");
+    expect(parsed.system[1].text).toBe(ZCODE_SYSTEM_BLOCKS[1].text);
+    expect(parsed.system[2].text).toBe("client instructions");
   });
 
   it("full alignment: ClaudeCode long-task body matches real ZCode wire format", () => {
@@ -1601,10 +1703,11 @@ describe("transformRequestBody — alignZCodeFormat (message body fingerprint al
     // 6. downstream metadata replaced with the official attribution envelope
     expect(JSON.parse(parsed.metadata.user_id)).toEqual({ device_id: "", account_uuid: "", session_id: "" });
 
-    // 7. v0.3.0: system = 3 ZCode official blocks + model line + client block (identity rewritten)
-    expect(parsed.system.length).toBe(5);
+    // 7. v0.3.10.4: system = minimal 2 identity blocks + client block
+    // (identity rewritten)
+    expect(parsed.system.length).toBe(3);
     expect(parsed.system[0].text).toBe("You are ZCode, an interactive coding agent");
-    expect(parsed.system[4].text).toContain("You are ZCode model working in Claude Code");
+    expect(parsed.system[2].text).toContain("You are ZCode model working in Claude Code");
 
     // 8. thinking simplified + budget injected; max_tokens=64000 (glm-5.2 spec);
     //    output_config injected
