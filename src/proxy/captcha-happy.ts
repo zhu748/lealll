@@ -1838,7 +1838,7 @@ const HOST_CRITICAL_GLOBALS = new Set([
 const EXTRA_WINDOW_PROPS = [
   "moveBy", "moveTo", "resizeBy", "resizeTo", "scrollTo", "scrollBy", "scroll",
   "open", "close", "stop", "focus", "blur", "print", "alert", "confirm",
-  "prompt", "getSelection", "find",
+  "prompt", "getSelection", "find", "matchMedia",
 ];
 
 // Ref-count: the pool solves in parallel waves; each window must keep the
@@ -2121,7 +2121,33 @@ function noteWindowSolved() {
   _reusePool.lastUsedAt = Date.now();
 }
 
-async function solveTraceless(opts) {
+// happy-dom script tags execute in Bun's host realm, so a solve temporarily
+// exposes its window through globalThis (installGlobalWindowAlias above).
+// Multiple simultaneous solves therefore cannot be isolated: the newest
+// window overwrites bare globals such as matchMedia, and destroying either
+// window can leave a sibling's FeiLin callbacks pointed at a closed realm.
+// That race produced the intermittent `ReferenceError: matchMedia is not
+// defined` followed by upstream 3007 rejections.
+//
+// Serialize the browser epochs. The token pool may still request/race several
+// solves; they queue here and successful extras are banked normally. This is
+// intentionally process-wide because the alias and cookie bridge are also
+// process-wide.
+let _solveLockTail: Promise<void> = Promise.resolve();
+
+async function withCaptchaSolveLock(task) {
+  const previous = _solveLockTail;
+  let release;
+  _solveLockTail = new Promise((resolve) => { release = resolve; });
+  await previous.catch(() => {});
+  try {
+    return await task();
+  } finally {
+    release();
+  }
+}
+
+async function solveTracelessUnlocked(opts) {
   const scene = opts.scene || "11xygtvd";
   const region = opts.region || "sgp";
   const prefix = opts.prefix || "no8xfe";
@@ -2291,4 +2317,16 @@ async function solveTraceless(opts) {
   }
 }
 
-export { solveTraceless, createDom, destroyDom, installGlobalWindowAlias, removeGlobalWindowAlias, GUEST_EVAL_PATCH };
+async function solveTraceless(opts) {
+  return withCaptchaSolveLock(() => solveTracelessUnlocked(opts));
+}
+
+export {
+  solveTraceless,
+  createDom,
+  destroyDom,
+  installGlobalWindowAlias,
+  removeGlobalWindowAlias,
+  GUEST_EVAL_PATCH,
+  withCaptchaSolveLock as _withCaptchaSolveLockForTesting,
+};

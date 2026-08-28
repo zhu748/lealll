@@ -32,7 +32,13 @@ import type { AuthManager } from "../auth/manager.js";
 import type { Credential } from "../auth/types.js";
 import { getProvider } from "../provider/providers.js";
 import { buildUpstreamRequest, type UpstreamHeaderPair } from "./upstream.js";
-import { getCaptchaToken, RETRY_HEADERS, urgentCaptcha, detectCaptchaChallenge } from "./captcha.js";
+import {
+  detectCaptchaChallenge,
+  getCaptchaToken,
+  invalidateCaptchaTokens,
+  RETRY_HEADERS,
+  urgentCaptcha,
+} from "./captcha.js";
 import { transformRequestBodyObj } from "./body-transformer.js";
 import { detectSseErrorAndConvert } from "./sse-error-detector.js";
 import { anthropicSseToBatchMessage } from "./sse-to-batch.js";
@@ -553,10 +559,18 @@ export async function proxyRequest(
   let hadRetryAttempt = false;
 
   const checkCaptchaVerifyFailed = async (resp: Response): Promise<{ failed: boolean; response: Response }> => {
-    if (currentPlan !== "start-plan" || resp.status !== 403) return { failed: false, response: resp };
+    if (currentPlan !== "start-plan" || resp.status < 400 || resp.status >= 500) {
+      return { failed: false, response: resp };
+    }
     // v0.3.0: header-based challenge detection (upstream v2.6.0) — a non-empty
     // x-aliyun-captcha-verify-param RESPONSE header means the gateway wants a
     // fresh token, even when the body doesn't carry the 3007 JSON.
+    //
+    // The gateway does not consistently use HTTP 403 here. In particular,
+    // after a 429 retry it currently returns HTTP 400 with
+    // {code:3007,msg:"captcha verify failed"}. Restricting detection to 403
+    // let that response escape as an ordinary bad request and produced the
+    // misleading "retry N succeeded (status 400)" log.
     if (detectCaptchaChallenge(resp)) return { failed: true, response: resp };
     try {
       const split = splitResponseForPreview(resp);
@@ -939,6 +953,10 @@ export async function proxyRequest(
     await cancelResponseBody(checkedResp);
     proxyLog(`${reqId} start-plan captcha verify failed${context}; taking a fresh pool token and retrying once...`);
     hadRetryAttempt = true;
+    // Tokens are minted in waves. A broken browser fingerprint can poison all
+    // siblings from the same wave, so do not take the next token from the
+    // already-rejected bank.
+    invalidateCaptchaTokens();
     // v0.3.0: request an urgent pool refill so the challenge doesn't drain
     // the pre-solved tokens (upstream v2.6.0 behavior).
     urgentCaptcha();
@@ -950,6 +968,7 @@ export async function proxyRequest(
       const checkedRetryResp = retryCheck.response;
       if (retryCheck.failed) {
         await cancelResponseBody(checkedRetryResp);
+        invalidateCaptchaTokens();
         return {
           response: checkedRetryResp,
           retried: true,

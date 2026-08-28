@@ -20,6 +20,7 @@ import {
   installGlobalWindowAlias,
   removeGlobalWindowAlias,
   GUEST_EVAL_PATCH,
+  _withCaptchaSolveLockForTesting,
 } from "./captcha-happy.js";
 
 /** Bare-identifier resolution exactly as guest <script> tags get under Bun
@@ -34,6 +35,7 @@ function makeFakeWindow(): Record<string, unknown> {
   const w: Record<string, unknown> = {};
   Object.defineProperty(w, "print", { value: () => {}, configurable: true, writable: true });
   w.alert = () => {};
+  w.matchMedia = (query: string) => ({ matches: false, media: query });
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const g = globalThis as any;
   w.setTimeout = g.setTimeout;
@@ -53,6 +55,10 @@ describe("installGlobalWindowAlias / removeGlobalWindowAlias (v0.3.6.0)", () => 
       expect(guestEval("print()")).toBe(undefined);
       // Non-critical window methods keep resolving as before.
       expect(guestEval("typeof alert")).toBe("function");
+      // FeiLin 1.5.1 calls matchMedia() through a bare identifier. Keep this
+      // explicit even if a future happy-dom build moves it to a prototype.
+      expect(guestEval("typeof matchMedia")).toBe("function");
+      expect(guestEval("matchMedia('(prefers-color-scheme: dark)').media")).toBe("(prefers-color-scheme: dark)");
       expect(guestEval("typeof window")).toBe("object");
       // Host-defined host-critical globals stay unshadowed (no getter).
       const consoleDesc = Object.getOwnPropertyDescriptor(globalThis, "console");
@@ -126,6 +132,38 @@ describe("installGlobalWindowAlias / removeGlobalWindowAlias (v0.3.6.0)", () => 
       expect(guestEval("typeof print")).toBe("undefined");
       expect(typeof setTimeout).toBe("function");
     }
+  });
+});
+
+describe("captcha browser-epoch serialization", () => {
+  it("never overlaps tasks that would share Bun globalThis aliases", async () => {
+    let active = 0;
+    let maxActive = 0;
+    const order: string[] = [];
+    const run = (id: number) => _withCaptchaSolveLockForTesting(async () => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      order.push(`start-${id}`);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      order.push(`end-${id}`);
+      active -= 1;
+      return id;
+    });
+
+    const values = await Promise.all([run(1), run(2), run(3)]);
+    expect(values).toEqual([1, 2, 3]);
+    expect(maxActive).toBe(1);
+    expect(order).toEqual(["start-1", "end-1", "start-2", "end-2", "start-3", "end-3"]);
+  });
+
+  it("releases the next browser epoch when a solve throws", async () => {
+    const first = _withCaptchaSolveLockForTesting(async () => {
+      throw new Error("expected test failure");
+    });
+    const second = _withCaptchaSolveLockForTesting(async () => "continued");
+
+    await expect(first).rejects.toThrow("expected test failure");
+    await expect(second).resolves.toBe("continued");
   });
 });
 

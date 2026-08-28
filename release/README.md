@@ -1,5 +1,14 @@
 # zcode-proxy 使用说明
 
+> **v0.3.10.5 — 修复 start-plan 重试后偶发 3007 验证失败**
+>
+> - 修复 Bun/happy-dom 并发解验证码时共享 `globalThis` 导致窗口环境互相覆盖的问题；FeiLin 的裸 `matchMedia()` 调用不再偶发报 `ReferenceError`。
+> - start-plan 现在能识别上游使用 HTTP 400 返回的 `code: 3007`，不再把它误记为“重试成功（status 400）”。
+> - 收到 3007 后会废弃同一批次的可疑 token，并阻止仍在生成的旧批次 token 重新进入池中，再使用全新 token 重试。
+> - 新增 `429 → 429 → HTTP 400/3007 → 刷新 token → 200` 完整回归测试。
+>
+> **升级建议**：使用 start-plan 的用户建议升级；coding-plan 用户不受影响。
+
 > **v0.3.10.4 — 思考注入对齐官方 SDK + system 注入精简为身份块**
 >
 > 本版包含两块改动，均基于官方 ZCode 3.9.2 桌面客户端解包逆向：

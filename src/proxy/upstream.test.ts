@@ -1830,6 +1830,85 @@ describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
     }
   });
 
+  it("recovers when a 429 retry returns HTTP 400 code 3007", async () => {
+    const startPlanConfig: ProxyConfig = {
+      ...testConfig,
+      plan: "start-plan",
+      retry: {
+        ...testConfig.retry,
+        maxRetries: 2,
+        initialDelayMs: 1,
+        maxDelayMs: 1,
+        retryableStatuses: [429],
+      },
+    };
+    const originalPreflight = process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
+    delete process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
+    let captchaSeq = 0;
+    const seenCaptchaHeaders: Array<string | null> = [];
+    const captchaTokenProvider = mock(async () => ({
+      verifyParam: `captcha-${++captchaSeq}`,
+      region: "cn-shanghai",
+      solveMs: 2,
+    }));
+    const successBody = JSON.stringify({
+      id: "msg_after_3007",
+      type: "message",
+      role: "assistant",
+      content: [{ type: "text", text: "recovered" }],
+      model: "glm-5.3",
+      stop_reason: "end_turn",
+      stop_sequence: null,
+      usage: { input_tokens: 5, output_tokens: 2 },
+    });
+
+    try {
+      const fetchMock = mock(async (req: Request): Promise<Response> => {
+        seenCaptchaHeaders.push(req.headers.get("x-aliyun-captcha-verify-param"));
+        if (seenCaptchaHeaders.length <= 2) {
+          return new Response(JSON.stringify({ code: 1302, msg: "rate limited" }), {
+            status: 429,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        if (seenCaptchaHeaders.length === 3) {
+          return new Response(JSON.stringify({ code: 3007, msg: "captcha verify failed" }), {
+            status: 400,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        return new Response(successBody, {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      });
+
+      const auth = new AuthManager({ mode: "oauth", provider: "zai" });
+      auth.setOAuthCredential({ apiKey: "dummy", provider: "zai", plan: "start-plan", jwt: "jwt-mock" });
+      const clientReq = new Request("http://localhost:8080/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "glm-5.3", max_tokens: 128, messages: [{ role: "user", content: "hi" }] }),
+      });
+
+      const resp = await proxyRequest(clientReq, "anthropic", {
+        config: startPlanConfig,
+        auth,
+        fetchImpl: fetchMock as any,
+        captchaTokenProvider,
+      });
+
+      expect(resp.status).toBe(200);
+      expect((await resp.json()).content[0].text).toBe("recovered");
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+      expect(captchaTokenProvider).toHaveBeenCalledTimes(4);
+      expect(seenCaptchaHeaders).toEqual(["captcha-1", "captcha-2", "captcha-3", "captcha-4"]);
+    } finally {
+      if (originalPreflight === undefined) delete process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT;
+      else process.env.ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT = originalPreflight;
+    }
+  });
+
   it("keeps the explicit client session id stable across start-plan retry attempts", async () => {
     // v0.3.0 (upstream v2.6.0 session-context): when the client identifies its
     // session (Claude Code's x-claude-code-session-id), the proxy reuses the

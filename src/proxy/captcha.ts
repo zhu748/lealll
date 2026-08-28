@@ -23,6 +23,7 @@ import { shutdownCaptchaSolver } from "./captcha-solver.js";
 import {
   configureCaptchaPool,
   getCaptchaPoolStats,
+  invalidateCaptchaPool,
   prefillCaptchaPool,
   takeCaptchaToken,
   startCaptchaPoolRefill,
@@ -127,6 +128,11 @@ export async function startCaptchaPool(appVersion: string): Promise<void> {
 /** Request an urgent refill burst (e.g. after a challenge/retry). */
 export function urgentCaptcha(): void {
   urgentCaptchaRefill();
+}
+
+/** Discard banked tokens after an upstream 3007 verification rejection. */
+export function invalidateCaptchaTokens(): void {
+  invalidateCaptchaPool();
 }
 
 export function captchaPoolStats(): { ready: number; target: number; activeSolves: number } {

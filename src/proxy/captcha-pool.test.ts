@@ -74,6 +74,30 @@ describe("CaptchaTokenPool", () => {
     expect(pool.stats().ready).toBe(0);
   });
 
+  it("does not re-bank an in-flight mint wave after invalidation", async () => {
+    // Keep the invalidated prefill from immediately starting a fresh
+    // generation; this test isolates whether the old in-flight result leaks
+    // back into the bank.
+    (pool as unknown as { opts: { staggerMs: number } }).opts.staggerMs = 60_000;
+    let started = 0;
+    let releaseWave!: () => void;
+    const waveGate = new Promise<void>((resolve) => { releaseWave = resolve; });
+    solveMock.mockImplementation(async () => {
+      const id = ++started;
+      await waveGate;
+      return `old-wave-${id}:${"x".repeat(48)}`;
+    });
+
+    const fill = pool.prefill(CFG, 1);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(started).toBe(1);
+    pool.invalidate();
+    releaseWave();
+    await fill;
+
+    expect(pool.stats().ready).toBe(0);
+  });
+
   it("pushToken rejects duplicate certifyId", async () => {
     const payload = Buffer.from(
       JSON.stringify({ certifyId: "dup-test-id", sceneId: "11xygtvd", isSign: true, securityToken: "x" }),

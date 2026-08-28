@@ -195,6 +195,8 @@ function resolvePoolOpts(opts: CaptchaPoolOptions): ResolvedPoolOpts {
 
 export class CaptchaTokenPool {
   private tokens: TokenEntry[] = [];
+  /** Incremented whenever upstream 3007 invalidates the current mint wave. */
+  private tokenGeneration = 0;
   private opts: ResolvedPoolOpts;
   private effectiveTarget: number;
   private refillTimer: ReturnType<typeof setInterval> | null = null;
@@ -274,6 +276,7 @@ export class CaptchaTokenPool {
   invalidate(): void {
     this.tokens = [];
     this.certifyIds.clear();
+    this.tokenGeneration += 1;
     this.pausedUntil = Date.now() + this.opts.staggerMs;
   }
 
@@ -594,6 +597,7 @@ export class CaptchaTokenPool {
       const wave = Math.min(remaining, concurrency, this.deficit());
       if (wave <= 0) break;
       if (this.opts.staggerMs > 0) await this.waitForStagger();
+      const waveGeneration = this.tokenGeneration;
       const results = await Promise.allSettled(
         Array.from({ length: wave }, () => this.solveOne(cfg)),
       );
@@ -601,7 +605,10 @@ export class CaptchaTokenPool {
       for (const r of results) {
         if (r.status === "fulfilled") {
           fulfilled += 1;
-          this.pushToken(r.value);
+          // invalidate() may have run while this wave was solving after the
+          // gateway rejected a sibling token. Never re-bank results from that
+          // now-poisoned generation.
+          if (waveGeneration === this.tokenGeneration) this.pushToken(r.value);
         } else {
           console.warn("[captcha-pool] parallel solve failed:", r.reason);
         }
@@ -749,6 +756,7 @@ export class CaptchaTokenPool {
     const racers = Math.max(1, Math.min(this.opts.emptyTakeRace, this.opts.solveConcurrency));
     if (racers <= 1) return this.solveFresh(cfg);
 
+    const raceGeneration = this.tokenGeneration;
     return new Promise<string>((resolve, reject) => {
       let pending = racers;
       let served = false;
@@ -758,7 +766,7 @@ export class CaptchaTokenPool {
           (param) => {
             if (served) {
               // Lost the race but minted a valid token — bank it.
-              this.pushToken(param);
+              if (raceGeneration === this.tokenGeneration) this.pushToken(param);
             } else {
               served = true;
               resolve(param);
@@ -845,4 +853,16 @@ export async function prefillCaptchaPool(cfg: CaptchaConfig, count?: number): Pr
 
 export function urgentCaptchaRefill(): void {
   pool.requestUrgentRefill();
+}
+
+/**
+ * Drop every banked verify param after the gateway rejects one with 3007.
+ *
+ * A 3007 commonly means a whole solve wave was minted from the same degraded
+ * browser epoch (for example, a missing FeiLin fingerprint API), not merely
+ * that one token was unlucky. Keeping sibling tokens from that wave makes the
+ * next retry deterministically fail with another stale/invalid param.
+ */
+export function invalidateCaptchaPool(): void {
+  pool.invalidate();
 }
