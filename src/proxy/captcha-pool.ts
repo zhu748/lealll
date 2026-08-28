@@ -540,6 +540,10 @@ export class CaptchaTokenPool {
 
   private async refill(opts: { urgent: boolean }): Promise<void> {
     if (!this.cfg) return;
+    // A live takeToken() solve has priority. Do not even enqueue background
+    // work behind it; the refill timer will try again after the request has
+    // obtained its token. This keeps boot warm-up from extending request TTFB.
+    if (!opts.urgent && this.activeSolves > 0) return;
     // Refresh sizing BEFORE the in-flight guard: a fill batch with slow or
     // stalling solves can hold refillInFlight for minutes, and freezing the
     // target that whole time starves the buffer exactly when demand exists.
@@ -581,12 +585,26 @@ export class CaptchaTokenPool {
       // Background waves are capped at bgSolveConcurrency: each happy-dom
       // solve carries multi-hundred-ms synchronous eval chunks on the shared
       // event loop, so a full-throttle background fill starves the admin API
-      // (v0.3.6.1 oauth login timeout bug). Urgent waves (a client is waiting
-      // on a token) keep the full governor allowance.
-      const waveConcurrency = opts.urgent
+      // (v0.3.6.1 oauth login timeout bug). Urgent waves may use the full
+      // governor allowance, but are still capped to one real backend wave.
+      const requestedWaveConcurrency = opts.urgent
         ? concurrency
         : Math.min(concurrency, this.opts.bgSolveConcurrency);
-      await this.solveBatch(this.cfg, need, Math.max(1, waveConcurrency));
+      // Never enqueue more work than the backend can truly execute. The
+      // in-process happy-dom backend reports one worker because its browser
+      // realm is global; configured values above that are only wishes.
+      const waveConcurrency = Math.max(
+        1,
+        Math.min(requestedWaveConcurrency, captchaSolverConcurrency()),
+      );
+      // Every refill yields after one concurrency-sized wave. Previously an
+      // "urgent" replenishment fired after each token take and received the
+      // whole deficit (often 20), so it monopolized the serialized browser
+      // realm even though the live request already had its token. Empty-pool
+      // live requests solve directly in takeToken(); refill never needs to
+      // build a long queue.
+      const batchNeed = Math.min(need, Math.max(1, waveConcurrency));
+      await this.solveBatch(this.cfg, batchNeed, Math.max(1, waveConcurrency));
     } finally {
       this.refillInFlight = false;
     }

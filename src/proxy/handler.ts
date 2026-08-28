@@ -37,7 +37,6 @@ import {
   getCaptchaToken,
   invalidateCaptchaTokens,
   RETRY_HEADERS,
-  urgentCaptcha,
 } from "./captcha.js";
 import { transformRequestBodyObj } from "./body-transformer.js";
 import { detectSseErrorAndConvert } from "./sse-error-detector.js";
@@ -957,9 +956,9 @@ export async function proxyRequest(
     // siblings from the same wave, so do not take the next token from the
     // already-rejected bank.
     invalidateCaptchaTokens();
-    // v0.3.0: request an urgent pool refill so the challenge doesn't drain
-    // the pre-solved tokens (upstream v2.6.0 behavior).
-    urgentCaptcha();
+    // Do not launch a separate refill before the live solve below. The
+    // happy-dom realm is serialized, so that old pattern put a background
+    // token ahead of the request that actually needs one.
     try {
       captchaRetryHeaders = await refreshCaptchaHeaders();
       const retryResp = await fetchUpstreamDetected(captchaRetryHeaders);

@@ -534,7 +534,7 @@ describe("CaptchaTokenPool mint breaker + backoff (v0.3.6.2)", () => {
     expect(solveMock.mock.calls.length).toBe(2);
   });
 
-  it("caps background wave concurrency at bgSolveConcurrency (urgent waves exempt)", async () => {
+  it("bounds both background and urgent refill to one wave", async () => {
     pool = new CaptchaTokenPool({
       poolSizeMin: 8,
       poolSizeMax: 8,
@@ -559,13 +559,43 @@ describe("CaptchaTokenPool mint breaker + backoff (v0.3.6.2)", () => {
     });
     await (pool as unknown as { refill: (o: { urgent: boolean }) => Promise<void> }).refill({ urgent: false });
     expect(maxInFlight).toBeLessThanOrEqual(2);
-    expect(pool.stats().ready).toBe(8);
+    expect(pool.stats().ready).toBe(2);
 
-    // Urgent refill keeps the full configured concurrency.
+    // Urgent means "schedule now", not "monopolize until the pool is full".
     (pool as unknown as { tokens: unknown[] }).tokens = [];
     inFlight = 0;
     maxInFlight = 0;
     await (pool as unknown as { refill: (o: { urgent: boolean }) => Promise<void> }).refill({ urgent: true });
-    expect(maxInFlight).toBeGreaterThan(2);
+    expect(maxInFlight).toBeLessThanOrEqual(2);
+    expect(pool.stats().ready).toBe(2);
+  });
+
+  it("does not enqueue background refill while a live token solve is active", async () => {
+    pool = new CaptchaTokenPool({
+      poolSizeMin: 3,
+      poolSizeMax: 3,
+      tokenTtlMs: 60_000,
+      refillIntervalMs: 600_000,
+      solveRetries: 1,
+      solveConcurrency: 1,
+      bgSolveConcurrency: 1,
+      cpuLimitPercent: 0,
+      scaleDownIdleMs: 600_000,
+    });
+    (pool as unknown as { cfg: unknown }).cfg = CFG;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    solveMock.mockImplementation(async () => {
+      await gate;
+      return "live:" + "x".repeat(60);
+    });
+
+    const liveTake = pool.takeToken(CFG);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(solveMock).toHaveBeenCalledTimes(1);
+    await (pool as unknown as { refill: (o: { urgent: boolean }) => Promise<void> }).refill({ urgent: false });
+    expect(solveMock).toHaveBeenCalledTimes(1);
+    release();
+    await liveTake;
   });
 });

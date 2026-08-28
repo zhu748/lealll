@@ -24,7 +24,6 @@ import {
   configureCaptchaPool,
   getCaptchaPoolStats,
   invalidateCaptchaPool,
-  prefillCaptchaPool,
   takeCaptchaToken,
   startCaptchaPoolRefill,
   stopCaptchaPool,
@@ -121,8 +120,12 @@ export async function startCaptchaPool(appVersion: string): Promise<void> {
   const min = Number(process.env.CAPTCHA_POOL_MIN || 20);
   const max = Number(process.env.CAPTCHA_POOL_MAX || Math.max(min * 6, 120));
   configureCaptchaPool({ poolSizeMin: min, poolSizeMax: max });
+  // startBackgroundRefill() already kicks an immediate fill. Running an
+  // awaited prefill here as well created a second solve chain, and with the
+  // Bun/happy-dom realm correctly serialized those two chains could queue
+  // ~20 solves ahead of a live request. Background refill is deliberately
+  // incremental; the periodic loop warms the pool without monopolizing it.
   startCaptchaPoolRefill(cfg as CaptchaConfig);
-  await prefillCaptchaPool(cfg as CaptchaConfig, min);
 }
 
 /** Request an urgent refill burst (e.g. after a challenge/retry). */
