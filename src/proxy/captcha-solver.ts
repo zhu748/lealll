@@ -26,5 +26,5 @@ export function setCaptchaSolverConcurrency(_n: number): void {}
 export function shutdownCaptchaSolver(): void {}
 
 export function captchaSolverConcurrency(): number {
-  return Number(process.env.CAPTCHA_DAEMON_CONCURRENCY || 4);
+  return 1;
 }

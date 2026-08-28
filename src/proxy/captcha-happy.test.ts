@@ -21,6 +21,7 @@ import {
   removeGlobalWindowAlias,
   GUEST_EVAL_PATCH,
   _withCaptchaSolveLockForTesting,
+  _drainGuestTailForTesting,
 } from "./captcha-happy.js";
 
 /** Bare-identifier resolution exactly as guest <script> tags get under Bun
@@ -36,6 +37,8 @@ function makeFakeWindow(): Record<string, unknown> {
   Object.defineProperty(w, "print", { value: () => {}, configurable: true, writable: true });
   w.alert = () => {};
   w.matchMedia = (query: string) => ({ matches: false, media: query });
+  w.Window = function Window() {};
+  w.Element = function Element() {};
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const g = globalThis as any;
   w.setTimeout = g.setTimeout;
@@ -152,17 +155,38 @@ describe("installGlobalWindowAlias / removeGlobalWindowAlias (v0.3.6.0)", () => 
         moveBy(1, 1);
         ({
           media: matchMedia('(prefers-reduced-motion: reduce)').media,
+          constructors: 0 * !Window * !Element,
           hasWindow: typeof window
         })
-      `) as { media: string; hasWindow: string };
+      `) as { media: string; constructors: number; hasWindow: string };
     });
     removeGlobalWindowAlias(globalThis, w);
 
     await expect(delayedCollector).resolves.toEqual({
       media: "(prefers-reduced-motion: reduce)",
+      constructors: 0,
       hasWindow: "undefined",
     });
     expect(guestEval("moveBy.toString()")).toContain("[native code]");
+    expect(guestEval("Window.toString()")).toContain("[native code]");
+    expect(guestEval("Element.toString()")).toContain("[native code]");
+  });
+
+  it("keeps the live realm installed while bounded guest-tail tasks drain", async () => {
+    const w = makeFakeWindow();
+    let observed = "";
+    w.happyDOM = {
+      waitUntilComplete: () => new Promise<void>((resolve) => {
+        setTimeout(() => {
+          observed = String(guestEval("Window === window.Window"));
+          resolve();
+        }, 5);
+      }),
+    };
+    installGlobalWindowAlias(globalThis, w);
+    await _drainGuestTailForTesting(w, 50);
+    expect(observed).toBe("true");
+    removeGlobalWindowAlias(globalThis, w);
   });
 });
 
@@ -195,6 +219,35 @@ describe("captcha browser-epoch serialization", () => {
 
     await expect(first).rejects.toThrow("expected test failure");
     await expect(second).resolves.toBe("continued");
+  });
+
+  it("drops stale queued solves without allowing the next epoch to overlap", async () => {
+    let releaseFirst!: () => void;
+    let firstActive = false;
+    let staleRan = false;
+    let thirdOverlapped = false;
+    const first = _withCaptchaSolveLockForTesting(async () => {
+      firstActive = true;
+      await new Promise<void>((resolve) => { releaseFirst = resolve; });
+      firstActive = false;
+    });
+    // Let the first task acquire the epoch before queueing the others.
+    await Promise.resolve();
+    const stale = _withCaptchaSolveLockForTesting(async () => {
+      staleRan = true;
+    }, 5);
+    const third = _withCaptchaSolveLockForTesting(async () => {
+      thirdOverlapped = firstActive;
+      return "third";
+    }, 100);
+
+    await expect(stale).rejects.toThrow("captcha solve queue timeout");
+    expect(staleRan).toBe(false);
+    expect(firstActive).toBe(true);
+    releaseFirst();
+    await expect(first).resolves.toBeUndefined();
+    await expect(third).resolves.toBe("third");
+    expect(thirdOverlapped).toBe(false);
   });
 });
 

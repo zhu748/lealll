@@ -99,10 +99,12 @@ const DEFAULT_POOL_MAX = Number(process.env.CAPTCHA_POOL_MAX || 120);
 const DEFAULT_TOKEN_TTL_MS = Number(process.env.CAPTCHA_CACHE_TTL_MS || 95_000);
 const DEFAULT_REFILL_INTERVAL_MS = Number(process.env.CAPTCHA_REFILL_INTERVAL_MS || 1_000);
 const DEFAULT_STAGGER_MS = Number(process.env.CAPTCHA_SOLVE_STAGGER_MS || 0);
-const DEFAULT_SOLVE_CONCURRENCY = Number(
-        process.env.CAPTCHA_SOLVE_CONCURRENCY ||
-                (process.env.ZCODE_CAPTCHA_LOW_CPU === "1" ? 3 : 8),
-);
+// happy-dom guest scripts share Bun's globalThis and are therefore serialized
+// by captcha-happy.ts. Advertising 3-8 workers here only queued duplicate
+// 30-second solves behind that lock; after a burst, live requests appeared to
+// hang even though no work was actually parallel. Keep one producer per
+// process. True concurrency requires isolated worker processes/realms.
+const DEFAULT_SOLVE_CONCURRENCY = 1;
 const DEFAULT_SCALE_DOWN_IDLE_MS = Number(process.env.CAPTCHA_POOL_SCALE_DOWN_IDLE_MS || 120_000);
 const DEFAULT_IDLE_FLOOR = Number(process.env.CAPTCHA_POOL_IDLE_FLOOR || 1);
 // Inter-attempt backoff inside one solveFresh retry chain. Without it, a
@@ -116,7 +118,7 @@ const DEFAULT_SOLVE_BACKOFF_BASE_MS = Number(process.env.CAPTCHA_SOLVE_BACKOFF_B
 const DEFAULT_SOLVE_BACKOFF_CAP_MS = Number(process.env.CAPTCHA_SOLVE_BACKOFF_CAP_MS || 4_000);
 // Background (no client waiting) solve wave concurrency cap. Urgent waves
 // (a live request needs a token) keep the full governor allowance.
-const DEFAULT_BG_SOLVE_CONCURRENCY = Math.max(1, Number(process.env.CAPTCHA_BG_SOLVE_CONCURRENCY || 2));
+const DEFAULT_BG_SOLVE_CONCURRENCY = 1;
 // Mint circuit breaker: after this many consecutive ALL-FAILED waves, park
 // background solving for an escalating cooldown. Kills the permanent retry
 // spiral when the environment simply cannot mint (flagged IP, broken FeiLin).
@@ -131,10 +133,11 @@ const DEFAULT_BREAKER_COOLDOWNS_MS = DEFAULT_BREAKER_COOLDOWN_SCHEDULE.length > 
 // Zero-traffic beyond this stops background solving entirely (floor 0): no
 // mint churn, near-zero CPU. The next token take restores poolSizeMin.
 const DEFAULT_DEEP_IDLE_AFTER_MS = Number(process.env.CAPTCHA_DEEP_IDLE_AFTER_MS || 900_000);
-// Parallel solves raced on an empty-pool take — first success serves the
-// client, the twins top up the pool. Cuts worst-case cold TTFB and widens
-// odds against a bad rotated pe bundle stalling one racer.
-const EMPTY_TAKE_RACE = Math.max(1, Number(process.env.CAPTCHA_EMPTY_TAKE_RACE || 3));
+// Empty-pool take uses the same single producer. Racing several callers here
+// cannot create real parallelism in the shared Bun realm and only grows the
+// lock queue. Unit tests can still pass an explicit value to exercise the
+// generic pool race implementation independently of the production backend.
+const EMPTY_TAKE_RACE = 1;
 const SOLVE_RETRIES = Number(process.env.ZCODE_CAPTCHA_RETRIES || 4);
 const SCALE_UP_STEP = 20;
 const TAKE_RATE_WINDOW_MS = 120_000;

@@ -1854,7 +1854,7 @@ const _delayedGuestFallbackFns = new WeakSet();
 // live epoch installGlobalWindowAlias still replaces them with the current
 // window's methods; between epochs they merely let stale, already-irrelevant
 // collectors finish harmlessly. Existing host globals are never overwritten.
-function installDelayedGuestFallbacks(g) {
+function installDelayedGuestFallbacks(g, constructorNames = []) {
   for (const name of EXTRA_WINDOW_PROPS) {
     try {
       if (name in g) continue;
@@ -1894,6 +1894,32 @@ function installDelayedGuestFallbacks(g) {
         configurable: true,
         writable: true,
         enumerable: true,
+      });
+    } catch (_) {}
+  }
+  // Discover the DOM constructor surface from the just-closed window instead
+  // of maintaining another brittle name list. FeiLin currently probes
+  // `Window` and `Element` with bare identifiers, and rotated builds may pick
+  // any of the other interfaces. Detached placeholders are sufficient for
+  // typeof/truthiness/instanceof probes and, crucially, retain no old realm.
+  for (const name of constructorNames) {
+    try {
+      if (name in g || !/^[A-Z][A-Za-z0-9_$]*$/.test(name)) continue;
+      const impl = function DelayedGuestConstructor() {};
+      _delayedGuestFallbackFns.add(impl);
+      try { Object.defineProperty(impl, "name", { value: name, configurable: true }); } catch (_) {}
+      try {
+        Object.defineProperty(impl, "toString", {
+          value: () => `function ${name}() { [native code] }`,
+          configurable: true,
+          writable: true,
+        });
+      } catch (_) {}
+      Object.defineProperty(g, name, {
+        value: impl,
+        configurable: true,
+        writable: true,
+        enumerable: false,
       });
     } catch (_) {}
   }
@@ -2069,6 +2095,15 @@ function removeGlobalWindowAlias(g, w) {
   if (_aliasRefCount <= 0) return;
   _aliasRefCount -= 1;
   if (_aliasRefCount > 0) return;
+  const delayedConstructorNames = [];
+  for (const [name, desc] of _savedGlobalDescMap) {
+    try {
+      const wasAbsentOrFallback = !desc || _delayedGuestFallbackFns.has(desc.value);
+      if (wasAbsentOrFallback && /^[A-Z]/.test(name) && typeof w[name] === "function") {
+        delayedConstructorNames.push(name);
+      }
+    } catch (_) {}
+  }
   // Restore the pre-epoch host descriptors. Names the host did NOT define
   // (print, window, self, __capWindowFor, ...) had undefined descriptors →
   // delete them. Names it DID define (setTimeout, console, ...) get their
@@ -2083,7 +2118,31 @@ function removeGlobalWindowAlias(g, w) {
   // Do this only after the exact host snapshot has been restored. The
   // fallback installer fills genuinely absent browser names and leaves all
   // real Bun/Node globals untouched.
-  installDelayedGuestFallbacks(g);
+  installDelayedGuestFallbacks(g, delayedConstructorNames);
+}
+
+async function drainGuestTail(win, maxMs = 160) {
+  // FeiLin fires fingerprint promises without awaiting them. Keep the live
+  // aliases around for a short bounded drain so its RAF/promise chain can
+  // finish against the correct window before teardown. waitUntilComplete()
+  // understands happy-dom timers/tasks; the host timer is a hard ceiling for
+  // SDK intervals that intentionally never finish.
+  const boundedMs = Math.max(0, Math.min(1_000, Number(maxMs) || 0));
+  if (boundedMs === 0) return;
+  let timer;
+  try {
+    await Promise.race([
+      Promise.resolve(win?.happyDOM?.waitUntilComplete?.()).catch(() => {}),
+      new Promise((resolve) => { timer = hostSetTimeout(resolve, boundedMs); }),
+    ]);
+    // Flush promise continuations queued by the final tracked task.
+    await Promise.resolve();
+    await Promise.resolve();
+  } catch (_) {
+    // Teardown must always continue.
+  } finally {
+    if (timer) hostClearTimeout(timer);
+  }
 }
 
 function destroyDom(win) {
@@ -2201,15 +2260,40 @@ function noteWindowSolved() {
 // process-wide.
 let _solveLockTail: Promise<void> = Promise.resolve();
 
-async function withCaptchaSolveLock(task) {
+async function withCaptchaSolveLock(
+  task,
+  maxWaitMs = Number(process.env.CAPTCHA_SOLVE_LOCK_WAIT_MS || 20_000),
+) {
   const previous = _solveLockTail;
   let release;
   _solveLockTail = new Promise((resolve) => { release = resolve; });
-  await previous.catch(() => {});
+  let acquired = false;
+  let waitTimer;
   try {
+    const boundedWaitMs = Math.max(1, Math.min(120_000, Number(maxWaitMs) || 20_000));
+    await Promise.race([
+      previous.catch(() => {}),
+      new Promise((_, reject) => {
+        waitTimer = hostSetTimeout(
+          () => reject(new Error(`captcha solve queue timeout (${boundedWaitMs}ms)`)),
+          boundedWaitMs,
+        );
+      }),
+    ]);
+    acquired = true;
+    if (waitTimer) hostClearTimeout(waitTimer);
     return await task();
   } finally {
-    release();
+    if (waitTimer) hostClearTimeout(waitTimer);
+    if (acquired) {
+      release();
+    } else {
+      // This stale queued solve timed out, but the next waiter must still stay
+      // behind the currently active epoch. Release our queue slot only when
+      // the predecessor ends; releasing immediately would reintroduce global
+      // alias overlap.
+      void previous.then(release, release);
+    }
   }
 }
 
@@ -2378,6 +2462,7 @@ async function solveTracelessUnlocked(opts) {
     // not poison later solves, and the retry rolls a fresh pe anyway.
     if (!keepWindow) {
       if (_reusePool.window === w) _reusePool.window = null;
+      await drainGuestTail(w, Number(process.env.CAPTCHA_GUEST_DRAIN_MS || 160));
       destroyDom(w);
     }
   }
@@ -2395,4 +2480,5 @@ export {
   removeGlobalWindowAlias,
   GUEST_EVAL_PATCH,
   withCaptchaSolveLock as _withCaptchaSolveLockForTesting,
+  drainGuestTail as _drainGuestTailForTesting,
 };
