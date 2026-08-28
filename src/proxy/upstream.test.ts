@@ -761,7 +761,7 @@ describe("proxyRequest", () => {
     async: { enabled: false, origin: "https://zcode.z.ai", pollIntervalMs: 5000, keepAliveIntervalMs: 3000, maxWaitMs: 0, maxRetries: 3, settleTimeoutMs: 8000, controlTimeoutMs: 15000, defaultModel: "" },
 
     logging: { level: "info" },
-    retry: { maxRetries: 0, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3 },
+    retry: { maxRetries: 0, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3, totalDeadlineMs: 0 },
   };
 
   it("forwards request to upstream with injected auth", async () => {
@@ -943,7 +943,7 @@ describe("proxyRequest", () => {
 
     const retryConfig: ProxyConfig = {
       ...testConfig,
-      retry: { maxRetries: 5, initialDelayMs: 60, maxDelayMs: 1000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3 },
+      retry: { maxRetries: 5, initialDelayMs: 60, maxDelayMs: 1000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3, totalDeadlineMs: 0 },
     };
     const auth = new AuthManager({ mode: "apikey", provider: "zai", apiKey: "testkey.testsecret" });
     const clientReq = new Request("http://localhost:8080/v1/messages", {
@@ -1243,7 +1243,7 @@ describe("proxyRequest — OpenAI translation mode (coding-plan)", () => {
     async: { enabled: false, origin: "https://zcode.z.ai", pollIntervalMs: 5000, keepAliveIntervalMs: 3000, maxWaitMs: 0, maxRetries: 3, settleTimeoutMs: 8000, controlTimeoutMs: 15000, defaultModel: "" },
 
     logging: { level: "info" },
-    retry: { maxRetries: 0, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3 },
+    retry: { maxRetries: 0, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3, totalDeadlineMs: 0 },
   };
 
   function makeOpenAIReq(body: string, headers: Record<string, string> = {}): Request {
@@ -1637,7 +1637,7 @@ describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
     async: { enabled: false, origin: "https://zcode.z.ai", pollIntervalMs: 5000, keepAliveIntervalMs: 3000, maxWaitMs: 0, maxRetries: 3, settleTimeoutMs: 8000, controlTimeoutMs: 15000, defaultModel: "" },
 
     logging: { level: "info" },
-    retry: { maxRetries: 0, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3 },
+    retry: { maxRetries: 0, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3, totalDeadlineMs: 0 },
   };
 
   it("Anthropic client request uses decompress:false passthrough and inflates compressed bodies", async () => {
@@ -2416,7 +2416,7 @@ describe("proxyRequest — per-account outbound proxy (v2.1.4.1test5)", () => {
     async: { enabled: false, origin: "https://zcode.z.ai", pollIntervalMs: 5000, keepAliveIntervalMs: 3000, maxWaitMs: 0, maxRetries: 3, settleTimeoutMs: 8000, controlTimeoutMs: 15000, defaultModel: "" },
 
     logging: { level: "info" },
-    retry: { maxRetries: 0, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3 },
+    retry: { maxRetries: 0, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3, totalDeadlineMs: 0 },
   };
 
   const successBody = JSON.stringify({

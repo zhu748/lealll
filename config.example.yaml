@@ -209,6 +209,11 @@ async:
 #   headers before each start-plan model attempt. Set
 #   ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT=0 only if you want diagnostic 3007-only
 #   solving.
+# - v0.3.10.9: RETRY attempts use a shorter captcha-take wait cap
+#   (ZCODE_STARTPLAN_RETRY_TAKE_MS, default 8000ms) so a starved pool cannot
+#   stall every retry; when even that fails, the request fails fast with
+#   503 captcha_failed + Retry-After instead of silently grinding through all
+#   retries. Slow takes (>2s) are logged with pool stats for visibility.
 # - Pool sizing: CAPTCHA_POOL_MIN (default 20), CAPTCHA_POOL_MAX (default
 #   max(min*6, 120)). Retries: ZCODE_CAPTCHA_RETRIES (default 4). CPU
 #   throttle: CAPTCHA_CPU_LIMIT_PCT (default 100 = off).
@@ -253,6 +258,15 @@ retry:
   # Maximum number of retry attempts. Set to 0 to disable retries entirely.
   # No upper bound — set as high as needed (e.g. 1000 for very flaky upstreams).
   maxRetries: 3
+  # Total wall-clock budget (ms) for the ENTIRE retry loop of one request.
+  # When exceeded the proxy stops retrying and returns 503 + Retry-After: 30
+  # so the client can back off — it never holds the connection silent beyond
+  # this. Covers backoff sleeps, captcha-pool takes, and retry fetches; does
+  # NOT cut short a successful streaming response (that is bounded by
+  # server.upstreamTimeoutMs). Set to 0 to disable (legacy unbounded — with
+  # large maxRetries + a starved captcha pool this held clients 10+ minutes).
+  # Env var: ZCODE_RETRY_TOTAL_DEADLINE_MS. Default: 300000 (5 minutes).
+  totalDeadlineMs: 300000
   # Initial delay (ms) before the first retry. Subsequent retries multiply by backoffFactor.
   initialDelayMs: 1000
   # Maximum delay cap (ms). Backoff will never exceed this value.

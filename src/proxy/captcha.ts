@@ -51,6 +51,13 @@ export interface LegacyCaptchaSolveOptions {
   deviceMid?: string;
   /** Ignored — the happy backend serves every solve. Kept for API stability. */
   solver?: "chrome" | "jsdom" | "auto";
+  /**
+   * v0.3.10.9: caller-side cap (ms) on how long an empty-pool take may wait
+   * for a mint before giving up (clamped to [1s, CAPTCHA_SOLVE_RACE_DEADLINE_MS]).
+   * The request-retry path passes a short value so a starved pool cannot add
+   * the full default 25s to every retry iteration. Warm takes ignore this.
+   */
+  maxWaitMs?: number;
 }
 
 export interface LegacyCaptchaSolveResult {
@@ -97,7 +104,9 @@ export async function getCaptchaToken(
   if (!cfg || !cfg.enabled || !cfg.prefix || !cfg.sceneId) throw new Error("Captcha config unavailable");
   // Pre-solved token pool: requests take an already-minted token (sub-ms)
   // while background solves refill — the hot path never waits on a solve.
-  const verifyParam = await takeCaptchaToken(cfg);
+  // v0.3.10.9: opts.maxWaitMs caps the empty-pool wait for callers on the
+  // request-retry path (see LegacyCaptchaSolveOptions.maxWaitMs).
+  const verifyParam = await takeCaptchaToken(cfg, opts.maxWaitMs);
   void reqId; // kept for signature compatibility; the pool logs internally
   return { verifyParam, region: cfg.region, solveMs: Date.now() - started };
 }

@@ -58,7 +58,7 @@ function makeConfig(overrides: Partial<ProxyConfig> = {}): ProxyConfig {
     async: { enabled: false, origin: "https://zcode.z.ai", pollIntervalMs: 5000, keepAliveIntervalMs: 3000, maxWaitMs: 0, maxRetries: 3, settleTimeoutMs: 8000, controlTimeoutMs: 15000, defaultModel: "" },
 
     logging: { level: "info" },
-    retry: { maxRetries: 10, initialDelayMs: 1, maxDelayMs: 5, backoffFactor: 1, retryableStatuses: [529], credentialSwitchThreshold: 5, emptyStreamSwitchThreshold: 3 },
+    retry: { maxRetries: 10, initialDelayMs: 1, maxDelayMs: 5, backoffFactor: 1, retryableStatuses: [529], credentialSwitchThreshold: 5, emptyStreamSwitchThreshold: 3, totalDeadlineMs: 0 },
     ...overrides,
   };
 }
@@ -146,7 +146,7 @@ describe("credential auto-switching", () => {
 
   it("does NOT switch when threshold is 0 (disabled)", async () => {
     const config = makeConfig({
-      retry: { maxRetries: 5, initialDelayMs: 1, maxDelayMs: 5, backoffFactor: 1, retryableStatuses: [529], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3 },
+      retry: { maxRetries: 5, initialDelayMs: 1, maxDelayMs: 5, backoffFactor: 1, retryableStatuses: [529], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3, totalDeadlineMs: 0 },
     });
     const auth = new AuthManager({
       mode: "oauth",
@@ -224,7 +224,7 @@ describe("credential auto-switching", () => {
 
   it("logs single-credential switch unavailability only once per request", async () => {
     const config = makeConfig({
-      retry: { maxRetries: 6, initialDelayMs: 1, maxDelayMs: 5, backoffFactor: 1, retryableStatuses: [529], credentialSwitchThreshold: 2, emptyStreamSwitchThreshold: 0 },
+      retry: { maxRetries: 6, initialDelayMs: 1, maxDelayMs: 5, backoffFactor: 1, retryableStatuses: [529], credentialSwitchThreshold: 2, emptyStreamSwitchThreshold: 0, totalDeadlineMs: 0 },
     });
     const auth = new AuthManager({
       mode: "oauth",
@@ -335,7 +335,7 @@ describe("credential auto-switching", () => {
 
   it("does not repeatedly attempt or log switching after all credentials are tried", async () => {
     const config = makeConfig({
-      retry: { maxRetries: 4, initialDelayMs: 1, maxDelayMs: 5, backoffFactor: 1, retryableStatuses: [529], credentialSwitchThreshold: 2, emptyStreamSwitchThreshold: 0 },
+      retry: { maxRetries: 4, initialDelayMs: 1, maxDelayMs: 5, backoffFactor: 1, retryableStatuses: [529], credentialSwitchThreshold: 2, emptyStreamSwitchThreshold: 0, totalDeadlineMs: 0 },
     });
     const auth = new AuthManager({
       mode: "oauth",
@@ -387,7 +387,7 @@ describe("credential auto-switching", () => {
 
   it("switches at threshold=1 (switch on every failure)", async () => {
     const config = makeConfig({
-      retry: { maxRetries: 3, initialDelayMs: 1, maxDelayMs: 5, backoffFactor: 1, retryableStatuses: [529], credentialSwitchThreshold: 1, emptyStreamSwitchThreshold: 3 },
+      retry: { maxRetries: 3, initialDelayMs: 1, maxDelayMs: 5, backoffFactor: 1, retryableStatuses: [529], credentialSwitchThreshold: 1, emptyStreamSwitchThreshold: 3, totalDeadlineMs: 0 },
     });
     const auth = new AuthManager({
       mode: "oauth",
@@ -433,7 +433,7 @@ describe("credential auto-switching", () => {
   it("switches multiple times with 3 credentials when earlier ones keep failing", async () => {
     const CRED_C: Credential = { apiKey: "key-CCC", provider: "zai", plan: "coding-plan", userId: "user-C" };
     const config = makeConfig({
-      retry: { maxRetries: 12, initialDelayMs: 1, maxDelayMs: 5, backoffFactor: 1, retryableStatuses: [529], credentialSwitchThreshold: 3, emptyStreamSwitchThreshold: 3 },
+      retry: { maxRetries: 12, initialDelayMs: 1, maxDelayMs: 5, backoffFactor: 1, retryableStatuses: [529], credentialSwitchThreshold: 3, emptyStreamSwitchThreshold: 3, totalDeadlineMs: 0 },
     });
     const auth = new AuthManager({
       mode: "oauth",
@@ -481,7 +481,7 @@ describe("credential auto-switching", () => {
 
   it("counts initial and retry network errors toward the credential-switch threshold", async () => {
     const config = makeConfig({
-      retry: { maxRetries: 8, initialDelayMs: 1, maxDelayMs: 5, backoffFactor: 1, retryableStatuses: [529], credentialSwitchThreshold: 3, emptyStreamSwitchThreshold: 3 },
+      retry: { maxRetries: 8, initialDelayMs: 1, maxDelayMs: 5, backoffFactor: 1, retryableStatuses: [529], credentialSwitchThreshold: 3, emptyStreamSwitchThreshold: 3, totalDeadlineMs: 0 },
     });
     const auth = new AuthManager({
       mode: "oauth",
@@ -610,7 +610,7 @@ describe("empty-stream 529 → 3 retries then credential switch", () => {
     // Default config: maxRetries=3, credentialSwitchThreshold=5
     // Empty-stream switch threshold is hardcoded to 3 in handler.ts
     const config = makeConfig({
-      retry: { maxRetries: 3, initialDelayMs: 1, maxDelayMs: 5, backoffFactor: 1, retryableStatuses: [529], credentialSwitchThreshold: 5, emptyStreamSwitchThreshold: 3 },
+      retry: { maxRetries: 3, initialDelayMs: 1, maxDelayMs: 5, backoffFactor: 1, retryableStatuses: [529], credentialSwitchThreshold: 5, emptyStreamSwitchThreshold: 3, totalDeadlineMs: 0 },
     });
     const auth = new AuthManager({
       mode: "oauth",
@@ -666,7 +666,7 @@ describe("empty-stream 529 → 3 retries then credential switch", () => {
 
   it("returns 529 to client when all credentials return empty streams", async () => {
     const config = makeConfig({
-      retry: { maxRetries: 3, initialDelayMs: 1, maxDelayMs: 5, backoffFactor: 1, retryableStatuses: [529], credentialSwitchThreshold: 5, emptyStreamSwitchThreshold: 3 },
+      retry: { maxRetries: 3, initialDelayMs: 1, maxDelayMs: 5, backoffFactor: 1, retryableStatuses: [529], credentialSwitchThreshold: 5, emptyStreamSwitchThreshold: 3, totalDeadlineMs: 0 },
     });
     const auth = new AuthManager({
       mode: "oauth",
@@ -722,7 +722,7 @@ describe("empty-stream 529 → 3 retries then credential switch", () => {
     // SSE event block (`\n\n`) instead of zero bytes. This test reproduces the
     // user's actual scenario — the SSE stream has bytes but no real events.
     const config = makeConfig({
-      retry: { maxRetries: 3, initialDelayMs: 1, maxDelayMs: 5, backoffFactor: 1, retryableStatuses: [529], credentialSwitchThreshold: 5, emptyStreamSwitchThreshold: 3 },
+      retry: { maxRetries: 3, initialDelayMs: 1, maxDelayMs: 5, backoffFactor: 1, retryableStatuses: [529], credentialSwitchThreshold: 5, emptyStreamSwitchThreshold: 3, totalDeadlineMs: 0 },
     });
     const auth = new AuthManager({
       mode: "oauth",
@@ -783,7 +783,7 @@ describe("empty-stream 529 → 3 retries then credential switch", () => {
     // User-visible symptom (from log):
     //   | #063 | ... | glm-5.2 | batch | 200 | 1019ms | in:- out:- |
     const config = makeConfig({
-      retry: { maxRetries: 3, initialDelayMs: 1, maxDelayMs: 5, backoffFactor: 1, retryableStatuses: [529], credentialSwitchThreshold: 5, emptyStreamSwitchThreshold: 3 },
+      retry: { maxRetries: 3, initialDelayMs: 1, maxDelayMs: 5, backoffFactor: 1, retryableStatuses: [529], credentialSwitchThreshold: 5, emptyStreamSwitchThreshold: 3, totalDeadlineMs: 0 },
     });
     const auth = new AuthManager({
       mode: "oauth",
@@ -843,7 +843,7 @@ describe("empty-stream 529 → 3 retries then credential switch", () => {
     // Another signature of quota exhaustion: gateway returns 200 + valid JSON
     // but the JSON has no recognizable content/choices/usage fields.
     const config = makeConfig({
-      retry: { maxRetries: 3, initialDelayMs: 1, maxDelayMs: 5, backoffFactor: 1, retryableStatuses: [529], credentialSwitchThreshold: 5, emptyStreamSwitchThreshold: 3 },
+      retry: { maxRetries: 3, initialDelayMs: 1, maxDelayMs: 5, backoffFactor: 1, retryableStatuses: [529], credentialSwitchThreshold: 5, emptyStreamSwitchThreshold: 3, totalDeadlineMs: 0 },
     });
     const auth = new AuthManager({
       mode: "oauth",

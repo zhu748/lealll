@@ -33,6 +33,7 @@ import type { Credential } from "../auth/types.js";
 import { getProvider } from "../provider/providers.js";
 import { buildUpstreamRequest, type UpstreamHeaderPair } from "./upstream.js";
 import {
+  captchaPoolStats,
   detectCaptchaChallenge,
   getCaptchaToken,
   invalidateCaptchaTokens,
@@ -189,6 +190,28 @@ export interface ProxyHandlerOptions {
  */
 const DEFAULT_UPSTREAM_TIMEOUT_STREAM_MS = 10 * 60_000;
 const DEFAULT_UPSTREAM_TIMEOUT_BATCH_MS = 5 * 60_000;
+// v0.3.10.9 ("two 429 requests then stuck for many minutes" report):
+//
+// The retry loop previously had NO wall-clock budget. With maxRetries=20,
+// exponential backoff alone sleeps ~143s, and on start-plan EVERY retry also
+// pays a captcha-pool take before the model call — up to 25s race deadline +
+// 10s grace when the pool is starved (empty + slow/failing mints) — so the
+// loop could hold the client silent for 10+ minutes with one log line per
+// ~35s. Two coupled fixes:
+//
+//   1. config.retry.totalDeadlineMs bounds the whole retry loop (default 5
+//      minutes; 0 = legacy unbounded).
+//   2. Retry-path captcha takes get this SHORT wait cap. The INITIAL preflight
+//      keeps the pool default (25s) — the client just arrived and one wait is
+//      acceptable — but retries must not re-pay it every attempt. When even
+//      this short take fails, the loop fails fast with 503 captcha_failed
+//      (mirroring the initial-preflight behavior) instead of misclassifying
+//      the mint failure as a transient network error and burning every
+//      remaining attempt.
+const STARTPLAN_RETRY_TAKE_MAX_WAIT_MS = Number(process.env.ZCODE_STARTPLAN_RETRY_TAKE_MS || 8_000);
+// A retry-path take slower than this logs pool stats so operators see pool
+// starvation in the request log instead of an unexplained silent gap.
+const CAPTCHA_TAKE_SLOW_LOG_MS = 2_000;
 const ERROR_RESPONSE_PREVIEW_BYTES = 64 * 1024;
 const PASSTHROUGH_USAGE_PREVIEW_BYTES = 2 * 1024 * 1024;
 
@@ -588,15 +611,18 @@ export async function proxyRequest(
     }
   };
 
-  const refreshCaptchaHeaders = async (_solver?: "chrome"): Promise<Record<string, string>> => {
+  const refreshCaptchaHeaders = async (maxWaitMs?: number): Promise<Record<string, string>> => {
     // v0.3.0: pool-based token take (sub-ms warm). The `solver` parameter is
     // retained for API compatibility — the happy backend serves every solve.
+    // v0.3.10.9: maxWaitMs caps the empty-pool wait (retry path uses a short
+    // cap; the initial preflight keeps the pool default).
     const solved = await (opts.captchaTokenProvider ?? getCaptchaToken)(reqId, {
       appVersion: config.identity.appVersion,
       sourceTitle: config.identity.sourceTitle,
       refererOrigin: config.identity.refererOrigin,
       releaseChannel: config.identity.releaseChannel,
       deviceMid: config.identity.deviceMid,
+      maxWaitMs,
     });
     totalCaptchaMs += solved.solveMs;
     return {
@@ -605,9 +631,9 @@ export async function proxyRequest(
     };
   };
 
-  const refreshStartPlanPreflightHeaders = async (): Promise<Record<string, string> | undefined> => {
+  const refreshStartPlanPreflightHeaders = async (maxWaitMs?: number): Promise<Record<string, string> | undefined> => {
     if (currentPlan === "start-plan" && startPlanCaptchaPreflightEnabled()) {
-      captchaRetryHeaders = await refreshCaptchaHeaders();
+      captchaRetryHeaders = await refreshCaptchaHeaders(maxWaitMs);
       return captchaRetryHeaders;
     }
     captchaRetryHeaders = undefined;
@@ -944,6 +970,7 @@ export async function proxyRequest(
   const retryStartPlanCaptchaChallenge = async (
     resp: Response,
     context: string,
+    maxWaitMs?: number,
   ): Promise<CaptchaChallengeResult> => {
     const captchaCheck = await checkCaptchaVerifyFailed(resp);
     const checkedResp = captchaCheck.response;
@@ -960,7 +987,10 @@ export async function proxyRequest(
     // happy-dom realm is serialized, so that old pattern put a background
     // token ahead of the request that actually needs one.
     try {
-      captchaRetryHeaders = await refreshCaptchaHeaders();
+      // v0.3.10.9: retry-context calls pass a shorter take deadline so a
+      // starved pool cannot extend an already-long retry loop by another
+      // ~35s here (the initial-attempt call keeps the pool default).
+      captchaRetryHeaders = await refreshCaptchaHeaders(maxWaitMs);
       const retryResp = await fetchUpstreamDetected(captchaRetryHeaders);
       if (!startPlanCaptchaPreflightEnabled()) captchaRetryHeaders = undefined;
       const retryCheck = await checkCaptchaVerifyFailed(retryResp);
@@ -1336,6 +1366,15 @@ export async function proxyRequest(
     const effectiveRetryLimit = (): number =>
       Math.min(config.retry.maxRetries + extraAttemptsFromSwitches, MAX_TOTAL_ATTEMPTS);
 
+    // v0.3.10.9: wall-clock budget for the ENTIRE retry loop. The attempt cap
+    // alone cannot bound the loop's duration — each iteration may sleep up to
+    // maxDelayMs AND (start-plan) wait on a captcha-pool take AND run a full
+    // upstream fetch. With large maxRetries the client could be held silent
+    // for 10+ minutes. The budget covers only the retry phase (pre-success);
+    // streaming of a successful response is bounded by upstreamTimeoutMs.
+    const retryTotalDeadlineMs = Math.max(0, config.retry.totalDeadlineMs ?? 0);
+    const retryLoopStartedAt = Date.now();
+
     for (let attempt = 1; attempt <= effectiveRetryLimit(); attempt++) {
       // v0.3.4: client disconnected during the backoff window — every further
       // attempt (and the sleep itself) is wasted work and wasted quota.
@@ -1343,6 +1382,37 @@ export async function proxyRequest(
         proxyLog(`${reqId} client disconnected during retry backoff — aborting retry loop`);
         printRow(reqId, format, meta, 499, started, Date.now(), 0, 0, 0, hadRetryAttempt, 0, currentCredentialStatsKey(), totalCaptchaMs);
         return errorResponse(499, "client_disconnected", "Client closed the connection before the response completed");
+      }
+      // v0.3.10.9: total wall-clock budget exceeded — stop retrying and hand
+      // the client a clean, retryable 503 with Retry-After. Forwarding the
+      // last upstreamResp here is NOT an option: previous iterations already
+      // cancelled its body (only the natural-exhaustion path keeps the last
+      // body intact), so the client would receive a bodyless 429.
+      if (retryTotalDeadlineMs > 0 && Date.now() - retryLoopStartedAt > retryTotalDeadlineMs) {
+        proxyLog(
+          `${reqId} retry total deadline (${retryTotalDeadlineMs}ms) exceeded after ${attempt - 1}/${effectiveRetryLimit()} retries ` +
+          `— returning 503 (Retry-After: 30) so the client can back off and retry`,
+        );
+        printRow(reqId, format, meta, 503, started, Date.now(), 0, 0, 0, hadRetryAttempt, 0, currentCredentialStatsKey(), totalCaptchaMs);
+        return new Response(
+          JSON.stringify({
+            error: {
+              type: "retry_deadline_exceeded",
+              message:
+                `The upstream kept returning retryable errors for over ${Math.round(retryTotalDeadlineMs / 1000)}s ` +
+                `(last status: ${upstreamResp.status}). The proxy stopped retrying to avoid holding the ` +
+                `connection open indefinitely — please retry after the Retry-After interval.`,
+            },
+          }),
+          {
+            status: 503,
+            headers: {
+              "content-type": "application/json",
+              "retry-after": "30",
+              "x-should-not-retry-immediately": "1",
+            },
+          },
+        );
       }
       // v0.2.2+ safety: if we've hit the hard cap, force-exit the loop
       // immediately. This catches the edge case where extraAttemptsFromSwitches
@@ -1364,10 +1434,43 @@ export async function proxyRequest(
       const retryAfter = upstreamResp.headers.get("retry-after");
       const delayMs = computeRetryDelayMs(config.retry, attempt, retryAfter);
 
+      // === v0.3.10.11 (retry latency): parallel captcha pre-take ===
+      // Start-plan retries need a FRESH verify param for every attempt (Aliyun
+      // params are one-shot). The old flow slept the full backoff FIRST and
+      // only then took a pool token, so every retry paid backoff + take
+      // back-to-back — with a cold pool that was e.g. 2s + 3-5s per retry,
+      // which the user rightly read as "retries are absurdly slow". Starting
+      // the take BEFORE the sleep overlaps the two waits: the retry now fires
+      // at max(backoff, take) instead of backoff + take. With a warm pool the
+      // take is sub-millisecond and the retry fires exactly at backoff expiry
+      // ("retry right after failing"); with a cold pool the mint runs during
+      // the backoff window instead of after it.
+      //
+      // Guard: only pre-take when the CURRENT plan is start-plan with the
+      // preflight enabled. If a mid-retry credential switch changes the plan
+      // (start-plan → coding-plan), the pre-take result is discarded below
+      // (one wasted pool token on a rare path — preferable to serializing the
+      // wait on the common path). `refreshCaptchaHeaders` is called DIRECTLY
+      // (not via refreshStartPlanPreflightHeaders) so the in-flight promise
+      // cannot assign stale headers into `captchaRetryHeaders` after a plan
+      // switch has cleared them.
+      const preTakeStartPlan = currentPlan === "start-plan" && startPlanCaptchaPreflightEnabled();
+      const preTakeStartedAt = Date.now();
+      let captchaPreTake: Promise<Record<string, string>> | undefined;
+      if (preTakeStartPlan) {
+        captchaPreTake = refreshCaptchaHeaders(STARTPLAN_RETRY_TAKE_MAX_WAIT_MS);
+        // Mark handled NOW: if we abandon this promise (client disconnect,
+        // deadline exit, plan switch), its eventual rejection must not surface
+        // as an unhandled rejection. Awaiting it later still re-throws.
+        captchaPreTake.catch(() => {});
+      }
+
       proxyLog(
-        `${reqId} upstream returned ${upstreamResp.status}, retry ${attempt}/${effectiveRetryLimit()} in ${delayMs}ms...`,
+        `${reqId} upstream returned ${upstreamResp.status}, retry ${attempt}/${effectiveRetryLimit()} in ${delayMs}ms` +
+        `${preTakeStartPlan ? " (captcha pre-take running in parallel)" : ""}...`,
       );
       hadRetryAttempt = true;
+      // The pre-take (if any) is already running — this sleep overlaps it.
       await sleep(delayMs);
 
       // v0.3.4: re-check AFTER the backoff sleep — the abort may have arrived
@@ -1487,6 +1590,63 @@ export async function proxyRequest(
         }
       }
 
+      // v0.3.10.9: the captcha preflight take is deliberately OUTSIDE the
+      // fetch try/catch below. A failed take (starved pool: empty + failing
+      // mints) is NOT a transient upstream condition — retrying the model
+      // call cannot fix a broken mint environment, yet the old placement
+      // funnelled it into the network-error handler ("fetch failed on retry
+      // N, will retry again") and burned EVERY remaining attempt at ~35s per
+      // take before the client saw anything (the reported "429 twice, then
+      // stuck for many minutes"). Fail fast with 503 captcha_failed — the
+      // same policy the INITIAL preflight path has always used — and let the
+      // CLIENT apply its own backoff and retry once the pool recovers.
+      try {
+        // v0.3.10.11: consume the PARALLEL pre-take when it is still valid
+        // (plan unchanged & preflight still enabled). Otherwise fall back to
+        // the serial take — refreshStartPlanPreflightHeaders also handles the
+        // captchaRetryHeaders cleanup when the plan is no longer start-plan.
+        const takeStartedAt = captchaPreTake ? preTakeStartedAt : Date.now();
+        if (captchaPreTake && currentPlan === "start-plan" && startPlanCaptchaPreflightEnabled()) {
+          captchaRetryHeaders = await captchaPreTake;
+        } else {
+          await refreshStartPlanPreflightHeaders(STARTPLAN_RETRY_TAKE_MAX_WAIT_MS);
+        }
+        const takeMs = Date.now() - takeStartedAt;
+        // Slow-take visibility: without this line, a starved pool shows up as
+        // an unexplained silent gap between the "retry N/M in Xms..." line and
+        // the next status line — the exact symptom in the user report.
+        // v0.3.10.11: for the parallel path this measures from the pre-take
+        // START (before the backoff sleep), so the log reflects the true take
+        // duration — the overlap means it is no longer dead time added on top.
+        if (takeMs > CAPTCHA_TAKE_SLOW_LOG_MS) {
+          let poolInfo = "";
+          try { poolInfo = JSON.stringify(captchaPoolStats()); } catch { /* stats must never break the request */ }
+          proxyLog(`${reqId} captcha preflight take on retry ${attempt} took ${takeMs}ms (pool: ${poolInfo})`);
+        }
+      } catch (err) {
+        const errMsg = (err as Error).message ?? String(err);
+        proxyLog(`${reqId} captcha preflight failed on retry ${attempt}: ${errMsg} — returning 503 captcha_failed (mint failure is not transient for this request)`);
+        printRow(reqId, format, meta, 503, started, Date.now(), 0, 0, 0, hadRetryAttempt, 0, currentCredentialStatsKey(), totalCaptchaMs);
+        return new Response(
+          JSON.stringify({
+            error: {
+              type: "captcha_failed",
+              message:
+                `Start-plan captcha preflight could not obtain a fresh verify param on retry ${attempt}: ${errMsg}. ` +
+                `The token pool is starved (empty + slow or failing mints). The proxy stopped retrying — ` +
+                `retry after the Retry-After interval; pool background refills continue meanwhile.`,
+            },
+          }),
+          {
+            status: 503,
+            headers: {
+              "content-type": "application/json",
+              "retry-after": "10",
+            },
+          },
+        );
+      }
+
       try {
         // Build a FRESH Request for each retry — never reuse upstreamReq.
         // fetchUpstreamDetected also runs SSE error detection so 200 streams
@@ -1497,9 +1657,8 @@ export async function proxyRequest(
         // retry because Aliyun verify params are one-shot and cannot be reused.
         // Operators can explicitly disable this with
         // ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT=0 to fall back to 3007-only solving.
-        await refreshStartPlanPreflightHeaders();
         upstreamResp = await fetchUpstreamDetected(captchaRetryHeaders);
-        const retryCaptchaResult = await retryStartPlanCaptchaChallenge(upstreamResp, ` on retry ${attempt}`);
+        const retryCaptchaResult = await retryStartPlanCaptchaChallenge(upstreamResp, ` on retry ${attempt}`, STARTPLAN_RETRY_TAKE_MAX_WAIT_MS);
         upstreamResp = retryCaptchaResult.response;
         if (retryCaptchaResult.error) {
           printRow(reqId, format, meta, 503, started, Date.now(), 0, 0, 0, hadRetryAttempt, 0, currentCredentialStatsKey(), totalCaptchaMs);

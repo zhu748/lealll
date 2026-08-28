@@ -41,7 +41,7 @@ function makeRetryConfig(): ProxyConfig {
 
     logging: { level: "info" },
     // Enable retries: 529 is retryable, use short delays for fast tests
-    retry: { maxRetries: 3, initialDelayMs: 10, maxDelayMs: 50, backoffFactor: 2, retryableStatuses: [529, 502], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3 },
+    retry: { maxRetries: 3, initialDelayMs: 10, maxDelayMs: 50, backoffFactor: 2, retryableStatuses: [529, 502], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3, totalDeadlineMs: 0 },
   };
 }
 

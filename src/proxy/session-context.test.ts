@@ -27,7 +27,7 @@ const BASE_CONFIG: ProxyConfig = {
   clientSigning: { enabled: false, origin: "https://zcode.z.ai" },
   async: { enabled: false, origin: "https://zcode.z.ai", pollIntervalMs: 5000, keepAliveIntervalMs: 3000, maxWaitMs: 0, maxRetries: 3, settleTimeoutMs: 8000, controlTimeoutMs: 15000, defaultModel: "" },
   logging: { level: "info" },
-  retry: { maxRetries: 0, initialDelayMs: 1, maxDelayMs: 1, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3 },
+  retry: { maxRetries: 0, initialDelayMs: 1, maxDelayMs: 1, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3, totalDeadlineMs: 0 },
 };
 
 describe("session context", () => {

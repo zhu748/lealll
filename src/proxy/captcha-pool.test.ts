@@ -123,6 +123,239 @@ describe("CaptchaTokenPool", () => {
     const taken = await pool.takeToken(CFG);
     expect(taken.startsWith("token-3:")).toBe(true);
   });
+
+  // v0.3.10.9 regression tests: the "two 429 requests then stuck for many
+  // minutes" report traced to retry-path takes waiting the full default
+  // deadline (25s) + grace (10s) per retry iteration, plus late-minted
+  // tokens being silently dropped after a deadline miss.
+  describe("retry-path take deadline + late-mint banking (v0.3.10.9)", () => {
+    const originalGrace = process.env.CAPTCHA_TAKE_GRACE_MS;
+    const originalDeadline = process.env.CAPTCHA_SOLVE_RACE_DEADLINE_MS;
+
+    beforeEach(() => {
+      // Fast grace exit so the deadline rejection surfaces quickly in tests.
+      process.env.CAPTCHA_TAKE_GRACE_MS = "30";
+      delete process.env.CAPTCHA_SOLVE_RACE_DEADLINE_MS;
+    });
+    afterEach(() => {
+      if (originalGrace === undefined) delete process.env.CAPTCHA_TAKE_GRACE_MS;
+      else process.env.CAPTCHA_TAKE_GRACE_MS = originalGrace;
+      if (originalDeadline === undefined) delete process.env.CAPTCHA_SOLVE_RACE_DEADLINE_MS;
+      else process.env.CAPTCHA_SOLVE_RACE_DEADLINE_MS = originalDeadline;
+      // Restore the module-default solver implementation — this describe's
+      // tests override it with gated/never-resolving promises, and later
+      // describes (deep idle etc.) rely on the default fast solver.
+      solveMock.mockImplementation(async () => "x".repeat(64));
+    });
+
+    it("takeToken honors a caller-provided maxWaitMs shorter than the env default", async () => {
+      solveMock.mockImplementation(async (): Promise<string> => {
+        await new Promise(() => {}); // mint never lands
+        return "unreachable";
+      });
+      const started = Date.now();
+      let err: unknown = null;
+      try {
+        await pool.takeToken(CFG, 1_100);
+      } catch (e) {
+        err = e;
+      }
+      const elapsed = Date.now() - started;
+      // Rejects with the deadline error after ~1.1s (env default is 25s —
+      // the shorter caller cap must win), NOT after the full default.
+      expect(String((err as Error)?.message)).toMatch(/deadline/);
+      expect(elapsed).toBeGreaterThanOrEqual(1_000);
+      expect(elapsed).toBeLessThan(1_800);
+    });
+
+    it("a take that misses its deadline banks the late-minted token for the next take", async () => {
+      let calls = 0;
+      solveMock.mockImplementation(async (): Promise<string> => {
+        calls += 1;
+        if (calls === 1) {
+          // First mint is slower than the 1s caller cap but eventually lands.
+          await new Promise((r) => setTimeout(r, 1_600));
+          return `late-token-1:${"x".repeat(48)}`;
+        }
+        // Any later mint (background refill etc.) never lands, so the ONLY
+        // servable token is the banked late one.
+        await new Promise(() => {});
+        return "unreachable";
+      });
+
+      let deadlineErr: unknown = null;
+      try {
+        await pool.takeToken(CFG, 1_000);
+      } catch (e) {
+        deadlineErr = e;
+      }
+      expect(String((deadlineErr as Error)?.message)).toMatch(/deadline/);
+
+      // Wait past the late mint's 1.6s landing time so the banking .then runs.
+      await new Promise((r) => setTimeout(r, 900));
+
+      // The next take must serve the BANKED late token instantly — without
+      // the fix the late mint was silently dropped and this take would hang
+      // until its own deadline (and mint yet another token upstream).
+      const t2Start = Date.now();
+      const second = await pool.takeToken(CFG, 1_000);
+      const t2Elapsed = Date.now() - t2Start;
+      expect(second.startsWith("late-token-1:")).toBe(true);
+      expect(t2Elapsed).toBeLessThan(500);
+      // NOTE: no "calls === 1" assertion here — a successful take legitimately
+      // fires an urgent background refill, which invokes the solver again
+      // (asynchronously). The served token's marker already proves the late
+      // mint was banked rather than dropped.
+    });
+
+    it("v0.3.10.11: caller maxWaitMs bounds the WHOLE take — default 10s grace cannot stack on top", async () => {
+      // The describe's beforeEach pins grace to 30ms for speed; this test
+      // needs the DEFAULT (10s) grace to prove the caller cap cuts the grace
+      // window down to whatever budget remains inside maxWaitMs.
+      delete process.env.CAPTCHA_TAKE_GRACE_MS;
+      try {
+        solveMock.mockImplementation(async (): Promise<string> => {
+          await new Promise(() => {}); // mint never lands
+          return "unreachable";
+        });
+        const started = Date.now();
+        let err: unknown = null;
+        try {
+          await pool.takeToken(CFG, 1_200);
+        } catch (e) {
+          err = e;
+        }
+        const elapsed = Date.now() - started;
+        // The race deadline fires at 1.2s. LEGACY behavior: the grace loop
+        // then created a FRESH 10s deadline → rejection at ~11.2s. FIXED
+        // behavior: grace is capped to the remaining maxWaitMs budget (≈0
+        // here) → rejection at ~1.2s.
+        expect(String((err as Error)?.message)).toMatch(/deadline/);
+        expect(elapsed).toBeGreaterThanOrEqual(1_100);
+        expect(elapsed).toBeLessThan(2_500);
+      } finally {
+        process.env.CAPTCHA_TAKE_GRACE_MS = "30"; // restore describe-level pin
+      }
+    });
+
+    it("v0.3.10.11: a FAST-failing mint still gets its grace window inside maxWaitMs (early failure can recover)", async () => {
+      delete process.env.CAPTCHA_TAKE_GRACE_MS;
+      try {
+        // The mint itself rejects quickly (storm), but a rescue token lands
+        // at 700ms via the grace polling loop. Caller cap is 1500ms, so the
+        // grace window has ~1450ms of remaining budget — the rescue MUST be
+        // served. This pins the "grace shrinks but does not vanish" half of
+        // the fix.
+        solveMock.mockImplementation(async (): Promise<string> => {
+          throw new Error("captcha solve stall pe=pe.099.storm.js");
+        });
+        const takePromise = pool.takeToken(CFG, 1_500);
+        const pushTimer = setTimeout(() => {
+          const p = pool as unknown as { pushToken: (s: string) => void };
+          p.pushToken(`cap-rescue:${"h".repeat(48)}`);
+        }, 700);
+        const param = await takePromise;
+        clearTimeout(pushTimer);
+        expect(param).toContain("cap-rescue");
+      } finally {
+        process.env.CAPTCHA_TAKE_GRACE_MS = "30"; // restore describe-level pin
+      }
+    });
+  });
+
+  // v0.3.10.10 regression tests: empty-pool takes used to immediately start
+  // their own live solve even while a background refill wave was mid-mint.
+  // The live solve then serialized behind the wave's solve on the global
+  // solver lock, so the caller paid two back-to-back solves (~6-10s per
+  // 429-retry preflight) while the wave's freshly banked token sat unused in
+  // the pool.
+  describe("empty-pool take serves in-flight background mints (v0.3.10.10)", () => {
+    afterEach(() => {
+      // Restore the default fast solver for later describes.
+      solveMock.mockImplementation(async () => "x".repeat(64));
+    });
+
+    it("waits for the in-flight wave's token instead of minting redundantly", async () => {
+      let started = 0;
+      let releaseWave!: () => void;
+      const waveGate = new Promise<void>((resolve) => { releaseWave = resolve; });
+      solveMock.mockImplementation(async () => {
+        started += 1;
+        await waveGate;
+        return `wave-token-${started}:${"x".repeat(48)}`;
+      });
+
+      // Background wave: one gated solve, banked on completion.
+      const fill = pool.prefill(CFG, 1);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(started).toBe(1); // wave is minting (gated)
+
+      // The take arrives mid-wave on an empty pool.
+      const take = pool.takeToken(CFG, 5_000);
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      // Core assertion: while the wave was still minting, the take did NOT
+      // start its own redundant live solve.
+      expect(started).toBe(1);
+
+      releaseWave();
+      const param = await take;
+      await fill;
+      // The take served the wave's BANKED token (marker 1), not a fresh mint.
+      expect(param.startsWith("wave-token-1:")).toBe(true);
+    });
+
+    it("starts its own live solve immediately when nothing is minting in the background", async () => {
+      let solveStartedAt = 0;
+      solveMock.mockImplementation(async () => {
+        if (!solveStartedAt) solveStartedAt = Date.now();
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        return `live-token:${"x".repeat(48)}`;
+      });
+      const takeStart = Date.now();
+      const param = await pool.takeToken(CFG, 5_000);
+      expect(param.startsWith("live-token:")).toBe(true);
+      // No bg-wait poll rounds: the solve began within a fraction of one poll
+      // interval (a spurious poll round would add ~120ms here).
+      expect(solveStartedAt - takeStart).toBeLessThan(100);
+    });
+
+    it("falls back to its own live solve when the in-flight background mint fails", async () => {
+      let calls = 0;
+      let gateReleased = false;
+      let releaseFailure!: () => void;
+      const failGate = new Promise<void>((resolve) => { releaseFailure = resolve; });
+      solveMock.mockImplementation(async () => {
+        calls += 1;
+        if (!gateReleased) {
+          // Any solve that started while the wave was mid-flight fails once
+          // the gate opens (wave-size agnostic — the CPU governor caps the
+          // urgent wave at one solve by default).
+          await failGate;
+          throw new Error("mint storm: F008");
+        }
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        return `own-token:${"x".repeat(48)}`;
+      });
+
+      // Prime cfg + start an urgent background wave of gated-failing mints.
+      await pool.prefill(CFG, 0);
+      pool.requestUrgentRefill();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(calls).toBeGreaterThanOrEqual(1); // wave in flight
+
+      const takeStart = Date.now();
+      const take = pool.takeToken(CFG, 5_000);
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      releaseFailure();
+      gateReleased = true;
+      const param = await take;
+      const elapsed = Date.now() - takeStart;
+      // The poll gave up once the wave failed (in-flight dropped to 0), the
+      // take minted its own token and still succeeded — bounded wait.
+      expect(param.startsWith("own-token:")).toBe(true);
+      expect(elapsed).toBeLessThan(2_500);
+    });
+  });
 });
 
 describe("CaptchaTokenPool deep idle", () => {

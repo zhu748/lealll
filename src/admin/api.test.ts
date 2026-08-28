@@ -66,7 +66,7 @@ function makeConfig(overrides: Partial<ProxyConfig> = {}): ProxyConfig {
     async: { enabled: false, origin: "https://zcode.z.ai", pollIntervalMs: 5000, keepAliveIntervalMs: 3000, maxWaitMs: 0, maxRetries: 3, settleTimeoutMs: 8000, controlTimeoutMs: 15000, defaultModel: "" },
 
     logging: { level: "info" },
-    retry: { maxRetries: 0, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3 },
+    retry: { maxRetries: 0, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3, totalDeadlineMs: 0 },
     ...overrides,
   };
 }
@@ -2597,7 +2597,7 @@ describe("/admin/api/config PUT — validation", () => {
       body: JSON.stringify({
         provider: "zai", plan: "coding-plan",
         defaultModel: "glm-4.6", models: ["glm-4.6"],
-        retry: { maxRetries: 50, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3 },
+        retry: { maxRetries: 50, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3, totalDeadlineMs: 0 },
       }),
     }), opts);
     expect(resp!.status).toBe(200);
@@ -2612,7 +2612,7 @@ describe("/admin/api/config PUT — validation", () => {
       body: JSON.stringify({
         provider: "zai", plan: "coding-plan",
         defaultModel: "glm-4.6", models: ["glm-4.6"],
-        retry: { maxRetries: -1, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3 },
+        retry: { maxRetries: -1, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3, totalDeadlineMs: 0 },
       }),
     }), opts);
     expect(resp!.status).toBe(500);
@@ -2627,7 +2627,7 @@ describe("/admin/api/config PUT — validation", () => {
       body: JSON.stringify({
         provider: "zai", plan: "coding-plan",
         defaultModel: "glm-4.6", models: ["glm-4.6"],
-        retry: { maxRetries: 3, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: -1, emptyStreamSwitchThreshold: 3 },
+        retry: { maxRetries: 3, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: -1, emptyStreamSwitchThreshold: 3, totalDeadlineMs: 0 },
       }),
     }), opts);
     expect(resp!.status).toBe(500);
@@ -2642,7 +2642,7 @@ describe("/admin/api/config PUT — validation", () => {
       body: JSON.stringify({
         provider: "zai", plan: "coding-plan",
         defaultModel: "glm-4.6", models: ["glm-4.6"],
-        retry: { maxRetries: 3, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3 },
+        retry: { maxRetries: 3, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3, totalDeadlineMs: 0 },
       }),
     }), opts);
     expect(resp!.status).toBe(200);
@@ -2701,7 +2701,7 @@ describe("/admin/api/config PUT — requiresRestart detection", () => {
         defaultModel: "glm-4.6", models: ["glm-4.6"],
         identity: { appVersion: "1.0", sourceTitle: "cli", refererOrigin: "https://z.ai" },
         logging: { level: "info" },
-        retry: { maxRetries: 0, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3 },
+        retry: { maxRetries: 0, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3, totalDeadlineMs: 0 },
       }),
     }), opts);
     const body = await resp!.json();
@@ -2719,7 +2719,7 @@ describe("/admin/api/config PUT — requiresRestart detection", () => {
         defaultModel: "glm-4.6", models: ["glm-4.6"],
         identity: { appVersion: "1.0", sourceTitle: "cli", refererOrigin: "https://z.ai" },
         logging: { level: "info" },
-        retry: { maxRetries: 0, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3 },
+        retry: { maxRetries: 0, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3, totalDeadlineMs: 0 },
       }),
     }), opts);
     const body = await resp!.json();

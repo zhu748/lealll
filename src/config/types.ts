@@ -130,6 +130,32 @@ export interface RetryConfig {
    * Environment variable: ZCODE_RETRY_EMPTY_STREAM_SWITCH_THRESHOLD
    */
   emptyStreamSwitchThreshold: number;
+  /**
+   * Total wall-clock budget (ms) for the ENTIRE retry loop of one request —
+   * backoff sleeps, captcha-preflight takes, and retry fetches all count
+   * against it. When the budget is exceeded the loop stops immediately and
+   * the client receives a 503 (with Retry-After) instead of being held
+   * silent for potentially 10+ minutes.
+   *
+   * Why this exists (the "429 then stuck forever" report): with
+   * maxRetries=20, exponential backoff alone sleeps ~143s, and on
+   * start-plan every retry additionally waits on a captcha-pool take
+   * (up to 25s race deadline + 10s grace when the pool is empty and mints
+   * are failing) — 20 x 35s ≈ 12 minutes with zero client-visible bytes.
+   * A wall-clock cap guarantees bounded response time regardless of
+   * maxRetries, backoff settings, or captcha-pool health.
+   *
+   * The budget applies ONLY to the retry phase (before a successful
+   * upstream response arrives); streaming of a successful response is
+   * bounded by server.upstreamTimeoutMs instead and is never cut short
+   * by this deadline.
+   *
+   * Set to 0 to disable (legacy unbounded behavior).
+   * Default: 300000 (5 minutes).
+   *
+   * Environment variable: ZCODE_RETRY_TOTAL_DEADLINE_MS
+   */
+  totalDeadlineMs: number;
 }
 
 /** Custom routing rule — overrides the default provider/endpoint for requests

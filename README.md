@@ -2,6 +2,148 @@
 
 A reverse proxy for Z.AI / Bigmodel.cn coding-plan APIs that exposes both OpenAI-compatible and Anthropic-format endpoints.
 
+## v0.3.10.11 — parallel captcha pre-take during backoff (retries fire at max(backoff, take))
+
+Third follow-up for the "retries are too slow" report. With v0.3.10.9/10
+the retry loop was bounded and stopped double-solving, but the WAIT
+STRUCTURE was still strictly serial:
+
+    429 → sleep(full backoff: 1s→2s→4s→8s) → take fresh captcha token
+    (0ms warm / ~3-5s cold) → refetch
+
+Every retry therefore paid `backoff + take` back-to-back. With a cold
+pool that is 2s + 3-5s ≈ 5-7s of dead time per retry — which reads as
+"the first request is instant, but every retry crawls".
+
+Fix in `handler.ts`: the moment a retryable status (e.g. 429) is
+observed, the captcha pre-take is started IMMEDIATELY and runs DURING
+the backoff sleep. The retried fetch now fires at
+`max(backoff, take)` instead of `backoff + take`:
+
+- Warm pool (take ≈ 0ms): the retry fires exactly at backoff expiry —
+  "fail → retry right away", matching the initial-request experience.
+- Cold pool (mint ~3-5s): the mint overlaps the backoff instead of
+  stacking after it — each retry saves the whole backoff window.
+
+The pre-take is guarded: it only starts when the current plan is
+start-plan with the preflight enabled, and a mid-retry credential switch
+that changes the plan simply discards the pre-taken token (rare path,
+one token of waste) instead of serializing the common path. Log lines
+now annotate `... (captcha pre-take running in parallel)` so operators
+can see the overlap happening.
+
+Companion fix in `CaptchaTokenPool.takeToken`: when the caller passes an
+explicit `maxWaitMs` (the retry path passes 8s via
+`ZCODE_STARTPLAN_RETRY_TAKE_MS`), that cap now bounds the WHOLE take —
+race + grace combined. Previously the post-failure grace window created
+a FRESH 10s deadline, so an "8s-capped" take could silently stretch to
+8s race + 10s grace = 18s on the failure path. The no-cap initial
+preflight keeps its legacy grace (it benefits from the extra
+convert-a-storm-503-into-a-slow-success window); an early-failing
+capped take still gets whatever grace budget remains inside the cap.
+
+Verified by the `v0.3.10.11` cases in `retry-stall-repro.test.ts`
+(1200ms take + 700ms backoff → retry fires at ~1.2s, not ~1.9s; warm
+pool → retry fires at backoff expiry with zero added wait) and in
+`captcha-pool.test.ts` (default 10s grace cannot stack onto a 1.2s
+caller cap — rejection at ~1.2s instead of ~11.2s; a fast-failing mint
+still recovers via a rescue token inside the cap).
+
+## v0.3.10.10 — faster retry captcha takes (serve in-flight background mints)
+
+Follow-up to v0.3.10.9 for the same report: even with the bounded loop,
+each 429-retry preflight was paying TWO back-to-back captcha solves.
+Sequence: concurrent requests drain the warm pool → every take fires an
+urgent background refill wave → the next (retry-path) take arrives while
+that wave is mid-mint → the take immediately starts its OWN live solve →
+the global solver lock serializes it behind the wave's solve → the caller
+waits wave-solve + own-solve (~6-10s per retry) while the wave's freshly
+banked token sat unused in the pool. The CPU governor caps the urgent
+wave at one concurrent solve by default, so the mint pipeline is a single
+lane — queueing a second mint behind it was pure added latency.
+
+Fix in `CaptchaTokenPool.takeToken`: when the pool is empty but a
+background mint is already in flight, the take now polls briefly
+(120ms cadence, bounded by the same race deadline) and serves the wave's
+token the moment it banks, instead of minting a redundant duplicate.
+It breaks out instantly when nothing is in flight (the plain empty-pool
+take still starts its live solve with zero added latency), and falls back
+to its own live solve when the in-flight mint fails. Fewer duplicate
+mints also means less Aliyun velocity flagging (F008) during retry
+storms — the failure mode that starves the pool in the first place.
+
+Per-retry effect in the reported scenario: the captcha take returns as
+soon as the in-flight mint lands (~3-5s) instead of ~2× that, and total
+mint volume during a 429 storm roughly halves.
+
+Note on why retries are still not instant: exponential backoff sleeps
+1s→2s→4s→8s between attempts by design (a 429 means "slow down"), and a
+cold Aliyun solve takes ~3-5s (the first request only feels instant
+because it is served from the pre-warmed token pool). Tune with
+`retry.maxRetries` / `ZCODE_RETRY_INITIAL_DELAY_MS` /
+`ZCODE_RETRY_MAX_DELAY_MS` if you run `maxRetries: 20` — backoff alone
+sleeps ~143s across 20 attempts.
+
+Verified by the `empty-pool take serves in-flight background mints
+(v0.3.10.10)` cases in `captcha-pool.test.ts` (no redundant mint, no
+poll delay when idle, fallback on wave failure).
+
+## v0.3.10.9 — bounded retry loop + retry-path captcha fast-fail ("two 429 requests then stuck for many minutes")
+
+User-visible symptom: two concurrent requests hit GLM's 429
+(`model admission concurrency limit exceeded`), both logged
+`retry 1/20` / `retry 2/20`, then the proxy went near-silent and the
+clients hung for many minutes.
+
+Root cause was three stacked design gaps, not a single bug:
+
+1. **No wall-clock budget on the retry loop.** The loop was bounded only by
+   attempts (`maxRetries`), but each iteration also sleeps (backoff up to
+   `maxDelayMs`) and — on start-plan — waits on a captcha-pool take. With
+   `maxRetries: 20`, backoff alone sleeps ~143s.
+2. **Every retry pays a full captcha take.** Aliyun verify params are
+   one-shot, so the preflight refreshes before each retry. When the pool is
+   starved (empty + slow/failing mints), each take waits the 25s race
+   deadline + 10s grace = ~35s — 20 retries × 35s ≈ 12 minutes of
+   near-silent grinding.
+3. **Retry-path captcha failures were misclassified** as transient network
+   errors ("fetch failed on retry N, will retry again"), so a dead mint
+   environment burned every remaining attempt instead of failing fast
+   (the INITIAL preflight already failed fast with 503 — inconsistent).
+
+Fixes:
+
+- New `retry.totalDeadlineMs` (default 300000, env
+  `ZCODE_RETRY_TOTAL_DEADLINE_MS`, 0 = legacy unbounded): the retry loop
+  stops when the budget is exceeded and returns a clean 503
+  `retry_deadline_exceeded` + `Retry-After: 30` so well-behaved clients
+  back off. Successful streaming responses are never cut short — only the
+  retry phase is budgeted.
+- Retry-path captcha takes use a shorter wait cap
+  (`ZCODE_STARTPLAN_RETRY_TAKE_MS`, default 8s; the initial preflight keeps
+  the pool's 25s default), plumbed through `getCaptchaToken` →
+  `takeCaptchaToken` → `CaptchaTokenPool.takeToken(cfg, maxWaitMs)`.
+- A failed retry-path preflight now fails the request fast with
+  503 `captcha_failed` + `Retry-After: 10` (mirroring the initial path)
+  instead of mis-retrying a non-transient mint failure.
+- `takeToken` now BANKS a late-minted token after a deadline miss instead
+  of silently dropping it — under pool starvation every dropped mint fed
+  the Aliyun velocity flagging (F008 / "too many captcha requests") that
+  starved the pool in the first place.
+- Slow retry takes (>2s) log pool stats
+  (`captcha preflight take on retry N took Xms (pool: {...})`), turning the
+  previously invisible stall into a one-line diagnosis.
+- `solveFresh`'s inter-attempt backoff now uses the host-timer quarantine
+  (was bare `setTimeout`): during overlapping solve epochs the bare global
+  resolves through the captcha window alias, and a window destroyed
+  mid-backoff cancelled the timer — hanging `solveFresh` forever with
+  `activeSolves` never decrementing, which permanently blocked background
+  refills. Same bug family as the v0.3.7.1 fix.
+
+Verified by `src/proxy/retry-stall-repro.test.ts` (the reported scenario,
+now bounded: fast-fail in milliseconds instead of a 12-minute grind) and
+new pool-level cases in `captcha-pool.test.ts`.
+
 ## v0.3.10.1 — ZCode 3.9.2 request fingerprint alignment
 
 Aligned the model-call path against the unpacked official ZCode 3.9.2

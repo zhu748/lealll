@@ -138,6 +138,9 @@ const DEFAULT_DEEP_IDLE_AFTER_MS = Number(process.env.CAPTCHA_DEEP_IDLE_AFTER_MS
 // lock queue. Unit tests can still pass an explicit value to exercise the
 // generic pool race implementation independently of the production backend.
 const EMPTY_TAKE_RACE = 1;
+// v0.3.10.10: poll cadence for an empty-pool take waiting on an in-flight
+// background mint (see takeToken's bg-wait loop).
+const TAKE_BG_POLL_INTERVAL_MS = 120;
 const SOLVE_RETRIES = Number(process.env.ZCODE_CAPTCHA_RETRIES || 4);
 const SCALE_UP_STEP = 20;
 const TAKE_RATE_WINDOW_MS = 120_000;
@@ -301,8 +304,14 @@ export class CaptchaTokenPool {
     }
   }
 
-  async takeToken(cfg: CaptchaConfig): Promise<string> {
+  async takeToken(cfg: CaptchaConfig, maxWaitMs?: number): Promise<string> {
     this.cfg = cfg;
+    // v0.3.10.11: wall-clock anchor for the WHOLE take (race + grace). When
+    // the caller passes an explicit maxWaitMs (the retry path does), that cap
+    // must bound the take END-TO-END — previously the grace loop created a
+    // FRESH deadline, so an 8s caller cap could silently stretch to 8s race +
+    // 10s grace = 18s on the failure path.
+    const takeStartedAt = Date.now();
 
     const readyBefore = this.tokens.length;
     const token = this.popFresh();
@@ -316,28 +325,94 @@ export class CaptchaTokenPool {
     // Re-size immediately from current demand (this take is already in the
     // window) so an empty-pool arrival widens the buffer right away.
     this.effectiveTarget = Math.max(this.effectiveTarget, this.computeActiveTarget());
+
+    // Overall deadline for the racing chain: during mint storms a racer can
+    // grind through its retry budget (~30-45s) — cap the client-facing wait
+    // and let the background waves finish the job instead.
+    //
+    // v0.3.10.9: callers may pass a SHORTER deadline (maxWaitMs) — the
+    // request-retry path uses one so a starved pool cannot stall a retry
+    // iteration for the full default 25s before every model attempt.
+    const envDeadlineMs = Number(process.env.CAPTCHA_SOLVE_RACE_DEADLINE_MS || 25_000);
+    // v0.3.10.11: explicit flag for "the CALLER capped this take" — distinct
+    // from callerDeadlineMs, which silently falls back to the env default and
+    // therefore cannot tell the two cases apart downstream.
+    const callerProvidedCap = Number.isFinite(maxWaitMs) && (maxWaitMs as number) > 0;
+    const callerDeadlineMs = callerProvidedCap ? (maxWaitMs as number) : envDeadlineMs;
+    const raceDeadlineMs = Math.max(1_000, Math.min(envDeadlineMs, callerDeadlineMs));
+
+    // v0.3.10.10 (retry latency): if a background mint is ALREADY in flight,
+    // wait briefly for its banked token instead of immediately queueing a
+    // redundant live solve behind it on the global solver lock.
+    //
+    // Symptom this fixes: two concurrent requests drain the warm pool and
+    // each take fires an urgent refill wave; the NEXT take (typically a
+    // 429-retry preflight) then arrived mid-wave and started its own live
+    // solve, which serialized behind the wave's solve — the caller paid
+    // wave-solve + own-solve back to back (~6-10s per retry) while the wave's
+    // freshly banked token sat unused in the pool. Serving the banked token
+    // hands it over the moment it lands AND skips the duplicate mint (fewer
+    // mints also means less Aliyun velocity flagging — F008 — during retry
+    // storms).
+    //
+    // Bounded by the same race deadline; breaks out instantly when no
+    // background work is in flight so a plain empty-pool take still starts
+    // its live solve immediately.
+    const bgWaitStartedAt = Date.now();
+    while (Date.now() - bgWaitStartedAt < raceDeadlineMs) {
+      if (!(this.refillInFlight || this.activeSolves > 0)) break;
+      await new Promise((r) => hostSetTimeout(r, TAKE_BG_POLL_INTERVAL_MS));
+      const banked = this.popFresh();
+      if (banked) {
+        this.markParamIssued(banked);
+        void this.refill({ urgent: true });
+        return banked;
+      }
+    }
+
     let param: string;
     try {
-      // Overall deadline for the racing chain: during mint storms a racer can
-      // grind through its retry budget (~30-45s) — cap the client-facing wait
-      // and let the background waves finish the job instead.
-      const raceDeadlineMs = Number(process.env.CAPTCHA_SOLVE_RACE_DEADLINE_MS || 25_000);
-      param = await Promise.race([
-        this.solveRaced(cfg),
-        new Promise<never>((_, rej) =>
-          hostSetTimeout(
-            () => rej(new Error(`captcha take deadline (${raceDeadlineMs}ms)`)),
-            Math.max(1_000, raceDeadlineMs),
+      const raced = this.solveRaced(cfg);
+      try {
+        param = await Promise.race([
+          raced,
+          new Promise<never>((_, rej) =>
+            hostSetTimeout(
+              () => rej(new Error(`captcha take deadline (${raceDeadlineMs}ms)`)),
+              raceDeadlineMs,
+            ),
           ),
-        ),
-      ]);
+        ]);
+      } catch (err) {
+        // Deadline fired (or the racer failed fast). If the racer is STILL
+        // minting, bank its eventual success instead of silently dropping
+        // it — under pool starvation every dropped mint was a full Aliyun
+        // solve wasted, and the NEXT take minted yet another one, feeding
+        // the very velocity flagging (F008 / "too many captcha requests")
+        // that starved the pool. Banked late tokens are picked up by the
+        // grace loop below or by the next take's popFresh().
+        raced.then(
+          (lateParam) => {
+            if (lateParam) this.pushToken(lateParam);
+          },
+          () => { /* mint failed — nothing to bank */ },
+        );
+        throw err;
+      }
     } catch (err) {
       // Mints fail in clusters (pe-stall storms, F008 velocity). Background
       // refill waves keep retrying — give them a short window to land a
       // token before surfacing a failure to the client. This converts most
       // storm-window 503s into slower successes.
       const graceMs = Number(process.env.CAPTCHA_TAKE_GRACE_MS || 10_000);
-      const deadline = Date.now() + Math.max(0, graceMs);
+      // v0.3.10.11: with a caller-provided cap, the grace window may only use
+      // whatever budget REMAINS inside maxWaitMs (race + grace together).
+      // The default (no-cap) path keeps the legacy behavior — a fresh grace
+      // deadline — because the initial-preflight take benefits from the extra
+      // convert-a-storm-503-into-a-slow-success window.
+      const deadline = callerProvidedCap
+        ? Math.min(Date.now() + Math.max(0, graceMs), takeStartedAt + raceDeadlineMs)
+        : Date.now() + Math.max(0, graceMs);
       while (Date.now() < deadline) {
         await new Promise((r) => hostSetTimeout(r, 400));
         const token = this.popFresh();
@@ -719,11 +794,19 @@ export class CaptchaTokenPool {
           // environment used to retry 4x back-to-back; each attempt burns
           // seconds of synchronous happy-dom eval on the shared event loop,
           // starving the admin API (oauth login 15s timeouts).
+          //
+          // v0.3.10.9: HOST timer (was bare `setTimeout`). This backoff runs
+          // BETWEEN solve epochs — exactly when a sibling solve's window alias
+          // can shadow the bare global — and a timer registered on a window
+          // registry is silently cancelled when that window closes, hanging
+          // solveFresh forever with activeSolves never decremented (which in
+          // turn permanently blocks background refills: refill() early-returns
+          // while activeSolves > 0). Same bug family as the v0.3.7.1 fix.
           const backoff = Math.min(
             this.opts.solveBackoffBaseMs * 2 ** (attempt - 2),
             Math.max(1, this.opts.solveBackoffCapMs),
           );
-          await new Promise((r) => setTimeout(r, backoff));
+          await new Promise((r) => hostSetTimeout(r, backoff));
         }
         try {
           const param = await runCaptchaSolve(cfg.sceneId, cfg.region, cfg.prefix);
@@ -855,11 +938,11 @@ export function stopCaptchaPool(): void {
   shutdownCaptchaSolver();
 }
 
-export async function takeCaptchaToken(cfg: CaptchaConfig): Promise<string> {
+export async function takeCaptchaToken(cfg: CaptchaConfig, maxWaitMs?: number): Promise<string> {
   if (!cfg.enabled || !cfg.prefix || !cfg.sceneId) {
     throw new Error("Captcha config unavailable from ZCode API");
   }
-  return pool.takeToken(cfg);
+  return pool.takeToken(cfg, maxWaitMs);
 }
 
 export function startCaptchaPoolRefill(cfg: CaptchaConfig): void {

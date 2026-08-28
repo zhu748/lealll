@@ -27,6 +27,7 @@ const ENV = {
   RETRY_BACKOFF_FACTOR: "ZCODE_RETRY_BACKOFF_FACTOR",
   RETRY_STATUSES: "ZCODE_RETRY_STATUSES",
   RETRY_CREDENTIAL_SWITCH_THRESHOLD: "ZCODE_RETRY_CREDENTIAL_SWITCH_THRESHOLD",
+  RETRY_TOTAL_DEADLINE_MS: "ZCODE_RETRY_TOTAL_DEADLINE_MS",
   RETRY_EMPTY_STREAM_SWITCH_THRESHOLD: "ZCODE_RETRY_EMPTY_STREAM_SWITCH_THRESHOLD",
   UPSTREAM_TIMEOUT_MS: "ZCODE_UPSTREAM_TIMEOUT_MS",
   TRUST_PROXY: "ZCODE_PROXY_TRUST_PROXY",
@@ -83,6 +84,9 @@ const DEFAULTS = {
   // so the new credential actually gets tried. Default still safe: if
   // maxRetries is increased, switchThreshold=2 just triggers earlier.
   RETRY_CREDENTIAL_SWITCH_THRESHOLD: 2,
+  // Total wall-clock budget for one request's ENTIRE retry loop (ms).
+  // 0 = disabled (legacy unbounded). See RetryConfig.totalDeadlineMs.
+  RETRY_TOTAL_DEADLINE_MS: 300_000,
   RETRY_EMPTY_STREAM_SWITCH_THRESHOLD: 3,
   // SSE heartbeat default — well under Cloudflare's 100s Proxy Read Timeout.
   // See src/utils/constants.ts SSE_HEARTBEAT for rationale.
@@ -470,7 +474,17 @@ function resolveRetry(raw?: unknown): RetryConfig {
     DEFAULTS.RETRY_EMPTY_STREAM_SWITCH_THRESHOLD,
   );
 
-  return { maxRetries, initialDelayMs, maxDelayMs, backoffFactor, retryableStatuses, credentialSwitchThreshold, emptyStreamSwitchThreshold };
+  // totalDeadlineMs: wall-clock budget for the whole retry loop. 0 disables
+  // (legacy unbounded behavior — retries end only when the attempt budget
+  // is exhausted, which with large maxRetries + slow captcha takes can hold
+  // a client silent for 10+ minutes).
+  const totalDeadlineMs = resolveNonNegativeInt(
+    process.env[ENV.RETRY_TOTAL_DEADLINE_MS] ?? r.totalDeadlineMs,
+    DEFAULTS.RETRY_TOTAL_DEADLINE_MS,
+    MAX_TIMER_MS,
+  );
+
+  return { maxRetries, initialDelayMs, maxDelayMs, backoffFactor, retryableStatuses, credentialSwitchThreshold, emptyStreamSwitchThreshold, totalDeadlineMs };
 }
 
 /** Resolve the configured model list while keeping the returned array isolated
