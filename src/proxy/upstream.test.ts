@@ -12,6 +12,7 @@ import {
   buildUpstreamURL,
   buildAuthHeaders,
   buildUpstreamHeaders,
+  deriveAnthropicBeta,
 } from "./upstream.js";
 import { proxyRequest, errorResponse, startPlanCaptchaPreflightEnabled, _readResponseTextPreviewForTesting, _setRequestBodyIdleTimeoutForTesting } from "./handler.js";
 import { importFromText, updatePoolConfig, _resetForTesting as resetProxyPoolForTesting } from "./proxy-pool.js";
@@ -138,9 +139,10 @@ describe("buildUpstreamURL", () => {
 });
 
 describe("buildAuthHeaders", () => {
-  it("injects x-api-key + anthropic-version for Anthropic", () => {
+  it("injects x-api-key + Bearer + anthropic-version for Anthropic", () => {
     const h = buildAuthHeaders("anthropic", ZAI_CRED, IDENTITY);
     expect(h["x-api-key"]).toBe("testkey.testsecret");
+    expect(h["authorization"]).toBe("Bearer testkey.testsecret");
     expect(h["anthropic-version"]).toBe("2023-06-01");
   });
 
@@ -183,8 +185,7 @@ describe("buildAuthHeaders", () => {
     expect(typeof h["x-query-id"]).toBe("string");
     expect(typeof h["x-session-id"]).toBe("string");
 
-    // pio wire order: HTTP-Referer → User-Agent → [App-Version] → X-Title →
-    // X-ZCode-Agent → X-Platform → … → auth last.
+    // ZCode 3.9.2 model order ends the identity block with X-ZCode-Agent.
     const keys = Object.keys(h);
     const refererIdx = keys.indexOf("HTTP-Referer");
     const uaIdx = keys.indexOf("User-Agent");
@@ -196,9 +197,9 @@ describe("buildAuthHeaders", () => {
     expect(refererIdx).toBeLessThan(uaIdx);
     expect(uaIdx).toBeLessThan(appVerIdx);
     expect(appVerIdx).toBeLessThan(titleIdx);
-    expect(titleIdx).toBeLessThan(agentIdx);
-    expect(agentIdx).toBeLessThan(platformIdx);
-    expect(platformIdx).toBeLessThan(authIdx);
+    expect(titleIdx).toBeLessThan(platformIdx);
+    expect(platformIdx).toBeLessThan(agentIdx);
+    expect(agentIdx).toBeLessThan(authIdx);
   });
 
   it("does NOT emit Accept header (v0.2.3+: real ZCode client never sends it on /v1/messages)", () => {
@@ -260,29 +261,32 @@ describe("buildUpstreamRequest", () => {
     expect(upstream.headers.get("content-type")).toBe("application/json");
   });
 
-  it("replaces downstream anthropic-beta with the fixed ZCode beta", () => {
-    // Real ZCode 3.1.8/3.2.5 sends exactly mid-conversation-system-2026-04-07
-    // on /v1/messages. Claude Code sends a long beta list with claude-code-*
-    // flags; those must never leak upstream.
+  it("derives mid-conversation-system beta from the transformed body", () => {
     const clientReq = makeClientReq("{}", {
       "anthropic-beta": "claude-code-20250219,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24",
     });
-    const upstream = buildUpstreamRequest(clientReq, "anthropic", ZAI_PROVIDER, ZAI_CRED, "{}", IDENTITY);
+    const body = JSON.stringify({ messages: [
+      { role: "user", content: "hi" },
+      { role: "system", content: "shell changed" },
+    ] });
+    const upstream = buildUpstreamRequest(clientReq, "anthropic", ZAI_PROVIDER, ZAI_CRED, body, IDENTITY);
     expect(upstream.headers.get("anthropic-beta")).toBe("mid-conversation-system-2026-04-07");
   });
 
-  it("does not pass through non-ZCode anthropic-beta values", () => {
+  it("does not pass through downstream beta values when the body needs no beta", () => {
     const clientReq = makeClientReq("{}", {
       "anthropic-beta": "prompt-caching-2024-07-31,some-other-flag",
     });
     const upstream = buildUpstreamRequest(clientReq, "anthropic", ZAI_PROVIDER, ZAI_CRED, "{}", IDENTITY);
-    expect(upstream.headers.get("anthropic-beta")).toBe("mid-conversation-system-2026-04-07");
+    expect(upstream.headers.get("anthropic-beta")).toBeNull();
   });
 
-  it("replaces a lone claude-code-* anthropic-beta flag too", () => {
+  it("does not synthesize beta for a leading system message", () => {
     const clientReq = makeClientReq("{}", { "anthropic-beta": "claude-code-20250219" });
-    const upstream = buildUpstreamRequest(clientReq, "anthropic", ZAI_PROVIDER, ZAI_CRED, "{}", IDENTITY);
-    expect(upstream.headers.get("anthropic-beta")).toBe("mid-conversation-system-2026-04-07");
+    const body = JSON.stringify({ messages: [{ role: "system", content: "initial" }, { role: "user", content: "hi" }] });
+    const upstream = buildUpstreamRequest(clientReq, "anthropic", ZAI_PROVIDER, ZAI_CRED, body, IDENTITY);
+    expect(upstream.headers.get("anthropic-beta")).toBeNull();
+    expect(deriveAnthropicBeta(body)).toBeUndefined();
   });
 
   it("strips client Authorization header (prevents credential leak)", () => {
@@ -290,7 +294,7 @@ describe("buildUpstreamRequest", () => {
     const upstream = buildUpstreamRequest(clientReq, "anthropic", ZAI_PROVIDER, ZAI_CRED, "{}", IDENTITY);
     // Auth should be the injected credential, NOT the client's
     expect(upstream.headers.get("x-api-key")).toBe("testkey.testsecret");
-    expect(upstream.headers.get("authorization")).toBeNull();
+    expect(upstream.headers.get("authorization")).toBe("Bearer testkey.testsecret");
   });
 
   it("strips client x-api-key header", () => {
@@ -439,8 +443,8 @@ describe("buildUpstreamRequest", () => {
       // Whitelist (explicit) — v0.3.0 full pio set + synthetic attribution
       "content-type",
       "x-api-key",            // anthropic coding-plan uses x-api-key
-      "anthropic-beta",
       "anthropic-version",
+      "authorization",
       "user-agent",
       "http-referer",
       "x-zcode-app-version",
@@ -460,7 +464,6 @@ describe("buildUpstreamRequest", () => {
       // Transport (auto-added by Bun's fetch / Headers)
       "host",
       "content-length",
-      "accept-encoding",
     ]);
 
     // === Collect ALL headers actually sent ===
@@ -481,9 +484,9 @@ describe("buildUpstreamRequest", () => {
     expect(upstream.headers.get("accept")).toBeNull();                      // not explicitly set
     expect(upstream.headers.get("content-type")).toBe("application/json");  // not text/plain
     expect(upstream.headers.get("x-api-key")).toBe("testkey.testsecret");   // not client-key
-    expect(upstream.headers.get("authorization")).toBeNull();               // anthropic coding-plan uses x-api-key
+    expect(upstream.headers.get("authorization")).toBe("Bearer testkey.testsecret");
     expect(upstream.headers.get("anthropic-version")).toBe("2023-06-01");   // not 9999-01-01
-    expect(upstream.headers.get("anthropic-beta")).toBe("mid-conversation-system-2026-04-07");
+    expect(upstream.headers.get("anthropic-beta")).toBeNull();
 
     // === Verify client fingerprint headers are ALL absent ===
     expect(upstream.headers.get("x-claude-code-session-id")).toBeNull();
@@ -560,25 +563,24 @@ describe("buildUpstreamRequest", () => {
     // default — the real ZCode Tauri client's encoding), not a client value.
     const expectedOrder = [
       "content-type",
-      "accept-encoding",
-      "anthropic-beta",
       "HTTP-Referer",
       "User-Agent",
       "X-ZCode-App-Version",
       "X-Title",
-      "X-ZCode-Agent",
-      "X-Platform",
       "X-Release-Channel",
       "X-Client-Language",
       "X-Client-Timezone",
+      "X-Platform",
       "X-Os-Category",
       "X-Os-Version",
+      "X-ZCode-Agent",
       "x-request-id",
       "x-zcode-session-type",
       "x-zcode-trace-id",
       "x-query-id",
       "x-session-id",
       "x-api-key",
+      "authorization",
       "anthropic-version",
     ];
 
@@ -600,7 +602,7 @@ describe("buildUpstreamRequest", () => {
     expect(h["X-Release-Channel"]).toBe("stable");
     expect(typeof h["X-Client-Language"]).toBe("string");
     expect(typeof h["X-Client-Timezone"]).toBe("string");
-    expect(h["X-Device-Mid"]).toBe("device-mid-test");
+    expect(h["X-Device-Mid"]).toBeUndefined();
   });
 
   it("emits headers in stable construction order (start-plan, Anthropic mirror — v0.3.7 default)", () => {
@@ -614,22 +616,21 @@ describe("buildUpstreamRequest", () => {
 
     const expectedOrder = [
       "content-type",
-      "accept-encoding",
-      "anthropic-beta",
       "HTTP-Referer",
       "User-Agent",
       "X-ZCode-App-Version",
       "X-Title",
-      "X-ZCode-Agent",
-      "X-Platform",
       "X-Release-Channel",
       "X-Client-Language",
       "X-Client-Timezone",
+      "X-Platform",
       "X-Os-Category",
       "X-Os-Version",
+      "X-ZCode-Agent",
       "x-request-id",
       "x-zcode-session-type",
       "x-zcode-trace-id",
+      "x-api-key",
       "authorization",
       "anthropic-version",
     ];
@@ -637,10 +638,10 @@ describe("buildUpstreamRequest", () => {
     const actualOrder = Object.keys(h);
     expect(actualOrder).toEqual(expectedOrder);
 
-    // Bearer JWT auth, never x-api-key, on the start-plan mirror path.
+    // The Anthropic SDK supplies x-api-key and ZCode adds Bearer auth.
     expect(h["authorization"]).toBe("Bearer jwt-token-xyz");
     expect(h["anthropic-version"]).toBe("2023-06-01");
-    expect(h["x-api-key"]).toBeUndefined();
+    expect(h["x-api-key"]).toBe("jwt-token-xyz");
     expect(h["X-ZCode-Agent"]).toBe("glm");
     expect(h["x-request-id"]).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
     expect(h["x-zcode-trace-id"]).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
@@ -662,7 +663,7 @@ describe("buildUpstreamRequest", () => {
     expect(h["authorization"]).toBe("Bearer jwt-from-api-key");
     expect(h["X-ZCode-Agent"]).toBe("glm");
     expect(h["x-zcode-trace-id"]).toBeTruthy();
-    expect(h["x-api-key"]).toBeUndefined();
+    expect(h["x-api-key"]).toBe("jwt-from-api-key");
   });
 
   it("does not double-prefix start-plan Bearer auth", () => {
@@ -676,7 +677,7 @@ describe("buildUpstreamRequest", () => {
     expect(h["authorization"]).toBe("Bearer jwt-already-prefixed");
     expect(h["X-ZCode-Agent"]).toBe("glm");
     expect(h["x-zcode-trace-id"]).toBeTruthy();
-    expect(h["x-api-key"]).toBeUndefined();
+    expect(h["x-api-key"]).toBe("jwt-already-prefixed");
   });
 
   it("emits headers in stable construction order (OpenAI format)", () => {
@@ -686,18 +687,17 @@ describe("buildUpstreamRequest", () => {
 
     const expectedOrder = [
       "content-type",
-      "accept-encoding",
       "HTTP-Referer",
       "User-Agent",
       "X-ZCode-App-Version",
       "X-Title",
-      "X-ZCode-Agent",
-      "X-Platform",
       "X-Release-Channel",
       "X-Client-Language",
       "X-Client-Timezone",
+      "X-Platform",
       "X-Os-Category",
       "X-Os-Version",
+      "X-ZCode-Agent",
       "x-request-id",
       "x-zcode-session-type",
       "x-zcode-trace-id",
@@ -709,21 +709,17 @@ describe("buildUpstreamRequest", () => {
     expect(h["authorization"]).toBe("Bearer testkey.testsecret");
   });
 
-  // v0.3.8.1: accept-encoding is the proxy's OWN fingerprint decision — the
-  // real ZCode Tauri client sends `accept-encoding: identity` (upstream
-  // zcode-api wire captures), and forwarding client gzip values made the
-  // zcode.z.ai ESA edge compress SSE passthrough bodies, silently killing
-  // token stats / heartbeat (the "in:- out:-" regression). Env escape hatch:
-  // ZCODE_UPSTREAM_ACCEPT_ENCODING.
-  it("advertises identity by default (v0.3.8.1+: real ZCode Tauri client value)", () => {
+  // ZCode 3.9.2 leaves accept-encoding to its embedded Node 24 transport.
+  // The proxy follows that application-level shape and keeps an env override.
+  it("lets the runtime negotiate accept-encoding by default (ZCode 3.9.2 Node transport)", () => {
     const h = buildUpstreamHeaders("anthropic", ZAI_CRED, IDENTITY);
-    expect(h["accept-encoding"]).toBe("identity");
+    expect(h["accept-encoding"]).toBeUndefined();
   });
 
   it("does NOT forward the client's accept-encoding (v0.3.8.1+)", () => {
     const clientReq = makeClientReq("{}", { "accept-encoding": "gzip, deflate, br, zstd" });
     const upstream = buildUpstreamRequest(clientReq, "anthropic", ZAI_PROVIDER, ZAI_CRED, "{}", IDENTITY);
-    expect(upstream.headers.get("accept-encoding")).toBe("identity");
+    expect(upstream.headers.get("accept-encoding")).toBeNull();
   });
 
   it("ZCODE_UPSTREAM_ACCEPT_ENCODING overrides the advertised value", () => {
@@ -1282,11 +1278,11 @@ describe("proxyRequest — OpenAI translation mode (coding-plan)", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it("uses x-api-key + anthropic-version on translated upstream request", async () => {
+  it("uses x-api-key + Bearer + anthropic-version on translated upstream request", async () => {
     const fetchMock = mock(async (req: Request): Promise<Response> => {
       expect(req.headers.get("x-api-key")).toBe("testkey.testsecret");
       expect(req.headers.get("anthropic-version")).toBe("2023-06-01");
-      expect(req.headers.get("authorization")).toBeNull();
+      expect(req.headers.get("authorization")).toBe("Bearer testkey.testsecret");
       return new Response(ANTHROPIC_RESPONSE, { status: 200, headers: { "content-type": "application/json" } });
     });
 
@@ -1686,8 +1682,8 @@ describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
         expect(req.url).toBe("https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages");
         expect(req.headers.get("authorization")).toBe("Bearer jwt-mock");
         expect(req.headers.get("anthropic-version")).toBe("2023-06-01");
-        expect(req.headers.get("x-api-key")).toBeNull();
-        expect(req.headers.get("anthropic-beta")).toBeTruthy();
+        expect(req.headers.get("x-api-key")).toBe("jwt-mock");
+        expect(req.headers.get("anthropic-beta")).toBeNull();
         expect(req.headers.get("x-zcode-trace-id")).toMatch(/^[0-9a-f-]{36}$/i);
         expect(req.headers.get("x-zcode-session-type")).toBe("main");
         expect(req.headers.get("x-aliyun-captcha-verify-param")).toBe("fresh-preflight-param");
@@ -1762,7 +1758,7 @@ describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
         expect(req.url).toBe("https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages");
         expect(req.headers.get("authorization")).toBe("Bearer jwt-mock");
         expect(req.headers.get("anthropic-version")).toBe("2023-06-01");
-        expect(req.headers.get("x-api-key")).toBeNull();
+        expect(req.headers.get("x-api-key")).toBe("jwt-mock");
         expect(req.headers.get("x-aliyun-captcha-verify-param")).toBe("fresh-preflight-param");
         const reqBody = JSON.parse(await req.text());
         // There is no Anthropic→OpenAI protocol conversion. The body remains
@@ -1780,7 +1776,8 @@ describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
         expect(typeof reqBody.max_tokens).toBe("number");
         expect(reqBody.stream).toBe(true);
         expect(reqBody.tool_choice).toEqual({ type: "auto" });
-        expect(reqBody.metadata).toBeUndefined();
+        expect(typeof reqBody.metadata?.user_id).toBe("string");
+        expect(JSON.parse(reqBody.metadata.user_id)).toMatchObject({ account_uuid: "" });
         expect(reqBody.context_management).toBeUndefined();
         return new Response(JSON.stringify({
           id: "msg_sp_ant",
@@ -2277,7 +2274,7 @@ describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
       // v0.3.7: start-plan routes through the zcode.z.ai Anthropic mirror.
       expect(req.url).toBe("https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages");
       expect(req.headers.get("authorization")).toBe("Bearer jwt-from-active-account");
-      expect(req.headers.get("x-api-key")).toBeNull();
+      expect(req.headers.get("x-api-key")).toBe("jwt-from-active-account");
       const reqBody = JSON.parse(await req.text());
       // OpenAI client translated to the Anthropic wire shape; start-plan
       // system blocks in top-level system[].

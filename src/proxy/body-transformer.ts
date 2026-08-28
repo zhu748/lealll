@@ -59,9 +59,8 @@
  *    text-only → last text block, single tool_result → that tool_result,
  *    multiple tool_results → no cache_control on that message.
  *
- * 9. `applyAnthropicUserId` — In OAuth/coding-plan mode, injects
- *    `metadata.user_id` for tracking. Start-plan deliberately skips it
- *    because the zcode-plan gateway rejects that metadata shape.
+ * 9. `applyAnthropicMetadata` — Replaces downstream metadata with ZCode's
+ *    nested JSON attribution shape (device_id/account_uuid/session_id).
  *
  * === TRANSFORM ORDER MATTERS ===
  *
@@ -69,7 +68,7 @@
  *   start-plan system prelude → unsupported field normalization →
  *   ZCode thinking/max_tokens injection → thinking block strip → document
  *   block convert → content normalize → sanitize (is_error:false) →
- *   cache_control placement → coding-plan metadata.user_id injection →
+ *   cache_control placement → ZCode metadata.user_id injection →
  *   align ZCode format (system inject + identity rewrite + key reorder)
  *
  * Reordering will break things. In particular, cache-control placement must
@@ -87,10 +86,9 @@
  *      `is_error:false` surviving the transform, indicate a regression.
  *   2. Check the dumped `zcode-proxy-debug-<reqId>.json` file in the proxy's
  *      working directory — it contains the FULL transformed request body.
- *   3. The `anthropic-beta sent:` line should show the fixed ZCode value
- *      `mid-conversation-system-2026-04-07`. Downstream beta lists are never
- *      passed through, eliminating Claude Code header/body fingerprint
- *      mismatches.
+ *   3. The `anthropic-beta sent:` line is normally `(none)` and contains
+ *      `mid-conversation-system-2026-04-07` only when messages[] includes a
+ *      mid-conversation system message. Downstream beta lists are never passed.
  *
  * @see _reverse/NOTEPAD.md "How Credential is Used for LLM Calls"
  */
@@ -99,11 +97,16 @@ import { buildStartPlanSystem, ZCODE_SYSTEM_BLOCKS } from "./system-prompt.js";
 import type { SystemBlock } from "./system-prompt.js";
 import { getThinkingSpec, normalizeTier, TIER_BUDGETS } from "./thinking-specs.js";
 import type { ThinkingTier } from "./thinking-specs.js";
+import { stripHeaderInternalPrefixes } from "./trace-headers.js";
 
 export interface TransformContext {
   format: Format;
-  /** When set (OAuth mode), the Anthropic-format body gets `metadata.user_id` injected. */
+  /** @deprecated Retained for call-site compatibility; official metadata does not use account userId. */
   userId?: string;
+  /** Stable ZCode telemetry device id embedded in Anthropic metadata.user_id. */
+  deviceMid?: string;
+  /** Current conversation/session id embedded in Anthropic metadata.user_id. */
+  sessionId?: string;
   /** When true (start-plan), prepend ZCode gateway system blocks. */
   startPlan?: boolean;
   /**
@@ -190,13 +193,7 @@ export function transformRequestBodyObj(parsed: unknown, ctx: TransformContext):
     // assistant messages with only tool_use blocks (18 in sample).
     modified = sanitizeContentBlocks(obj) || modified;
     modified = applyAnthropicCacheControl(obj) || modified;
-    // start-plan: ZCode gateway is stricter than official Anthropic API and
-    // rejects `metadata.user_id` (returns 200 + empty SSE stream — invisible
-    // to the SSE error detector, surfaces as "empty/malformed response" in
-    // Claude Code). Only inject for coding-plan.
-    if (ctx.userId && !ctx.startPlan) {
-      modified = applyAnthropicUserId(obj, ctx.userId) || modified;
-    }
+    modified = applyAnthropicMetadata(obj, ctx.deviceMid, ctx.sessionId) || modified;
     // Align request structure to match real ZCode client (must run LAST so
     // all other transforms have settled). Rewrites top-level field order,
     // injects ZCode system blocks (both coding-plan AND start-plan), and
@@ -393,18 +390,28 @@ function applyAnthropicCacheControl(
 }
 
 /**
- * Anthropic: inject `metadata: { user_id }` when not already set.
- * Preserves any existing `metadata.*` fields other than `user_id`.
+ * Anthropic metadata emitted by ZCode 3.9.2. The value is itself a compact
+ * JSON string; account_uuid is intentionally empty in the official bundle.
+ * Downstream metadata is replaced instead of passed through.
  */
-function applyAnthropicUserId(body: Record<string, unknown>, userId: string): boolean {
+export function buildAnthropicMetadataUserId(deviceMid?: string, sessionId?: string): string {
+  const strippedSessionId = sessionId
+    ? stripHeaderInternalPrefixes(sessionId, ["sess_", "subagent_agent_"])
+    : "";
+  return JSON.stringify({
+    device_id: deviceMid?.trim() ?? "",
+    account_uuid: "",
+    session_id: strippedSessionId,
+  });
+}
+
+function applyAnthropicMetadata(body: Record<string, unknown>, deviceMid?: string, sessionId?: string): boolean {
+  const userId = buildAnthropicMetadataUserId(deviceMid, sessionId);
   const existing = body.metadata;
-  if (isPlainObject(existing) && existing.user_id === userId) {
+  if (isPlainObject(existing) && Object.keys(existing).length === 1 && existing.user_id === userId) {
     return false;
   }
-  body.metadata = {
-    ...(isPlainObject(existing) ? existing : {}),
-    user_id: userId,
-  };
+  body.metadata = { user_id: userId };
   return true;
 }
 
@@ -601,7 +608,7 @@ function injectZCodeThinkingFormat(body: Record<string, unknown>, level: "low" |
  *    - stream: true (unconditional)
  *    - tool_choice: {type:auto} (when tools present)
  *    - system: [ZCode official +cc, ZCode official +cc, user blocks +cc on last]
- *    - metadata / context_management / billing-header: stripped
+ *    - metadata replaced with ZCode attribution; context_management / billing-header stripped
  *    - document / thinking blocks in messages: stripped
  *    - string content → array form
  *
@@ -615,7 +622,7 @@ function injectZCodeThinkingFormat(body: Record<string, unknown>, level: "low" |
  *    - Removing stream:true force → breaks non-stream clients (no SSE buffering)
  *    - Removing cache_control injection on last system block → WAF fingerprint mismatch
  *    - Reordering steps → field conflicts / 3001 "parameter error" from gateway
- *    - Removing metadata drop → "non-ZCode client" fingerprint
+ *    - Passing through client metadata → "non-ZCode client" fingerprint
  * =====================================================================
  *
  * Triggered only when `ctx.alignZCodeFormat === true`. Performs these transformations:
@@ -796,22 +803,14 @@ function alignZCodeRequestFormat(body: Record<string, unknown>): Record<string, 
   body.stream = true;
   changed = true;
 
-  // === Step 4: Drop fields real ZCode client never sends ===
-  // Claude Code sends `metadata: { user_id: "..." }` for tracking. Real ZCode
-  // client never sends this field — its presence is a clear "non-ZCode client"
-  // fingerprint. Drop it.
-  if ("metadata" in body) {
-    delete body.metadata;
-    changed = true;
-  }
-
   // === Step 5: Rebuild top-level keys in ZCode wire order ===
-  // Real ZCode order (reverse-engineered):
-  //   model → max_tokens → thinking → output_config → system → messages →
-  //   tools → tool_choice → stream → (others)
+  // Order follows the bundled @ai-sdk/anthropic request builder.
   const ORDERED_KEYS = [
-    "model", "max_tokens", "thinking", "output_config",
-    "system", "messages", "tools", "tool_choice", "stream",
+    "model", "max_tokens", "temperature", "top_k", "top_p",
+    "stop_sequences", "thinking", "output_config", "speed",
+    "inference_geo", "cache_control", "metadata", "mcp_servers",
+    "container", "system", "messages", "context_management", "tools",
+    "tool_choice", "stream",
   ];
   const result: Record<string, unknown> = {};
   for (const k of ORDERED_KEYS) {
@@ -819,8 +818,7 @@ function alignZCodeRequestFormat(body: Record<string, unknown>): Record<string, 
       result[k] = body[k];
     }
   }
-  // Append any remaining keys not in the ordered list (e.g. stop_sequences)
-  // — but NOT metadata (already deleted in Step 4).
+  // Append any remaining provider extensions not in the known SDK order.
   for (const k of Object.keys(body)) {
     if (!ORDERED_KEYS.includes(k)) {
       result[k] = body[k];

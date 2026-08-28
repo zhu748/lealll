@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { buildIdentityHeaders, _resetIdentityEnvCacheForTesting } from "./identity.js";
+import { buildIdentityHeaders, buildModelIdentityHeaders, _resetIdentityEnvCacheForTesting } from "./identity.js";
 import type { ProxyIdentity } from "../config/types.js";
 
 const BASE: ProxyIdentity = {
@@ -158,5 +158,25 @@ describe("buildIdentityHeaders (pio order, upstream zcode-api v2.6.0 aligned)", 
     const actualOrder = Object.keys(h);
     // All pio headers present (deviceMid optional — not configured here)
     expect(actualOrder).toEqual(expectedOrder.slice(0, expectedOrder.length - 1));
+  });
+});
+
+describe("buildModelIdentityHeaders (official ZCode 3.9.2 model path)", () => {
+  it("puts X-ZCode-Agent last and omits X-Device-Mid", () => {
+    const h = buildModelIdentityHeaders({ ...BASE, deviceMid: "mid-1234" });
+    expect(Object.keys(h)).toEqual([
+      "HTTP-Referer",
+      "User-Agent",
+      "X-ZCode-App-Version",
+      "X-Title",
+      "X-Release-Channel",
+      "X-Client-Language",
+      "X-Client-Timezone",
+      "X-Platform",
+      "X-Os-Category",
+      "X-Os-Version",
+      "X-ZCode-Agent",
+    ]);
+    expect(h["X-Device-Mid"]).toBeUndefined();
   });
 });

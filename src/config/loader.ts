@@ -59,7 +59,9 @@ const DEFAULTS = {
   // control permission prompts + browser tab fixes; no wire-protocol change,
   // safe bump). Keep in sync with src/auth/quota.ts DEFAULT_APP_VERSION.
   APP_VERSION: "3.9.2",
-  SOURCE_TITLE: "cli",
+  // Desktop app-server requests identify their source as Z Code@electron.
+  // The standalone CLI uses "cli", which remains available as an override.
+  SOURCE_TITLE: "electron",
   REFERER_ORIGIN: "https://zcode.z.ai",
   RELEASE_CHANNEL: "production",
   ZCODE_AGENT: "glm",

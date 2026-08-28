@@ -437,7 +437,22 @@ export async function proxyRequest(
   if (initialPipeline.error) return initialPipeline.error;
   const upstreamBodyObj: unknown = initialPipeline.obj;
 
-  let transformedObj = transformRequestBodyObj(upstreamBodyObj, { format: upstreamFormat, userId: cred.userId, startPlan: currentPlan === "start-plan", thinkingLevel: config.thinkingLevel === "low" || config.thinkingLevel === "high" ? config.thinkingLevel : "max" });
+  // Resolve the conversation before body alignment because the official
+  // Anthropic request embeds device/session attribution in metadata.user_id.
+  let clientSession: ReturnType<typeof resolveSessionContext> = undefined;
+  try {
+    clientSession = resolveSessionContext({ clientReq, body, upstreamFormat, model: meta.model, config });
+  } catch { /* session inference must never break the request */ }
+  const metadataSessionId = clientSession?.upstreamSessionId ?? clientSession?.sessionId;
+
+  let transformedObj = transformRequestBodyObj(upstreamBodyObj, {
+    format: upstreamFormat,
+    userId: cred.userId,
+    deviceMid: config.identity.deviceMid,
+    sessionId: metadataSessionId,
+    startPlan: currentPlan === "start-plan",
+    thinkingLevel: config.thinkingLevel === "low" || config.thinkingLevel === "high" ? config.thinkingLevel : "max",
+  });
 
   // v0.2.2+ PERF: cache transformed body keyed by (userId|plan|thinkingLevel).
   // On credential switch mid-retry, the transform is re-run even though
@@ -488,6 +503,8 @@ export async function proxyRequest(
     transformedObj = transformRequestBodyObj(pipeline.obj, {
       format: upstreamFormat,
       userId: newUserId,
+      deviceMid: config.identity.deviceMid,
+      sessionId: metadataSessionId,
       startPlan: newPlan === "start-plan",
       thinkingLevel: config.thinkingLevel === "low" || config.thinkingLevel === "high" ? config.thinkingLevel : "max",
     });
@@ -530,18 +547,6 @@ export async function proxyRequest(
   let totalCaptchaMs = 0;
   let captchaRetryHeaders: Record<string, string> | undefined;
   let hadRetryAttempt = false;
-
-  // v0.3.0 (upstream v2.6.0): session-context resolution — replicates ZCode's
-  // single-user-identity UUID generation. The resolver maps this request to a
-  // stable upstream session via explicit client headers (x-claude-code-
-  // session-id / x-opencode-session / …) or conversation-lineage hashing, and
-  // the resulting session feeds the exact-path trace headers (x-request-id /
-  // x-zcode-session-type / x-zcode-trace-id / x-query-id / x-session-id).
-  // Replaces the v0.2.x per-credential attribution cache.
-  let clientSession: ReturnType<typeof resolveSessionContext> = undefined;
-  try {
-    clientSession = resolveSessionContext({ clientReq, body, upstreamFormat, model: meta.model, config });
-  } catch { /* session inference must never break the request */ }
 
   const checkCaptchaVerifyFailed = async (resp: Response): Promise<{ failed: boolean; response: Response }> => {
     if (currentPlan !== "start-plan" || resp.status !== 403) return { failed: false, response: resp };
@@ -620,9 +625,8 @@ export async function proxyRequest(
       clientSession ?? undefined,
     );
 
-  // Track the last anthropic-beta header actually sent upstream. We send the
-  // fixed ZCode beta value and never pass through downstream client beta lists
-  // (Claude Code sends many claude-code-* flags).
+  // Track the feature-derived anthropic-beta header actually sent upstream.
+  // Downstream beta lists are never passed through.
   let lastSentBeta: string | null = null;
 
   // === Global proxy pool integration ===

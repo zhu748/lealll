@@ -230,7 +230,7 @@ auth:
 `);
     const cfg = loadConfig(path);
     expect(cfg.identity.appVersion).toBe("3.9.2");
-    expect(cfg.identity.sourceTitle).toBe("cli");
+    expect(cfg.identity.sourceTitle).toBe("electron");
     expect(cfg.identity.refererOrigin).toBe("https://zcode.z.ai");
     expect(cfg.identity.releaseChannel).toBe("production");
     expect(cfg.identity.zcodeAgent).toBe("glm");
@@ -762,7 +762,7 @@ describe("resolveDefaultIdentity", () => {
     const identity = resolveDefaultIdentity();
     // Same defaults the YAML path lands on when nothing is set.
     expect(identity.appVersion).toBe("3.9.2");
-    expect(identity.sourceTitle).toBe("cli");
+    expect(identity.sourceTitle).toBe("electron");
     expect(identity.refererOrigin).toBe("https://zcode.z.ai");
     expect(identity.zcodeAgent).toBe("glm");
   });

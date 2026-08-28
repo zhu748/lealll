@@ -24,22 +24,23 @@ export function startPlanCaptchaPreflightEnabled(): boolean {
  * in-stream error detection) silently disabled themselves for compressed
  * bodies → dashboard/log rows showed `in:- out:-` with no tok/s.
  *
- * The real ZCode desktop client (Tauri builds) sends `accept-encoding:
- * identity` (observed in upstream zcode-api wire captures — see their
- * buildUpstreamHeaderPairs comment), so `identity` is BOTH the better
- * fingerprint match AND the fix: the upstream stops compressing, stats
- * parse plaintext again, and the heartbeat is safe to inject.
+ * Static inspection of the official ZCode 3.9.2 Electron bundle shows that
+ * application code does not set accept-encoding. Node 24 fetch negotiates it
+ * at transport time, so the aligned default is to omit the explicit header.
  *
  * handler.ts additionally decompresses any compressed passthrough response
  * (gzip/deflate/zstd via DecompressionStream) as defense in depth, so
  * overriding this back to "gzip" keeps stats working too — only "br"
  * (unsupported by Bun's DecompressionStream) would disable them.
  *
- *   ZCODE_UPSTREAM_ACCEPT_ENCODING=identity  (default, real-client value)
- *   ZCODE_UPSTREAM_ACCEPT_ENCODING=gzip      (bandwidth over CPU; still
- *                                             decompressed in-proxy)
+ *   ZCODE_UPSTREAM_ACCEPT_ENCODING=identity  (force plaintext for debugging)
+ *   ZCODE_UPSTREAM_ACCEPT_ENCODING=gzip      (explicit compression override)
  */
-export function upstreamAcceptEncoding(): string {
+export function upstreamAcceptEncoding(): string | undefined {
   const raw = process.env.ZCODE_UPSTREAM_ACCEPT_ENCODING?.trim();
-  return raw && raw.length > 0 ? raw : "identity";
+  // ZCode 3.9.2 does not set this header in application code. Its Node 24
+  // fetch transport negotiates gzip/deflate automatically. Omitting it here
+  // gives the proxy runtime the same responsibility; operators can still pin
+  // `identity` when diagnosing a non-conforming intermediary.
+  return raw && raw.length > 0 ? raw : undefined;
 }

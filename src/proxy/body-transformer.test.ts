@@ -970,13 +970,13 @@ describe("transformRequestBody — alignZCodeFormat (ZCode wire format alignment
     const out = transformRequestBody(body, { format: "anthropic" });
     const parsed = JSON.parse(out as string);
     const keys = Object.keys(parsed);
-    // Expected order: model, max_tokens, thinking, output_config (injected),
-    // system (injected), messages, tools (n/a), tool_choice (n/a), stream
+    // Expected order follows the bundled Anthropic SDK request builder.
     expect(keys[0]).toBe("model");
     expect(keys[1]).toBe("max_tokens");
     expect(keys[2]).toBe("thinking");
     expect(keys[3]).toBe("output_config"); // injected by injectZCodeThinkingFormat
-    expect(keys[4]).toBe("system"); // injected by alignZCodeRequestFormat
+    expect(keys[4]).toBe("metadata");
+    expect(keys[5]).toBe("system"); // injected by alignZCodeRequestFormat
     expect(keys.indexOf("messages")).toBeGreaterThan(keys.indexOf("system"));
     expect(keys.indexOf("stream")).toBeGreaterThan(keys.indexOf("messages"));
   });
@@ -1257,7 +1257,7 @@ describe("transformRequestBody — alignZCodeFormat (field fill + drop, v0.2.0+)
     expect(parsed.stream).toBe(true);
   });
 
-  it("drops metadata field (Claude Code's user_id tracking — real ZCode never sends it)", () => {
+  it("replaces downstream metadata with the ZCode 3.9.2 attribution shape", () => {
     const body = JSON.stringify({
       model: "glm-5.2",
       max_tokens: 1000,
@@ -1265,9 +1265,11 @@ describe("transformRequestBody — alignZCodeFormat (field fill + drop, v0.2.0+)
       messages: [{ role: "user", content: "hi" }],
       metadata: { user_id: "device-123" },
     });
-    const out = transformRequestBody(body, { format: "anthropic" });
+    const out = transformRequestBody(body, { format: "anthropic", deviceMid: "mid-123", sessionId: "sess_session-456" });
     const parsed = JSON.parse(out as string);
-    expect(parsed.metadata).toBeUndefined();
+    expect(parsed.metadata).toEqual({
+      user_id: JSON.stringify({ device_id: "mid-123", account_uuid: "", session_id: "session-456" }),
+    });
   });
 
   it("complete alignment: Claude Code request → real ZCode wire format", () => {
@@ -1296,14 +1298,15 @@ describe("transformRequestBody — alignZCodeFormat (field fill + drop, v0.2.0+)
     expect(keys[1]).toBe("max_tokens");
     expect(keys[2]).toBe("thinking");
     expect(keys[3]).toBe("output_config");
-    expect(keys[4]).toBe("system");
-    expect(keys[5]).toBe("messages");
-    expect(keys[6]).toBe("tools");
-    expect(keys[7]).toBe("tool_choice");
-    expect(keys[8]).toBe("stream");
+    expect(keys[4]).toBe("metadata");
+    expect(keys[5]).toBe("system");
+    expect(keys[6]).toBe("messages");
+    expect(keys[7]).toBe("tools");
+    expect(keys[8]).toBe("tool_choice");
+    expect(keys[9]).toBe("stream");
 
-    // 2. No metadata (dropped)
-    expect(parsed.metadata).toBeUndefined();
+    // 2. Client metadata is replaced by the official nested JSON shape.
+    expect(JSON.parse(parsed.metadata.user_id)).toEqual({ device_id: "", account_uuid: "", session_id: "" });
 
     // 3. tool_choice filled
     expect(parsed.tool_choice).toEqual({ type: "auto" });
@@ -1568,7 +1571,7 @@ describe("transformRequestBody — alignZCodeFormat (message body fingerprint al
     // 1. Top-level key order matches ZCode exactly
     expect(keys).toEqual([
       "model", "max_tokens", "thinking", "output_config",
-      "system", "messages", "tools", "tool_choice", "stream",
+      "metadata", "system", "messages", "tools", "tool_choice", "stream",
     ]);
 
     // 2. tool_result.content stayed as STRING (not converted to array)
@@ -1595,8 +1598,8 @@ describe("transformRequestBody — alignZCodeFormat (message body fingerprint al
     const lastBlock = lastUser.content[lastUser.content.length - 1];
     expect(lastBlock.cache_control).toEqual({ type: "ephemeral" });
 
-    // 6. metadata dropped (real ZCode never sends it)
-    expect(parsed.metadata).toBeUndefined();
+    // 6. downstream metadata replaced with the official attribution envelope
+    expect(JSON.parse(parsed.metadata.user_id)).toEqual({ device_id: "", account_uuid: "", session_id: "" });
 
     // 7. v0.3.0: system = 3 ZCode official blocks + model line + client block (identity rewritten)
     expect(parsed.system.length).toBe(5);

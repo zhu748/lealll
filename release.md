@@ -208,8 +208,8 @@ bash -n release/start.sh
 
 | Plan | 上游地址 | 认证方式 | 用途 |
 |------|---------|---------|------|
-| `coding-plan` | `{provider}.anthropicBase` / `{provider}.openaiBase` | `x-api-key: {apiKey}` | API Key 直连 |
-| `start-plan` | `https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages` | `Authorization: Bearer {jwt}` + 验证码 token | 通过 ZCode Anthropic 镜像（free 试用层） |
+| `coding-plan` | `{provider}.anthropicBase` / `{provider}.openaiBase` | Anthropic 为 `x-api-key` + `Authorization: Bearer`；OpenAI 为 Bearer | API Key 直连 |
+| `start-plan` | `https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages` | `x-api-key` + `Authorization: Bearer {jwt}` + 验证码 token | 通过 ZCode Anthropic 镜像（free 试用层） |
 
 **Plan 在以下位置生效**：
 1. **CLI** — `auth login bigmodel --plan=start-plan`

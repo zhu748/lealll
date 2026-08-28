@@ -128,11 +128,13 @@ identity:
   # Release channel header (X-Release-Channel). Default "production".
   # Env var: ZCODE_RELEASE_CHANNEL.
   releaseChannel: "production"
-  # Optional X-Device-Mid. If omitted, the proxy tries to read the existing
+  # Device id embedded in Anthropic metadata.user_id (and used by some
+  # control-plane calls). If omitted, the proxy tries to read the existing
   # ZCode telemetry-state.json deviceMid. Env var: ZCODE_DEVICE_MID.
   # deviceMid: ""
-  # X-Title header suffix. Default "cli".
-  sourceTitle: "cli"
+  # X-Title header suffix. Desktop app-server default: "electron".
+  # Use "cli" only when deliberately emulating the standalone CLI.
+  sourceTitle: "electron"
   # HTTP-Referer URL. Default "https://zcode.z.ai".
   refererOrigin: "https://zcode.z.ai"
   # X-ZCode-Agent header for upstream model requests. Default "glm".

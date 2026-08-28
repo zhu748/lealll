@@ -2,6 +2,24 @@
 
 A reverse proxy for Z.AI / Bigmodel.cn coding-plan APIs that exposes both OpenAI-compatible and Anthropic-format endpoints.
 
+## v0.3.10.1 — ZCode 3.9.2 request fingerprint alignment
+
+Aligned the model-call path against the unpacked official ZCode 3.9.2
+Electron client:
+
+- Anthropic requests now carry both SDK `x-api-key` and ZCode's
+  `Authorization: Bearer` header, including Start Plan.
+- Model identity headers use the official order, default to
+  `X-Title: Z Code@electron`, append `X-ZCode-Agent` last, and no longer put
+  `X-Device-Mid` on the model request.
+- Device/session attribution is emitted as ZCode's nested JSON
+  `metadata.user_id` value; downstream client metadata is replaced.
+- `anthropic-beta` is derived from request features instead of being fixed;
+  `mid-conversation-system-2026-04-07` appears only when needed.
+- `accept-encoding` is runtime-managed by default, matching the official
+  Node 24 fetch path. The explicit environment override and streaming
+  decompression safety net remain available.
+
 ## v0.3.10.0 — Per-model thinking specs + current zcode model lineup
 
 Follow-up to v0.3.9.0: the thinking tiers are **per model**, not global. The
@@ -94,12 +112,11 @@ while zero SSE events parsed.
 
 Fix (two layers):
 
-- **Request `accept-encoding: identity` on model calls** — the value the
-  real ZCode Tauri client sends (per upstream zcode-api wire captures), so
-  this is a fingerprint *improvement*, not a compromise. The upstream stops
-  compressing; stats, heartbeat, and error detection see plaintext again.
-  Escape hatch: `ZCODE_UPSTREAM_ACCEPT_ENCODING=gzip` restores compression
-  (bandwidth) — the second layer keeps stats working even then.
+- **Let the runtime negotiate `accept-encoding`** — the official ZCode 3.9.2
+  Electron bundle does not set this header in application code; its embedded
+  Node 24 transport adds compression negotiation. The proxy now follows that
+  behavior. `ZCODE_UPSTREAM_ACCEPT_ENCODING=identity` remains an escape hatch
+  for diagnosing a non-conforming edge.
 - **In-stream decompression of compressed passthrough bodies** (defense in
   depth): any gzip/deflate/zstd passthrough response is piped through
   `DecompressionStream` inside `fetchUpstreamDetected`, with
@@ -237,8 +254,8 @@ restored):
   battle-tested coding-plan pipeline (wire-shape alignment, SSE→batch
   folding, session-context, SSE error detection) instead of the gateway
   translation pipeline.
-- Auth is `Authorization: Bearer <jwt>` + `anthropic-version` — the header
-  builder already supported this combination (it was the pre-v0.3.0 path).
+- Auth follows the official Anthropic SDK/provider combination: `x-api-key:
+  <jwt>` + `Authorization: Bearer <jwt>` + `anthropic-version`.
 - The body-transformer's start-plan system blocks (`applyStartPlanSystem`:
   zcode_system.json blocks + dynamic model line, the gateway 3012 content
   check) were never removed — they activate again automatically.
@@ -786,11 +803,11 @@ docker run --rm -p 8080:8080 \
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ZCODE_APP_VERSION` | `3.9.2` | `User-Agent: ZCode/{version}` sent to upstream. The start-plan captcha config request also sends this as `app_version`, matching the official client. Must be printable ASCII. |
-| `ZCODE_SOURCE_TITLE` | `Z Code@electron` | `X-Title` sent to upstream. |
+| `ZCODE_SOURCE_TITLE` | `electron` | Suffix used to build `X-Title: Z Code@electron`. |
 | `ZCODE_REFERER_ORIGIN` | `https://zcode.z.ai` | `HTTP-Referer` URL sent to upstream. |
 | `ZCODE_AGENT` | `glm` | `X-ZCode-Agent` sent on upstream model requests to mirror the official GLM agent provider. |
 | `ZCODE_STARTPLAN_CAPTCHA_PREFLIGHT` | enabled | Start-plan pre-solves and sends fresh Aliyun captcha runtime headers before each model attempt, matching ZCode. Set to `0`, `false`, `off`, `no`, or `never` to solve only after an explicit `3007` challenge. |
-| `ZCODE_UPSTREAM_ACCEPT_ENCODING` | `identity` | v0.3.8.1: accept-encoding advertised to model-call upstreams. `identity` (default) matches the real ZCode Tauri client and keeps SSE responses uncompressed so token stats and the heartbeat work. Override to `gzip` to save proxy↔upstream bandwidth — compressed responses are decompressed in-proxy (stats keep working); only `br` would disable them. |
+| `ZCODE_UPSTREAM_ACCEPT_ENCODING` | runtime-managed | Optional explicit model-call value. Leave unset to match ZCode 3.9.2; use `identity` to force plaintext or `gzip` to force compression. gzip/deflate responses are decompressed in-proxy. |
 
 #### Retry policy (optional)
 
@@ -1197,10 +1214,10 @@ curl http://localhost:8080/v1/models \
 | `auth.apiKey` | `ZCODE_API_KEY` | — | Upstream API key |
 | `auth.proxyApiKey` | `ZCODE_PROXY_API_KEY` | — | Client auth key |
 | `provider` | `ZCODE_PROVIDER` | `zai` | Upstream provider |
-| `identity.appVersion` | `ZCODE_APP_VERSION` | `3.2.5` | `User-Agent: ZCode/{version}` |
-| `identity.sourceTitle` | `ZCODE_SOURCE_TITLE` | `Z Code@electron` | `X-Title` |
+| `identity.appVersion` | `ZCODE_APP_VERSION` | `3.9.2` | `User-Agent: ZCode/{version}` |
+| `identity.sourceTitle` | `ZCODE_SOURCE_TITLE` | `electron` | Builds `X-Title: Z Code@{sourceTitle}` |
 | `identity.refererOrigin` | `ZCODE_REFERER_ORIGIN` | `https://zcode.z.ai` | `HTTP-Referer` URL |
-| `identity.deviceMid` | `ZCODE_DEVICE_MID` | auto-read from ZCode telemetry | Optional `X-Device-Mid` |
+| `identity.deviceMid` | `ZCODE_DEVICE_MID` | auto-read from ZCode telemetry | Embedded in Anthropic `metadata.user_id`; control-plane calls may also send `X-Device-Mid` |
 | `identity.zcodeAgent` | `ZCODE_AGENT` | `glm` | `X-ZCode-Agent` for model requests |
 | `server.maxRequestBodyBytes` | `ZCODE_PROXY_MAX_REQUEST_BODY_BYTES` | `67108864` | Max client request body size in bytes; set `0` to disable. |
 | — | `ZCODE_PROXY_LEGACY_SEED` | unset | Manual one-time recovery seed for credentials.json encrypted by an older version. See Security Notes. `ZCODE_PROXY_CREDENTIAL_SECRET` is intentionally NOT consulted — it was the #1 cause of credential loss on restart. |
@@ -1240,17 +1257,15 @@ Route Detection + Plan-aware Routing
 Body Transformation (ZCode-equivalent mutations)
   OpenAI streaming    → inject stream_options.include_usage
   Anthropic           → add cache_control to last user message
-  Anthropic + OAuth   → inject metadata.user_id
+  Anthropic           → replace metadata.user_id with ZCode device/session attribution
       │
       ▼
 [Translation mode only] OpenAI request → Anthropic request body
       │
       ▼
 Auth + Identity Header Injection
-  Translation/coding-plan:  x-api-key: {credential} + anthropic-version
-  Translation/start-plan:   Authorization: Bearer {jwt} + anthropic-version
-  Passthrough/start-plan:   Authorization: Bearer {jwt} + anthropic-version
-  Passthrough/coding-plan:  x-api-key: {credential} + anthropic-version
+  Anthropic/coding-plan:    x-api-key + Authorization: Bearer + anthropic-version
+  Anthropic/start-plan:     x-api-key + Authorization: Bearer + anthropic-version
   Both:                     User-Agent: ZCode/{version} + X-ZCode-* + trace headers
       │
       ▼

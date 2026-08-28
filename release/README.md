@@ -1,5 +1,17 @@
 # zcode-proxy 使用说明
 
+> **v0.3.10.1 — 对齐官方 ZCode 3.9.2 模型请求指纹**
+>
+> 本版依据官方 ZCode 3.9.2 桌面客户端解包结果，修正了模型请求的认证、身份标识与 Anthropic 请求体：
+>
+> - 所有 Anthropic 模型请求（包括 start-plan）同时发送 SDK 生成的 `x-api-key` 与 ZCode 运行时追加的 `Authorization: Bearer`。
+> - 默认身份改为 `X-Title: Z Code@electron`；模型头按官方顺序发送，`X-ZCode-Agent` 位于最后。`X-Device-Mid` 不再出现在模型请求头中。
+> - `metadata.user_id` 改为官方的嵌套 JSON 字符串，包含稳定的设备 id、空 `account_uuid` 和会话 id；客户端自带 metadata 不再透传。
+> - `anthropic-beta` 不再固定发送，只有消息数组出现会话中途 system 消息时才携带 `mid-conversation-system-2026-04-07`。
+> - 默认让运行时协商 `accept-encoding`，仍保留 `ZCODE_UPSTREAM_ACCEPT_ENCODING=identity` 作为排障开关；gzip/deflate 透传响应会在代理内解压，统计与 SSE 心跳不受影响。
+>
+> **升级建议**：使用 Claude Code、Codex 或 start-plan 的用户建议直接升级。若你的网络中间层对压缩 SSE 处理异常，可在配置环境中设置 `ZCODE_UPSTREAM_ACCEPT_ENCODING=identity`。
+
 > **v0.3.10.0 — 思考档位按模型区分 + 模型目录对齐 zcode 现役阵容**
 >
 > v0.3.9.0 的后续：思考档位**因模型而异**，不是全局统一。zcode 官方文档（zcode.z.ai/docs/configuration）直接给出了档位映射表，docs.z.ai 给出了参数支持矩阵——两者现已固化为代理内的每模型规格表（`src/proxy/thinking-specs.ts`）：

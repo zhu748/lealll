@@ -179,3 +179,38 @@ export function buildIdentityHeaders(id: ProxyIdentity): Record<string, string> 
   if (deviceMid) headers["X-Device-Mid"] = deviceMid;
   return headers;
 }
+
+/**
+ * Identity headers for model-provider requests, matching ZCode 3.9.2's
+ * bundled CLI provider helper (`qtn` + `PIi`).  This is deliberately separate
+ * from buildIdentityHeaders(): control-plane calls may carry X-Device-Mid,
+ * while the official model path puts the device id in Anthropic
+ * `metadata.user_id` and appends X-ZCode-Agent last.
+ */
+export function buildModelIdentityHeaders(id: ProxyIdentity): Record<string, string> {
+  const env = getCachedEnv();
+  const n = resolveAppVersion(id.appVersion);
+  const refererOrigin = normalizePrintableHeaderValue(id.refererOrigin) ?? "https://zcode.z.ai";
+  const sourceTitle = normalizePrintableHeaderValue(id.sourceTitle) ?? "electron";
+  const platform = normalizePrintableHeaderValue(env.platform);
+  const arch = normalizePrintableHeaderValue(env.arch);
+  const release = normalizePrintableHeaderValue(env.osRelease);
+  const releaseChannel = normalizePrintableHeaderValue(process.env.ZCODE_IDENTITY_RELEASE_CHANNEL)
+    ?? normalizePrintableHeaderValue(id.releaseChannel)
+    ?? env.envReleaseChannel;
+
+  const headers: Record<string, string> = {
+    "HTTP-Referer": refererOrigin,
+    "User-Agent": `ZCode/${n ?? "unknown"}`,
+  };
+  if (n) headers["X-ZCode-App-Version"] = n;
+  headers["X-Title"] = `Z Code@${sourceTitle}`;
+  if (releaseChannel) headers["X-Release-Channel"] = releaseChannel;
+  headers["X-Client-Language"] = env.clientLanguage ?? "unknown";
+  headers["X-Client-Timezone"] = env.clientTimezone ?? "unknown";
+  if (platform && arch) headers["X-Platform"] = `${platform}-${arch}`;
+  if (platform) headers["X-Os-Category"] = env.osCategory;
+  if (release) headers["X-Os-Version"] = release;
+  headers["X-ZCode-Agent"] = normalizePrintableHeaderValue(id.zcodeAgent) ?? "glm";
+  return headers;
+}

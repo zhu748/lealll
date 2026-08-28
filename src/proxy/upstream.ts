@@ -33,13 +33,11 @@
  *      trace-headers.ts) which replicates ZCode's single-user-identity UUID
  *      generation and emits `x-zcode-session-type` on every model request.
  *
- *   4. ACCEPT-ENCODING: v0.3.8.1 — model requests advertise `identity`
- *      (the real ZCode Tauri client's value, per upstream wire captures)
- *      instead of forwarding the client's value. Forwarding gzip made the
- *      zcode.z.ai ESA edge compress SSE passthrough bodies, silently killing
- *      the token-stats observer, the SSE heartbeat, and in-stream error
- *      detection (see runtime-options.ts upstreamAcceptEncoding). Env
- *      escape hatch: ZCODE_UPSTREAM_ACCEPT_ENCODING.
+ *   4. ACCEPT-ENCODING: ZCode 3.9.2 leaves negotiation to its Node 24 fetch
+ *      transport. The proxy therefore omits an application-level value by
+ *      default and never forwards the downstream client's value. An explicit
+ *      ZCODE_UPSTREAM_ACCEPT_ENCODING override remains available; compressed
+ *      passthrough bodies are decoded in-proxy before SSE observation.
  *
  * === HEADER WHITELIST (local fork policy, kept from v0.2.3+) ===
  *
@@ -54,13 +52,13 @@
  * the actual wire):
  *
  *   1.  content-type             : application/json
- *   2.  accept-encoding          : identity (ZCODE_UPSTREAM_ACCEPT_ENCODING override)
- *   3.  anthropic-beta           : mid-conversation-system-2026-04-07 (Anthropic upstream only, fixed ZCode value)
+ *   2.  accept-encoding          : runtime-managed (optional env override)
+ *   3.  anthropic-beta           : derived from request features (Anthropic only)
  *   4.  anthropic-version        : 2023-06-01                       (Anthropic upstream only)
- *   5.  x-api-key | authorization: <upstream credential>            (format/plan dependent)
- *   6.  HTTP-Referer → User-Agent → [X-ZCode-App-Version] → X-Title → X-ZCode-Agent →
- *       X-Platform → [X-Release-Channel] → X-Client-Language → X-Client-Timezone →
- *       X-Os-Category → [X-Os-Version] → [X-Device-Mid]                (identity block, pio order)
+ *   5.  x-api-key + authorization: <upstream credential>              (Anthropic)
+ *   6.  HTTP-Referer → User-Agent → [X-ZCode-App-Version] → X-Title →
+ *       [X-Release-Channel] → X-Client-Language → X-Client-Timezone →
+ *       X-Platform → X-Os-Category → [X-Os-Version] → X-ZCode-Agent
  *   7.  x-request-id / x-zcode-session-type / x-zcode-trace-id / [x-query-id / x-session-id]
  *                                                               (attribution block — synthetic or
  *                                                                session-context exact)
@@ -68,7 +66,7 @@
  *       injected via extraHeaders by the captcha pool)
  *
  * PASSTHROUGH / POLICY NOTES (real client wire captures):
- *   - anthropic-beta            ✅ fixed ZCode value only; downstream values are never passed through
+ *   - anthropic-beta            ✅ feature-derived only; downstream values are never passed through
  *   - accept                    ❌ (not on model requests; was a v0.2.2 bug)
  *   - any x-stainless-*         ❌ (Anthropic SDK fingerprint)
  *   - any x-claude-* / x-claude-code-*  ❌ (Claude Code CLI fingerprint)
@@ -86,7 +84,7 @@ import type { ProviderDef } from "../provider/types.js";
 import type { Credential } from "../auth/types.js";
 import type { ProxyIdentity } from "../config/types.js";
 import { credentialString } from "../auth/types.js";
-import { buildIdentityHeaders } from "./identity.js";
+import { buildModelIdentityHeaders } from "./identity.js";
 import { buildZcodeTraceHeaders } from "./trace-headers.js";
 import { sessionIdForHeader, shouldUseExactTraceHeaders, type SessionHeaderContext } from "./session-context.js";
 import { upstreamAcceptEncoding } from "./runtime-options.js";
@@ -104,7 +102,7 @@ export interface UpstreamClientSession {
 export type UpstreamHeaderPair = [string, string];
 
 const ANTHROPIC_VERSION = "2023-06-01";
-const ANTHROPIC_BETA = "mid-conversation-system-2026-04-07";
+const MID_CONVERSATION_SYSTEM_BETA = "mid-conversation-system-2026-04-07";
 
 const ALIYUN_CAPTCHA_HEADERS = new Set([
   "x-aliyun-captcha-verify-param",
@@ -117,6 +115,30 @@ function normalizeBearerHeader(token: string | undefined): string | undefined {
   const trimmed = token?.trim();
   if (!trimmed) return undefined;
   return /^Bearer\s+/i.test(trimmed) ? trimmed : `Bearer ${trimmed}`;
+}
+
+/**
+ * The bundled Anthropic SDK builds anthropic-beta from features actually used
+ * by the request.  For the request shapes this proxy can generate, the only
+ * applicable beta is a system message that occurs after conversation content.
+ */
+export function deriveAnthropicBeta(body: string | undefined): string | undefined {
+  if (!body) return undefined;
+  try {
+    const parsed = JSON.parse(body) as { messages?: unknown };
+    if (!Array.isArray(parsed.messages)) return undefined;
+    let sawConversationMessage = false;
+    for (const item of parsed.messages) {
+      if (!item || typeof item !== "object") continue;
+      const role = (item as { role?: unknown }).role;
+      if (role === "system") {
+        if (sawConversationMessage) return MID_CONVERSATION_SYSTEM_BETA;
+      } else if (role === "user" || role === "assistant") {
+        sawConversationMessage = true;
+      }
+    }
+  } catch { /* invalid JSON is handled by the upstream */ }
+  return undefined;
 }
 
 /**
@@ -206,9 +228,8 @@ function buildTraceHeaders(plan: "coding-plan" | "start-plan", clientSession?: U
  * Build auth + identity + trace headers for the upstream request.
  *
  * Auth scheme selection:
- * - Anthropic upstream, coding-plan → `x-api-key: {cred}` + `anthropic-version`
- * - Anthropic upstream, start-plan  → `Authorization: Bearer {jwt}` + `anthropic-version`
- *                                         (v0.3.7 default — zcode.z.ai mirror)
+ * - Anthropic upstream, both plans  → `x-api-key: {cred}` +
+ *   `Authorization: Bearer {cred}` + `anthropic-version`
  * - OpenAI upstream, coding-plan    → `Authorization: Bearer {cred}`
  */
 export function buildAuthHeaders(
@@ -219,27 +240,23 @@ export function buildAuthHeaders(
   clientSession?: UpstreamClientSession,
 ): Record<string, string> {
   const credStr = plan === "start-plan" && cred.jwt ? cred.jwt : credentialString(cred);
-  const startPlanAuthorization = plan === "start-plan"
-    ? normalizeBearerHeader(cred.jwt ?? credentialString(cred))
-    : undefined;
 
   // Identity block first (pio order), then attribution/trace headers, then
   // auth — matches the current bundle's assembly order.
   const headers: Record<string, string> = {
-    ...buildIdentityHeaders(identity),
+    ...buildModelIdentityHeaders(identity),
     ...buildTraceHeaders(plan, clientSession),
   };
 
   if (format === "anthropic") {
-    if (plan === "start-plan") {
-      // Official start-plan providers store the JWT in provider.apiKey and the
-      // runtime converts it to Authorization: Bearer <jwt>. Imported OAuth
-      // credentials keep the same value in cred.jwt; manual/API-key mode may
-      // only have it as apiKey, so normalize either source here.
-      if (startPlanAuthorization) headers["authorization"] = startPlanAuthorization;
-    } else {
-      headers["x-api-key"] = credStr;
-    }
+    // createAnthropic always derives x-api-key from provider.apiKey. ZCode's
+    // provider wrapper then adds Authorization: Bearer with the same value.
+    // Consequently the official 3.9.2 client sends both headers on Anthropic
+    // model calls, including the start-plan mirror.
+    const anthropicApiKey = credStr.replace(/^Bearer\s+/i, "");
+    headers["x-api-key"] = anthropicApiKey;
+    const authorization = normalizeBearerHeader(anthropicApiKey);
+    if (authorization) headers["authorization"] = authorization;
     headers["anthropic-version"] = ANTHROPIC_VERSION;
   } else {
     headers["authorization"] = `Bearer ${credStr}`;
@@ -252,10 +269,9 @@ export function buildAuthHeaders(
  * Build the COMPLETE upstream header set as ordered pairs.
  *
  * This is a strict whitelist — no client header is read at all. In
- * particular `accept-encoding` is NOT forwarded from the client: the value
- * sent upstream is the proxy's own fingerprint decision (identity by
- * default — matches the real ZCode desktop client; see
- * runtime-options.ts upstreamAcceptEncoding).
+ * particular `accept-encoding` is NOT forwarded from the client. It is
+ * omitted by default so the transport negotiates it, with an operator-only
+ * override in runtime-options.ts.
  *
  * `extraHeaders` is layered LAST so trusted internal subsystems can override
  * transport headers if needed; it is never used for client passthrough.
@@ -268,18 +284,16 @@ export function buildUpstreamHeaderPairs(
   plan: "coding-plan" | "start-plan" = "coding-plan",
   extraHeaders?: Record<string, string>,
   clientSession?: UpstreamClientSession,
+  body?: string,
 ): UpstreamHeaderPair[] {
   void clientReq; // kept in the signature for call-site stability
-  const pairs: UpstreamHeaderPair[] = [
-    ["content-type", "application/json"],
-    ["accept-encoding", upstreamAcceptEncoding()],
-  ];
+  const pairs: UpstreamHeaderPair[] = [["content-type", "application/json"]];
+  const acceptEncoding = upstreamAcceptEncoding();
+  if (acceptEncoding) pairs.push(["accept-encoding", acceptEncoding]);
 
-  // Fixed ZCode beta flag on Anthropic upstream only. Never pass through
-  // downstream beta lists (Claude Code sends many claude-code-* flags that
-  // are a fingerprint mismatch).
   if (format === "anthropic") {
-    pairs.push(["anthropic-beta", ANTHROPIC_BETA]);
+    const beta = deriveAnthropicBeta(body);
+    if (beta) pairs.push(["anthropic-beta", beta]);
   }
 
   for (const [k, v] of Object.entries(buildAuthHeaders(format, cred, identity, plan, clientSession))) {
@@ -312,9 +326,8 @@ export function buildUpstreamHeaders(
   clientSession?: UpstreamClientSession,
 ): Record<string, string> {
   const pairs = buildUpstreamHeaderPairs(
-    // buildUpstreamHeaders historically did not read the client request; the
-    // accept-encoding passthrough needs one, so synthesize a bare request
-    // carrying no accept-encoding header (falls back to the "gzip" default).
+    // buildUpstreamHeaders historically did not read the client request;
+    // synthesize a bare request to preserve that API contract.
     new Request("http://internal.invalid/", { method: "POST" }),
     format,
     cred,
@@ -349,7 +362,7 @@ export function buildUpstreamRequest(
   // session-context system instead.
   void clientIp(clientReq, resolveClientIp, trustProxy);
   const url = buildUpstreamURL(format, provider, plan);
-  const headerPairs = buildUpstreamHeaderPairs(clientReq, format, cred, identity, plan, extraHeaders, clientSession);
+  const headerPairs = buildUpstreamHeaderPairs(clientReq, format, cred, identity, plan, extraHeaders, clientSession, body);
 
   const init: RequestInit = {
     method: "POST",
