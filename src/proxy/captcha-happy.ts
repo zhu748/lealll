@@ -1840,6 +1840,64 @@ const EXTRA_WINDOW_PROPS = [
   "open", "close", "stop", "focus", "blur", "print", "alert", "confirm",
   "prompt", "getSelection", "find", "matchMedia",
 ];
+const _delayedGuestFallbackFns = new WeakSet();
+
+// FeiLin starts a few fingerprint collectors without awaiting them. A solve
+// can therefore finish (or fail), destroy its happy-dom window, and only then
+// resume one of those promise continuations. Bare browser names in that tail
+// used to disappear with the global alias epoch, producing intermittent
+// `moveBy is not defined` / `matchMedia is not defined` errors. More names can
+// be selected by a rotated FeiLin build, so keep a complete, inert browser
+// method surface after teardown instead of chasing individual exceptions.
+//
+// These fallbacks deliberately do NOT retain the destroyed window. During a
+// live epoch installGlobalWindowAlias still replaces them with the current
+// window's methods; between epochs they merely let stale, already-irrelevant
+// collectors finish harmlessly. Existing host globals are never overwritten.
+function installDelayedGuestFallbacks(g) {
+  for (const name of EXTRA_WINDOW_PROPS) {
+    try {
+      if (name in g) continue;
+      const noop = () => undefined;
+      const returnsFalse = () => false;
+      let impl;
+      if (["open", "prompt", "getSelection"].includes(name)) {
+        impl = () => null;
+      } else if (["confirm", "find"].includes(name)) {
+        impl = returnsFalse;
+      } else if (name === "matchMedia") {
+        impl = (query) => ({
+          matches: false,
+          media: String(query ?? ""),
+          onchange: null,
+          addListener: noop,
+          removeListener: noop,
+          addEventListener: noop,
+          removeEventListener: noop,
+          dispatchEvent: returnsFalse,
+        });
+      } else {
+        impl = noop;
+      }
+      _delayedGuestFallbackFns.add(impl);
+      // Give fingerprint probes the ordinary browser-function shape.
+      try { Object.defineProperty(impl, "name", { value: name, configurable: true }); } catch (_) {}
+      try {
+        Object.defineProperty(impl, "toString", {
+          value: () => `function ${name}() { [native code] }`,
+          configurable: true,
+          writable: true,
+        });
+      } catch (_) {}
+      Object.defineProperty(g, name, {
+        value: impl,
+        configurable: true,
+        writable: true,
+        enumerable: true,
+      });
+    } catch (_) {}
+  }
+}
 
 // Ref-count: the pool solves in parallel waves; each window must keep the
 // aliases alive until the LAST concurrent window is destroyed, otherwise one
@@ -1900,7 +1958,11 @@ function installGlobalWindowAlias(g, w) {
     // exactly what a real browser realm resolves.
     if (HOST_CRITICAL_GLOBALS.has(prop)) {
       record(prop);
-      if (_savedGlobalDescMap.get(prop) !== undefined) continue; // host-defined → protected
+      const savedDesc = _savedGlobalDescMap.get(prop);
+      // A fallback left by the previous captcha epoch is ours, not a real
+      // host global, so the live window should still replace it. Genuine
+      // Bun/Node globals remain protected exactly as before.
+      if (savedDesc !== undefined && !_delayedGuestFallbackFns.has(savedDesc.value)) continue;
     }
     gDefine(prop, {
       get() {
@@ -2018,6 +2080,10 @@ function removeGlobalWindowAlias(g, w) {
     } catch (_) {}
   }
   _savedGlobalDescMap.clear();
+  // Do this only after the exact host snapshot has been restored. The
+  // fallback installer fills genuinely absent browser names and leaves all
+  // real Bun/Node globals untouched.
+  installDelayedGuestFallbacks(g);
 }
 
 function destroyDom(win) {

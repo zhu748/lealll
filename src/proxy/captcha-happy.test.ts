@@ -66,8 +66,12 @@ describe("installGlobalWindowAlias / removeGlobalWindowAlias (v0.3.6.0)", () => 
     } finally {
       removeGlobalWindowAlias(globalThis, w);
     }
-    // Cleanup: the host never defined print, so it must be gone again.
-    expect(guestEval("typeof print")).toBe("undefined");
+    // Delayed FeiLin promise continuations may resume after cleanup, so
+    // browser methods remain available as inert host-level fallbacks. The
+    // destroyed window itself must still be released.
+    expect(guestEval("typeof print")).toBe("function");
+    expect(guestEval("typeof moveBy")).toBe("function");
+    expect(guestEval("typeof matchMedia")).toBe("function");
     expect(guestEval("typeof window")).toBe("undefined");
   });
 
@@ -119,19 +123,46 @@ describe("installGlobalWindowAlias / removeGlobalWindowAlias (v0.3.6.0)", () => 
     } finally {
       removeGlobalWindowAlias(globalThis, w2);
     }
-    expect(guestEval("typeof print")).toBe("undefined");
+    expect(guestEval("typeof print")).toBe("function");
     expect(typeof setTimeout).toBe("function");
   });
 
   it("survives sequential alias epochs (pool refills reuse install/remove cycles)", () => {
     for (let i = 0; i < 3; i++) {
       const w = makeFakeWindow();
+      w.print = () => `window-${i}`;
       installGlobalWindowAlias(globalThis, w);
       expect(guestEval("typeof print")).toBe("function");
+      expect(guestEval("print()")).toBe(`window-${i}`);
       removeGlobalWindowAlias(globalThis, w);
-      expect(guestEval("typeof print")).toBe("undefined");
+      expect(guestEval("typeof print")).toBe("function");
       expect(typeof setTimeout).toBe("function");
     }
+  });
+
+  it("lets delayed guest collectors call browser methods after their window is destroyed", async () => {
+    const w = makeFakeWindow();
+    installGlobalWindowAlias(globalThis, w);
+
+    // Capture a continuation while the guest epoch is live, but run the bare
+    // identifiers only after teardown, matching FeiLin's unawaited collectors.
+    const delayedCollector = Promise.resolve().then(async () => {
+      await Promise.resolve();
+      return guestEval(`
+        moveBy(1, 1);
+        ({
+          media: matchMedia('(prefers-reduced-motion: reduce)').media,
+          hasWindow: typeof window
+        })
+      `) as { media: string; hasWindow: string };
+    });
+    removeGlobalWindowAlias(globalThis, w);
+
+    await expect(delayedCollector).resolves.toEqual({
+      media: "(prefers-reduced-motion: reduce)",
+      hasWindow: "undefined",
+    });
+    expect(guestEval("moveBy.toString()")).toContain("[native code]");
   });
 });
 

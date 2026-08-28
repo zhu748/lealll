@@ -1,5 +1,14 @@
 # zcode-proxy 使用说明
 
+> **v0.3.10.6 — 修复验证码窗口销毁后的异步指纹异常**
+>
+> - 修复 FeiLin 的未等待异步采集器在验证码窗口销毁后继续执行时，偶发抛出 `moveBy is not defined`、`matchMedia is not defined` 等错误。
+> - 页面存活期间仍使用当前 happy-dom 窗口的浏览器方法；页面销毁后改用不引用旧 DOM、无副作用的宿主级兜底，避免内存泄漏及失效 token。
+> - 兜底覆盖完整的浏览器方法面，不再逐个追补变量；真实 Bun/Node 全局不会被覆盖。
+> - 新增“窗口销毁后延迟回调继续执行”以及连续验证码生命周期回归测试。
+>
+> **升级建议**：使用 start-plan 的用户建议从 v0.3.10.5 升级；coding-plan 用户不受影响。
+
 > **v0.3.10.5 — 修复 start-plan 重试后偶发 3007 验证失败**
 >
 > - 修复 Bun/happy-dom 并发解验证码时共享 `globalThis` 导致窗口环境互相覆盖的问题；FeiLin 的裸 `matchMedia()` 调用不再偶发报 `ReferenceError`。
