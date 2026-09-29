@@ -74,6 +74,8 @@ export interface OAuthFlowTokens {
   accessToken: string;
   userId?: string;
   jwt?: string;
+  /** Account email (fork multi-account layer) — names the new account in the dashboard. */
+  email?: string;
 }
 
 /** Shape of the zcode.z.ai `{code, data, msg}` envelope (token + cli-login endpoints). */
@@ -161,7 +163,7 @@ interface CliInitData {
 interface CliPollData {
   status: string;
   token?: string;
-  user?: { user_id?: unknown };
+  user?: { user_id?: unknown; email?: unknown };
   zai?: { access_token?: unknown };
   bigmodel?: { access_token?: unknown };
 }
@@ -276,6 +278,9 @@ export class PollOAuthClient extends OAuthFlowClient {
           accessToken,
           jwt: typeof data.token === "string" ? data.token.trim() : undefined,
           userId: typeof data.user?.user_id === "string" ? data.user.user_id : undefined,
+          // Fork multi-account layer: the email names the new account in the
+          // dashboard (`{email}-{plan}`). Absent in some responses — optional.
+          email: typeof data.user?.email === "string" ? data.user.email : undefined,
         };
       }
       if (data?.status === "failed") {

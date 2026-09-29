@@ -6,10 +6,10 @@ import { loadConfig } from "./config/loader.js";
 import { AuthManager } from "./auth/manager.js";
 import { startServer, type ProxyServer } from "./server/server.js";
 import { startControlListener, LogBuffer, type ControlState } from "./android/control.js";
-import { loadCredential, saveCredential, clearCredential, getStorePath } from "./auth/store.js";
+import { loadCredential, saveCredential, clearCredential, getStorePath, exportAccounts } from "./auth/store.js";
 import { ZaiOAuthClient, BigmodelOAuthClient, BigmodelPollOAuthClient, LOGIN_TIMEOUT_MS, parsePastedCallbackUrl, type OAuthResult } from "./auth/oauth.js";
 import { KeyResolver } from "./auth/resolver.js";
-import type { Credential } from "./auth/types.js";
+import type { Credential, PlanId } from "./auth/types.js";
 import type { ProviderId } from "./provider/types.js";
 import type { ProxyConfig } from "./config/types.js";
 import { updateConfigYaml, ensureConfigFile } from "./config/edit.js";
@@ -21,8 +21,9 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { ensureNodeFetchNoTimeouts } from "./runtime/node-fetch-compat.js";
+import { initPool } from "./proxy/proxy-pool.js";
 
-export const VERSION = "4.7.1";
+export const VERSION = "4.7.1-fork.1";
 
 if (require.main === module) main();
 
@@ -162,34 +163,130 @@ Examples:
 `);
 }
 
+/**
+ * Build the multi-account AuthManager (fork layer).
+ *
+ * `listAllCredentials` exposes the full stored-account list so the proxy's
+ * retry loop can auto-switch to a different account when the current one
+ * fails repeatedly. In apikey mode there's only one credential, so switching
+ * is a no-op (switchToNextCredential returns null) — that's fine.
+ */
+function buildAuthManager(config: ProxyConfig): AuthManager {
+  return new AuthManager({
+    mode: config.auth.mode ?? "oauth",
+    provider: config.provider,
+    apiKey: config.auth.apiKey ?? config.providers[config.provider].credential,
+    listAllCredentials: async () => {
+      const accounts = await exportAccounts();
+      return accounts.map(a => a.credential);
+    },
+  });
+}
+
 async function serve(configPath: string | undefined, debug: boolean): Promise<void> {
   const path = configPath ?? process.env.ZCODE_PROXY_CONFIG ?? "config.yaml";
   if (ensureConfigFile(path)) {
     ensureDeviceMidInConfig(path);
     console.log(`Created ${path} from bundled template.`);
-    console.log(`Run: zcode-proxy auth login <zai|bigmodel>\n`);
+    console.log(`Run: zcode-proxy auth login <zai|bigmodel>`);
+    console.log(`(or start the server and log in from the dashboard at /admin)\n`);
   }
   const config = loadConfig(path);
 
-  const auth = new AuthManager();
-  const cred = await loadCredential();
-  if (!cred) {
-    console.error("Not logged in. Run: zcode-proxy auth login " + config.provider);
-    process.exit(1);
+  // Fork multi-account layer: the manager owns mode/apikey-vs-oauth and the
+  // full-account list for failover switching.
+  const auth = buildAuthManager(config);
+
+  if ((config.auth.mode ?? "oauth") === "oauth") {
+    const cred = await loadCredential();
+    if (!cred) {
+      // Fork behavior — DON'T throw / exit: let the server start so the user
+      // can open the dashboard and log in via OAuth. The old behavior (exit
+      // with "Not logged in") was a chicken-and-egg trap: the user couldn't
+      // open the dashboard to log in because the server refused to start
+      // (Windows exe double-click scenario). Now: server starts, dashboard is
+      // accessible, and any /v1/* request before login returns 503
+      // "credential_unavailable" (handled by proxyRequest). The new
+      // credential is hot-swapped into the running server via
+      // opts.auth.setOAuthCredential — no restart needed.
+      console.warn("");
+      console.warn("  ⚠  OAuth mode: no credential stored yet.");
+      console.warn("  ⚠  The server is starting anyway so you can log in via the dashboard.");
+      console.warn(`  ⚠  Open http://127.0.0.1:${config.server.port}/admin and click "OAuth 登录" or "从 ZCode 导入".`);
+      console.warn("  ⚠  API requests will return 503 until a credential is added.");
+      console.warn("");
+    } else {
+      auth.setOAuthCredential(cred);
+      // Resolve the effective plan from the credential (fork logic). Priority:
+      //   1. cred.plan — explicit
+      //   2. inferred from cred.jwt — JWTs are start-plan exclusive
+      //   3. config.yaml's plan — final fallback
+      if (cred.plan || cred.jwt) {
+        const effectivePlan: PlanId = cred.plan ?? (cred.jwt ? "start-plan" : config.plan);
+        if (effectivePlan !== config.plan) {
+          console.log(`  Overriding plan: ${config.plan} → ${effectivePlan} (from credential)`);
+          config.plan = effectivePlan;
+        }
+      }
+    }
   }
-  auth.setOAuthCredential(cred);
 
-  if (debug) printDebugBanner(config, path, cred);
+  if (debug) printDebugBanner(config, path, await loadCredential().catch(() => null));
 
-  const server = await startServer(buildServerOptions(config, auth, debug));
+  // Intercept console.log for admin dashboard log streaming (fork layer).
+  // Wrapped so a logging failure never breaks the actual console output.
+  const origLog = console.log;
+  const origError = console.error;
+  const origWarn = console.warn;
+  const { appendLog, setLogFilePath, flushLogFileForShutdown } = await import("./admin/api.js");
+
+  const serialize = (a: unknown): string => {
+    if (typeof a === "string") return a;
+    if (a instanceof Error) return a.stack ?? `${a.name}: ${a.message}`;
+    if (a === null || a === undefined || typeof a === "number" || typeof a === "boolean") return String(a);
+    try { return JSON.stringify(a); } catch { return String(a); }
+  };
+  const logLevelRank = (level: string | undefined): number =>
+    level === "debug" ? 0 : level === "info" ? 1 : level === "warn" ? 2 : level === "error" ? 3 : 1;
+  const minRank = logLevelRank(config.logging?.level);
+  const safeAppend = (level: string, levelRank: number, args: unknown[]) => {
+    if (levelRank < minRank) return; // below configured minimum — skip
+    try { appendLog(level, args.map(serialize).join(" ")); }
+    catch { /* appendLog may throw if log buffer is full; never let it kill the request */ }
+  };
+  console.log = (...args: unknown[]) => { origLog(...args); safeAppend("info", 1, args); };
+  console.error = (...args: unknown[]) => { origError(...args); safeAppend("error", 3, args); };
+  console.warn = (...args: unknown[]) => { origWarn(...args); safeAppend("warn", 2, args); };
+
+  // Fork: file logging — mirror dashboard log entries to a JSON-lines file.
+  const logFile = config.logging?.file || process.env.ZCODE_PROXY_LOG_FILE;
+  if (logFile) setLogFilePath(logFile);
+
+  const server = await startServer(buildServerOptions(config, auth, debug, { configPath: path }));
   const url = `http://${server.hostname}:${server.port}`;
-  console.log(`zcode-proxy listening on ${url}`);
+  console.log(`zcode-proxy ${VERSION} listening on ${url}`);
+  console.log(`  dashboard: ${url}/admin`);
   if (config.plan === "start-plan") {
     // Pre-solve the captcha token pool in the background so first requests
     // don't pay the full solve latency (in-process happy-dom backend).
     import("./proxy/captcha.js")
       .then((m) => m.startCaptchaPool(config.identity.appVersion))
       .catch((err) => console.error(`[captcha] pool warmup failed: ${(err as Error).message}`));
+  } else {
+    // Fork: multi-account mode — the retry engine may switch to a stored
+    // start-plan account mid-request, so pre-solve when ANY stored credential
+    // is a start-plan account. Fresh oauth installs skip the pre-solver
+    // (nothing can consume the tokens yet; the pool starts lazily after the
+    // first start-plan credential is saved — see admin/api.ts
+    // ensureCaptchaPoolForStartPlan).
+    const storedAccounts = await exportAccounts().catch(() => []);
+    const anyStartPlanCredential = storedAccounts.length > 0
+      && storedAccounts.some(a => a.credential?.plan === "start-plan" || Boolean(a.credential?.jwt));
+    if (anyStartPlanCredential) {
+      import("./proxy/captcha.js")
+        .then((m) => m.startCaptchaPool(config.identity.appVersion))
+        .catch((err) => console.error(`[captcha] pool warmup failed: ${(err as Error).message}`));
+    }
   }
   if (config.claim.enabled && config.claim.auto) {
     import("./claim/runtime.js")
@@ -201,18 +298,31 @@ async function serve(configPath: string | undefined, debug: boolean): Promise<vo
   }
   console.log(`  provider: ${config.provider}`);
   console.log(`  plan: ${config.plan}`);
+  console.log(`  auth mode: ${config.auth.mode ?? "oauth"}`);
   console.log(`  models: ${config.models.length} available`);
   if (config.responses.enabled) console.log(`  /v1/responses: ON`);
   if (config.async.enabled) {
     console.log(config.plan === "coding-plan" ? `  /async/v1/*: ON` : `  /async/v1/*: OFF (requires plan "coding-plan")`);
   }
+  if (config.mcp.gateway.enabled) console.log(`  /mcp gateway: ON`);
   if (debug) console.log(`  debug: ON`);
+
+  // Fork: initialize the global outbound proxy pool (reads
+  // ~/.zcode-proxy/proxy-pool.json, schedules auto-refresh). Best-effort:
+  // errors here don't stop the server.
+  try {
+    await initPool();
+  } catch (e) {
+    console.warn(`[proxy-pool] init failed (non-fatal): ${(e as Error).message}`);
+  }
 
   process.on("SIGINT", () => {
     console.log("\nShutting down...");
+    void flushLogFileForShutdown().catch(() => {});
     server.stop(true);
   });
   process.on("SIGTERM", () => {
+    void flushLogFileForShutdown().catch(() => {});
     server.stop(true);
   });
 }
@@ -254,7 +364,9 @@ async function runAndroid(): Promise<void> {
   console.error = (...args: unknown[]) => { logBuffer.push("[error] " + args.join(" ")); origErr(...args); };
   console.warn = (...args: unknown[]) => { logBuffer.push("[warn] " + args.join(" ")); origWarn(...args); };
 
-  const auth = new AuthManager();
+  // Fork multi-account layer: same listAllCredentials wiring as serve(), so
+  // the retry engine can failover across accounts on Android too.
+  const auth = buildAuthManager(config);
 
   const serverRef: { current: ProxyServer | null } = { current: null };
 
@@ -264,7 +376,7 @@ async function runAndroid(): Promise<void> {
     if (!cred) return { ok: false, error: "not_logged_in" };
     auth.setOAuthCredential(cred);
     try {
-      const s = await startServer(buildServerOptions(config, auth, false));
+      const s = await startServer(buildServerOptions(config, auth, false, { configPath: path }));
       serverRef.current = s;
       console.log(`zcode-proxy listening on http://${s.hostname}:${s.port}`);
       return { ok: true, port: s.port };

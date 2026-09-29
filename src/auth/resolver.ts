@@ -1,4 +1,4 @@
-import type { Credential } from "./types.js";
+import type { Credential, PlanId } from "./types.js";
 import type { ProviderId } from "../provider/types.js";
 import type { FetchFn } from "./oauth.js";
 
@@ -137,9 +137,20 @@ export class KeyResolver {
     accessToken: string,
     provider: ProviderId,
     userId?: string,
+    plan: PlanId = "coding-plan",
+    email?: string,
   ): Promise<Credential> {
     if (provider === "zai") {
-      const bizToken = await this.resolveZaiBizToken(accessToken);
+      let bizToken = accessToken;
+      try {
+        // Fork (from lealll v0.3.x): OAuth responses from zcode.z.ai still
+        // carry a raw ZAI access token, but ZCode 3.2.5 stores
+        // oauth:zai:access_token after it has already been exchanged through
+        // /api/auth/z/login. Tolerate both shapes.
+        bizToken = await this.resolveZaiBizToken(accessToken);
+      } catch {
+        bizToken = accessToken;
+      }
       const host = "https://api.z.ai";
       const authorization = `Bearer ${bizToken}`;
 
@@ -153,7 +164,9 @@ export class KeyResolver {
         throw new Error("zai API key copy response is missing secretKey");
       }
 
-      return { apiKey, secret, provider: "zai", userId };
+      const cred: Credential = { apiKey, secret, provider: "zai", plan, userId };
+      if (email) cred.email = email;
+      return cred;
     }
 
     const host = "https://bigmodel.cn";
@@ -168,6 +181,63 @@ export class KeyResolver {
       if (secret) fullKey = `${apiKey}.${secret}`;
     } catch { /* use apiKey only */ }
 
-    return { apiKey: fullKey, provider: "bigmodel", userId };
+    const cred: Credential = { apiKey: fullKey, provider: "bigmodel", plan, userId };
+    if (email) cred.email = email;
+    return cred;
+  }
+
+  /**
+   * Fork multi-account entry point (from lealll v0.3.x): resolve a credential
+   * with a start-plan graceful fallback.
+   *
+   * For **coding-plan**, the biz-API exchange is mandatory — there is no
+   * alternative credential, so any failure propagates (throws).
+   *
+   * For **start-plan**, the actual upstream credential is the ZCode plan JWT
+   * (sent as `Authorization: Bearer {jwt}` via zcode.z.ai). The biz-API
+   * `apiKey`/`secret` are only decorative for start-plan, so if the biz
+   * exchange fails (e.g. the 1-hour access token already expired, or the
+   * account has no biz profile), we MUST NOT lose the whole login. Fall back
+   * to a start-plan credential whose `apiKey` mirrors the JWT (matching the
+   * import path's start-plan shape), so the credential still saves and works.
+   */
+  async resolveCredential(
+    accessToken: string,
+    provider: ProviderId,
+    userId: string | undefined,
+    plan: PlanId,
+    jwt?: string,
+    email?: string,
+  ): Promise<Credential> {
+    if (plan !== "start-plan") {
+      const cred = await this.resolveCodingPlanCredential(accessToken, provider, userId, plan, email);
+      if (jwt) cred.jwt = jwt;
+      return cred;
+    }
+
+    try {
+      const cred = await this.resolveCodingPlanCredential(accessToken, provider, userId, plan, email);
+      if (jwt) cred.jwt = jwt;
+      return cred;
+    } catch (err) {
+      if (!jwt) {
+        // Nothing to fall back to — propagate so the caller surfaces the error
+        // instead of silently storing an empty credential.
+        throw err;
+      }
+      console.warn(
+        `[resolver] start-plan biz-API exchange failed (${(err as Error).message}); ` +
+        `falling back to JWT-only start-plan credential.`,
+      );
+      const cred: Credential = {
+        apiKey: jwt,
+        provider,
+        plan: "start-plan",
+        jwt,
+        userId,
+      };
+      if (email) cred.email = email;
+      return cred;
+    }
   }
 }

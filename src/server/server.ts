@@ -19,8 +19,18 @@ import { handleResponsesRoute } from "./routes-responses.js";
 import { handleAsyncMessagesRoute, handleAsyncChatRoute, handleAsyncHealthRoute } from "./routes-async.js";
 import { handleMcpListingRoute, handleMcpRelayRoute, type McpRouteOptions } from "./routes-mcp.js";
 import { handleQuota } from "./routes-quota.js";
+import { handleAdminRoute, type AdminOptions } from "../admin/api.js";
 import { errorResponse } from "../proxy/handler.js";
 import type { ResponseStore } from "../responses/store.js";
+
+/**
+ * Symbol-keyed stash of the TCP peer address (fork multi-account layer).
+ * Pinned by the node:http adapter in `nodeReqToWebRequest` and read by the
+ * admin dashboard's loopback gate / verify rate limiter via
+ * `resolveClientIp`. Symbol-keyed so it never collides with anything the
+ * app layer puts on the Request.
+ */
+const CLIENT_IP = Symbol("clientIp");
 
 interface ServerOptions {
   config: ProxyConfig;
@@ -31,6 +41,18 @@ interface ServerOptions {
   debug?: boolean;
   /** Responses-API state store. When absent, `/v1/responses` runs stateless (`previous_response_id` returns 404). */
   responseStore?: ResponseStore;
+  /** Path to the config file (fork admin dashboard config save). */
+  configPath?: string;
+  /** Process start time (fork admin dashboard uptime card). */
+  startTime?: number;
+  /**
+   * Resolve the TCP-remote client IP for a request (fork admin security).
+   * Wired by startServer from the socket remote address; tests omit it, in
+   * which case loopback detection falls back to the "unknown → allow" path.
+   */
+  resolveClientIp?: (req: Request) => string | undefined;
+  /** Pre-built admin options (internal: startServer passes these through). */
+  adminOpts?: AdminOptions;
 }
 
 /** Minimal server handle: what the caller needs to print URLs and shut down. */
@@ -65,6 +87,18 @@ export function createFetchHandler(opts: ServerOptions): (req: Request) => Promi
     auth,
     ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
   };
+  // Fork multi-account layer: the admin dashboard rides the SAME port as the
+  // proxy. Tests construct createFetchHandler directly without adminOpts —
+  // build a default (no resolveClientIp → loopback "unknown → allow" path,
+  // preserving legacy test behavior) so /admin works in that scenario too.
+  const adminOpts: AdminOptions = opts.adminOpts ?? {
+    config,
+    auth,
+    configPath: opts.configPath ?? "config.yaml",
+    startTime: opts.startTime ?? Date.now(),
+    ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
+    ...(opts.resolveClientIp ? { resolveClientIp: opts.resolveClientIp } : {}),
+  };
 
   return async (req: Request): Promise<Response> => {
     const url = new URL(req.url);
@@ -82,6 +116,16 @@ export function createFetchHandler(opts: ServerOptions): (req: Request) => Promi
         status: 200,
         headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-cache" },
       });
+    }
+
+    // Fork multi-account layer: admin dashboard routes — intercepted BEFORE
+    // the proxyApiKey gate. The dashboard page itself is open (it authenticates
+    // per-API-call with the proxy key / loopback gate inside handleAdminRoute);
+    // without this early return, a keyless dashboard deployment would 401 the
+    // admin page itself and the operator could never log in from a browser.
+    if (path === "/admin" || path === "/admin/" || path.startsWith("/admin/api/")) {
+      const adminResp = await handleAdminRoute(req, adminOpts);
+      if (adminResp) return addCorsHeaders(adminResp, cors);
     }
 
     if (config.auth.proxyApiKey) {
@@ -178,7 +222,22 @@ export function createFetchHandler(opts: ServerOptions): (req: Request) => Promi
  * timeouts.
  */
 export function startServer(opts: ServerOptions): Promise<ProxyServer> {
-  const handler = createFetchHandler(opts);
+  // Fork multi-account layer: wire the admin's client-IP resolver to the real
+  // TCP peer address (stashed by nodeReqToWebRequest under the CLIENT_IP
+  // symbol) so the loopback gate / verify rate limiter can't be spoofed by
+  // X-Forwarded-For (unless server.trustProxy is explicitly set).
+  const resolveClientIp = (req: Request): string | undefined => {
+    return (req as { [CLIENT_IP]?: string })[CLIENT_IP];
+  };
+  const adminOpts: AdminOptions = {
+    config: opts.config,
+    auth: opts.auth,
+    configPath: opts.configPath ?? "config.yaml",
+    startTime: opts.startTime ?? Date.now(),
+    ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
+    resolveClientIp,
+  };
+  const handler = createFetchHandler({ ...opts, adminOpts, resolveClientIp });
   const { port: requestedPort, host } = opts.config.server;
   const cors = corsHeaders(Boolean(opts.config.auth.proxyApiKey));
 
@@ -255,7 +314,10 @@ function nodeReqToWebRequest(req: import("node:http").IncomingMessage, signal?: 
   const method = req.method ?? "GET";
 
   if (method === "GET" || method === "HEAD") {
-    return new Request(url, { method, headers, signal });
+    const webReq = new Request(url, { method, headers, signal });
+    // Stash the TCP peer address for the admin loopback gate (see CLIENT_IP).
+    (webReq as { [CLIENT_IP]?: string })[CLIENT_IP] = req.socket.remoteAddress;
+    return webReq;
   }
 
   // Cast: Node's ReadableStream type ≠ Web ReadableStream type at the type layer, but `Readable.toWeb` returns a spec-compliant stream at runtime.
@@ -267,7 +329,10 @@ function nodeReqToWebRequest(req: import("node:http").IncomingMessage, signal?: 
     duplex: "half",
     signal,
   };
-  return new Request(url, init);
+  const webReq = new Request(url, init);
+  // Stash the TCP peer address for the admin loopback gate (see CLIENT_IP).
+  (webReq as { [CLIENT_IP]?: string })[CLIENT_IP] = req.socket.remoteAddress;
+  return webReq;
 }
 
 /** Write a Web API Response to a Node.js ServerResponse. */

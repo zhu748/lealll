@@ -1,14 +1,40 @@
 server:
   port: 8080
   host: "0.0.0.0"
+  # --- fork extensions (web dashboard at /admin) ---
+  # Upstream request timeout in ms. 0/omit = built-in defaults (stream 10 min,
+  # batch 5 min). Env: ZCODE_PROXY_UPSTREAM_TIMEOUT_MS
+  # upstreamTimeoutMs: 0
+  # Trust X-Forwarded-For / X-Real-IP for client-IP detection (admin loopback
+  # gate). Enable ONLY behind a reverse proxy you control.
+  # Env: ZCODE_PROXY_TRUST_PROXY=true
+  # trustProxy: false
+  # SSE keepalive comment interval while waiting for the upstream's first byte
+  # (defeats Cloudflare 100s idle timeouts on long thinking requests).
+  # Env: ZCODE_PROXY_SSE_HEARTBEAT_MS
+  # sseHeartbeatMs: 15000
+  # Max client request body size in bytes. Env: ZCODE_PROXY_MAX_REQUEST_BODY_BYTES
+  # maxRequestBodyBytes: 67108864
 
 auth:
   # Key that clients must provide to use the proxy.
   # Set to null/omit to disable client auth.
   proxyApiKey: "your-proxy-secret"
 
+  # --- fork multi-account layer ---
+  # How the upstream credential is obtained:
+  #   "oauth"  (default) — from the encrypted multi-account store
+  #            (~/.zcode-proxy/credentials.json): `auth login`, the /admin
+  #            dashboard, or ZCode imports all land there. Unlimited accounts,
+  #            one-click switching, automatic failover on repeated failures.
+  #   "apikey" — a static credential string below (no store involvement).
+  # mode: "oauth"
+  # Static credential for apikey mode: "{apiKey}" or "{apiKey}.{secret}".
+  # apiKey: ""
+
   # Upstream credentials come from the OAuth login flow — run this first:
   #   bun run src/index.ts auth login <zai|bigmodel>
+  # ...or just start the server and log in from the dashboard at /admin.
   # Parsed but currently not honored — the credential store path is fixed at
   # ~/.zcode-proxy/credentials.json:
   # oauthCredentialsPath: "~/.zcode-proxy/credentials.json"
@@ -200,5 +226,68 @@ clientSigning:
   enabled: true
   origin: "https://zcode.z.ai"
 
+# ---------------------------------------------------------------------------
+# fork multi-account / resilience layer (web dashboard: http://127.0.0.1:8080/admin)
+# ---------------------------------------------------------------------------
+
+# Retry + credential failover. When a request hits a retryable status (529/429)
+# the proxy backs off in-process; after `credentialSwitchThreshold` consecutive
+# failures it switches to the next stored account (skipping already-tried
+# keys), and only surfaces the failure when every option is exhausted —
+# returning 503 `all_credentials_exhausted` (non-retryable) so client retry
+# loops stop hammering.
+retry:
+  # Retry attempts per request. 0 disables in-process retries entirely.
+  maxRetries: 3
+  initialDelayMs: 1000
+  maxDelayMs: 8000
+  backoffFactor: 2
+  # Statuses that trigger the retry loop. Retry-After is honored, capped by
+  # maxDelayMs.
+  retryableStatuses: [529, 429]
+  # Consecutive failures with the same account before auto-switching to the
+  # next stored account. 0 disables switching. Env:
+  # ZCODE_RETRY_CREDENTIAL_SWITCH_THRESHOLD
+  credentialSwitchThreshold: 2
+  # Wall-clock budget for the entire retry loop of one request (ms). 0 = off.
+  # Env: ZCODE_RETRY_TOTAL_DEADLINE_MS
+  totalDeadlineMs: 300000
+
+# CORS origin allowlist. When set, only these origins get CORS headers.
+# Env: ZCODE_PROXY_CORS_ALLOWLIST (comma-separated).
+# corsAllowList: []
+
+# Per-model routing rules (dashboard: Proxy Rules). Shell-glob `pattern`
+# matched against the request model; matched requests use the override
+# provider/endpoint instead of the default one.
+# routingRules: []
+#   - { pattern: "glm-5*", provider: "bigmodel" }
+
+# Client model id → GLM model id rewrites (e.g. Codex CLI's gpt-* → glm-*).
+# modelMappings: []
+#   - { from: "gpt-5.5", to: "glm-5.3" }
+
+# Force-enable thinking on /v1/responses for specific models (post-mapping ids).
+# responsesThinking:
+#   models: []
+
+# Thinking tier injected when the client sends thinking.type=enabled:
+# low / high / max (max = 128000 max_tokens, 32000 budget). Env:
+# ZCODE_PROXY_THINKING_LEVEL
+# thinkingLevel: "max"
+
 logging:
   level: info
+  # --- fork extensions (all optional; dashboard-toggeable) ---
+  # Log full upstream request headers (masked) + body preview per request.
+  # Env: ZCODE_PROXY_VERBOSE_LOGGING=1
+  # verbose: false
+  # Log full upstream response details (status / headers / body preview).
+  # Env: ZCODE_PROXY_DEBUG_LOGGING=1
+  # debug: false
+  # Mirror the dashboard log ring buffer to a JSON-lines file.
+  # Env: ZCODE_PROXY_LOG_FILE
+  # file: ""
+  # Write paired inbound/upstream header JSON files per request (translation
+  # pipeline diffing). Env: ZCODE_PROXY_HEADER_DEBUG=1
+  # headerDebug: false

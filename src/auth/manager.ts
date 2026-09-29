@@ -1,39 +1,176 @@
 /**
- * Auth manager — resolves the upstream credential from the OAuth login flow.
+ * Auth manager — picks the right credential source based on mode.
  * @see .omo/plans/zcode-proxy.md Task 4
  */
-import type { Credential } from "./types.js";
+import type { AuthMode, Credential, PlanId } from "./types.js";
+import { createApiKeyCredential } from "./apikey.js";
+import type { ProviderId } from "../provider/types.js";
+
+/** Options for constructing an `AuthManager`. All fields optional for
+ * backward compatibility with the upstream `new AuthManager()` call sites
+ * (TUI / android / tests) — defaults mirror the upstream oauth-only shape. */
+export interface AuthManagerOptions {
+  mode?: AuthMode;
+  provider?: ProviderId;
+  /** Raw credential string for apikey mode (`{apiKey}` or `{apiKey}.{secret}`). */
+  apiKey?: string;
+  /**
+   * Optional: returns all stored credentials (for multi-account credential
+   * switching on repeated upstream failures). When omitted, credential
+   * switching is effectively disabled (switchToNextCredential always returns null).
+   */
+  listAllCredentials?: () => Promise<Credential[]>;
+}
+
+function cloneCredential(cred: Credential): Credential {
+  return { ...cred };
+}
 
 /**
  * Resolves the upstream credential to inject into proxied requests.
  *
- * The credential comes from `auth login` and is injected via
- * {@link setOAuthCredential} at startup (and re-loaded on Android's
- * `startProxy` so a fresh login after restart is picked up).
+ * In `apikey` mode: returns a static credential parsed from the config string.
+ * In `oauth` mode: throws "not implemented" until T9/T10 land.
  */
 export class AuthManager {
+  private mode: AuthMode;
+  private provider: ProviderId;
+  private cachedApiKeyCred: Credential | null = null;
   private oauthCred: Credential | null = null;
+  private listAllCredentials?: () => Promise<Credential[]>;
 
-  /**
-   * Returns the current credential or throws when none is stored.
-   *
-   * There is no proactive refresh: the login flows never populate
-   * `expiresAt`, so expiry surfaces as an upstream 401, not here. The guard
-   * below is retained for the day a flow starts filling `expiresAt`.
-   */
+  constructor(opts: AuthManagerOptions = {}) {
+    this.mode = opts.mode ?? "oauth";
+    this.provider = opts.provider ?? "zai";
+    this.listAllCredentials = opts.listAllCredentials;
+    if (this.mode === "apikey" && opts.apiKey) {
+      this.cachedApiKeyCred = createApiKeyCredential(this.provider, opts.apiKey);
+    }
+  }
+
+  /** Returns the current credential, refreshing if necessary. */
   async getCredential(): Promise<Credential> {
+    if (this.mode === "apikey") {
+      if (this.cachedApiKeyCred) return cloneCredential(this.cachedApiKeyCred);
+      throw new Error("apikey mode configured but no credential was set");
+    }
+
+    // oauth mode
     if (this.oauthCred) {
       if (this.oauthCred.expiresAt && Date.now() >= this.oauthCred.expiresAt) {
         this.oauthCred = null;
         throw new Error("OAuth credential expired; re-authentication required — run: zcode-proxy auth login");
       }
-      return this.oauthCred;
+      return cloneCredential(this.oauthCred);
     }
+    // Message kept in sync with the upstream manager so route handlers that
+    // surface it verbatim (mcp relay / async bridge) keep their contract.
     throw new Error("OAuth credential not available — run: zcode-proxy auth login");
   }
 
-  /** Set the OAuth credential (used by the `auth login` flow). */
+  /** Set the OAuth credential (used by T9/T10 OAuth flow). */
   setOAuthCredential(cred: Credential): void {
-    this.oauthCred = cred;
+    this.oauthCred = cloneCredential(cred);
+  }
+
+  /**
+   * Clear the in-memory OAuth credential (vceshi0.0.7+).
+   *
+   * Called by the dashboard's "Clear all credentials" handler so that running
+   * requests stop using the just-deleted credential. Without this, the proxy
+   * would keep serving from the stale in-memory credential until restart —
+   * defeating the purpose of the clear action.
+   */
+  clearOAuthCredential(): void {
+    this.oauthCred = null;
+  }
+
+  /**
+   * Hot-apply auth-related config after the admin dashboard saves config.
+   *
+   * The live `ProxyConfig` object is mutated in-place by the admin API, but
+   * AuthManager keeps its own private mode/provider/static API-key cache.
+   * Without syncing this object too, the dashboard can report "auth saved"
+   * while requests keep using the old credential until process restart.
+   */
+  updateConfig(opts: { mode: AuthMode; provider: ProviderId; apiKey?: string; plan?: PlanId }): void {
+    this.mode = opts.mode;
+    this.provider = opts.provider;
+    if (opts.mode === "apikey") {
+      this.oauthCred = null;
+      this.cachedApiKeyCred = opts.apiKey
+        ? createApiKeyCredential(opts.provider, opts.apiKey, opts.plan)
+        : null;
+      return;
+    }
+    this.cachedApiKeyCred = null;
+  }
+
+  /**
+   * Switch to a different stored credential, skipping the current credential
+   * and any credentials in `excludeApiKeys` (credentials already tried and
+   * failed in the same request). Returns the new credential, or null if no
+   * alternative is available.
+   *
+   * Side effect: updates the in-memory active credential so subsequent
+   * getCredential() calls return the new one. Does NOT persist the change to
+   * the on-disk store — the caller is responsible for that (via switchAccount)
+   * if it wants the dashboard to reflect the switch.
+   */
+  async switchToNextCredential(excludeApiKeys?: Set<string>): Promise<Credential | null> {
+    if (!this.listAllCredentials) return null;
+    let all: Credential[];
+    try {
+      all = await this.listAllCredentials();
+    } catch {
+      return null;
+    }
+    if (all.length <= 1) return null;
+
+    const current = this.cachedApiKeyCred ?? this.oauthCred;
+    const currentKey = current?.apiKey;
+
+    // Build the exclusion set: current credential + any explicitly excluded keys.
+    // This prevents cycling back to a credential that already failed in this request.
+    const excluded = new Set<string>(excludeApiKeys);
+    if (currentKey) excluded.add(currentKey);
+
+    const candidates = all.filter(c => !excluded.has(c.apiKey) && !c.disabled);
+    if (candidates.length === 0) return null;
+
+    // Pick the first candidate. A round-robin based on a stored index could be
+    // added later, but for now first-available is deterministic and simple.
+    const next = cloneCredential(candidates[0]);
+
+    if (this.mode === "oauth") {
+      this.oauthCred = cloneCredential(next);
+    } else {
+      this.cachedApiKeyCred = cloneCredential(next);
+    }
+    return cloneCredential(next);
+  }
+
+  /** Current auth mode. */
+  getMode(): AuthMode {
+    return this.mode;
+  }
+
+  /**
+   * Returns the count of NON-DISABLED stored credentials available for
+   * switching. Used by the proxy's retry loop to distinguish "no alternatives
+   * because there's only one credential" (transient overload, return 529)
+   * from "no alternatives because all N credentials have been tried"
+   * (genuinely exhausted, return 503 to stop client retry loops).
+   *
+   * Returns 0 if listAllCredentials is not configured or throws.
+   */
+  async getAvailableCredentialCount(): Promise<number> {
+    if (!this.listAllCredentials) return 0;
+    try {
+      const all = await this.listAllCredentials();
+      return all.filter(c => !c.disabled).length;
+    } catch {
+      return 0;
+    }
   }
 }

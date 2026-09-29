@@ -407,7 +407,7 @@ provider: openai
     expect(() => loadConfig(path)).toThrow(/Invalid provider/);
   });
 
-  it("ignores legacy auth.mode/auth.apiKey keys (oauth-only proxy)", () => {
+  it("accepts auth.mode/auth.apiKey (fork multi-account layer; legacy oauth-only builds ignored them)", () => {
     const path = writeYaml(`
 auth:
   mode: apikey
@@ -415,7 +415,11 @@ auth:
   proxyApiKey: "client-secret"
 `);
     const cfg = loadConfig(path);
-    expect(cfg.auth).toEqual({ proxyApiKey: "client-secret" });
+    expect(cfg.auth.proxyApiKey).toBe("client-secret");
+    // fork behavior: mode/apikey are now first-class — auth.mode selects the
+    // static-credential path instead of the encrypted multi-account store.
+    expect(cfg.auth.mode).toBe("apikey");
+    expect(cfg.auth.apiKey).toBe("legacy-key");
   });
 
   it("throws when config file not found", () => {

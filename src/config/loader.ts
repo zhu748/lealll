@@ -4,7 +4,7 @@
  */
 import { readFileSync, existsSync } from "node:fs";
 import { parse } from "yaml";
-import type { ClientIdentityConfig, ProxyConfig, ProviderEndpoints, ProxyIdentity, ResponsesConfig, McpConfig, AsyncConfig, EndpointRoutingConfig, ClientSigningConfig, ClaimConfig } from "./types.js";
+import type { ClientIdentityConfig, ProxyConfig, ProviderEndpoints, ProxyIdentity, ResponsesConfig, McpConfig, AsyncConfig, EndpointRoutingConfig, ClientSigningConfig, ClaimConfig, RetryConfig, RoutingRule, ModelMapping, ResponsesThinkingConfig } from "./types.js";
 
 /** Environment variable keys that override YAML values. */
 const ENV = {
@@ -26,6 +26,21 @@ const ENV = {
   CLIENT_SIGNING_ENABLED: "ZCODE_CLIENT_SIGNING",
   MCP_GATEWAY_ENABLED: "ZCODE_MCP_GATEWAY",
   MCP_GATEWAY_ORIGIN: "ZCODE_MCP_GATEWAY_ORIGIN",
+  // --- fork multi-account / resilience extensions ---
+  AUTH_MODE: "ZCODE_PROXY_AUTH_MODE",
+  API_KEY: "ZCODE_PROXY_APIKEY",
+  UPSTREAM_TIMEOUT_MS: "ZCODE_PROXY_UPSTREAM_TIMEOUT_MS",
+  TRUST_PROXY: "ZCODE_PROXY_TRUST_PROXY",
+  SSE_HEARTBEAT_MS: "ZCODE_PROXY_SSE_HEARTBEAT_MS",
+  MAX_REQUEST_BODY_BYTES: "ZCODE_PROXY_MAX_REQUEST_BODY_BYTES",
+  RETRY_MAX: "ZCODE_RETRY_MAX",
+  RETRY_INITIAL_DELAY_MS: "ZCODE_RETRY_INITIAL_DELAY_MS",
+  RETRY_MAX_DELAY_MS: "ZCODE_RETRY_MAX_DELAY_MS",
+  RETRY_BACKOFF_FACTOR: "ZCODE_RETRY_BACKOFF_FACTOR",
+  RETRY_STATUSES: "ZCODE_RETRY_STATUSES",
+  RETRY_CREDENTIAL_SWITCH_THRESHOLD: "ZCODE_RETRY_CREDENTIAL_SWITCH_THRESHOLD",
+  RETRY_EMPTY_STREAM_SWITCH_THRESHOLD: "ZCODE_RETRY_EMPTY_STREAM_SWITCH_THRESHOLD",
+  RETRY_TOTAL_DEADLINE_MS: "ZCODE_RETRY_TOTAL_DEADLINE_MS",
 } as const;
 
 /** Mirrors the ZCode desktop release (`_reverse/NOTEPAD.md`); bump per client
@@ -80,6 +95,19 @@ const DEFAULTS = {
   ENDPOINT_ROUTING_ORIGIN: "https://zcode.z.ai",
   CLIENT_SIGNING_ENABLED: true,
   CLIENT_SIGNING_ORIGIN: "https://zcode.z.ai",
+  // --- fork multi-account / resilience extensions ---
+  AUTH_MODE: "oauth" as const,
+  UPSTREAM_TIMEOUT_MS: 0,
+  SSE_HEARTBEAT_MS: 15000,
+  MAX_REQUEST_BODY_BYTES: 64 * 1024 * 1024,
+  RETRY_MAX_RETRIES: 3,
+  RETRY_INITIAL_DELAY_MS: 1000,
+  RETRY_MAX_DELAY_MS: 8000,
+  RETRY_BACKOFF_FACTOR: 2,
+  RETRY_STATUSES: [529, 429],
+  RETRY_CREDENTIAL_SWITCH_THRESHOLD: 2,
+  RETRY_EMPTY_STREAM_SWITCH_THRESHOLD: 3,
+  RETRY_TOTAL_DEADLINE_MS: 300000,
 };
 
 /** Printable-ASCII gate copied from the ZCode bundle's `rYn` helper. */
@@ -101,9 +129,33 @@ export function loadConfig(path: string): ProxyConfig {
   const port = resolvePort(process.env[ENV.PORT] ?? parsed?.server?.port);
   const host = typeof parsed?.server?.host === "string" ? parsed.server.host : DEFAULTS.HOST;
 
+  // --- server (fork extensions) ---
+  const upstreamTimeoutMs = resolveNonNegativeInt(
+    process.env[ENV.UPSTREAM_TIMEOUT_MS] ?? parsed?.server?.upstreamTimeoutMs,
+    DEFAULTS.UPSTREAM_TIMEOUT_MS,
+  );
+  const trustProxyRaw = process.env[ENV.TRUST_PROXY] ?? parsed?.server?.trustProxy;
+  const trustProxy = trustProxyRaw === true || trustProxyRaw === "true" || trustProxyRaw === "1";
+  const sseHeartbeatMs = resolveNonNegativeInt(
+    process.env[ENV.SSE_HEARTBEAT_MS] ?? parsed?.server?.sseHeartbeatMs,
+    DEFAULTS.SSE_HEARTBEAT_MS,
+  );
+  const maxRequestBodyBytes = resolveNonNegativeInt(
+    process.env[ENV.MAX_REQUEST_BODY_BYTES] ?? parsed?.server?.maxRequestBodyBytes,
+    DEFAULTS.MAX_REQUEST_BODY_BYTES,
+  );
+
   // --- auth ---
   const proxyApiKey = process.env[ENV.PROXY_API_KEY] ?? parsed?.auth?.proxyApiKey;
   const oauthCredentialsPath = parsed?.auth?.oauthCredentialsPath;
+  // Fork multi-account layer: mode selects between the encrypted multi-account
+  // store ("oauth", default) and a static config string ("apikey").
+  const modeEnv = process.env[ENV.AUTH_MODE]?.toLowerCase().trim();
+  const authMode: "apikey" | "oauth" =
+    modeEnv === "oauth" ? "oauth"
+    : modeEnv === "apikey" ? "apikey"
+    : (parsed?.auth?.mode === "apikey" ? "apikey" : DEFAULTS.AUTH_MODE);
+  const authApiKey = process.env[ENV.API_KEY] ?? (typeof parsed?.auth?.apiKey === "string" ? parsed.auth.apiKey : undefined);
 
   // --- provider ---
   const provider = resolveProvider(process.env[ENV.PROVIDER] ?? parsed?.provider);
@@ -113,10 +165,12 @@ export function loadConfig(path: string): ProxyConfig {
   const zai: ProviderEndpoints = {
     anthropicBase: parsed?.providers?.zai?.anthropicBase ?? DEFAULTS.ZAI_ANTHROPIC_BASE,
     openaiBase: parsed?.providers?.zai?.openaiBase ?? DEFAULTS.ZAI_OPENAI_BASE,
+    ...(typeof parsed?.providers?.zai?.credential === "string" ? { credential: parsed.providers.zai.credential } : {}),
   };
   const bigmodel: ProviderEndpoints = {
     anthropicBase: parsed?.providers?.bigmodel?.anthropicBase ?? DEFAULTS.BIGMODEL_ANTHROPIC_BASE,
     openaiBase: parsed?.providers?.bigmodel?.openaiBase ?? DEFAULTS.BIGMODEL_OPENAI_BASE,
+    ...(typeof parsed?.providers?.bigmodel?.credential === "string" ? { credential: parsed.providers.bigmodel.credential } : {}),
   };
 
   // --- models ---
@@ -145,9 +199,31 @@ export function loadConfig(path: string): ProxyConfig {
   const endpointRouting = resolveEndpointRoutingConfig(parsed?.endpointRouting);
   const clientSigning = resolveClientSigningConfig(parsed?.clientSigning);
 
+  // --- fork dashboard / resilience extensions ---
+  const retry = resolveRetry(parsed?.retry);
+  const routingRules = resolveRoutingRules(parsed?.routingRules);
+  const modelMappings = resolveModelMappings(parsed?.modelMappings);
+  const responsesThinking = resolveResponsesThinking(parsed?.responsesThinking);
+  const verboseLogging = process.env.ZCODE_PROXY_VERBOSE_LOGGING === "1"
+    || (typeof parsed?.logging === "object" && parsed?.logging?.verbose === true);
+  const debugLogging = process.env.ZCODE_PROXY_DEBUG_LOGGING === "1"
+    || (typeof parsed?.logging === "object" && parsed?.logging?.debug === true);
+  const headerDebug = process.env.ZCODE_PROXY_HEADER_DEBUG === "1"
+    || (typeof parsed?.logging === "object" && parsed?.logging?.headerDebug === true);
+  const logFile = process.env.ZCODE_PROXY_LOG_FILE
+    ?? (typeof parsed?.logging?.file === "string" ? parsed.logging.file : undefined);
+  const corsAllowList = resolveCorsAllowList(
+    process.env.ZCODE_PROXY_CORS_ALLOWLIST
+      ? String(process.env.ZCODE_PROXY_CORS_ALLOWLIST).split(",")
+      : parsed?.corsAllowList,
+  );
+  const thinkingLevelRaw = process.env.ZCODE_PROXY_THINKING_LEVEL ?? parsed?.thinkingLevel;
+  const thinkingLevel: "low" | "high" | "max" =
+    thinkingLevelRaw === "low" || thinkingLevelRaw === "high" ? thinkingLevelRaw : "max";
+
   const config: ProxyConfig = {
-    server: { port, host },
-    auth: { proxyApiKey, oauthCredentialsPath },
+    server: { port, host, upstreamTimeoutMs, trustProxy, sseHeartbeatMs, maxRequestBodyBytes },
+    auth: { proxyApiKey, mode: authMode, apiKey: authApiKey, oauthCredentialsPath },
     provider,
     plan,
     providers: { zai, bigmodel },
@@ -161,7 +237,13 @@ export function loadConfig(path: string): ProxyConfig {
     mcp,
     async: asyncCfg,
     claim: claimCfg,
-    logging: { level: logLevel },
+    logging: { level: logLevel, verbose: verboseLogging, debug: debugLogging, file: logFile, headerDebug },
+    retry,
+    corsAllowList,
+    routingRules,
+    modelMappings,
+    responsesThinking,
+    thinkingLevel,
   };
 
   validate(config);
@@ -297,20 +379,22 @@ function resolveBool(raw: unknown, fallback: boolean): boolean {
   return fallback;
 }
 
-function resolvePositiveInt(raw: unknown, fallback: number, name: string): number {
+function resolvePositiveInt(raw: unknown, fallback: number, name?: string): number {
   if (raw === undefined || raw === null) return fallback;
   const n = typeof raw === "number" ? raw : parseInt(String(raw), 10);
   if (!Number.isInteger(n) || n < 1) {
-    throw new Error(`${name} must be a positive integer`);
+    if (name) throw new Error(`${name} must be a positive integer`);
+    return fallback;
   }
   return n;
 }
 
-function resolveNonNegativeInt(raw: unknown, fallback: number, name: string): number {
+function resolveNonNegativeInt(raw: unknown, fallback: number, name?: string): number {
   if (raw === undefined || raw === null) return fallback;
   const n = typeof raw === "number" ? raw : parseInt(String(raw), 10);
   if (!Number.isInteger(n) || n < 0) {
-    throw new Error(`${name} must be a non-negative integer`);
+    if (name) throw new Error(`${name} must be a non-negative integer`);
+    return fallback;
   }
   return n;
 }
@@ -407,8 +491,159 @@ function validate(config: ProxyConfig): void {
     throw new Error(`server.port ${config.server.port} is out of range (1-65535)`);
   }
 
+  // Fork multi-account layer: in apikey mode a static credential must exist
+  // (global or provider-scoped). OAuth mode (default) pulls from the store.
+  if (config.auth.mode === "apikey") {
+    const hasGlobal = typeof config.auth.apiKey === "string" && config.auth.apiKey.length > 0;
+    const hasProvider = typeof config.providers[config.provider].credential === "string";
+    if (!hasGlobal && !hasProvider) {
+      throw new Error(
+        `auth.apiKey is required when auth.mode is "apikey" (or set providers.${config.provider}.credential)`,
+      );
+    }
+  }
+
   if (!config.models.includes(config.defaultModel)) {
     // defaultModel not in the models list — add it automatically
     config.models.push(config.defaultModel);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Fork dashboard / resilience extension resolvers
+// ---------------------------------------------------------------------------
+
+/** Resolve retry configuration (fork) with env-var overrides and defaults. */
+function resolveRetry(raw?: unknown): RetryConfig {
+  const r = (typeof raw === "object" && raw !== null) ? raw as Record<string, unknown> : {};
+
+  const maxRetries = resolveNonNegativeInt(process.env[ENV.RETRY_MAX] ?? r.maxRetries, DEFAULTS.RETRY_MAX_RETRIES);
+  const initialDelayMs = resolvePositiveInt(process.env[ENV.RETRY_INITIAL_DELAY_MS] ?? r.initialDelayMs, DEFAULTS.RETRY_INITIAL_DELAY_MS);
+  const maxDelayMs = resolvePositiveInt(process.env[ENV.RETRY_MAX_DELAY_MS] ?? r.maxDelayMs, DEFAULTS.RETRY_MAX_DELAY_MS);
+  const backoffFactor = resolvePositiveFloat(process.env[ENV.RETRY_BACKOFF_FACTOR] ?? r.backoffFactor, DEFAULTS.RETRY_BACKOFF_FACTOR);
+
+  // retryableStatuses: env var is comma-separated (e.g. "529,429,503"), YAML is array
+  let retryableStatuses = [...DEFAULTS.RETRY_STATUSES];
+  const envStatuses = process.env[ENV.RETRY_STATUSES];
+  if (typeof envStatuses === "string" && envStatuses.trim().length > 0) {
+    retryableStatuses = normalizeRetryableStatuses(envStatuses.split(","), DEFAULTS.RETRY_STATUSES);
+  } else if (Array.isArray(r.retryableStatuses) && r.retryableStatuses.length > 0) {
+    retryableStatuses = normalizeRetryableStatuses(r.retryableStatuses, DEFAULTS.RETRY_STATUSES);
+  }
+
+  const credentialSwitchThreshold = resolveNonNegativeInt(
+    process.env[ENV.RETRY_CREDENTIAL_SWITCH_THRESHOLD] ?? r.credentialSwitchThreshold,
+    DEFAULTS.RETRY_CREDENTIAL_SWITCH_THRESHOLD,
+  );
+  const emptyStreamSwitchThreshold = resolveNonNegativeInt(
+    process.env[ENV.RETRY_EMPTY_STREAM_SWITCH_THRESHOLD] ?? r.emptyStreamSwitchThreshold,
+    DEFAULTS.RETRY_EMPTY_STREAM_SWITCH_THRESHOLD,
+  );
+  const totalDeadlineMs = resolveNonNegativeInt(
+    process.env[ENV.RETRY_TOTAL_DEADLINE_MS] ?? r.totalDeadlineMs,
+    DEFAULTS.RETRY_TOTAL_DEADLINE_MS,
+  );
+
+  return { maxRetries, initialDelayMs, maxDelayMs, backoffFactor, retryableStatuses, credentialSwitchThreshold, emptyStreamSwitchThreshold, totalDeadlineMs };
+}
+
+function resolvePositiveFloat(raw: unknown, fallback: number): number {
+  if (raw === undefined || raw === null) return fallback;
+  const n = typeof raw === "number" ? raw : parseFloat(String(raw));
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+function normalizeRetryableStatuses(raw: unknown[], fallback: number[]): number[] {
+  const out: number[] = [];
+  const seen = new Set<number>();
+  for (const value of raw) {
+    const n = typeof value === "number" ? value : parseInt(String(value), 10);
+    if (!Number.isInteger(n) || n < 100 || n > 599) continue;
+    if (seen.has(n)) continue;
+    seen.add(n);
+    out.push(n);
+  }
+  return out.length > 0 ? out : [...fallback];
+}
+
+/** Resolve routing rules from YAML, validating each rule's shape. */
+function resolveRoutingRules(raw: unknown): RoutingRule[] {
+  if (!Array.isArray(raw)) return [];
+  const rules: RoutingRule[] = [];
+  for (const item of raw) {
+    if (typeof item !== "object" || item === null) continue;
+    const r = item as Record<string, unknown>;
+    if (typeof r.pattern !== "string" || r.pattern.trim() === "") continue;
+    if (r.provider !== "zai" && r.provider !== "bigmodel") continue;
+    rules.push({
+      pattern: r.pattern.trim(),
+      provider: r.provider,
+      endpoint: typeof r.endpoint === "string" && r.endpoint.trim() ? r.endpoint.trim() : undefined,
+      note: typeof r.note === "string" && r.note.trim() ? r.note.trim() : undefined,
+    });
+  }
+  return rules;
+}
+
+/** Resolve model mappings from YAML. `from` is lowercased for case-insensitive lookup. */
+function resolveModelMappings(raw: unknown): ModelMapping[] {
+  if (!Array.isArray(raw)) return [];
+  const mappings: ModelMapping[] = [];
+  for (const item of raw) {
+    if (typeof item !== "object" || item === null) continue;
+    const m = item as Record<string, unknown>;
+    if (typeof m.from !== "string" || m.from.trim() === "") continue;
+    if (typeof m.to !== "string" || m.to.trim() === "") continue;
+    mappings.push({
+      from: m.from.trim().toLowerCase(),
+      to: m.to.trim(),
+      note: typeof m.note === "string" && m.note.trim() ? m.note.trim() : undefined,
+    });
+  }
+  return mappings;
+}
+
+/**
+ * Resolve responses-thinking override from YAML. Accepts either
+ * `{ models: [...] }` (canonical) or a bare array of model ids (shorthand).
+ */
+function resolveResponsesThinking(raw: unknown): ResponsesThinkingConfig {
+  const arr: unknown = Array.isArray(raw)
+    ? raw
+    : (typeof raw === "object" && raw !== null)
+      ? (raw as Record<string, unknown>).models
+      : undefined;
+  if (!Array.isArray(arr)) return { models: [] };
+  const seen = new Set<string>();
+  const models: string[] = [];
+  for (const item of arr) {
+    if (typeof item !== "string") continue;
+    const id = item.trim();
+    if (!id) continue;
+    const key = id.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    models.push(id);
+  }
+  return { models };
+}
+
+/** Parse CORS allowlist from env (`a,b`) or YAML (`[a, b]`). */
+function resolveCorsAllowList(raw: unknown): string[] | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (Array.isArray(raw)) {
+    const list = raw.map((entry) => {
+      if (typeof entry !== "string") {
+        throw new Error("corsAllowList must contain only strings");
+      }
+      return entry.trim();
+    }).filter(Boolean);
+    return list.length > 0 ? list : undefined;
+  }
+  if (typeof raw === "string") {
+    if (raw.trim().length === 0) return undefined;
+    const list = raw.split(",").map(s => s.trim()).filter(Boolean);
+    return list.length > 0 ? list : undefined;
+  }
+  return undefined;
 }

@@ -27,6 +27,11 @@ import { isCaptchaChallenged, retryOnCaptchaChallenge } from "./captcha-retry.js
 import { type ClientSessionResult } from "./client-session.js";
 import { resolveSessionContext } from "./session-context.js";
 import { gzipSync } from "node:zlib";
+// --- fork multi-account resilience layer ---
+import { maskApiKey, switchAccount, exportAccounts, credentialStatsKey } from "../auth/store.js";
+import { sleep } from "../utils/sleep.js";
+import { recordStat } from "../admin/api.js";
+import type { Credential } from "../auth/types.js";
 
 // captcha.ts is loaded lazily inside the `startPlan` branch (only path that
 // touches it). The solver itself (captcha-happy.ts) is dynamically imported
@@ -120,7 +125,7 @@ export async function proxyRequest(
     openaiBaseURL: config.providers[config.provider].openaiBase,
   };
 
-  let cred;
+  let cred: Credential;
   try {
     cred = await auth.getCredential();
   } catch (err) {
@@ -129,13 +134,37 @@ export async function proxyRequest(
     return errorResponse(503, "credential_unavailable", (err as Error).message);
   }
 
+  // ---- fork multi-account retry layer: config fallbacks (field-by-field,
+  // matching admin RETRY_DEFAULTS so hand-built configs still retry sanely).
+  const retryCfg = {
+    maxRetries: config.retry?.maxRetries ?? 3,
+    initialDelayMs: config.retry?.initialDelayMs ?? 1000,
+    maxDelayMs: config.retry?.maxDelayMs ?? 8000,
+    backoffFactor: config.retry?.backoffFactor ?? 2,
+    retryableStatuses: config.retry?.retryableStatuses ?? [529, 429],
+    credentialSwitchThreshold: config.retry?.credentialSwitchThreshold ?? 2,
+    totalDeadlineMs: config.retry?.totalDeadlineMs ?? 300000,
+  };
+
+  // fork: credential-driven plan resolution. A credential's own plan (or its
+  // start-plan JWT) wins over config.yaml — switching accounts mid-retry may
+  // also switch plans (coding-plan ↔ start-plan), which changes the upstream
+  // URL, auth headers, and captcha behavior.
+  const effectivePlanForCred = (c: Credential): "coding-plan" | "start-plan" =>
+    c.plan ?? (c.jwt ? "start-plan" : config.plan);
+  let currentPlan = effectivePlanForCred(cred);
+  if (currentPlan !== config.plan) {
+    if (debug) debugLine(reqId, `plan ${config.plan} → ${currentPlan} (from credential)`);
+    config.plan = currentPlan;
+  }
+
   // v2.6: both plans use the Anthropic upstream. coding-plan mirrors the real
   // ZCode client (api.z.ai/api/anthropic → ultra via endpoint routing);
   // start-plan's old OpenAI gateway (/api/v1/zcode-plan/chat/completions) was
   // retired server-side (404 as of 2026-08-28) — the live desktop client now
   // posts Anthropic messages to /api/v1/zcode-plan/anthropic/v1/messages with
   // the start-plan JWT, so we do the same (no OpenAI translation either way).
-  const startPlan = config.plan === "start-plan";
+  let startPlan = currentPlan === "start-plan";
   const translateAnthropicToOpenAI = false;
   const translateOpenAIToAnthropic = format === "openai";
   const upstreamFormat: Format = "anthropic";
@@ -161,44 +190,70 @@ export async function proxyRequest(
   // Bundle `E2e` fires for EVERY anthropic-kind request (both plans) — the
   // injected user_id is the device/session blob, never the account uuid.
   const metadataUserId = buildAnthropicMetadataUserId(config.identity.deviceMid, clientSession?.sessionId);
-  const transformedBody = transformRequestBody(upstreamBody, { format: upstreamFormat, metadataUserId, startPlan, provider: config.provider });
+  // fork: rebuildable — a mid-retry credential switch can flip startPlan,
+  // which changes the injected system-prompt block / metadata shape.
+  const rebuildTransformedBody = (): void => {
+    transformedBody = transformRequestBody(upstreamBody, { format: upstreamFormat, metadataUserId, startPlan, provider: config.provider });
+  };
+  let transformedBody = transformRequestBody(upstreamBody, { format: upstreamFormat, metadataUserId, startPlan, provider: config.provider });
   if (debug && transformedBody !== upstreamBody) {
     debugLine(reqId, `body transformed (upstreamFormat=${upstreamFormat}, startPlan=${startPlan}, bytes=${transformedBody?.length ?? 0})`);
   }
 
-  let captchaHeaders: Record<string, string> | undefined;
-  if (startPlan) {
-    try {
-      const captcha = await loadCaptcha();
-      const token = await captcha.getCaptchaToken(config.identity.appVersion);
-      captchaHeaders = { [captcha.RETRY_HEADERS.PARAM]: token.verifyParam, [captcha.RETRY_HEADERS.REGION]: token.region };
-    } catch {
-      // Will solve on 403 fallback below
-    }
-  }
+  // ---- fork retry-loop state ----
+  let consecutiveCredFailures = 0;
+  // Credentials already tried in this request — prevents cycling back to a
+  // known-failing credential when multiple alternatives exist.
+  const triedApiKeys = new Set<string>([cred.apiKey]);
+  let totalAvailableCredentials = 1;
+  try {
+    totalAvailableCredentials = Math.max(1, await auth.getAvailableCredentialCount());
+  } catch { /* ignore — fall back to 1 */ }
+  // Set ONLY when we actually had multiple credentials AND all failed; the
+  // post-loop check then returns 503 (non-retryable) instead of forwarding
+  // the retryable upstream status — tells well-behaved clients to STOP.
+  let allCredentialsExhausted = false;
+  // Hard cap on total attempts (fork v0.2.2+): maxRetries*4+10, capped at 20.
+  const MAX_TOTAL_ATTEMPTS = Math.min(retryCfg.maxRetries * 4 + 10, 20);
+  const retryLoopStartedAt = Date.now();
+  let hadRetryAttempt = false;
 
   const useOrderedTransport = shouldUseOrderedTransport(config, clientSession, hasCustomFetchImpl);
-  let upstreamHeaderPairs = buildUpstreamHeaderPairs(clientReq, upstreamFormat, cred, config.identity, config.plan, captchaHeaders, clientSession);
-  let upstreamReq = buildUpstreamRequest(clientReq, upstreamFormat, provider, cred, transformedBody, config.identity, config.plan, captchaHeaders, clientSession);
+  const translateMode = translateOpenAIToAnthropic || translateAnthropicToOpenAI;
 
   const routing = opts.endpointRouting !== undefined ? opts.endpointRouting : getDefaultEndpointRouting(config);
   const signer = opts.clientSigning !== undefined ? opts.clientSigning : getDefaultClientSigning(config);
-  const translateMode = translateOpenAIToAnthropic || translateAnthropicToOpenAI;
-  // When the ordered transport must READ the upstream body (translate mode), it
-  // has to inflate whatever coding the upstream picks — cap the advertised
-  // accept-encoding (a passthrough of the inbound client's list, which browsers
-  // set to `gzip, deflate, br, zstd`) to what the transport can decompress.
-  // The ultra CDN serves SSE brotli-compressed when `br` is advertised, and a
-  // coding the transport cannot inflate would starve the SSE translator
-  // (observed 2026-09-18 as 0-byte streams → client timeouts). Pure-passthrough
-  // requests keep the client's list verbatim — the client decodes those itself.
-  if (useOrderedTransport && translateMode) {
-    upstreamHeaderPairs = capOrderedAcceptEncoding(upstreamHeaderPairs);
-  }
-  const dispatch = async (req: Request, pairs: UpstreamHeaderPair[]): Promise<Response> => {
+
+  /** Start-plan captcha preflight: a fresh one-shot Aliyun verify param.
+   * Failure falls back to the 403-challenge solve path downstream. */
+  const buildCaptchaHeaders = async (): Promise<Record<string, string> | undefined> => {
+    if (!startPlan) return undefined;
+    try {
+      const captcha = await loadCaptcha();
+      const token = await captcha.getCaptchaToken(config.identity.appVersion);
+      return { [captcha.RETRY_HEADERS.PARAM]: token.verifyParam, [captcha.RETRY_HEADERS.REGION]: token.region };
+    } catch {
+      // Will solve on 403 fallback below
+      return undefined;
+    }
+  };
+
+  /** Dispatch with the CURRENT credential (fork: parameterized so the retry
+   * loop can re-dispatch with a switched account). Body/headers rebuilt per
+   * call — a reused Request has its body stream marked used after the first
+   * fetch. */
+  const dispatch = async (credNow: Credential, captchaHeaders: Record<string, string> | undefined): Promise<Response> => {
+    let pairs = buildUpstreamHeaderPairs(clientReq, upstreamFormat, credNow, config.identity, currentPlan, captchaHeaders, clientSession);
+    // When the ordered transport must READ the upstream body (translate mode),
+    // it has to inflate whatever coding the upstream picks — cap the advertised
+    // accept-encoding (see capOrderedAcceptEncoding for the CDN brotli war story).
+    if (useOrderedTransport && translateMode) {
+      pairs = capOrderedAcceptEncoding(pairs);
+    }
+    const req = buildUpstreamRequest(clientReq, upstreamFormat, provider, credNow, transformedBody, config.identity, currentPlan, captchaHeaders, clientSession);
     let sendUrl = req.url;
     if (routing) {
-      const routed = await routing.resolve(req.url, credentialString(cred));
+      const routed = await routing.resolve(req.url, credentialString(credNow));
       if (routed.routed) {
         sendUrl = routed.url;
         if (debug) debugLine(reqId, `endpoint routing: ${req.url} -> ${routed.url}`);
@@ -210,15 +265,11 @@ export async function proxyRequest(
     return sendWithClientSigning(signer, {
       url: req.url,
       headerPairs: pairs,
-      credential: credentialString(cred),
+      credential: credentialString(credNow),
       appVersion: config.identity.appVersion,
       debug: debug ? (message) => debugLine(reqId, message) : undefined,
       send: (finalPairs) => {
         if (dumpEnabled()) {
-          // The pre-built `upstream_out` line shows the pre-routing URL and
-          // pre-signing header set; this line captures what actually went on
-          // the wire (routed URL + signed pairs) — the two diverge silently
-          // otherwise and misled a 2026-09-18 debugging session.
           dumpPhase(reqId, "wire_out", {
             url: sendUrl,
             signed: finalPairs.some(([k]) => k.toLowerCase() === "x-client-sig"),
@@ -237,121 +288,292 @@ export async function proxyRequest(
     });
   };
 
-  if (debug) {
-    debugLine(reqId, `→ POST ${upstreamReq.url}`);
-    debugLine(reqId, `  ${formatHeaderPairs(upstreamReq.headers)}`);
-    if (transformedBody) debugLine(reqId, `  body preview: ${previewBody(transformedBody)}`);
-  }
+  /**
+   * fork multi-account core: on repeated failures with the current credential,
+   * switch to the next stored account (skipping already-tried keys), sync the
+   * plan, rebuild the body, and persist the new active account (best-effort).
+   * Returns true when the request should be retried with the new credential.
+   */
+  const maybeSwitchCredential = async (): Promise<boolean> => {
+    if (!(retryCfg.credentialSwitchThreshold > 0 && consecutiveCredFailures >= retryCfg.credentialSwitchThreshold)) {
+      return false;
+    }
+    // Refresh the available count so a credential added mid-request can be picked up.
+    if (totalAvailableCredentials <= 1 || triedApiKeys.size >= totalAvailableCredentials) {
+      try { totalAvailableCredentials = Math.max(1, await auth.getAvailableCredentialCount()); } catch { /* keep last */ }
+    }
+    if (!(totalAvailableCredentials > 1 && triedApiKeys.size < totalAvailableCredentials)) {
+      if (totalAvailableCredentials > 1) {
+        allCredentialsExhausted = true;
+        console.log(`${reqId} no alternative credential left (tried ${triedApiKeys.size}/${totalAvailableCredentials}) — will return 503 after retries exhaust`);
+      } else {
+        console.log(`${reqId} no alternative credential available (single account) — continuing with current`);
+      }
+      return false;
+    }
+    const newCred = await auth.switchToNextCredential(triedApiKeys);
+    if (!newCred) {
+      if (totalAvailableCredentials > 1) allCredentialsExhausted = true;
+      return false;
+    }
+    const fromKey = cred.apiKey;
+    cred = newCred;
+    triedApiKeys.add(newCred.apiKey);
+    consecutiveCredFailures = 0;
+    const newPlan = effectivePlanForCred(newCred);
+    if (newPlan !== currentPlan) {
+      console.log(`${reqId} plan synced to ${newPlan} (from new credential ${maskApiKey(newCred.apiKey)})`);
+      currentPlan = newPlan;
+      config.plan = newPlan;
+      startPlan = newPlan === "start-plan";
+      rebuildTransformedBody();
+    }
+    console.log(`${reqId} credential switched: ${maskApiKey(fromKey)} → ${maskApiKey(newCred.apiKey)}`);
+    // Persist the switch so the dashboard reflects the new active account.
+    // Non-fatal: if persistence fails, the in-memory switch still works for
+    // the remainder of this request.
+    try {
+      const accounts = await exportAccounts();
+      const match = accounts.find(a => a.credential.apiKey === newCred.apiKey);
+      if (match) {
+        const persistResult = await switchAccount(match.id);
+        if (persistResult === true) {
+          console.log(`${reqId} auto-switched active account to "${match.label}"`);
+        }
+        // null (store transiently unreadable) / false (race): in-memory switch
+        // already applied — nothing actionable, skip logging noise.
+      }
+    } catch (e) {
+      console.log(`${reqId} could not persist credential switch: ${(e as Error).message}`);
+    }
+    return true;
+  };
 
-  if (dumpEnabled()) {
-    dumpPhase(reqId, "upstream_out", {
-      method: upstreamReq.method,
-      url: upstreamReq.url,
-      headers: dumpHeaders(upstreamReq.headers),
-      body: dumpBody(transformedBody),
-      upstreamFormat,
-      translateMode: translateOpenAIToAnthropic || translateAnthropicToOpenAI,
-      useOrderedTransport,
-      startPlan,
-    });
-  }
-
-  let upstreamResp: Response;
-  try {
-    // Transient connect failures (DNS blip, TLS reset, Bun "Unable to
-    // connect") happen a few times a day against the gateway. Retry the
-    // CONNECT twice with a short backoff before surfacing a 502 — the
-    // request never reached upstream, so resending is side-effect-free.
-    // Guard rails: skip retry when the client already aborted or the ordered
-    // transport flagged the failure postWrite; re-dispatch a FRESH Request
-    // each attempt — a reused Request has its body stream marked used after
-    // the first fetch (start-plan hits the plain pass-through path where
-    // dispatch does NOT rebuild the Request).
-    let dispatchAttempt = 0;
-    upstreamResp = await dispatchWithConnectRetry(
-      () => {
-        dispatchAttempt += 1;
-        const currentReq = dispatchAttempt === 1
-          ? upstreamReq
-          : buildUpstreamRequest(clientReq, upstreamFormat, provider, cred, transformedBody, config.identity, config.plan, captchaHeaders, clientSession);
-        return dispatch(currentReq, upstreamHeaderPairs);
-      },
-      {
-        isAborted: () => clientReq.signal.aborted,
-        onRetry: (attempt, err) => {
-          if (debug) debugError(reqId, "upstream_connect_retry", `attempt ${attempt}/${MAX_CONNECT_ATTEMPTS - 1} failed (${err.message}), retrying in ${500 * attempt}ms`);
-          console.log(`${reqId} upstream connect failed (${err.message}), retry ${attempt + 1}/${MAX_CONNECT_ATTEMPTS} in ${500 * attempt}ms`);
-        },
-      },
+  /** RFC 7231 §7.1.3 Retry-After (delta-seconds or HTTP-date), capped by maxDelayMs. */
+  const computeRetryDelayMs = (attempt: number, retryAfter: string | null): number => {
+    let delayMs = Math.min(
+      retryCfg.initialDelayMs * Math.pow(retryCfg.backoffFactor, attempt - 1),
+      retryCfg.maxDelayMs,
     );
-  } catch (err) {
-    if (debug) debugError(reqId, "upstream_unreachable", (err as Error).message);
-    printRow(reqId, format, meta, 502, started, Date.now(), 0, 0, 0);
-    return errorResponse(502, "upstream_unreachable", (err as Error).message);
-  }
-  const headersAt = Date.now();
-
-  if (debug) {
-    debugLine(reqId, `← ${upstreamResp.status} ${upstreamResp.statusText}`);
-    debugLine(reqId, `  ${formatResponseHeaders(upstreamResp.headers)}`);
-  }
-
-  if (dumpEnabled()) {
-    dumpPhase(reqId, "upstream_in", {
-      status: upstreamResp.status,
-      statusText: upstreamResp.statusText,
-      headers: dumpHeaders(upstreamResp.headers),
-      isSSE: upstreamResp.headers.get("content-type")?.includes("text/event-stream") ?? false,
-      ttfbMs: headersAt - started,
-    });
-  }
-
-  if (upstreamResp.status === 401 && startPlan) {
-    if (debug) debugError(reqId, "start_plan_jwt_invalid", "JWT rejected upstream");
-    printRow(reqId, format, meta, 401, started, headersAt, 0, 0, 0);
-    return errorResponse(401, "start_plan_jwt_invalid", "Start-plan JWT was rejected. Re-run: zcode-proxy auth login");
-  }
-
-  // start-plan: on explicit captcha challenge, retry once with a fresh
-  // pooled token (the challenged token was already consumed by this request;
-  // getCaptchaToken takes the next pre-solved one). Detection covers the
-  // response-header variant AND the in-body `{"code":3007}` variant (observed
-  // 2026-08-29 as HTTP 400 JSON with no captcha header) via the shared
-  // captcha-retry seam (used by /v1/responses too).
-  const captcha = startPlan ? await loadCaptcha() : null;
-  const captchaChallenge = captcha ? await isCaptchaChallenged(upstreamResp, captcha) : false;
-  if (captchaChallenge && captcha) {
-    console.log(`${reqId} captcha challenge, re-solving...`);
-    const outcome = await retryOnCaptchaChallenge({
-      captcha,
-      appVersion: config.identity.appVersion,
-      challengedResp: upstreamResp,
-      debug: debug ? (message) => debugLine(reqId, message) : undefined,
-      solveAndRetry: (retryHeaders) => {
-        console.log(`${reqId} captcha re-solved (token ${retryHeaders[captcha.RETRY_HEADERS.PARAM].length} chars), retrying...`);
-        upstreamHeaderPairs = buildUpstreamHeaderPairs(clientReq, upstreamFormat, cred, config.identity, config.plan, retryHeaders, clientSession);
-        if (useOrderedTransport && translateMode) {
-          upstreamHeaderPairs = capOrderedAcceptEncoding(upstreamHeaderPairs);
+    if (retryAfter) {
+      const s = Number(retryAfter.trim());
+      if (Number.isFinite(s) && s >= 0) {
+        delayMs = Math.min(s * 1000, retryCfg.maxDelayMs);
+      } else {
+        const dateMs = Date.parse(retryAfter);
+        if (Number.isFinite(dateMs)) {
+          delayMs = Math.min(Math.max(0, dateMs - Date.now()), retryCfg.maxDelayMs);
         }
-        upstreamReq = buildUpstreamRequest(clientReq, upstreamFormat, provider, cred, transformedBody, config.identity, config.plan, retryHeaders, clientSession);
-        return dispatch(upstreamReq, upstreamHeaderPairs).then((resp) => {
-          if (debug) debugLine(reqId, `← retry ${resp.status} ${resp.statusText}`);
-          return resp;
-        });
-      },
-      mapError: (err, phase) => {
-        if (phase === "solver") {
-          if (debug) debugError(reqId, "captcha_solver_failed", err.message);
-          printRow(reqId, format, meta, 503, started, Date.now(), 0, 0, 0);
-          return errorResponse(503, "captcha_solver_failed", err.message);
-        }
-        if (debug) debugError(reqId, "upstream_unreachable", err.message);
-        printRow(reqId, format, meta, 502, started, Date.now(), 0, 0, 0);
-        return errorResponse(502, "upstream_unreachable", err.message);
-      },
-    });
-    if (!outcome.ok) return outcome.resp;
-    upstreamResp = outcome.resp;
+      }
+    }
+    return delayMs;
+  };
+
+  // Per-request stats context handed to printRow → recordStat (fork dashboard
+  // stats collector): retry flag + per-credential usage bucket.
+  const rowStats = (): { retried: boolean; credentialKey?: string } => {
+    let credentialKey: string | undefined;
+    try { credentialKey = credentialStatsKey(cred); } catch { /* best-effort */ }
+    return { retried: hadRetryAttempt, ...(credentialKey ? { credentialKey } : {}) };
+  };
+
+  let upstreamResp!: Response;
+  let headersAt = 0;
+  let attempt = 0;
+
+  // ============================================================
+  // fork resilience loop: attempt → captcha-challenge replay →
+  // retryable-status backoff → credential switch → re-dispatch.
+  // The upstream 4.x handler forwarded 529/429 straight to the client;
+  // the fork retries them in-process (backoff + multi-account failover)
+  // and only surfaces the failure when every option is exhausted.
+  // ============================================================
+  retryLoop: while (true) {
+    attempt++;
+
+    if (debug) {
+      debugLine(reqId, `→ attempt ${attempt} (cred ${maskApiKey(cred.apiKey)}, plan ${currentPlan})`);
+    }
+
+    // Start-plan captcha preflight: a fresh one-shot verify param per attempt
+    // (Aliyun params cannot be reused across retries).
+    const captchaHeaders = await buildCaptchaHeaders();
+
+    if (debug) {
+      const dbgReq = buildUpstreamRequest(clientReq, upstreamFormat, provider, cred, transformedBody, config.identity, currentPlan, captchaHeaders, clientSession);
+      debugLine(reqId, `→ POST ${dbgReq.url}`);
+      debugLine(reqId, `  ${formatHeaderPairs(dbgReq.headers)}`);
+      if (transformedBody) debugLine(reqId, `  body preview: ${previewBody(transformedBody)}`);
+    }
+
+    if (dumpEnabled()) {
+      const dbgReq = buildUpstreamRequest(clientReq, upstreamFormat, provider, cred, transformedBody, config.identity, currentPlan, captchaHeaders, clientSession);
+      dumpPhase(reqId, "upstream_out", {
+        method: dbgReq.method,
+        url: dbgReq.url,
+        headers: dumpHeaders(dbgReq.headers),
+        body: dumpBody(transformedBody),
+        upstreamFormat,
+        translateMode,
+        useOrderedTransport,
+        startPlan,
+      });
+    }
+
+    try {
+      // Transient connect failures (DNS blip, TLS reset) are retried inside
+      // dispatchWithConnectRetry — dispatch() rebuilds the Request per call
+      // (a reused Request has its body stream marked used after the first
+      // fetch).
+      upstreamResp = await dispatchWithConnectRetry(
+        () => dispatch(cred, captchaHeaders),
+        {
+          isAborted: () => clientReq.signal.aborted,
+          onRetry: (connectAttempt, err) => {
+            if (debug) debugError(reqId, "upstream_connect_retry", `attempt ${connectAttempt}/${MAX_CONNECT_ATTEMPTS - 1} failed (${err.message}), retrying in ${500 * connectAttempt}ms`);
+            console.log(`${reqId} upstream connect failed (${err.message}), retry ${connectAttempt + 1}/${MAX_CONNECT_ATTEMPTS} in ${500 * connectAttempt}ms`);
+          },
+        },
+      );
+    } catch (err) {
+      // Connect-level failure after the internal ladder. fork behavior:
+      // count it toward the credential-switch threshold and retry with a
+      // different account when available — otherwise surface the 502.
+      consecutiveCredFailures++;
+      hadRetryAttempt = true;
+      if (
+        attempt < MAX_TOTAL_ATTEMPTS &&
+        !(retryCfg.totalDeadlineMs > 0 && Date.now() - retryLoopStartedAt > retryCfg.totalDeadlineMs) &&
+        (await maybeSwitchCredential())
+      ) {
+        continue;
+      }
+      if (debug) debugError(reqId, "upstream_unreachable", (err as Error).message);
+      printRow(reqId, format, meta, 502, started, Date.now(), 0, 0, 0, rowStats());
+      return errorResponse(502, "upstream_unreachable", (err as Error).message);
+    }
+    headersAt = Date.now();
+
+    if (debug) {
+      debugLine(reqId, `← ${upstreamResp.status} ${upstreamResp.statusText}`);
+      debugLine(reqId, `  ${formatResponseHeaders(upstreamResp.headers)}`);
+    }
+
+    if (dumpEnabled()) {
+      dumpPhase(reqId, "upstream_in", {
+        status: upstreamResp.status,
+        statusText: upstreamResp.statusText,
+        headers: dumpHeaders(upstreamResp.headers),
+        isSSE: upstreamResp.headers.get("content-type")?.includes("text/event-stream") ?? false,
+        ttfbMs: headersAt - started,
+        attempt,
+      });
+    }
+
+    if (upstreamResp.status === 401 && startPlan) {
+      if (debug) debugError(reqId, "start_plan_jwt_invalid", "JWT rejected upstream");
+      printRow(reqId, format, meta, 401, started, headersAt, 0, 0, 0, rowStats());
+      return errorResponse(401, "start_plan_jwt_invalid", "Start-plan JWT was rejected. Re-run: zcode-proxy auth login");
+    }
+
+    // start-plan: on explicit captcha challenge, retry once with a fresh
+    // pooled token (the challenged token was already consumed by this request;
+    // getCaptchaToken takes the next pre-solved one). Detection covers the
+    // response-header variant AND the in-body `{"code":3007}` variant via the
+    // shared captcha-retry seam (used by /v1/responses too).
+    const captcha = startPlan ? await loadCaptcha() : null;
+    const captchaChallenge = captcha ? await isCaptchaChallenged(upstreamResp, captcha) : false;
+    if (captchaChallenge && captcha) {
+      console.log(`${reqId} captcha challenge, re-solving...`);
+      const outcome = await retryOnCaptchaChallenge({
+        captcha,
+        appVersion: config.identity.appVersion,
+        challengedResp: upstreamResp,
+        debug: debug ? (message) => debugLine(reqId, message) : undefined,
+        solveAndRetry: (retryHeaders) => {
+          console.log(`${reqId} captcha re-solved (token ${retryHeaders[captcha.RETRY_HEADERS.PARAM].length} chars), retrying...`);
+          return dispatch(cred, retryHeaders).then((resp) => {
+            if (debug) debugLine(reqId, `← retry ${resp.status} ${resp.statusText}`);
+            return resp;
+          });
+        },
+        mapError: (err, phase) => {
+          if (phase === "solver") {
+            if (debug) debugError(reqId, "captcha_solver_failed", err.message);
+            printRow(reqId, format, meta, 503, started, Date.now(), 0, 0, 0, rowStats());
+            return errorResponse(503, "captcha_solver_failed", err.message);
+          }
+          if (debug) debugError(reqId, "upstream_unreachable", err.message);
+          printRow(reqId, format, meta, 502, started, Date.now(), 0, 0, 0, rowStats());
+          return errorResponse(502, "upstream_unreachable", err.message);
+        },
+      });
+      if (!outcome.ok) return outcome.resp;
+      upstreamResp = outcome.resp;
+    }
+
+    // ---- fork: retryable-status handling (529/429/…). Upstream 4.x simply
+    // forwarded these; the fork backs off in-process, switches accounts when
+    // the threshold hits, and only surfaces the failure at the end.
+    if (retryCfg.maxRetries > 0 && retryCfg.retryableStatuses.includes(upstreamResp.status)) {
+      consecutiveCredFailures++;
+      hadRetryAttempt = true;
+
+      // Wall-clock budget exceeded — stop retrying with a clean 503 so the
+      // client can back off (forwarding the last status would invite an
+      // immediate client retry against a still-overloaded upstream).
+      if (retryCfg.totalDeadlineMs > 0 && Date.now() - retryLoopStartedAt > retryCfg.totalDeadlineMs) {
+        console.log(`${reqId} retry total deadline (${retryCfg.totalDeadlineMs}ms) exceeded after ${attempt} attempt(s) — returning 503`);
+        printRow(reqId, format, meta, 503, started, Date.now(), 0, 0, 0, rowStats());
+        return new Response(
+          JSON.stringify({
+            error: {
+              type: "retry_deadline_exceeded",
+              message: `The upstream kept returning retryable errors for over ${Math.round(retryCfg.totalDeadlineMs / 1000)}s (last status: ${upstreamResp.status}). Please retry later.`,
+            },
+          }),
+          { status: 503, headers: { "content-type": "application/json", "retry-after": "30" } },
+        );
+      }
+      if (attempt >= MAX_TOTAL_ATTEMPTS) {
+        console.log(`${reqId} hit MAX_TOTAL_ATTEMPTS cap (${MAX_TOTAL_ATTEMPTS}) — stopping retry loop`);
+        break; // hand the last upstream response to the post-loop checks
+      }
+
+      // Respect Retry-After (delta-seconds or HTTP-date), capped by maxDelayMs.
+      const delayMs = computeRetryDelayMs(attempt, upstreamResp.headers.get("retry-after"));
+      console.log(`${reqId} upstream returned ${upstreamResp.status}, retry ${attempt} in ${delayMs}ms${totalAvailableCredentials > 1 ? ` (credential failover available: ${triedApiKeys.size}/${totalAvailableCredentials} tried)` : ""}...`);
+      await sleep(delayMs);
+
+      // Client disconnected during backoff — every further attempt is wasted.
+      if (clientReq.signal.aborted) {
+        console.log(`${reqId} client disconnected during retry backoff`);
+        printRow(reqId, format, meta, 499, started, Date.now(), 0, 0, 0, rowStats());
+        return errorResponse(499, "client_disconnected", "Client closed the connection before the response completed");
+      }
+
+      // Credential switching on threshold; otherwise retry the same account.
+      await maybeSwitchCredential();
+      continue;
+    }
+
+    // Success (or a non-retryable failure) — leave the retry loop; the
+    // response continues to the translation / passthrough path below.
+    break;
+  }
+
+  // fork: when every stored credential was tried and failed, return 503
+  // (non-retryable) instead of forwarding the retryable upstream status —
+  // tells clients to STOP hammering.
+  if (allCredentialsExhausted && retryCfg.retryableStatuses.includes(upstreamResp.status)) {
+    console.log(`${reqId} all credentials exhausted (${triedApiKeys.size}/${totalAvailableCredentials} tried) — returning 503 all_credentials_exhausted`);
+    printRow(reqId, format, meta, 503, started, headersAt, 0, 0, 0, rowStats());
+    return errorResponse(
+      503,
+      "all_credentials_exhausted",
+      `All ${totalAvailableCredentials} stored credential(s) were tried and failed (last upstream status: ${upstreamResp.status}). ` +
+        `Add another account or wait for quota to reset — this response is NOT retryable by design.`,
+    );
   }
 
   const isSSE = upstreamResp.headers.get("content-type")?.includes("text/event-stream") ?? false;
@@ -359,7 +581,7 @@ export async function proxyRequest(
   if (translateOpenAIToAnthropic) {
     if (!upstreamResp.ok) {
       const errBody = await upstreamResp.text().catch(() => "");
-      printRow(reqId, format, meta, 502, started, headersAt, 0, 0, 0);
+      printRow(reqId, format, meta, 502, started, headersAt, 0, 0, 0, rowStats());
       return errorResponse(502, "translation_failed", `upstream returned ${upstreamResp.status}: ${errBody.slice(0, 200)}`);
     }
     if (isSSE && upstreamResp.body) {
@@ -374,7 +596,7 @@ export async function proxyRequest(
   if (translateAnthropicToOpenAI) {
     if (!upstreamResp.ok) {
       const errBody = await upstreamResp.text().catch(() => "");
-      printRow(reqId, format, meta, 502, started, headersAt, 0, 0, 0);
+      printRow(reqId, format, meta, 502, started, headersAt, 0, 0, 0, rowStats());
       return errorResponse(502, "translation_failed", `upstream returned ${upstreamResp.status}: ${errBody.slice(0, 200)}`);
     }
     if (isSSE && upstreamResp.body) {
@@ -392,7 +614,7 @@ export async function proxyRequest(
     return passthroughResponse(upstreamResp, clientAcceptsGzip(clientReq), clientBody);
   }
 
-  printRow(reqId, format, meta, upstreamResp.status, started, headersAt, 0, 0, 0);
+  printRow(reqId, format, meta, upstreamResp.status, started, headersAt, 0, 0, 0, rowStats());
   return passthroughResponse(upstreamResp, clientAcceptsGzip(clientReq));
 }
 
@@ -634,16 +856,11 @@ function passthroughResponse(
   });
 }
 
-/** Build a JSON error response. */
-export function errorResponse(status: number, type: string, message: string): Response {
-  const body = JSON.stringify({
-    error: { type, message },
-  });
-  return new Response(body, {
-    status,
-    headers: { "content-type": "application/json" },
-  });
-}
+/** Build a JSON error response. Implementation lives in its own leaf module
+ * (translated-response.ts) so the fork's admin dashboard can import it
+ * without creating a handler → stats → admin/api → handler cycle. */
+import { errorResponse } from "./translated-response.js";
+export { errorResponse };
 
 /** Translate an OpenAI request body string to Anthropic JSON. Returns error Response on failure. */
 function translateOpenAIBody(body: string | undefined): Response | string | undefined {
@@ -920,7 +1137,26 @@ function printRow(
   tokens: number,
   avgTps: number,
   streamEndAt: number,
+  stats?: { retried?: boolean; credentialKey?: string; captchaMs?: number; inputTokens?: number; cacheReadTokens?: number },
 ): void {
+  // fork: feed the admin dashboard's stats collector (recordStat dedups by
+  // id, so retry-loop re-prints for the same request collapse into one entry).
+  try {
+    recordStat({
+      id: reqId,
+      time: new Date(started).toISOString().slice(11, 19),
+      model: meta.model,
+      status,
+      ttfb: `${Math.max(0, headersAt - started)}ms`,
+      tokens: tokens > 0 ? String(tokens) : "-",
+      ...(stats?.inputTokens !== undefined ? { inputTokens: String(stats.inputTokens) } : {}),
+      ...(stats?.cacheReadTokens !== undefined ? { cacheReadTokens: String(stats.cacheReadTokens) } : {}),
+      ...(stats?.credentialKey ? { credentialKey: stats.credentialKey } : {}),
+      ...(stats?.retried ? { retried: true } : {}),
+      ...(stats?.captchaMs && stats.captchaMs > 0 ? { captchaMs: `${stats.captchaMs}ms` } : {}),
+    });
+  } catch { /* stats must never break the request path */ }
+
   printHeader();
   const tag = format === "anthropic" ? "ANT" : "OAI";
   const mode = meta.stream ? "stream" : "batch";

@@ -9,7 +9,15 @@ export interface ProviderEndpoints {
   anthropicBase: string;
   /** Base URL for OpenAI-format API, e.g. "https://api.z.ai/api/coding/paas/v4". */
   openaiBase: string;
+  /** Provider-specific credential override (fork admin dashboard). If absent, uses the stored multi-account credential. */
+  credential?: string;
 }
+
+/** How the proxy obtains the upstream credential (fork multi-account layer). */
+export type AuthMode = "apikey" | "oauth";
+
+/** Plan tier the credential is associated with. */
+export type PlanId = "coding-plan" | "start-plan";
 
 /** Auth section of the proxy configuration. */
 interface AuthConfig {
@@ -18,8 +26,93 @@ interface AuthConfig {
    * If unset, the proxy does not require client auth.
    */
   proxyApiKey?: string;
+  /**
+   * How the proxy obtains the upstream credential (fork multi-account layer).
+   * Default "oauth": the credential comes from the encrypted multi-account
+   * store (`auth login` / dashboard / import). "apikey" uses the static
+   * `auth.apiKey` string instead. Only the dashboard hot-applies changes to
+   * this field at runtime; the CLI always prefers the store when non-empty.
+   */
+  mode?: AuthMode;
+  /** Direct credential for `apikey` mode. Format: `{apiKey}` or `{apiKey}.{secret}` (Z.AI). */
+  apiKey?: string;
   /** Path to stored OAuth credentials created by `auth login`. */
   oauthCredentialsPath?: string;
+}
+
+/** Retry configuration for upstream requests (fork resilience layer). */
+export interface RetryConfig {
+  /** Maximum number of retry attempts for retryable status codes. Default: 3. */
+  maxRetries: number;
+  /** Initial delay in milliseconds before the first retry. Default: 1000. */
+  initialDelayMs: number;
+  /** Maximum delay cap in milliseconds. Default: 8000. */
+  maxDelayMs: number;
+  /** Multiplier applied to the delay for each subsequent retry attempt. Default: 2. */
+  backoffFactor: number;
+  /** HTTP status codes that should trigger a retry. Default: [529, 429]. */
+  retryableStatuses: number[];
+  /**
+   * Number of consecutive failed attempts (including the initial request) with
+   * the same credential before automatically switching to another stored
+   * credential. Set to 0 to disable credential switching entirely. Default: 2.
+   *
+   * Environment variable: ZCODE_RETRY_CREDENTIAL_SWITCH_THRESHOLD
+   */
+  credentialSwitchThreshold: number;
+  /**
+   * Number of consecutive empty-stream 529 responses (HTTP 200 + zero SSE
+   * events — the typical "quota exhausted" signature) with the same credential
+   * before automatically switching to another stored credential. Set to 0 to
+   * disable. Default: 3.
+   *
+   * Environment variable: ZCODE_RETRY_EMPTY_STREAM_SWITCH_THRESHOLD
+   */
+  emptyStreamSwitchThreshold: number;
+  /**
+   * Total wall-clock budget (ms) for the ENTIRE retry loop of one request.
+   * When exceeded the loop stops and the client receives a 503.
+   * Set to 0 to disable. Default: 300000 (5 minutes).
+   *
+   * Environment variable: ZCODE_RETRY_TOTAL_DEADLINE_MS
+   */
+  totalDeadlineMs: number;
+}
+
+/** Custom routing rule — overrides the default provider/endpoint for requests
+ * whose model name matches `pattern` (shell-glob style, e.g. "glm-5*").
+ */
+export interface RoutingRule {
+  /** Glob-style model pattern (matched against request body's `model` field). */
+  pattern: string;
+  /** Override provider for matched models. */
+  provider: "zai" | "bigmodel";
+  /** Optional endpoint override (full URL). If empty, the provider's default endpoint is used. */
+  endpoint?: string;
+  /** Optional note for the operator. */
+  note?: string;
+}
+
+/**
+ * Model mapping — rewrites the client-sent `model` field to a different id
+ * before forwarding upstream (e.g. Codex CLI's `gpt-5.5` → a real GLM model).
+ */
+export interface ModelMapping {
+  /** Client-sent model id to rewrite (case-insensitive exact match). */
+  from: string;
+  /** Target model id to forward upstream. */
+  to: string;
+  /** Optional note for the operator. */
+  note?: string;
+}
+
+/**
+ * Responses-API thinking override — force-enable thinking on `/v1/responses`
+ * for specific models (matched against the post-mapping GLM model id).
+ */
+export interface ResponsesThinkingConfig {
+  /** Model ids (post-mapping) for which thinking is force-enabled on /v1/responses. */
+  models: string[];
 }
 
 /**
@@ -46,6 +139,16 @@ export interface ProxyIdentity {
    * per-request.
    */
   deviceMid?: string;
+  /**
+   * ZCode release channel — emitted as the `X-Release-Channel` header (fork
+   * dashboard identity panel). When unset / empty, the header is omitted.
+   */
+  releaseChannel?: string;
+  /**
+   * ZCode agent marker sent on upstream model requests as `X-ZCode-Agent`
+   * (fork dashboard identity panel). Empty omits the header.
+   */
+  zcodeAgent?: string;
 }
 
 /** Local client-session inference mode for upstream session affinity. */
@@ -207,6 +310,29 @@ export interface ProxyConfig {
   server: {
     port: number;
     host: string;
+    /**
+     * Upstream request timeout in milliseconds (fork). Leave unset or 0 for
+     * the built-in defaults (stream 10 min, batch 5 min).
+     */
+    upstreamTimeoutMs?: number;
+    /**
+     * Whether to trust X-Forwarded-For / X-Real-IP headers for client IP
+     * detection (fork admin security). Enable ONLY behind a trusted reverse
+     * proxy. Default: false.
+     */
+    trustProxy?: boolean;
+    /**
+     * SSE heartbeat interval in milliseconds (fork): no-op SSE comment lines
+     * flushed to the client while waiting for the upstream's first byte, so
+     * reverse proxies with idle timeouts (e.g. Cloudflare 100s) don't kill
+     * long thinking requests. Default: 15000. Set 0 to disable.
+     */
+    sseHeartbeatMs?: number;
+    /**
+     * Maximum client request body size in bytes for proxy endpoints (fork).
+     * Default: 64 MiB. Set 0 to disable the guard.
+     */
+    maxRequestBodyBytes?: number;
   };
   auth: AuthConfig;
   /** Active upstream provider. */
@@ -243,5 +369,49 @@ export interface ProxyConfig {
   claim: ClaimConfig;
   logging: {
     level: "debug" | "info" | "warn" | "error";
+    /**
+     * Verbose logging (fork): each request logs the full upstream request
+     * headers (masked) + transformed body preview. Toggleable via dashboard.
+     * Env: ZCODE_PROXY_VERBOSE_LOGGING=1
+     */
+    verbose?: boolean;
+    /**
+     * Debug response logging (fork): logs full upstream response details
+     * (status, key headers, body/SSE preview). Env: ZCODE_PROXY_DEBUG_LOGGING=1
+     */
+    debug?: boolean;
+    /**
+     * Optional JSON-lines log file (fork) mirrored from the dashboard log
+     * ring buffer. Env: ZCODE_PROXY_LOG_FILE
+     */
+    file?: string;
+    /**
+     * Header debug logging (fork): writes paired inbound/upstream header
+     * JSON files per request for translation-pipeline diffing.
+     * Env: ZCODE_PROXY_HEADER_DEBUG=1
+     */
+    headerDebug?: boolean;
   };
+  /**
+   * Retry / credential-switch resilience configuration (fork multi-account layer).
+   * Optional for backward compatibility with hand-built test configs; the
+   * proxy handler falls back to the loader defaults field-by-field.
+   */
+  retry?: RetryConfig;
+  /**
+   * CORS origin allowlist (fork). When set, only origins in this list receive
+   * `Access-Control-Allow-Origin` headers. Env: ZCODE_PROXY_CORS_ALLOWLIST.
+   */
+  corsAllowList?: string[];
+  /** Custom per-model routing rules (fork dashboard). Empty by default. */
+  routingRules?: RoutingRule[];
+  /** Client model id → GLM model id rewrite table (fork dashboard). Empty by default. */
+  modelMappings?: ModelMapping[];
+  /** Force-enable thinking on /v1/responses for specific models (fork dashboard). */
+  responsesThinking?: ResponsesThinkingConfig;
+  /**
+   * ZCode thinking level (fork dashboard) — controls budget_tokens + effort
+   * injected when the client sends `thinking.type=enabled`. Default "max".
+   */
+  thinkingLevel?: "low" | "high" | "max";
 }
