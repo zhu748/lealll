@@ -9,3 +9,6 @@
 *.jar binary
 *.so binary
 *.png binary
+# Batch file MUST keep CRLF bytes in the blob — CMD breaks if/goto on LF,
+# and the release CI guards "file release/start.bat | grep CRLF" on checkout.
+release/start.bat -text

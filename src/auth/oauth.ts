@@ -56,6 +56,8 @@ export interface OAuthResult {
   userId?: string;
   /** ZCode plan JWT for start-plan (zcode.z.ai). The token-exchange response includes this alongside the provider access_token. */
   jwt?: string;
+  /** Account email (fork multi-account layer) — names the new account as `{email}-{plan}`. */
+  email?: string;
 }
 
 export type FetchFn = typeof fetch;
@@ -115,7 +117,7 @@ export abstract class OAuthFlowClient {
     onAuthorizeUrl?.(started.authorizeUrl);
     try {
       const tokens = await this.complete(started, timeoutMs);
-      return { accessToken: tokens.accessToken, provider: this.provider, userId: tokens.userId, jwt: tokens.jwt };
+      return { accessToken: tokens.accessToken, provider: this.provider, userId: tokens.userId, jwt: tokens.jwt, email: tokens.email };
     } finally {
       await this.close();
     }

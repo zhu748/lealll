@@ -1,13 +1,13 @@
 name: CI
 
-# Triggered on every PR (any target) and on every push to master so direct
-# commits are gated too. Required status checks (Settings → Branches →
+# Triggered on every PR (any target) and on every push to main/master so
+# direct commits are gated too. Required status checks (Settings → Branches →
 # Branch protection rules) make CI failures block merge.
 
 on:
   pull_request:
   push:
-    branches: [master]
+    branches: [main, master]
 
 permissions:
   contents: read
