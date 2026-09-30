@@ -17,11 +17,12 @@
  *      zcode.z.ai desktop bundle `getSnapshotForQuery`/`BigModelUsageQuotaProvider`)
  */
 import os from "node:os";
+import { randomUUID } from "node:crypto";
 import { loadCredential } from "../auth/store.js";
 import { buildIdentityHeaders, normalizePrintableHeaderValue } from "../proxy/identity.js";
 import { inspectJwt } from "../auth/jwt-age.js";
 import { credentialString, type Credential } from "../auth/types.js";
-import { createResetClient, DEFAULT_RESET_ORIGIN, type ResetStatus } from "../auth/reset.js";
+import { createResetClient, DEFAULT_RESET_ORIGIN, normalizeResetType, type ResetStatus, type ResetType } from "../auth/reset.js";
 import { createClaimClient, ClaimPreviewError } from "../claim/client.js";
 import type { ClaimablePlan, ClaimOutcome } from "../claim/types.js";
 import { getCaptchaToken } from "../proxy/captcha.js";
@@ -351,6 +352,93 @@ export async function handleQuotaReset(
     });
   } catch (e) {
     return errorResponse(503, "quota_reset_unavailable", `reset status query failed: ${(e as Error).message}`);
+  }
+}
+
+/** Parsed `POST /quota/reset` body — `use` spends one reset, `opportunity`
+ * asks the server for an automatic grant (same actions as the CLI's
+ * `zcode-proxy reset --use/--opportunity`). */
+export interface QuotaResetActionBody {
+  action?: unknown;
+  type?: unknown;
+  idempotency_key?: unknown;
+}
+
+/** Handle POST /quota/reset — spend a stockpiled reset or request an automatic
+ * reset grant for the active credential. Body `{action:"use",type:"five_hour"|"week"}`
+ * or `{action:"opportunity"}`; an optional `idempotency_key` (1-64 chars) is
+ * honored so retries stay idempotent, otherwise a fresh UUID is generated.
+ * Business verdicts (`ResetApiError`) come back as 200 `{ok:false,...}` so the
+ * dashboard can render the upstream reason verbatim; transport failures use
+ * the error envelope. `resetClientImpl` is a DI seam for tests. */
+export async function handleQuotaResetAction(
+  req: Request,
+  config: ProxyConfig,
+  fetchImpl: typeof fetch = fetch,
+  loadCredentialImpl: typeof loadCredential = loadCredential,
+  resetClientImpl: typeof createResetClient = createResetClient,
+): Promise<Response> {
+  let body: QuotaResetActionBody = {};
+  try {
+    const text = await req.text();
+    if (text.trim() !== "") body = JSON.parse(text) as typeof body;
+  } catch {
+    return errorResponse(400, "reset_invalid_body", "request body must be JSON");
+  }
+  const cred = await loadCredentialImpl();
+  if (!cred) {
+    return errorResponse(401, "not_logged_in", "not logged in (run: zcode-proxy auth login)");
+  }
+  const action = body.action;
+  let type: ResetType | undefined;
+  if (action === "use") {
+    // Validate the reset type BEFORE any upstream call so a bad value is a
+    // clean 400 instead of a transport-shaped 502.
+    try {
+      type = normalizeResetType(typeof body.type === "string" ? body.type : "");
+    } catch (e) {
+      return errorResponse(400, "reset_invalid_type", (e as Error).message);
+    }
+  }
+  const client = resetClientImpl(cred, {
+    origin: config.claim.origin || DEFAULT_RESET_ORIGIN,
+    fetchImpl,
+    identity: config.identity,
+  });
+  // The CLI generates the key the same way (random UUID per invocation).
+  const rawKey = typeof body.idempotency_key === "string" ? body.idempotency_key : "";
+  const idempotencyKey = rawKey.trim() !== "" ? rawKey : randomUUID();
+  try {
+    if (action === "opportunity") {
+      const result = await client.requestOpportunity(idempotencyKey);
+      return new Response(JSON.stringify({ ok: true, action: "opportunity", ...result }, null, 1), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    if (action === "use" && type) {
+      await client.use(type, idempotencyKey);
+      return new Response(JSON.stringify({ ok: true, action: "use", used: true, type }, null, 1), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return errorResponse(
+      400,
+      "reset_invalid_action",
+      'body.action must be "use" (with type "five_hour"|"week") or "opportunity"',
+    );
+  } catch (e) {
+    const message = (e as Error).message ?? String(e);
+    // ResetApiError (business verdict: no stock, invalid key, 429 backoff…)
+    // is a normal upstream answer — surface it verbatim, not as a 5xx.
+    if ((e as Error).name === "ResetApiError") {
+      return new Response(JSON.stringify({ ok: false, action: body.action ?? null, error: message }, null, 1), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return errorResponse(502, "reset_action_failed", `reset action failed: ${message}`);
   }
 }
 

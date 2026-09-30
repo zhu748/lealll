@@ -568,3 +568,156 @@ describe("quota claim routes (collectClaimSnapshot / handleQuotaClaim*)", () => 
     expect(body.failureEndsAt).toBe(1759100000);
   });
 });
+
+// ---------------------------------------------------------------------------
+// POST /quota/reset — spend a stockpiled reset / request an automatic grant
+// (dashboard "用量窗口重置" card actions; mirrors the CLI's --use/--opportunity).
+// ---------------------------------------------------------------------------
+import { handleQuotaResetAction } from "./routes-quota.js";
+
+describe("POST /quota/reset (handleQuotaResetAction)", () => {
+  const resetCred: Credential = { apiKey: "key-x.secret-y", provider: "zai", jwt: makeJwt(), maasToken: "maas-token-1" };
+  const loadResetCred = async (): Promise<Credential> => resetCred;
+
+  it("returns 401 not_logged_in without a stored credential", async () => {
+    const resp = await handleQuotaResetAction(
+      new Request("http://x/quota/reset", { method: "POST", body: "{}" }),
+      makeConfig(),
+      fetch,
+      loadNone,
+    );
+    expect(resp.status).toBe(401);
+    const body = (await resp.json()) as { error?: { type?: string } };
+    expect(body.error?.type).toBe("not_logged_in");
+  });
+
+  it("returns 400 reset_invalid_body on invalid JSON", async () => {
+    const resp = await handleQuotaResetAction(
+      new Request("http://x/quota/reset", { method: "POST", body: "not-json" }),
+      makeConfig(),
+      fetch,
+      loadResetCred,
+    );
+    expect(resp.status).toBe(400);
+    const body = (await resp.json()) as { error?: { type?: string } };
+    expect(body.error?.type).toBe("reset_invalid_body");
+  });
+
+  it("returns 400 reset_invalid_action on an unknown action", async () => {
+    const resp = await handleQuotaResetAction(
+      new Request("http://x/quota/reset", { method: "POST", body: JSON.stringify({ action: "nope" }) }),
+      makeConfig(),
+      fetch,
+      loadResetCred,
+    );
+    expect(resp.status).toBe(400);
+    const body = (await resp.json()) as { error?: { type?: string } };
+    expect(body.error?.type).toBe("reset_invalid_action");
+  });
+
+  it("returns 400 reset_invalid_type on a bad use type without calling upstream", async () => {
+    let upstreamCalls = 0;
+    const fetchImpl: typeof fetch = (async () => {
+      upstreamCalls++;
+      return new Response("{}", { status: 200 });
+    }) as unknown as typeof fetch;
+    const resp = await handleQuotaResetAction(
+      new Request("http://x/quota/reset", { method: "POST", body: JSON.stringify({ action: "use", type: "yearly" }) }),
+      makeConfig(),
+      fetchImpl,
+      loadResetCred,
+    );
+    expect(resp.status).toBe(400);
+    const body = (await resp.json()) as { error?: { type?: string } };
+    expect(body.error?.type).toBe("reset_invalid_type");
+    expect(upstreamCalls).toBe(0);
+  });
+
+  it("action=use normalizes the type, posts the idempotency key and returns ok:true", async () => {
+    const postCalls: Array<string | undefined> = [];
+    const fetchImpl: typeof fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      postCalls.push(typeof init?.body === "string" ? init.body : undefined);
+      return new Response(JSON.stringify({ code: 0, msg: "ok", data: { used: true } }), { status: 200 });
+    }) as unknown as typeof fetch;
+    const resp = await handleQuotaResetAction(
+      new Request("http://x/quota/reset", { method: "POST", body: JSON.stringify({ action: "use", type: "five_hour", idempotency_key: " key-1 " }) }),
+      makeConfig(),
+      fetchImpl,
+      loadResetCred,
+    );
+    expect(resp.status).toBe(200);
+    const body = (await resp.json()) as { ok?: boolean; action?: string; used?: boolean; type?: string };
+    expect(body.ok).toBe(true);
+    expect(body.action).toBe("use");
+    expect(body.used).toBe(true);
+    expect(body.type).toBe("FIVE_HOUR");
+    // The user-supplied idempotency key is honored (trimmed, verbatim on the wire).
+    const sent = JSON.parse(postCalls[0] ?? "{}") as { idempotency_key?: string; reset_type?: string };
+    expect(sent.idempotency_key).toBe("key-1");
+    expect(sent.reset_type).toBe("FIVE_HOUR");
+  });
+
+  it("action=use generates a UUID idempotency key when the body omits one", async () => {
+    const postCalls: Array<string | undefined> = [];
+    const fetchImpl: typeof fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      postCalls.push(typeof init?.body === "string" ? init.body : undefined);
+      return new Response(JSON.stringify({ code: 0, msg: "ok", data: { used: true } }), { status: 200 });
+    }) as unknown as typeof fetch;
+    const resp = await handleQuotaResetAction(
+      new Request("http://x/quota/reset", { method: "POST", body: JSON.stringify({ action: "use", type: "week" }) }),
+      makeConfig(),
+      fetchImpl,
+      loadResetCred,
+    );
+    expect(resp.status).toBe(200);
+    const sent = JSON.parse(postCalls[0] ?? "{}") as { idempotency_key?: string };
+    // UUID v4 shape (36 chars, 4 hyphens) — retries without a key stay idempotent-safe.
+    expect(sent.idempotency_key).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+  });
+
+  it("action=opportunity maps business 3301 to granted:false with nextTryAt", async () => {
+    const fetchImpl: typeof fetch = (async () =>
+      new Response(JSON.stringify({ code: 3301, msg: "no opportunity", data: { next_try_at: 1759009999 } }), { status: 200 })) as unknown as typeof fetch;
+    const resp = await handleQuotaResetAction(
+      new Request("http://x/quota/reset", { method: "POST", body: JSON.stringify({ action: "opportunity" }) }),
+      makeConfig(),
+      fetchImpl,
+      loadResetCred,
+    );
+    expect(resp.status).toBe(200);
+    const body = (await resp.json()) as { ok?: boolean; granted?: boolean; nextTryAt?: number | null };
+    expect(body.ok).toBe(true);
+    expect(body.granted).toBe(false);
+    expect(body.nextTryAt).toBe(1759009999);
+  });
+
+  it("action=opportunity maps a grant to granted:true", async () => {
+    const fetchImpl: typeof fetch = (async () =>
+      new Response(JSON.stringify({ code: 0, msg: "ok", data: { granted: true } }), { status: 200 })) as unknown as typeof fetch;
+    const resp = await handleQuotaResetAction(
+      new Request("http://x/quota/reset", { method: "POST", body: JSON.stringify({ action: "opportunity" }) }),
+      makeConfig(),
+      fetchImpl,
+      loadResetCred,
+    );
+    expect(resp.status).toBe(200);
+    const body = (await resp.json()) as { ok?: boolean; granted?: boolean };
+    expect(body.ok).toBe(true);
+    expect(body.granted).toBe(true);
+  });
+
+  it("ResetApiError business verdicts come back as 200 {ok:false} with the upstream message", async () => {
+    const fetchImpl: typeof fetch = (async () =>
+      new Response(JSON.stringify({ code: 1204, msg: "no available reset stock" }), { status: 200 })) as unknown as typeof fetch;
+    const resp = await handleQuotaResetAction(
+      new Request("http://x/quota/reset", { method: "POST", body: JSON.stringify({ action: "use", type: "week" }) }),
+      makeConfig(),
+      fetchImpl,
+      loadResetCred,
+    );
+    expect(resp.status).toBe(200);
+    const body = (await resp.json()) as { ok?: boolean; error?: string };
+    expect(body.ok).toBe(false);
+    expect(body.error).toContain("no available reset stock");
+  });
+});

@@ -1,5 +1,15 @@
 # zcode-proxy 使用说明
 
+> **v4.7.4-fork.1 — 管理面板「权益领取」页 + POST /quota/reset**
+>
+> - Web 管理面板新增「权益领取」独立页面：限时体验套餐列表（额度万/亿格式化、daily/one_time 周期、生效时间、发放窗口、优先级）+ 逐套餐领取与一键默认领取（自动求解阿里云验证码，结果横幅含 3.14.4 全字段，失败按错误码中文提示）。
+> - 同页新增「用量窗口重置」卡片：5 小时/周重置券库存、到期时间、最近使用记录，一键用掉重置券（二次确认）与申请自动重置额度（含服务端下次可试时间提示）。
+> - 新增 `POST /quota/reset`：`{action:"use",type:"five_hour"|"week"}` 花费一张重置券、`{action:"opportunity"}` 申请自动重置（可选 `idempotency_key` 幂等），业务裁决（无库存等）以 200 `{ok:false,error}` 透传，对齐 CLI 全部重置动作。
+> - `PUT /admin/api/config` 对 `claim` 段深合并 + 热应用：面板保存 `claim.planId` 不再丢 `pollIntervalMs`/`cooldownMs` 等字段。
+> - 面板领取/重置与 HTTP 接口同走代理密钥认证；淡季无活动显示明确空状态而非报错。
+>
+> 升级建议：直接替换二进制；无需重新登录。
+
 > **v4.7.3-fork.1 — 活动额度领取 HTTP 接口 + 对齐桌面端 3.14.4 领取协议**
 >
 > - 新增 `GET /quota/claim`（列出当前可领的限时体验套餐，即"一亿 token"类活动页数据）与 `POST /quota/claim`（自动求解阿里云验证码后提交领取，可传 `{plan_id}` 指定套餐）。与既有 CLI `zcode-proxy claim [list|now]`、后台自动抢领共用同一套实战验证过的客户端（含活动网关要求的 X-Device-Mid 指纹）。

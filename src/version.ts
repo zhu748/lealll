@@ -6,4 +6,4 @@
  * web dashboard + proxy pool + retry resilience (v0.3.10.11 lineage).
  * The dashboard replaces `__ZCODE_PROXY_VERSION__` with this value.
  */
-export const VERSION = "4.7.3-fork.1";
+export const VERSION = "4.7.4-fork.1";

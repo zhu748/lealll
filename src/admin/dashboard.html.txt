@@ -847,6 +847,8 @@ td input{font-family:var(--font-mono)}
 .hint.hint-warn .hint-icon{color:var(--warn)}
 .hint.hint-danger{background:var(--danger-soft);border-color:var(--danger);border-left-color:var(--danger)}
 .hint.hint-danger .hint-icon{color:var(--danger)}
+.hint.hint-success{background:var(--success-soft);border-color:var(--success);border-left-color:var(--success)}
+.hint.hint-success .hint-icon{color:var(--success)}
 
 /* Page section spacing */
 .section-divider{
@@ -1254,6 +1256,10 @@ td input{font-family:var(--font-mono)}
         <div class="nav-item" data-page="accounts">
           <span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg></span>
           <span class="nav-text">账号管理</span>
+        </div>
+        <div class="nav-item" data-page="claim">
+          <span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 12 20 22 4 22 4 12"/><rect x="2" y="7" width="20" height="5"/><line x1="12" y1="22" x2="12" y2="7"/><path d="M12 7H7.5a2.5 2.5 0 0 1 0-5C11 2 12 7 12 7z"/><path d="M12 7h4.5a2.5 2.5 0 0 0 0-5C13 2 12 7 12 7z"/></svg></span>
+          <span class="nav-text">权益领取</span>
         </div>
         <div class="nav-item" data-page="oauth">
           <span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></span>
@@ -1726,6 +1732,48 @@ td input{font-family:var(--font-mono)}
               从文件导入
             </button>
             <input type="file" id="importFileInput" accept=".json" style="display:none" onchange="importAccountsFromFile(this)">
+          </div>
+        </div>
+      </div>
+
+      <!-- ============================================================ Claim / Benefits ============================================================ -->
+      <div class="page" id="page-claim">
+        <div class="main-header">
+          <div class="header-left">
+            <h1>权益领取</h1>
+            <div class="subtitle">限时体验套餐领取 + 用量窗口重置（针对当前激活账号）</div>
+          </div>
+          <div class="header-actions">
+            <button class="btn btn-ghost btn-sm" onclick="loadClaimPage()">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+              刷新
+            </button>
+          </div>
+        </div>
+
+        <div class="hint">
+          <span class="hint-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></span>
+          <div>套餐列表与官方桌面端「限时体验」同源（<code class="code-inline">billing/preview</code> 平面）。活动由服务端部署：淡季列表为空属正常状态，无需处理。领取时验证码在本进程内自动求解；切换激活账号请前往「账号管理」。</div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title"><span class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 12 20 22 4 22 4 12"/><rect x="2" y="7" width="20" height="5"/><line x1="12" y1="22" x2="12" y2="7"/><path d="M12 7H7.5a2.5 2.5 0 0 1 0-5C11 2 12 7 12 7z"/><path d="M12 7h4.5a2.5 2.5 0 0 0 0-5C13 2 12 7 12 7z"/></svg></span>限时体验套餐</div>
+            <button class="btn btn-primary btn-sm" id="claimDefaultBtn" onclick="claimPlan('')" style="display:none">一键领取（默认目标）</button>
+          </div>
+          <div class="card-body">
+            <div id="claimResult"></div>
+            <div id="claimPlans" style="min-height:60px"></div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title"><span class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg></span>用量窗口重置</div>
+          </div>
+          <div class="card-body">
+            <div id="resetStatus" style="min-height:40px"></div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px" id="resetActions"></div>
           </div>
         </div>
       </div>
@@ -2618,6 +2666,10 @@ document.querySelectorAll('.nav-item').forEach(el=>{
     document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
     el.classList.add('active');
     document.getElementById('page-'+el.dataset.page).classList.add('active');
+    // Lazy-load the claim page on first visit (and re-sync on every visit):
+    // both planes are light GETs, so refreshing per visit keeps the claimable
+    // snapshot current without polling while the page is hidden.
+    if(el.dataset.page==='claim')loadClaimPage();
     // Mobile: close the drawer after navigating
     const sidebar=document.querySelector('.sidebar');
     if(sidebar&&sidebar.classList.contains('show')){
@@ -5107,6 +5159,211 @@ async function resetStats(){
   }finally{
     endExclusiveAction('statsReset');
   }
+}
+
+// --- Claim / benefits page (权益领取) ---
+// Talks to the proxy-key-gated /quota/claim + /quota/reset planes directly
+// (authHeaders() carries the same key the login verified). Generation guards
+// follow the shared dashboard convention so stale responses never overwrite
+// fresher ones after logout / re-init.
+let claimPageGeneration=0;
+let claimActionInFlight=false;
+
+function claimFailureText(kind){
+  switch(kind){
+    case 'not_found':return '活动不存在或已下线';
+    case 'unavailable':return '活动暂不可领取';
+    case 'already_claimed':return '该账号已领取过';
+    case 'ineligible':return '账号不符合领取条件';
+    case 'quota_exhausted':return '领取名额已用完';
+    case 'invalid_request':return '请求参数被上游拒绝';
+    case 'captcha':return '验证码校验失败，可重试';
+    case 'login_required':return '登录态失效，请重新 OAuth 登录';
+    case 'http_error':return '上游网络错误';
+    default:return '未知错误';
+  }
+}
+
+function claimFmtUnix(sec){
+  if(typeof sec!=='number'||!Number.isFinite(sec)||sec<=0)return '';
+  try{return new Date(sec*1000).toLocaleString('zh-CN',{hour12:false});}catch{return String(sec);}
+}
+
+function claimFmtUnits(n){
+  if(typeof n!=='number'||!Number.isFinite(n))return escapeHtml(String(n??''));
+  if(n>=1e8)return (n/1e8).toFixed(n%1e8===0?0:2)+' 亿';
+  if(n>=1e4)return (n/1e4).toFixed(n%1e4===0?0:2)+' 万';
+  return n.toLocaleString('zh-CN');
+}
+
+function claimPeriodText(period){
+  if(period==='daily')return '每日发放';
+  if(period==='one_time')return '一次性发放';
+  return period?escapeHtml(String(period)):'';
+}
+
+async function loadClaimPage(){
+  const requestAuthToken=authToken;
+  const requestInitGeneration=dashboardInitGeneration;
+  const generation=++claimPageGeneration;
+  const plansEl=document.getElementById('claimPlans');
+  const resetEl=document.getElementById('resetStatus');
+  const actionsEl=document.getElementById('resetActions');
+  const defaultBtn=document.getElementById('claimDefaultBtn');
+  if(!plansEl||!resetEl)return;
+  plansEl.innerHTML='<div class="empty-state"><div class="empty-text">加载中...</div></div>';
+  resetEl.innerHTML='<div class="empty-state"><div class="empty-text">加载中...</div></div>';
+  if(actionsEl)actionsEl.innerHTML='';
+  if(defaultBtn)defaultBtn.style.display='none';
+  const resultEl=document.getElementById('claimResult');
+  if(resultEl)resultEl.innerHTML='';
+  // Both planes are light; fetch in parallel like the desktop's snapshot flow.
+  const [claimRes,resetRes]=await Promise.allSettled([
+    fetchJsonWithTimeout(API+'/quota/claim',{headers:authHeaders()},15000),
+    fetchJsonWithTimeout(API+'/quota/reset',{headers:authHeaders()},15000),
+  ]);
+  if(generation!==claimPageGeneration||!dashboardActionCurrent(requestInitGeneration,requestAuthToken))return;
+  if(claimRes.status==='fulfilled'){
+    renderClaimPlans(claimRes.value||{});
+  }else{
+    plansEl.innerHTML='<div class="hint hint-danger" style="margin:0"><span class="hint-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12.01" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg></span><div>领取快照加载失败：'+escapeHtml((claimRes.reason&&claimRes.reason.message)||String(claimRes.reason||'未知错误'))+'</div></div>';
+  }
+  if(resetRes.status==='fulfilled'){
+    renderResetCard(resetRes.value||{});
+  }else{
+    resetEl.innerHTML='<div class="hint hint-danger" style="margin:0"><span class="hint-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12.01" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg></span><div>重置状态加载失败：'+escapeHtml((resetRes.reason&&resetRes.reason.message)||String(resetRes.reason||'未知错误'))+'</div></div>';
+    if(actionsEl)actionsEl.innerHTML='';
+  }
+}
+
+function renderClaimPlans(d){
+  const plansEl=document.getElementById('claimPlans');
+  const defaultBtn=document.getElementById('claimDefaultBtn');
+  if(!plansEl)return;
+  const plans=Array.isArray(d.plans)?d.plans:[];
+  if(d.available===false){
+    plansEl.innerHTML='<div class="empty-state"><div class="empty-text">当前没有可领取的活动</div><div class="empty-hint">'+escapeHtml(d.reason||'活动已结束或未部署（服务端淡季属正常状态）')+'</div></div>';
+    return;
+  }
+  if(!plans.length){
+    plansEl.innerHTML='<div class="empty-state"><div class="empty-text">当前没有可领取的活动</div><div class="empty-hint">活动由服务端部署，上线后会自动出现在这里</div></div>';
+    return;
+  }
+  if(defaultBtn)defaultBtn.style.display='';
+  plansEl.innerHTML=plans.map(p=>{
+    const ents=(Array.isArray(p.entitlements)?p.entitlements:[]).map(e=>'<tr><td>'+escapeHtml(e.showName||e.entitlementId||'-')+'</td><td class="td-mono">'+claimFmtUnits(e.grantUnits)+(e.unitType?' <span class="td-mute">'+escapeHtml(e.unitType)+'</span>':'')+'</td><td class="td-mute">'+claimPeriodText(e.period)+'</td><td class="td-mute">'+(e.effectiveAt?claimFmtUnix(e.effectiveAt):'-')+'</td></tr>').join('');
+    const windowTxt=(p.startsAt||p.endsAt)?(claimFmtUnix(p.startsAt)+' ~ '+claimFmtUnix(p.endsAt)):'不限时';
+    return '<div style="border:1px solid var(--border);border-radius:var(--r-md);padding:var(--s-4);margin-bottom:12px">'
+      +'<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap">'
+      +'<div><div style="font-weight:600">'+escapeHtml(p.name||p.planId||'未命名套餐')+'</div>'
+      +(p.description?'<div class="td-mute" style="font-size:12px;margin-top:2px">'+escapeHtml(p.description)+'</div>':'')
+      +'</div>'
+      +'<button class="btn btn-primary btn-sm" onclick="claimPlan(\''+escapeJsAttrString(p.planId||'')+'\')">领取此套餐</button>'
+      +'</div>'
+      +'<div class="td-mute" style="font-size:12px;margin:8px 0">发放窗口：'+escapeHtml(windowTxt)+' · 优先级 '+escapeHtml(String(p.priority??'-'))+'</div>'
+      +(ents?'<div class="table-wrap"><table><thead><tr><th>权益</th><th>额度</th><th>周期</th><th>生效时间</th></tr></thead><tbody>'+ents+'</tbody></table></div>':'')
+      +'</div>';
+  }).join('');
+}
+
+function renderClaimOutcome(outcome){
+  const el=document.getElementById('claimResult');
+  if(!el||!outcome||typeof outcome!=='object')return;
+  if(outcome.ok===true){
+    const ents=(Array.isArray(outcome.entitlements)?outcome.entitlements:[]).map(e=>'<span class="badge badge-success" style="margin-right:6px">'+escapeHtml(e.showName||e.entitlementId||'权益')+'</span>').join('');
+    el.innerHTML='<div class="hint hint-success" style="margin:0 0 12px"><span class="hint-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg></span><div><strong>领取成功</strong>'+escapeHtml(outcome.planId?'：'+outcome.planId:'')+(outcome.status?'（状态 '+escapeHtml(outcome.status)+'）':'')+(outcome.userPlanId?' · 记录 '+escapeHtml(outcome.userPlanId):'')+((outcome.startsAt||outcome.endsAt)?' · 生效窗口 '+escapeHtml(claimFmtUnix(outcome.startsAt)||'?')+' ~ '+escapeHtml(claimFmtUnix(outcome.endsAt)||'?'):'')+(ents?'<div style="margin-top:6px">'+ents+'</div>':'')+'</div></div>';
+    toast('领取成功','success');
+  }else if(outcome.ok===false){
+    const msg=String(outcome.message||'').slice(0,180);
+    el.innerHTML='<div class="hint hint-danger" style="margin:0 0 12px"><span class="hint-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg></span><div><strong>领取失败</strong>：'+escapeHtml(claimFailureText(outcome.failureKind))+(msg?'（'+escapeHtml(msg)+'）':'')+'</div></div>';
+    toast('领取失败：'+claimFailureText(outcome.failureKind),'error');
+  }
+}
+
+async function claimPlan(planId){
+  if(claimActionInFlight){toast('已有领取/重置请求进行中，请稍候','warn');return;}
+  const label=planId?('套餐 '+planId):'默认目标（配置的 plan_id，未配置则取最高优先级）';
+  if(!confirm('确认领取？\n目标：'+label+'\n\n领取动作由当前激活账号发起，验证码在本进程内自动求解。'))return;
+  claimActionInFlight=true;
+  const requestAuthToken=authToken;
+  const requestInitGeneration=dashboardInitGeneration;
+  const generation=++claimPageGeneration;
+  try{
+    // Captcha solving can take a while — 60s mirrors the mutation timeout headroom.
+    const d=await fetchJsonMutationWithTimeout(API+'/quota/claim',{method:'POST',headers:authHeaders(),body:JSON.stringify(planId?{plan_id:planId}:{})},60000);
+    if(generation!==claimPageGeneration||!dashboardActionCurrent(requestInitGeneration,requestAuthToken))return;
+    renderClaimOutcome(d);
+  }catch(e){
+    if(dashboardActionCurrent(requestInitGeneration,requestAuthToken)){
+      toast('领取请求失败：'+((e&&e.message)||e),'error');
+    }
+  }finally{
+    claimActionInFlight=false;
+  }
+}
+
+function renderResetCard(d){
+  const resetEl=document.getElementById('resetStatus');
+  const actionsEl=document.getElementById('resetActions');
+  if(!resetEl)return;
+  if(d.available===false){
+    resetEl.innerHTML='<div class="empty-state"><div class="empty-text">重置功能不可用</div><div class="empty-hint">'+escapeHtml(d.reason||'缺少双令牌凭证（4.7.2-fork.1 之前的登录需重新 OAuth）')+'</div></div>';
+    if(actionsEl)actionsEl.innerHTML='';
+    return;
+  }
+  const s=d.status||{};
+  const five=Array.isArray(s.availableFiveHourResets)?s.availableFiveHourResets:[];
+  const week=Array.isArray(s.availableWeekResets)?s.availableWeekResets:[];
+  const latest=s.latestFiveHourResetHistory||s.latestWeekResetHistory||null;
+  const nearest=list=>list.length?claimFmtUnix(Math.max.apply(null,list.map(r=>r&&r.expireAt||0))):'-';
+  resetEl.innerHTML='<div class="table-wrap"><table><thead><tr><th>类型</th><th>库存</th><th>备注</th></tr></thead><tbody>'
+    +'<tr><td>五小时窗口重置</td><td>'+(five.length?'<span class="badge badge-success">可用 × '+five.length+'</span>':'<span class="badge">无库存</span>')+'</td><td class="td-mute">'+(five.length?'最近到期 '+escapeHtml(nearest(five)):'-')+'</td></tr>'
+    +'<tr><td>周窗口重置</td><td>'+(week.length?'<span class="badge badge-success">可用 × '+week.length+'</span>':'<span class="badge">无库存</span>')+'</td><td class="td-mute">'+(week.length?'最近到期 '+escapeHtml(nearest(week)):'-')+'</td></tr>'
+    +'<tr><td>最近一次使用</td><td colspan="2" class="td-mute">'+(latest?escapeHtml(claimFmtUnix(latest.usedAt)):'从未使用')+'</td></tr>'
+    +'</tbody></table></div>';
+  if(actionsEl){
+    let html='';
+    if(five.length)html+='<button class="btn btn-primary btn-sm" onclick="useQuotaReset(\'five_hour\')">用掉一次五小时重置</button>';
+    if(week.length)html+='<button class="btn btn-primary btn-sm" onclick="useQuotaReset(\'week\')">用掉一次周重置</button>';
+    html+='<button class="btn btn-ghost btn-sm" onclick="askResetOpportunity()">申请自动重置额度</button>';
+    actionsEl.innerHTML=html;
+  }
+}
+
+async function postResetAction(body){
+  return fetchJsonMutationWithTimeout(API+'/quota/reset',{method:'POST',headers:authHeaders(),body:JSON.stringify(body)},30000);
+}
+
+async function useQuotaReset(type){
+  if(claimActionInFlight){toast('已有领取/重置请求进行中，请稍候','warn');return;}
+  if(!confirm('确认用掉一次'+(type==='week'?'周':'五小时')+'窗口重置？此操作立即生效且不可撤销。'))return;
+  claimActionInFlight=true;
+  try{
+    const d=await postResetAction({action:'use',type});
+    if(d&&d.ok===true)toast('重置已使用，用量窗口已刷新','success');
+    else toast('重置失败：'+((d&&d.error)||'未知错误'),'error');
+  }catch(e){
+    toast('重置请求失败：'+((e&&e.message)||e),'error');
+  }finally{
+    claimActionInFlight=false;
+  }
+  await loadClaimPage();
+}
+
+async function askResetOpportunity(){
+  if(claimActionInFlight){toast('已有领取/重置请求进行中，请稍候','warn');return;}
+  claimActionInFlight=true;
+  try{
+    const d=await postResetAction({action:'opportunity'});
+    if(d&&d.ok===true&&d.granted===true)toast('已获得自动重置额度，可在库存中直接使用','success');
+    else if(d&&d.ok===true)toast('暂无自动重置机会'+(d.nextTryAt?'（'+claimFmtUnix(d.nextTryAt)+' 后可再试）':''),'warn');
+    else toast('申请失败：'+((d&&d.error)||'未知错误'),'error');
+  }catch(e){
+    toast('请求失败：'+((e&&e.message)||e),'error');
+  }finally{
+    claimActionInFlight=false;
+  }
+  await loadClaimPage();
 }
 
 // --- Toast (enhanced) ---

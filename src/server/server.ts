@@ -18,7 +18,7 @@ import { handleMessages } from "./routes-anthropic.js";
 import { handleResponsesRoute } from "./routes-responses.js";
 import { handleAsyncMessagesRoute, handleAsyncChatRoute, handleAsyncHealthRoute } from "./routes-async.js";
 import { handleMcpListingRoute, handleMcpRelayRoute, type McpRouteOptions } from "./routes-mcp.js";
-import { handleQuota, handleQuotaReset, handleQuotaClaim, handleQuotaClaimSubmit } from "./routes-quota.js";
+import { handleQuota, handleQuotaReset, handleQuotaResetAction, handleQuotaClaim, handleQuotaClaimSubmit } from "./routes-quota.js";
 import { handleAdminRoute, type AdminOptions } from "../admin/api.js";
 import { errorResponse } from "../proxy/handler.js";
 import type { ResponseStore } from "../responses/store.js";
@@ -153,6 +153,9 @@ export function createFetchHandler(opts: ServerOptions): (req: Request) => Promi
 
     if (path === "/quota/reset" && method === "GET") {
       return handleQuotaReset(config, opts.fetchImpl);
+    }
+    if (path === "/quota/reset" && method === "POST") {
+      return handleQuotaResetAction(req, config, opts.fetchImpl);
     }
 
     if (path === "/quota/claim" && method === "GET") {

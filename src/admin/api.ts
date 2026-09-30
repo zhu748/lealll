@@ -1479,6 +1479,7 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
       const identityBody = optionalConfigObject(body, "identity");
       const loggingBody = optionalConfigObject(body, "logging");
       const providersBody = optionalConfigObject(body, "providers");
+      const claimBody = optionalConfigObject(body, "claim");
       if (hasModels && !Array.isArray(body.models)) {
         throw new Error("models must be an array");
       }
@@ -1527,6 +1528,12 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
       }
       if (identityBody) {
         newConfig.identity = { ...opts.config.identity, ...identityBody };
+      }
+      // Deep-merge the claim section the same way as retry/identity — without
+      // this a partial PUT like {"claim":{"planId":"x"}} would drop
+      // pollIntervalMs/cooldownMs and the scheduler would crash at next boot.
+      if (claimBody) {
+        newConfig.claim = { ...opts.config.claim, ...claimBody };
       }
       if (loggingBody) {
         newConfig.logging = { ...opts.config.logging, ...loggingBody };
@@ -1650,6 +1657,14 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
       // providers.*.anthropicBase / openaiBase: also hot-swappable
       if (providersBody) {
         opts.config.providers = newConfig.providers;
+      }
+      // claim.*: hot-swappable for the request-path default target
+      // (handleQuotaClaimSubmit reads claim.planId per request). The
+      // background scheduler reads the config at boot, so pollIntervalMs /
+      // cooldownMs changes still need a restart to re-arm — same semantics
+      // as the CLI's config file.
+      if (claimBody) {
+        opts.config.claim = newConfig.claim;
       }
       // v0.2.1.7+: server hot-swappable fields (NOT port/host — those need
       // restart, tracked in restartFields above). upstreamTimeoutMs,

@@ -104,6 +104,40 @@ describe("dashboard HTML inline scripts", () => {
     expect(html).toContain("logSearch').addEventListener('input',scheduleLogFilterRender)");
   });
 
+  it("renders the claim page with lazy loading, reset actions, and stale-response guards", () => {
+    const html = readDashboardHtml();
+    // Sidebar entry + page shell.
+    expect(html).toContain('<div class="nav-item" data-page="claim">');
+    expect(html).toContain('<div class="page" id="page-claim">');
+    // Lazy (re)load on every visit, not just the first.
+    expect(html).toContain("if(el.dataset.page==='claim')loadClaimPage();");
+    // Generation guards follow the shared dashboard convention.
+    expect(html).toContain("let claimPageGeneration=0");
+    expect(html).toContain("let claimActionInFlight=false");
+    expect(html).toContain("if(generation!==claimPageGeneration||!dashboardActionCurrent(requestInitGeneration,requestAuthToken))return;");
+    // Both planes load in parallel.
+    expect(html).toContain("API+'/quota/claim',{headers:authHeaders()},15000");
+    expect(html).toContain("API+'/quota/reset',{headers:authHeaders()},15000");
+    // Claim actions: per-plan button + default-target button + confirm dialog.
+    expect(html).toContain("onclick=\"claimPlan('')\" style=\"display:none\"");
+    expect(html).toContain("async function claimPlan(planId)");
+    expect(html).toContain("if(!confirm('确认领取？");
+    expect(html).toContain("body:JSON.stringify(planId?{plan_id:planId}:{})");
+    // 3.14.4 outcome fields render (user_plan_id / status / entitlements[]).
+    expect(html).toContain("function renderClaimOutcome(outcome)");
+    expect(html).toContain("outcome.userPlanId");
+    expect(html).toContain("claimFailureText(outcome.failureKind)");
+    // Reset card: status table + use/opportunity actions.
+    expect(html).toContain("function renderResetCard(d)");
+    expect(html).toContain("onclick=\"useQuotaReset(\\'five_hour\\')\"");
+    expect(html).toContain("onclick=\"useQuotaReset(\\'week\\')\"");
+    expect(html).toContain("async function askResetOpportunity()");
+    expect(html).toContain("{action:'use',type}");
+    expect(html).toContain("{action:'opportunity'}");
+    // Off-season campaign degrades to an empty state, not an error.
+    expect(html).toContain("if(d.available===false){");
+  });
+
   it("cancels queued log renders on logout, hide, and manual clear", () => {
     const html = readDashboardHtml();
     expect(html).toContain("let _logRenderTimer=null");

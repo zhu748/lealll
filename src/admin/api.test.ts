@@ -3717,6 +3717,26 @@ describe("PUT /admin/api/config — deep merge of nested objects (vceshi0.0.5+)"
     expect(opts.config.retry!.maxDelayMs).toBe(8000);
   });
 
+  it("partial claim update preserves other claim fields (scheduler survives partial PUTs)", async () => {
+    // Send only planId in the claim object. Without deep-merge this would drop
+    // pollIntervalMs/cooldownMs/enabled/auto and the auto-claim scheduler would
+    // crash or misbehave on the next boot.
+    const opts = makeAdminOpts();
+    const resp = await handleAdminRoute(
+      authedReq("/admin/api/config", {
+        method: "PUT",
+        body: JSON.stringify({ claim: { planId: "wk-campaign" } }),
+      }),
+      opts,
+    );
+    expect(resp!.status).toBe(200);
+    expect(opts.config.claim.planId).toBe("wk-campaign");
+    expect(opts.config.claim.enabled).toBe(opts.config.claim.enabled); // still defined
+    expect(typeof opts.config.claim.pollIntervalMs).toBe("number"); // preserved
+    expect(typeof opts.config.claim.cooldownMs).toBe("number"); // preserved
+    expect(opts.config.claim.origin.length).toBeGreaterThan(0); // preserved
+  });
+
   it("rejects invalid retryableStatuses without mutating live config", async () => {
     const opts = makeAdminOpts();
     const resp = await handleAdminRoute(
