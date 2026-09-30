@@ -22,6 +22,9 @@ import { buildIdentityHeaders, normalizePrintableHeaderValue } from "../proxy/id
 import { inspectJwt } from "../auth/jwt-age.js";
 import { credentialString, type Credential } from "../auth/types.js";
 import { createResetClient, DEFAULT_RESET_ORIGIN, type ResetStatus } from "../auth/reset.js";
+import { createClaimClient, ClaimPreviewError } from "../claim/client.js";
+import type { ClaimablePlan, ClaimOutcome } from "../claim/types.js";
+import { getCaptchaToken } from "../proxy/captcha.js";
 import type { ProxyConfig } from "../config/types.js";
 import { errorResponse } from "../proxy/handler.js";
 
@@ -38,7 +41,14 @@ export interface QuotaPlanEntry {
   planId: string;
   name: string;
   description?: string;
-  entitlements: Array<{ showName: string; grantUnits: number; unitType: string; effectiveAt?: number }>;
+  entitlements: Array<{
+    showName: string;
+    grantUnits: number;
+    unitType: string;
+    /** Grant recurrence — 3.14.4 adds "daily" | "one_time" (banner subtitle). */
+    period?: string;
+    effectiveAt?: number;
+  }>;
 }
 
 /**
@@ -243,6 +253,9 @@ export async function collectQuotaSnapshot(
         showName: String(e.show_name ?? ""),
         grantUnits: toFiniteNumber(e.grant_units ?? e.grantUnits) ?? 0,
         unitType: String(e.unit_type ?? e.unitType ?? "token"),
+        ...(typeof e.period === "string" && e.period.trim() !== ""
+          ? { period: e.period.trim() }
+          : {}),
         ...(toFiniteNumber(e.effective_at ?? e.effectiveAt) !== undefined
           ? { effectiveAt: toFiniteNumber(e.effective_at ?? e.effectiveAt) as number }
           : {}),
@@ -338,5 +351,156 @@ export async function handleQuotaReset(
     });
   } catch (e) {
     return errorResponse(503, "quota_reset_unavailable", `reset status query failed: ${(e as Error).message}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Manual claim plan (desktop 3.14.4 alignment) — limited-time trial-plan
+// claiming (the "100M tokens" style marketing events).
+//
+// The claim CLIENT lives in `src/claim/client.ts` (3.12.3 verbatim mirror +
+// campaign-proven X-Device-Mid deviation + Aliyun captcha pool). These routes
+// expose it over HTTP so the dashboard can render the banner data the desktop
+// shows (`manualClaimPlan.*` i18n namespace):
+//
+//   `GET /quota/claim`  — claimable plans for the active account (`billing/
+//                         preview` plane; 404 campaigns degrade to an empty
+//                         list, matching the desktop's “活动已结束” state).
+//   `POST /quota/claim` — claim one plan; body `{plan_id?}`. The captcha
+//                         verify param is solved in-process via the captcha
+//                         pool (`getCaptchaToken`) — the same path the CLI's
+//                         `claim now` uses. Business failures return the
+//                         upstream verdict `{success:false, code, failureKind}`
+//                         verbatim; transport failures use the error envelope.
+// ---------------------------------------------------------------------------
+
+/** Claim-plane snapshot served by `GET /quota/claim`. */
+export interface QuotaClaimSnapshot {
+  provider: string;
+  serverTime: number;
+  /** False when the campaign endpoint is not deployed (HTTP 404 off-season). */
+  available: boolean;
+  /** Human-readable blocker when `available === false`. */
+  reason?: string;
+  plans: ClaimablePlan[];
+}
+
+/** Collect claimable plans for the active credential. Exported for tests. */
+export async function collectClaimSnapshot(
+  config: ProxyConfig,
+  fetchImpl: typeof fetch = fetch,
+  loadCredentialImpl: typeof loadCredential = loadCredential,
+): Promise<QuotaClaimSnapshot> {
+  const cred = await loadCredentialImpl();
+  if (!cred) {
+    throw new Error("not logged in (run: zcode-proxy auth login)");
+  }
+  const client = createClaimClient({
+    origin: config.claim.origin || "https://zcode.z.ai",
+    jwt: cred.jwt,
+    appVersion: config.identity.appVersion,
+    platform: `${process.platform}-${os.arch()}`,
+    deviceMid: config.identity.deviceMid,
+    fetchImpl: fetchImpl as unknown as (url: string | URL | Request, init?: RequestInit) => Promise<Response>,
+  });
+  try {
+    const plans = await client.getPreviews();
+    return { provider: config.provider, serverTime: Math.floor(Date.now() / 1000), available: true, plans };
+  } catch (e) {
+    // Off-season: the desktop renders "活动已结束或套餐暂不可领取" — an empty
+    // list with `available:false`, not an error.
+    if (e instanceof ClaimPreviewError && e.status === 404) {
+      return {
+        provider: config.provider,
+        serverTime: Math.floor(Date.now() / 1000),
+        available: false,
+        reason: "campaign endpoint not deployed (404) — no claimable plans right now",
+        plans: [],
+      };
+    }
+    throw e;
+  }
+}
+
+/** Handle GET /quota/claim — claimable plans with the proxy error envelope on failure. */
+export async function handleQuotaClaim(
+  config: ProxyConfig,
+  fetchImpl: typeof fetch = fetch,
+  loadCredentialImpl: typeof loadCredential = loadCredential,
+): Promise<Response> {
+  try {
+    const snapshot = await collectClaimSnapshot(config, fetchImpl, loadCredentialImpl);
+    return new Response(JSON.stringify(snapshot, null, 1), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  } catch (e) {
+    return errorResponse(503, "quota_claim_unavailable", `claim preview failed: ${(e as Error).message}`);
+  }
+}
+
+/** Handle POST /quota/claim — claim the configured (or highest-priority) plan
+ * with an in-process solved captcha. Body `{plan_id?}` (optional: defaults to
+ * `claim.planId` from config, else the highest-priority preview). Business
+ * failures come back as 200 `{success:false,...}` verbatim from upstream.
+ * `captchaImpl` is a DI seam for tests (defaults to the real captcha pool). */
+export async function handleQuotaClaimSubmit(
+  req: Request,
+  config: ProxyConfig,
+  fetchImpl: typeof fetch = fetch,
+  loadCredentialImpl: typeof loadCredential = loadCredential,
+  captchaImpl: typeof getCaptchaToken = getCaptchaToken,
+): Promise<Response> {
+  let body: { plan_id?: unknown } = {};
+  try {
+    const text = await req.text();
+    if (text.trim() !== "") body = JSON.parse(text) as typeof body;
+  } catch {
+    return errorResponse(400, "claim_invalid_body", "request body must be JSON");
+  }
+  const cred = await loadCredentialImpl();
+  if (!cred) {
+    return errorResponse(401, "not_logged_in", "not logged in (run: zcode-proxy auth login)");
+  }
+  if (!cred.jwt?.trim()) {
+    return errorResponse(401, "claim_login_required", "claim requires the zcode plan JWT (re-login to capture it)");
+  }
+  const client = createClaimClient({
+    origin: config.claim.origin || "https://zcode.z.ai",
+    jwt: cred.jwt,
+    appVersion: config.identity.appVersion,
+    platform: `${process.platform}-${os.arch()}`,
+    deviceMid: config.identity.deviceMid,
+    fetchImpl: fetchImpl as unknown as (url: string | URL | Request, init?: RequestInit) => Promise<Response>,
+  });
+  try {
+    // Resolve the target plan: explicit body param → configured claim.planId
+    // → highest-priority preview (same precedence as runClaimCli).
+    let planId = typeof body.plan_id === "string" ? body.plan_id.trim() : "";
+    if (!planId) {
+      const plans = await client.getPreviews();
+      const wanted = config.claim.planId.trim();
+      const target = wanted
+        ? plans.find((p) => p.planId === wanted)
+        : [...plans].sort((a, b) => b.priority - a.priority)[0];
+      if (!target) {
+        return errorResponse(404, "claim_no_target", `no claimable plan to target (configured planId "${wanted}" not in preview)`);
+      }
+      planId = target.planId;
+    }
+    // Captcha solved in-process (pool take + happy-dom solve) — the same flow
+    // the CLI and scheduler use; the desktop solves the identical Aliyun
+    // widget locally before submitting.
+    const captcha = await captchaImpl(config.identity.appVersion);
+    const outcome: ClaimOutcome = await client.claim(planId, {
+      verifyParam: captcha.verifyParam,
+      region: captcha.region || undefined,
+    });
+    return new Response(JSON.stringify(outcome, null, 1), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  } catch (e) {
+    return errorResponse(502, "claim_submit_failed", `claim failed: ${(e as Error).message}`);
   }
 }

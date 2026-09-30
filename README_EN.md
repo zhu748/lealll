@@ -197,6 +197,8 @@ The plan type (`plan`: `coding-plan` personal / `start-plan` trial) can be toggl
 
 **Usage-window resets (reset, new in 4.7.2-fork.1)** — aligned with the coding-plan reset system added in ZCode desktop 3.14.4 (`/api/v1/coding-plan/reset/*`): accounts can hold reset entitlements (granted via rewards/events) that immediately clear the 5-hour or weekly usage window. CLI: `zcode-proxy reset` lists available resets and latest history, `zcode-proxy reset --use five_hour` / `--use week` spends one, `--opportunity` asks the server for an automatic grant; HTTP: `GET /quota/reset`. Accounts must re-login after upgrading (the credential now also stores the raw OAuth access token required by these endpoints).
 
+**Claim HTTP endpoints (claim, new in 4.7.3-fork.1)** — the desktop 3.14.4 limited-time trial-plan claiming (the "100M tokens" style events: `billing/preview` + `billing/claim` + Aliyun captcha) now also exposes two HTTP routes next to the existing CLI (`zcode-proxy claim`) and the background auto-claimer: `GET /quota/claim` lists currently claimable plans (a 404 off-season campaign degrades to `available:false` with an empty list, matching the desktop's "campaign ended" state); `POST /quota/claim` (optional body `{plan_id}`, defaults to the configured `claim.planId` or the highest-priority preview) solves the Aliyun captcha in-process and submits the claim. Success responses carry the 3.14.4 fields `user_plan_id` / `status` / `entitlements`; business failures (1001-1005: not found / ended / already claimed / ineligible / daily quota exhausted) pass through verbatim with the desktop's error codes.
+
 </details>
 
 ## 🧮 Available Models

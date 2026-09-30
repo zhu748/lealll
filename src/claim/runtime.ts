@@ -130,9 +130,15 @@ function printPlans(plans: ClaimablePlan[]): void {
 function printOutcome(outcome: ClaimOutcome): void {
   if (outcome.ok) {
     console.log(`\nClaimed: ${outcome.planId}`);
+    if (outcome.userPlanId !== undefined) console.log(`  user-plan: ${outcome.userPlanId}`);
+    if (outcome.status !== undefined) console.log(`  status:    ${outcome.status}`);
     if (outcome.startsAt !== undefined) console.log(`  activates: ${new Date(outcome.startsAt * 1000).toISOString()}`);
     if (outcome.endsAt !== undefined) console.log(`  expires:   ${new Date(outcome.endsAt * 1000).toISOString()}`);
     if (outcome.startsAt === undefined && outcome.endsAt === undefined) console.log("  active immediately");
+    for (const g of outcome.entitlements ?? []) {
+      const at = g.effectiveAt !== undefined ? ` (activates ${new Date(g.effectiveAt * 1000).toISOString()})` : "";
+      console.log(`  · ${g.showName || g.entitlementId}${at}`);
+    }
     return;
   }
   const label = FAILURE_LABELS[outcome.failureKind] ?? FAILURE_LABELS.unknown;

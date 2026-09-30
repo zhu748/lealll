@@ -213,6 +213,8 @@ services:
 
 **用量窗口重置 (reset，4.7.2-fork.1 新增)** —— 对齐 ZCode 桌面端 3.14.4 新增的编码套餐额度重置系统（`/api/v1/coding-plan/reset/*`）：账号可持有"重置券"（活动/奖励发放），花费一张立即清零 5 小时或每周用量窗口，无需等自然滚动。命令行：`zcode-proxy reset` 查看可用张数与最近使用记录，`zcode-proxy reset --use five_hour` / `--use week` 花费一张，`--opportunity` 向服务端申请自动重置机会；HTTP 接口 `GET /quota/reset` 返回同样信息。需要 4.7.2-fork.1 之后重新登录的账号（新版凭证额外保存 OAuth 原始 access token，老账号请重新 `auth login` 一次）。
 
+**活动额度领取 HTTP 接口 (claim，4.7.3-fork.1 新增)** —— 桌面端 3.14.4 的限时体验套餐领取（"一亿 token"类活动，`billing/preview` + `billing/claim` + 阿里云验证码）在既有 CLI（`zcode-proxy claim`）与后台自动抢领之外，新增两个 HTTP 接口供面板/脚本调用：`GET /quota/claim` 返回当前可领套餐列表（活动未部署时 404 自动降级为 `available:false` 空列表，与桌面端"活动已结束"状态一致）；`POST /quota/claim`（body 可选 `{plan_id}`，缺省用配置的 `claim.planId` 或最高优先级套餐）自动求解阿里云验证码后提交领取，成功响应包含 3.14.4 新增的 `user_plan_id` / `status` / `entitlements` 明细，业务失败（1001-1005：不存在/已结束/已领取/不符合条件/当日名额用完）按桌面端同款错误码透传。
+
 </details>
 
 ## 🧮 可用模型

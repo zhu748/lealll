@@ -390,3 +390,181 @@ describe("quota reset snapshot (collectResetSnapshot)", () => {
     expect(body.error?.type).toBe("quota_reset_unavailable");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Manual claim plan (desktop 3.14.4 alignment): GET /quota/claim snapshot and
+// POST /quota/claim submit — backed by the campaign-proven src/claim client.
+// ---------------------------------------------------------------------------
+
+import { collectClaimSnapshot, handleQuotaClaim, handleQuotaClaimSubmit } from "./routes-quota.js";
+
+describe("quota claim routes (collectClaimSnapshot / handleQuotaClaim*)", () => {
+  const claimCred: Credential = { apiKey: "key-x.secret-y", provider: "zai", jwt: makeJwt() };
+  const loadClaimCred = async (): Promise<Credential> => claimCred;
+
+  /** Upstream billing/preview mock serving one wk-campaign plan. */
+  const previewBody = {
+    code: 0,
+    data: {
+      server_time: 1759000000,
+      plans: [
+        {
+          plan_id: "wk-campaign",
+          name: "Weekend 100M",
+          description: "Limited trial",
+          priority: 10,
+          starts_at: 1759000000,
+          ends_at: 1759100000,
+          entitlements: [
+            {
+              entitlement_id: "ent-1",
+              show_name: "GLM-4.6 daily bonus",
+              meter: "glm-4.6",
+              unit_type: "token",
+              capabilities: ["chat"],
+              grant_units: 100000000,
+              period: "daily",
+              priority: 1,
+            },
+          ],
+        },
+      ],
+    },
+  };
+
+  it("collectClaimSnapshot maps the preview envelope to the claim snapshot", async () => {
+    const calls: string[] = [];
+    const fetchImpl: typeof fetch = (async (url: string | URL | Request) => {
+      calls.push(String(url instanceof Request ? url.url : url));
+      return new Response(JSON.stringify(previewBody), { status: 200 });
+    }) as unknown as typeof fetch;
+    const snap = await collectClaimSnapshot(makeConfig(), fetchImpl, loadClaimCred);
+    expect(snap.available).toBe(true);
+    expect(snap.plans).toHaveLength(1);
+    expect(snap.plans[0]?.planId).toBe("wk-campaign");
+    expect(snap.plans[0]?.entitlements[0]?.period).toBe("daily");
+    expect(snap.plans[0]?.entitlements[0]?.grantUnits).toBe(100000000);
+    // app_version + platform query params (desktop preview contract).
+    expect(calls[0]).toContain("/api/v1/zcode-plan/billing/preview?");
+    expect(calls[0]).toContain("app_version=test-1.0.0");
+    expect(calls[0]).toContain("platform=linux-");
+    // X-Device-Mid rides along (campaign gateway requirement).
+    const init = (fetchImpl as any).mock;
+    void init;
+  });
+
+  it("preview 404 (off-season) degrades to available:false with an empty list", async () => {
+    const fetchImpl: typeof fetch = (async (_url: string | URL | Request) =>
+      new Response("404 page not found", { status: 404 })) as unknown as typeof fetch;
+    const snap = await collectClaimSnapshot(makeConfig(), fetchImpl, loadClaimCred);
+    expect(snap.available).toBe(false);
+    expect(snap.plans).toEqual([]);
+    expect(snap.reason).toContain("404");
+  });
+
+  it("handleQuotaClaim returns 503 quota_claim_unavailable when not logged in", async () => {
+    const resp = await handleQuotaClaim(makeConfig(), fetch, loadNone);
+    expect(resp.status).toBe(503);
+    const body = (await resp.json()) as { error?: { type?: string } };
+    expect(body.error?.type).toBe("quota_claim_unavailable");
+  });
+
+  it("POST /quota/claim without a JWT returns 401 claim_login_required", async () => {
+    const jwtLess: Credential = { apiKey: "key-x.secret-y", provider: "zai" };
+    const resp = await handleQuotaClaimSubmit(
+      new Request("http://x/quota/claim", { method: "POST", body: "{}" }),
+      makeConfig(),
+      fetch,
+      async () => jwtLess,
+      async () => ({ verifyParam: "cap", region: "cn" }),
+    );
+    expect(resp.status).toBe(401);
+    const body = (await resp.json()) as { error?: { type?: string } };
+    expect(body.error?.type).toBe("claim_login_required");
+  });
+
+  it("POST /quota/claim with invalid JSON returns 400 claim_invalid_body", async () => {
+    const resp = await handleQuotaClaimSubmit(
+      new Request("http://x/quota/claim", { method: "POST", body: "not-json" }),
+      makeConfig(),
+      fetch,
+      loadClaimCred,
+      async () => ({ verifyParam: "cap", region: "cn" }),
+    );
+    expect(resp.status).toBe(400);
+    const body = (await resp.json()) as { error?: { type?: string } };
+    expect(body.error?.type).toBe("claim_invalid_body");
+  });
+
+  it("POST /quota/claim submits the captcha headers and returns the 3.14.4 outcome fields", async () => {
+    const postCalls: Array<{ url: string; init?: RequestInit }> = [];
+    const fetchImpl: typeof fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = String(url instanceof Request ? url.url : url);
+      if (u.includes("/billing/preview")) {
+        return new Response(JSON.stringify(previewBody), { status: 200 });
+      }
+      postCalls.push({ url: u, init });
+      return new Response(
+        JSON.stringify({
+          code: 0,
+          msg: "ok",
+          data: {
+            server_time: 1759000100,
+            plan: {
+              user_plan_id: "up-77",
+              plan_id: "wk-campaign",
+              status: "active",
+              starts_at: 1759000100,
+              ends_at: 1759100100,
+              entitlements: [{ entitlement_id: "ent-1", show_name: "GLM-4.6 daily bonus", effective_at: 1759000500 }],
+            },
+          },
+        }),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+    const resp = await handleQuotaClaimSubmit(
+      new Request("http://x/quota/claim", { method: "POST", body: JSON.stringify({ plan_id: "wk-campaign" }) }),
+      makeConfig(),
+      fetchImpl,
+      loadClaimCred,
+      async () => ({ verifyParam: "captcha-token", region: "cn-gd" }),
+    );
+    expect(resp.status).toBe(200);
+    const body = (await resp.json()) as any;
+    expect(body.ok).toBe(true);
+    expect(body.planId).toBe("wk-campaign");
+    expect(body.userPlanId).toBe("up-77");
+    expect(body.status).toBe("active");
+    expect(body.entitlements[0].entitlementId).toBe("ent-1");
+    // Claim request carries the Aliyun captcha headers + billing fingerprint.
+    const headers = postCalls[0]?.init?.headers as Record<string, string>;
+    expect(headers["X-Aliyun-Captcha-Verify-Param"]).toBe("captcha-token");
+    expect(headers["X-Aliyun-Captcha-Verify-Region"]).toBe("cn-gd");
+    expect(headers["X-ZCode-App-Version"]).toBe("test-1.0.0");
+    expect(headers["X-Platform"]).toContain("linux-");
+  });
+
+  it("POST /quota/claim surfaces upstream business failures verbatim (code 1005)", async () => {
+    const fetchImpl: typeof fetch = (async (url: string | URL | Request) => {
+      const u = String(url instanceof Request ? url.url : url);
+      if (u.includes("/billing/preview")) return new Response(JSON.stringify(previewBody), { status: 200 });
+      return new Response(
+        JSON.stringify({ code: 1005, msg: "quota exhausted", data: { plan: { ends_at: 1759100000 } } }),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+    const resp = await handleQuotaClaimSubmit(
+      new Request("http://x/quota/claim", { method: "POST", body: JSON.stringify({ plan_id: "wk-campaign" }) }),
+      makeConfig(),
+      fetchImpl,
+      loadClaimCred,
+      async () => ({ verifyParam: "cap", region: "cn" }),
+    );
+    expect(resp.status).toBe(200);
+    const body = (await resp.json()) as any;
+    expect(body.ok).toBe(false);
+    expect(body.failureKind).toBe("quota_exhausted");
+    expect(body.failureEndsAt).toBe(1759100000);
+  });
+});

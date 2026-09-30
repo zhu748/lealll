@@ -23,8 +23,10 @@ import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { ensureNodeFetchNoTimeouts } from "./runtime/node-fetch-compat.js";
 import { initPool } from "./proxy/proxy-pool.js";
-
-export const VERSION = "4.7.2-fork.1";
+import { VERSION } from "./version.js";
+// tui/app.ts historically imported VERSION from this module; keep the
+// re-export so the version source stays package.json → version.ts only.
+export { VERSION };
 
 if (require.main === module) main();
 

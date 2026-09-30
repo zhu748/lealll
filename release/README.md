@@ -1,5 +1,22 @@
 # zcode-proxy 使用说明
 
+> **v4.7.3-fork.1 — 活动额度领取 HTTP 接口 + 对齐桌面端 3.14.4 领取协议**
+>
+> - 新增 `GET /quota/claim`（列出当前可领的限时体验套餐，即"一亿 token"类活动页数据）与 `POST /quota/claim`（自动求解阿里云验证码后提交领取，可传 `{plan_id}` 指定套餐）。与既有 CLI `zcode-proxy claim [list|now]`、后台自动抢领共用同一套实战验证过的客户端（含活动网关要求的 X-Device-Mid 指纹）。
+> - 领取成功响应新增桌面端 3.14.4 字段：`user_plan_id`、`status`、`entitlements` 明细；业务失败（1001 不存在 / 1002 已结束 / 1003 已领取 / 1004 不符合条件 / 1005 当日名额用完）按桌面端同款错误码透传。
+> - `GET /quota` 的 claimablePlans 现在也返回套餐权益的 `period`（daily / one_time）字段。
+> - 命令行与脚本均可调用：`curl -X POST http://127.0.0.1:PORT/quota/claim -d '{}'`。
+>
+> 升级建议：直接替换二进制；无需重新登录（claim 使用既有 JWT 凭证）。
+
+> **v4.7.2-fork.1 — 对齐上游 v4.7.2 + 用量窗口重置 (reset)**
+>
+> - 合并上游 TriDefender/zcode-api v4.7.2 全部改动，fork 自研能力（多账号库 / Web 面板 / 代理池 / 故障转移 / 统计）零丢失。
+> - 新增编码套餐用量窗口重置（对齐桌面端 3.14.4）：`zcode-proxy reset` 查看重置券、`--use five_hour|week` 花费一张立即清零 5 小时/周用量窗口、`--opportunity` 申请自动重置机会；HTTP `GET /quota/reset`。
+> - 凭证新增 OAuth 原始 access token（maasToken）字段，重置端点要求双 token —— **老账号需重新 `auth login` 一次**。
+>
+> 升级建议：替换二进制后重新执行一次 `zcode-proxy auth login`（reset 功能需要）。
+
 > **v4.7.1-fork.1 — 对齐上游 v4.7.1：多账号 + Web 管理面板 + claim 领取优惠全部就位**
 >
 > 本版本是 fork（zhu748/lealll 多账号分支）与原作者最新上游（TriDefender/zcode-api v4.7.1）的合并版：上游两个月来的全部更新被完整吸收，fork 的自研能力全部保留。

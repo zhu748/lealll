@@ -81,6 +81,15 @@ interface RawEntitlement {
   effective_at?: number;
 }
 
+interface RawClaimedPlan {
+  user_plan_id?: string;
+  plan_id?: string;
+  status?: string;
+  starts_at?: number;
+  ends_at?: number;
+  entitlements?: Array<{ entitlement_id?: string; show_name?: string; effective_at?: number }>;
+}
+
 interface RawPlan {
   plan_id?: string;
   name?: string;
@@ -209,13 +218,35 @@ export function createClaimClient(opts: ClaimClientOptions): ClaimClient {
       if (deviceMid) headers["X-Device-Mid"] = deviceMid;
       const { status, json, text } = await request("POST", "/api/v1/zcode-plan/billing/claim", { body: { plan_id: planId }, headers, signal });
 
-      const data = json?.data as { plan?: RawPlan } | undefined;
+      const data = json?.data as { plan?: RawPlan | RawClaimedPlan } | undefined;
       const bizCode = json?.code !== undefined ? (json.code as number) : undefined;
       const plan = data?.plan;
       if (status >= 200 && status < 300 && bizCode === 0 && plan) {
+        // 3.14.4 echoes the claimed plan with user_plan_id/status/entitlements;
+        // older campaigns returned bare starts_at/ends_at — accept both.
+        const claimed = plan as RawClaimedPlan;
         const out: ClaimOutcome = { ok: true, planId };
         if (Number.isFinite(plan.starts_at)) out.startsAt = plan.starts_at as number;
         if (Number.isFinite(plan.ends_at)) out.endsAt = plan.ends_at as number;
+        if (typeof claimed.user_plan_id === "string" && claimed.user_plan_id.trim()) {
+          out.userPlanId = claimed.user_plan_id.trim();
+        }
+        if (typeof claimed.status === "string" && claimed.status.trim()) {
+          out.status = claimed.status.trim();
+        }
+        const grants = Array.isArray(claimed.entitlements)
+          ? claimed.entitlements.flatMap((e) => {
+              const id = e?.entitlement_id?.trim() ?? "";
+              if (!id) return [];
+              const g: { entitlementId: string; showName: string; effectiveAt?: number } = {
+                entitlementId: id,
+                showName: e.show_name?.trim() ?? "",
+              };
+              if (Number.isFinite(e?.effective_at)) g.effectiveAt = e.effective_at as number;
+              return [g];
+            })
+          : [];
+        if (grants.length > 0) out.entitlements = grants;
         return out;
       }
       const { code, message } = unwrapError(json, status, text);

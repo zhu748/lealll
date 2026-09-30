@@ -47,7 +47,18 @@ export type ClaimFailureKind =
   | "unknown";
 
 export type ClaimOutcome =
-  | { ok: true; planId: string; startsAt?: number; endsAt?: number }
+  | {
+      ok: true;
+      planId: string;
+      startsAt?: number;
+      endsAt?: number;
+      /** Server-side user-plan record id (3.14.4 `data.plan.user_plan_id`). */
+      userPlanId?: string;
+      /** Plan status string (3.14.4 `data.plan.status`, e.g. `"active"`). */
+      status?: string;
+      /** Grant details echoed by the claim response (3.14.4 entitlements[]). */
+      entitlements?: Array<{ entitlementId: string; showName: string; effectiveAt?: number }>;
+    }
   | { ok: false; planId: string; failureKind: ClaimFailureKind; code: number | string; message: string; failureEndsAt?: number };
 
 /** Map a server biz code to the client failure kind (mirrors `$vt` in the desktop bundle). */
