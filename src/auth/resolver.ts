@@ -166,6 +166,9 @@ export class KeyResolver {
 
       const cred: Credential = { apiKey, secret, provider: "zai", plan, userId };
       if (email) cred.email = email;
+      // 4.7.2-fork.1: retain the raw OAuth access token — the 3.14.4 desktop
+      // reset endpoints require it as `X-Bigmodel-Authorization`.
+      cred.maasToken = accessToken;
       return cred;
     }
 
@@ -183,6 +186,8 @@ export class KeyResolver {
 
     const cred: Credential = { apiKey: fullKey, provider: "bigmodel", plan, userId };
     if (email) cred.email = email;
+    // 4.7.2-fork.1: bigmodel OAuth token doubles as the MAAS authorization.
+    cred.maasToken = accessToken;
     return cred;
   }
 
@@ -237,6 +242,7 @@ export class KeyResolver {
         userId,
       };
       if (email) cred.email = email;
+      cred.maasToken = accessToken;
       return cred;
     }
   }

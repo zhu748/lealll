@@ -28,6 +28,19 @@ export interface Credential {
   /** JWT token for start-plan (zcode.z.ai). Present when login captured the ZCode plan token. */
   jwt?: string;
   /**
+   * Raw OAuth provider access token (`data.zai.access_token` / `data.bigmodel.access_token`
+   * of the poll `ready` response), stored alongside the derived `apiKey`.
+   *
+   * The 3.14.4 desktop client sends this value as `X-Bigmodel-Authorization` on the
+   * coding-plan reset endpoints (`/api/v1/coding-plan/reset/*`) in addition to the
+   * zcode plan JWT (`Authorization: Bearer <jwt>`). Older accounts logged in before
+   * this field existed lack it — the reset client surfaces a re-login hint in that
+   * case instead of sending a broken request.
+   *
+   * Introduced in 4.7.2-fork.1 (desktop 3.14.4 alignment).
+   */
+  maasToken?: string;
+  /**
    * Outbound HTTP proxy URL (per-account override).
    *
    * When set, all upstream requests made under this credential are routed

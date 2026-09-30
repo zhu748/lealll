@@ -195,6 +195,8 @@ The plan type (`plan`: `coding-plan` personal / `start-plan` trial) can be toggl
 
 **Quota display (quota)** — after login the panel fetches quota once automatically; refresh manually with <kbd>r</kbd>. Data comes from two upstream planes: trial/credits-plan buckets (`billing/balance`, remaining / total units, expiry) and individual coding-plan usage windows (`/api/monitor/usage/quota/limit`, same endpoint the official usage panel reads — 5-hour / weekly window remaining / total and reset time). CLI: `bun run src/index.ts quota` (HTTP: `GET /quota`). The upstream gateways rate-limit frequent queries, so the panel does not poll on a timer.
 
+**Usage-window resets (reset, new in 4.7.2-fork.1)** — aligned with the coding-plan reset system added in ZCode desktop 3.14.4 (`/api/v1/coding-plan/reset/*`): accounts can hold reset entitlements (granted via rewards/events) that immediately clear the 5-hour or weekly usage window. CLI: `zcode-proxy reset` lists available resets and latest history, `zcode-proxy reset --use five_hour` / `--use week` spends one, `--opportunity` asks the server for an automatic grant; HTTP: `GET /quota/reset`. Accounts must re-login after upgrading (the credential now also stores the raw OAuth access token required by these endpoints).
+
 </details>
 
 ## 🧮 Available Models

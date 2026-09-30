@@ -21,6 +21,7 @@ import { loadCredential } from "../auth/store.js";
 import { buildIdentityHeaders, normalizePrintableHeaderValue } from "../proxy/identity.js";
 import { inspectJwt } from "../auth/jwt-age.js";
 import { credentialString, type Credential } from "../auth/types.js";
+import { createResetClient, DEFAULT_RESET_ORIGIN, type ResetStatus } from "../auth/reset.js";
 import type { ProxyConfig } from "../config/types.js";
 import { errorResponse } from "../proxy/handler.js";
 
@@ -274,5 +275,68 @@ export async function handleQuota(
     });
   } catch (e) {
     return errorResponse(503, "quota_unavailable", `quota query failed: ${(e as Error).message}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Coding-plan reset (desktop 3.14.4 alignment, 4.7.2-fork.1)
+//
+// `GET /quota/reset` — reset entitlements for the active account, fetched from
+// the zcode plane (`/api/v1/coding-plan/reset/status`). Kept separate from
+// `/quota` so the (heavier) billing/monitor snapshot stays untouched; the
+// dashboard polls both in parallel. Accounts missing the dual reset tokens
+// (pre-4.7.2-fork.1 logins have no stored `maasToken`) degrade to
+// `{available:false, reason}` instead of failing the whole response.
+// ---------------------------------------------------------------------------
+
+/** Reset snapshot served by `GET /quota/reset`. */
+export interface QuotaResetSnapshot {
+  provider: string;
+  serverTime: number;
+  /** False when the account cannot use the reset endpoints (tokens missing / request failed). */
+  available: boolean;
+  /** Human-readable blocker when `available === false` (re-login hint etc.). */
+  reason?: string;
+  status: ResetStatus | null;
+}
+
+/** Collect the reset snapshot for the active credential. Exported for tests. */
+export async function collectResetSnapshot(
+  config: ProxyConfig,
+  fetchImpl: typeof fetch = fetch,
+  loadCredentialImpl: typeof loadCredential = loadCredential,
+): Promise<QuotaResetSnapshot> {
+  const cred = await loadCredentialImpl();
+  if (!cred) {
+    throw new Error("not logged in (run: zcode-proxy auth login)");
+  }
+  const client = createResetClient(cred, {
+    origin: config.claim.origin || DEFAULT_RESET_ORIGIN,
+    fetchImpl,
+    identity: config.identity,
+  });
+  try {
+    const status = await client.getStatus();
+    return { provider: config.provider, serverTime: Math.floor(Date.now() / 1000), available: true, status };
+  } catch (e) {
+    const reason = e instanceof Error ? e.message : String(e);
+    return { provider: config.provider, serverTime: Math.floor(Date.now() / 1000), available: false, reason, status: null };
+  }
+}
+
+/** Handle GET /quota/reset — reset entitlements with the proxy error envelope on failure. */
+export async function handleQuotaReset(
+  config: ProxyConfig,
+  fetchImpl: typeof fetch = fetch,
+  loadCredentialImpl: typeof loadCredential = loadCredential,
+): Promise<Response> {
+  try {
+    const snapshot = await collectResetSnapshot(config, fetchImpl, loadCredentialImpl);
+    return new Response(JSON.stringify(snapshot, null, 1), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  } catch (e) {
+    return errorResponse(503, "quota_reset_unavailable", `reset status query failed: ${(e as Error).message}`);
   }
 }

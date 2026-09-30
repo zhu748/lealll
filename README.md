@@ -211,6 +211,8 @@ services:
 
 **额度显示 (quota)** —— 登录后面板会自动查一次额度，之后按 <kbd>r</kbd> 手动刷新。数据来自上游两个额度平面：体验/积分制套餐的积分桶（`billing/balance`，剩余 / 总额、到期时间），以及个人编码套餐的用量窗口（`/api/monitor/usage/quota/limit`，与官方用量面板同源，5 小时 / 周窗口的剩余 / 总量与重置时间）。命令行直接查：`bun run src/index.ts quota`（对应 HTTP 接口 `GET /quota`）。注意上游网关对频繁查询有限速，所以面板不做定时轮询。
 
+**用量窗口重置 (reset，4.7.2-fork.1 新增)** —— 对齐 ZCode 桌面端 3.14.4 新增的编码套餐额度重置系统（`/api/v1/coding-plan/reset/*`）：账号可持有"重置券"（活动/奖励发放），花费一张立即清零 5 小时或每周用量窗口，无需等自然滚动。命令行：`zcode-proxy reset` 查看可用张数与最近使用记录，`zcode-proxy reset --use five_hour` / `--use week` 花费一张，`--opportunity` 向服务端申请自动重置机会；HTTP 接口 `GET /quota/reset` 返回同样信息。需要 4.7.2-fork.1 之后重新登录的账号（新版凭证额外保存 OAuth 原始 access token，老账号请重新 `auth login` 一次）。
+
 </details>
 
 ## 🧮 可用模型

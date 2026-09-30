@@ -527,6 +527,10 @@ function normalizeCredential(raw: unknown): Credential | null {
   if (userId) cred.userId = userId;
   const jwt = normalizeNonEmptyString(raw.jwt);
   if (jwt) cred.jwt = jwt;
+  // 4.7.2-fork.1: raw OAuth provider access token (desktop 3.14.4 reset
+  // endpoints use it as X-Bigmodel-Authorization).
+  const maasToken = normalizeNonEmptyString(raw.maasToken);
+  if (maasToken) cred.maasToken = maasToken;
   const proxy = normalizeNonEmptyString(raw.proxy);
   if (proxy && validateProxyUrl(proxy).ok) cred.proxy = proxy;
   const name = normalizeNonEmptyString(raw.name);

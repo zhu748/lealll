@@ -319,3 +319,74 @@ describe("collectQuotaSnapshot coding plane", () => {
     expect(snap.errors).toEqual([]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// GET /quota/reset — coding-plan reset entitlements (desktop 3.14.4 alignment)
+// ---------------------------------------------------------------------------
+
+import { collectResetSnapshot, handleQuotaReset } from "./routes-quota.js";
+
+describe("quota reset snapshot (collectResetSnapshot)", () => {
+  // Local jwt-less loader (the coding-plane describe block keeps its own copy).
+  const resetJwtLessCred: Credential = { apiKey: "key-x.secret-y", provider: "zai" };
+  const loadJwtLessReset = async (): Promise<Credential> => resetJwtLessCred;
+
+  // Dual-token credential: the reset endpoints need jwt + maasToken.
+  const resetCred: Credential = { apiKey: "key-x.secret-y", provider: "zai", jwt: makeJwt(), maasToken: "maas-token" };
+  const loadResetCred = async (): Promise<Credential> => resetCred;
+
+  it("maps a successful status envelope to the reset snapshot", async () => {
+    const fetchImpl: typeof fetch = (async (url: string | URL | Request) => {
+      const u = String(url instanceof Request ? url.url : url);
+      if (u.endsWith("/api/v1/coding-plan/reset/status")) {
+        return new Response(
+          JSON.stringify({
+            code: 0,
+            data: {
+              available_five_hour_resets: [{ expire_at: 1000 }],
+              available_week_resets: [],
+              latest_five_hour_reset_history: null,
+              latest_week_reset_history: { used_at: 700 },
+              has_unread_history: false,
+            },
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response("unexpected", { status: 404 });
+    }) as typeof fetch;
+    const snap = await collectResetSnapshot(makeConfig(), fetchImpl, loadResetCred);
+    expect(snap.available).toBe(true);
+    expect(snap.status?.availableFiveHourResets).toEqual([{ expireAt: 1000 }]);
+    expect(snap.status?.latestWeekResetHistory).toEqual({ usedAt: 700 });
+    expect(snap.reason).toBeUndefined();
+  });
+
+  it("credential without dual reset tokens degrades to available:false with a re-login hint", async () => {
+    // jwt-less account: the reset client throws ResetAuthMissingError before
+    // any network call; the snapshot layer converts it into a soft failure.
+    const fetchImpl = (async (_url: string | URL | Request) => {
+      throw new Error("network must not be reached");
+    }) as unknown as typeof fetch;
+    const snap = await collectResetSnapshot(makeConfig(), fetchImpl, loadJwtLessReset);
+    expect(snap.available).toBe(false);
+    expect(snap.status).toBeNull();
+    expect(snap.reason).toBeTruthy();
+  });
+
+  it("upstream failure degrades to available:false, reason carries the message", async () => {
+    const fetchImpl: typeof fetch = (async (_url: string | URL | Request) =>
+      new Response(JSON.stringify({ code: 3103, msg: "quota exhausted" }), { status: 200 })) as unknown as typeof fetch;
+    const snap = await collectResetSnapshot(makeConfig(), fetchImpl, loadResetCred);
+    expect(snap.available).toBe(false);
+    // Upstream error reader prefers the server msg over the raw code string.
+    expect(snap.reason).toContain("quota exhausted");
+  });
+
+  it("handleQuotaReset returns the proxy error envelope when not logged in", async () => {
+    const resp = await handleQuotaReset(makeConfig(), fetch, loadNone);
+    expect(resp.status).toBe(503);
+    const body = (await resp.json()) as { error?: { type?: string } };
+    expect(body.error?.type).toBe("quota_reset_unavailable");
+  });
+});
