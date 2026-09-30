@@ -4,6 +4,15 @@
  * Upstream base: TriDefender/zcode-api v4.7.2 (claim / MCP / TUI / captcha
  * worker architecture). Fork layer: zhu748/lealll multi-account store +
  * web dashboard + proxy pool + retry resilience (v0.3.10.11 lineage).
+ *
+ * v4.7.5-fork.1 (desktop 3.14.4 alignment, supplemental): added MCP usage
+ * quota query (`/api/v1/mcp/usage`), remote provider config delivery
+ * (`/api/v1/client/configs`), subscription availability probe
+ * (`/api/biz/subscription/list`). GET /quota now returns `mcpUsage` +
+ * `subscriptionAvailability` fields alongside the existing balances /
+ * codingPlan / claimablePlans. All four supplemental planes fail-open
+ * (null / kind:"unknown") to match the desktop's tolerance.
+ *
  * The dashboard replaces `__ZCODE_PROXY_VERSION__` with this value.
  */
-export const VERSION = "4.7.4-fork.1";
+export const VERSION = "4.7.5-fork.1";

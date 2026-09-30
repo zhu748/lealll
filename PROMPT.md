@@ -4,6 +4,8 @@
 
 ZCode 的 system prompt 由多个模块化 section 组合注入，按 `injectionTarget` 分为 `system` 和 `meta_user` 两类，按 `cacheHint` 分为 `stable` 和 `dynamic`。
 
+> **2026-09-30 刷新（对齐 ZCode 3.14.4 build 10bbcea5）**：再次解包 3.14.4 linux-x64 AppImage，逐符号验证 PROMPT.md 中所有关键符号（Hre/nct/Wre/Ylt/T9o/STr/xTr/blt/tct/Vre/pK/p2/u9o/wTr/Xlt/eMi/fio/g6n/CSs/IJt/V6n/IL/lsa/csa/tq/Oe/cU/Llr/yE/c5/Plt/Mlt）在 3.14.4 CLI bundle 中均存在；现行 §1-3/§7/§9 各 section 标志句唯一命中，旧版 §4/§5/§6 零命中（与 PROMPT.md 既有说明一致）。system prompt 模拟层无需任何调整。3.14.4 解包资产保留于 `_reverse/3.14.4/`。
+
 > **2026-09-11 刷新（对齐 ZCode 3.11.2 CLI bundle）**：本文档已按 `_reverse/zcode.cjs`（3.11.2）
 > 的 `ContextBuilder`（`Hre`）逐符号核对更新。注意两点：
 > 1. **§4 Task Behavior / §5 Risky Actions / §6 Communication Style 是 2026-06-20 提取时的旧版

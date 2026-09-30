@@ -79,8 +79,8 @@ models:
 identity:
   # Mirrors process.env.ZCODE_APP_VERSION in the ZCode bundle.
   # Must be printable ASCII; non-conforming values fall back to the default.
-  # Default: "3.14.0" (current ZCode release). Override to match your real client.
-  appVersion: "3.14.0"
+  # Default: "3.14.4" (current ZCode release). Override to match your real client.
+  appVersion: "3.14.4"
   # X-Title suffix → "Z Code@{sourceTitle}". Default "cli".
   sourceTitle: "cli"
   # HTTP-Referer URL. Default "https://zcode.z.ai".
@@ -127,6 +127,12 @@ mcp:
   webReader: false
   # (planned) Inject the three `zread` tools (search_doc/get_repo_structure/read_file).
   zread: false
+  # --- 3.14.4 supplemental: MCP gateway usage quota (v4.7.5-fork.1) ---
+  # When enabled, GET /quota fetches /api/v1/mcp/usage on the zcode plane
+  # and returns it in the `mcpUsage` field. The desktop uses this to render
+  # the plugin-MCP gateway usage panel. Fail-open: any error → null.
+  # Env: ZCODE_MCP_USAGE_ENABLED=false to disable.
+  usageEnabled: true
   # Official plugin-MCP gateway relay (tianyancha / Wind / 同花顺 iFinD ...).
   # GET /mcp lists the served endpoints; /mcp/{server} relays MCP streamable
   # HTTP to Z.AI's official gateway with your OAuth login injected — inbound
@@ -146,6 +152,37 @@ mcp:
     # Production default per the desktop bundle (`jee`); the
     # chatglm.site variant is the TEST env origin.
     upstreamOrigin: https://zcode.z.ai
+
+# --- 3.14.4 supplemental: remote provider config delivery (v4.7.5-fork.1) ---
+# Mirrors the desktop `xnr` function: on startup, fetch
+# /api/v1/client/configs?app_version=X&platform=Y to discover a CDN URL
+# pointing to the latest zcode-builtin.json (model list). The desktop uses
+# this to push new GLM model releases without an app upgrade.
+# The proxy merges the remote model list with the local `models:` field
+# above (remote wins); failures silently fall back to local-only, matching
+# the desktop's catch → local-fallback behavior.
+# Env: ZCODE_CLIENT_CONFIG_REFRESH_ON_START=false to disable,
+#      ZCODE_CLIENT_CONFIG_ORIGIN to override the endpoint origin.
+clientConfig:
+  refreshOnStart: true
+  origin: "https://zcode.z.ai"
+  # Request timeout in ms (desktop uses 20s in `xnr`).
+  timeoutMs: 20000
+
+# --- 3.14.4 supplemental: coding-plan subscription availability (v4.7.5-fork.1) ---
+# Mirrors the desktop `validateCodingPlanProviderAvailability` function:
+# probe /api/biz/subscription/list to check whether the active credential
+# has a usable coding-plan subscription. Used by the multi-account
+# credential rotation loop to skip expired subscriptions without burning
+# a credential-switch threshold on a 401.
+# Returns {kind:"unknown"|"available"|"unavailable"}; "unknown" is
+# fail-open for transient errors (do not skip the account).
+# Env: ZCODE_SUBSCRIPTION_CHECK_ON_SWITCH=false to disable,
+#      ZCODE_SUBSCRIPTION_ORIGIN to override the biz plane origin.
+subscription:
+  checkOnSwitch: true
+  origin: "https://api.z.ai"
+  timeoutMs: 15000
 
 # Async (off-peak / "idle plan") bridge.
 # When enabled, exposes POST /async/v1/messages and /async/v1/chat/completions

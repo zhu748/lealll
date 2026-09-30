@@ -4,7 +4,7 @@
  */
 import { readFileSync, existsSync } from "node:fs";
 import { parse } from "yaml";
-import type { ClientIdentityConfig, ProxyConfig, ProviderEndpoints, ProxyIdentity, ResponsesConfig, McpConfig, AsyncConfig, EndpointRoutingConfig, ClientSigningConfig, ClaimConfig, RetryConfig, RoutingRule, ModelMapping, ResponsesThinkingConfig } from "./types.js";
+import type { ClientIdentityConfig, ProxyConfig, ProviderEndpoints, ProxyIdentity, ResponsesConfig, McpConfig, AsyncConfig, EndpointRoutingConfig, ClientSigningConfig, ClaimConfig, RetryConfig, RoutingRule, ModelMapping, ResponsesThinkingConfig, ClientConfigConfig, SubscriptionConfig } from "./types.js";
 
 /** Environment variable keys that override YAML values. */
 const ENV = {
@@ -26,6 +26,11 @@ const ENV = {
   CLIENT_SIGNING_ENABLED: "ZCODE_CLIENT_SIGNING",
   MCP_GATEWAY_ENABLED: "ZCODE_MCP_GATEWAY",
   MCP_GATEWAY_ORIGIN: "ZCODE_MCP_GATEWAY_ORIGIN",
+  MCP_USAGE_ENABLED: "ZCODE_MCP_USAGE_ENABLED",
+  CLIENT_CONFIG_REFRESH_ON_START: "ZCODE_CLIENT_CONFIG_REFRESH_ON_START",
+  CLIENT_CONFIG_ORIGIN: "ZCODE_CLIENT_CONFIG_ORIGIN",
+  SUBSCRIPTION_CHECK_ON_SWITCH: "ZCODE_SUBSCRIPTION_CHECK_ON_SWITCH",
+  SUBSCRIPTION_ORIGIN: "ZCODE_SUBSCRIPTION_ORIGIN",
   // --- fork multi-account / resilience extensions ---
   AUTH_MODE: "ZCODE_PROXY_AUTH_MODE",
   API_KEY: "ZCODE_PROXY_APIKEY",
@@ -45,7 +50,7 @@ const ENV = {
 
 /** Mirrors the ZCode desktop release (`_reverse/NOTEPAD.md`); bump per client
  *  release or User-Agent/X-ZCode-App-Version become distinguishable. */
-export const DEFAULT_APP_VERSION = "3.14.0";
+export const DEFAULT_APP_VERSION = "3.14.4";
 
 const DEFAULTS = {
   PORT: 8080,
@@ -76,6 +81,14 @@ const DEFAULTS = {
   // bundle `jee`; the `sYe` fallback "https://zcode.chatglm.site" is the TEST
   // env origin — NOT for production traffic. 3.14.3 `p1`/`air`).
   MCP_GATEWAY_ORIGIN: "https://zcode.z.ai",
+  // 3.14.4 supplemental (v4.7.5-fork.1): MCP usage quota + remote provider config + subscription availability
+  MCP_USAGE_ENABLED: true,
+  CLIENT_CONFIG_REFRESH_ON_START: true,
+  CLIENT_CONFIG_ORIGIN: "https://zcode.z.ai",
+  CLIENT_CONFIG_TIMEOUT_MS: 20000,
+  SUBSCRIPTION_CHECK_ON_SWITCH: true,
+  SUBSCRIPTION_ORIGIN: "https://api.z.ai",
+  SUBSCRIPTION_TIMEOUT_MS: 15000,
   ASYNC_ENABLED: false,
   ASYNC_ORIGIN: "https://zcode.z.ai",
   ASYNC_POLL_INTERVAL_MS: 5000,
@@ -194,6 +207,8 @@ export function loadConfig(path: string): ProxyConfig {
   const clientIdentity = resolveClientIdentity(parsed?.clientIdentity);
   const responses = resolveResponsesConfig(parsed?.responses);
   const mcp = resolveMcpConfig(parsed?.mcp);
+  const clientConfig = resolveClientConfig(parsed?.clientConfig);
+  const subscription = resolveSubscriptionConfig(parsed?.subscription);
   const asyncCfg = resolveAsyncConfig(parsed?.async);
   const claimCfg = resolveClaimConfig(parsed?.claim);
   const endpointRouting = resolveEndpointRoutingConfig(parsed?.endpointRouting);
@@ -235,6 +250,8 @@ export function loadConfig(path: string): ProxyConfig {
     endpointRouting,
     clientSigning,
     mcp,
+    ...(clientConfig ? { clientConfig } : {}),
+    ...(subscription ? { subscription } : {}),
     async: asyncCfg,
     claim: claimCfg,
     logging: { level: logLevel, verbose: verboseLogging, debug: debugLogging, file: logFile, headerDebug },
@@ -282,15 +299,73 @@ function resolveMcpConfig(raw: unknown): McpConfig {
   const gwOrigin = (gwOriginEnv ?? (typeof gwRaw.upstreamOrigin === "string" ? gwRaw.upstreamOrigin : DEFAULTS.MCP_GATEWAY_ORIGIN)).trim()
     || DEFAULTS.MCP_GATEWAY_ORIGIN;
   validateOrigin(gwOrigin, "mcp.gateway.upstreamOrigin");
+  const usageEnabledEnv = process.env[ENV.MCP_USAGE_ENABLED];
   return {
     enabled: resolveBool(obj.enabled, DEFAULTS.MCP_ENABLED),
     webSearch: resolveBool(obj.webSearch ?? obj.web_search, DEFAULTS.MCP_WEB_SEARCH),
     webReader: resolveBool(obj.webReader ?? obj.web_reader, DEFAULTS.MCP_WEB_READER),
     zread: resolveBool(obj.zread, DEFAULTS.MCP_ZREAD),
+    usageEnabled: usageEnabledEnv !== undefined ? resolveBool(usageEnabledEnv, DEFAULTS.MCP_USAGE_ENABLED) : resolveBool(obj.usageEnabled ?? obj.usage_enabled, DEFAULTS.MCP_USAGE_ENABLED),
     gateway: {
       enabled: gwEnabledEnv !== undefined ? resolveBool(gwEnabledEnv, DEFAULTS.MCP_GATEWAY_ENABLED) : resolveBool(gwRaw.enabled, DEFAULTS.MCP_GATEWAY_ENABLED),
       upstreamOrigin: gwOrigin,
     },
+  };
+}
+
+/**
+ * Resolve the optional `clientConfig` section (3.14.4 supplemental,
+ * v4.7.5-fork.1). Absent YAML + absent env → undefined (the proxy uses
+ * local-only `models`); present env with absent YAML returns an explicit
+ * disabled-enabled flag so operators can opt out without writing a section.
+ */
+function resolveClientConfig(raw: unknown): ClientConfigConfig | undefined {
+  if (raw === undefined || raw === null) {
+    const envOff = process.env[ENV.CLIENT_CONFIG_REFRESH_ON_START];
+    if (envOff === undefined) return undefined;
+    return {
+      refreshOnStart: resolveBool(envOff, DEFAULTS.CLIENT_CONFIG_REFRESH_ON_START),
+      origin: DEFAULTS.CLIENT_CONFIG_ORIGIN,
+      timeoutMs: DEFAULTS.CLIENT_CONFIG_TIMEOUT_MS,
+    };
+  }
+  const obj = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
+  const originEnv = process.env[ENV.CLIENT_CONFIG_ORIGIN];
+  const origin = (originEnv ?? (typeof obj.origin === "string" ? obj.origin : DEFAULTS.CLIENT_CONFIG_ORIGIN)).trim()
+    || DEFAULTS.CLIENT_CONFIG_ORIGIN;
+  validateOrigin(origin, "clientConfig.origin");
+  const refreshEnv = process.env[ENV.CLIENT_CONFIG_REFRESH_ON_START];
+  return {
+    refreshOnStart: refreshEnv !== undefined ? resolveBool(refreshEnv, DEFAULTS.CLIENT_CONFIG_REFRESH_ON_START) : resolveBool(obj.refreshOnStart ?? obj.refresh_on_start, DEFAULTS.CLIENT_CONFIG_REFRESH_ON_START),
+    origin,
+    timeoutMs: resolvePositiveInt(obj.timeoutMs ?? obj.timeout_ms, DEFAULTS.CLIENT_CONFIG_TIMEOUT_MS, "clientConfig.timeoutMs"),
+  };
+}
+
+/**
+ * Resolve the optional `subscription` section (3.14.4 supplemental,
+ * v4.7.5-fork.1). Same absent-section semantics as `clientConfig`.
+ */
+function resolveSubscriptionConfig(raw: unknown): SubscriptionConfig | undefined {
+  if (raw === undefined || raw === null) {
+    const envOff = process.env[ENV.SUBSCRIPTION_CHECK_ON_SWITCH];
+    if (envOff === undefined) return undefined;
+    return {
+      checkOnSwitch: resolveBool(envOff, DEFAULTS.SUBSCRIPTION_CHECK_ON_SWITCH),
+      origin: DEFAULTS.SUBSCRIPTION_ORIGIN,
+      timeoutMs: DEFAULTS.SUBSCRIPTION_TIMEOUT_MS,
+    };
+  }
+  const obj = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
+  const originEnv = process.env[ENV.SUBSCRIPTION_ORIGIN];
+  const origin = (originEnv ?? (typeof obj.origin === "string" ? obj.origin : DEFAULTS.SUBSCRIPTION_ORIGIN)).trim()
+    || DEFAULTS.SUBSCRIPTION_ORIGIN;
+  validateOrigin(origin, "subscription.origin");
+  const checkEnv = process.env[ENV.SUBSCRIPTION_CHECK_ON_SWITCH];
+  return {
+    checkOnSwitch: checkEnv !== undefined ? resolveBool(checkEnv, DEFAULTS.SUBSCRIPTION_CHECK_ON_SWITCH) : resolveBool(obj.checkOnSwitch ?? obj.check_on_switch, DEFAULTS.SUBSCRIPTION_CHECK_ON_SWITCH),
+    origin,
+    timeoutMs: resolvePositiveInt(obj.timeoutMs ?? obj.timeout_ms, DEFAULTS.SUBSCRIPTION_TIMEOUT_MS, "subscription.timeoutMs"),
   };
 }
 

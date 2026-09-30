@@ -28,6 +28,8 @@ import type { ClaimablePlan, ClaimOutcome } from "../claim/types.js";
 import { getCaptchaToken } from "../proxy/captcha.js";
 import type { ProxyConfig } from "../config/types.js";
 import { errorResponse } from "../proxy/handler.js";
+import { fetchMcpUsage, type McpUsageSnapshot } from "../auth/mcp-quota.js";
+import { fetchSubscriptionAvailability, type SubscriptionAvailability } from "../auth/subscription.js";
 
 export interface QuotaBalanceEntry {
   showName: string;
@@ -93,6 +95,23 @@ export interface QuotaSnapshot {
    * unreachable — the official panel tolerates the same way (quota: null).
    */
   codingPlan: QuotaCodingPlan | null;
+  /**
+   * MCP gateway usage snapshot (3.14.4 `yme`/`fetchMcpQuotaSnapshot` plane).
+   * Null when the credential has no coding-plan JWT or the endpoint failed
+   * — the official panel tolerates the same way (usage: null).
+   *
+   * Introduced in v4.7.5-fork.1 (desktop 3.14.4 alignment, supplemental).
+   */
+  mcpUsage?: McpUsageSnapshot | null;
+  /**
+   * Coding-plan subscription availability (3.14.4 `nfe`/`validateCodingPlanProviderAvailability`
+   * plane). Returns `{kind:'unknown'|'available'|'unavailable', count}`.
+   * `kind:'unknown'` is fail-open for transient errors (do not skip account
+   * in failover loop).
+   *
+   * Introduced in v4.7.5-fork.1 (desktop 3.14.4 alignment, supplemental).
+   */
+  subscriptionAvailability?: SubscriptionAvailability | null;
   errors: string[];
 }
 
@@ -271,6 +290,23 @@ export async function collectQuotaSnapshot(
     balances,
     claimablePlans,
     codingPlan,
+    // 3.14.4 supplemental planes — both fail-open (null) on any error to
+    // match the desktop's tolerance of usage:null / availability:unknown.
+    // Gated by config.mcp.usageEnabled (default true) / config.subscription?.checkOnSwitch
+    // (default true when section absent, false when explicitly disabled).
+    mcpUsage: config.mcp.usageEnabled === false
+      ? null
+      : await fetchMcpUsage(cred, {
+          origin,
+          fetchImpl,
+          identity: config.identity,
+        }).catch(() => null),
+    subscriptionAvailability: config.subscription?.checkOnSwitch === false
+      ? null
+      : await fetchSubscriptionAvailability(cred, {
+          fetchImpl,
+          identity: config.identity,
+        }).catch(() => null),
     errors,
   };
 }

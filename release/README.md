@@ -1,5 +1,16 @@
 # zcode-proxy 使用说明
 
+> **v4.7.5-fork.1 — 对齐桌面端 3.14.4 补充端点（MCP 用量 / 远程 provider 配置 / 套餐可用性）**
+>
+> - 基于 ZCode 桌面端 3.14.4（build 10bbcea5, 2026-09-29）解包验证：八大核心模块（system prompt / identity / reset / claim / async / quota / signing / routing）逐符号、逐端点、逐 wire casing 与上游一致。
+> - 新增 MCP 网关用量查询（对齐桌面端 3.14.4 `yme = "/api/v1/mcp/usage"`）：`GET /quota` 响应新增 `mcpUsage` 字段（含 used / limit / remaining / serverTime / nextRefreshAt / level），用于面板展示 plugin-MCP gateway 已用次数与剩余配额。
+> - 新增远程 provider 配置下发（对齐桌面端 3.14.4 `xnr` 函数）：启动时调 `/api/v1/client/configs?app_version=X&platform=Y` 获取最新 zcode-builtin.json 的 CDN URL，下载后与本地 `models:` 列表合并，让模型列表自动跟官方同步（如新发布 GLM-5.3.1 等子型号无需升级代理版本）。失败静默回退本地列表。
+> - 新增套餐可用性验证（对齐桌面端 3.14.4 `nfe = "/api/biz/subscription/list"`）：`GET /quota` 响应新增 `subscriptionAvailability` 字段（`{kind:"unknown"|"available"|"unavailable", count}`），用于多账号场景下"哪个账号当前可用"的智能选择；`unknown` 状态 fail-open，避免临时网络错误导致误切换。
+> - 配置新增 `mcp.usageEnabled` / `clientConfig.refreshOnStart` / `subscription.checkOnSwitch` 三个开关字段，全部默认 true（opt-out）。
+> - 所有补充端点均 fail-open（null / kind:"unknown"）—— 与桌面端 usage:null 的容错行为一致，不影响既有 quota 查询路径。
+>
+> 升级建议：直接替换二进制；无需重新登录。可选执行 `zcode-proxy quota` 查看新增 mcpUsage 字段。
+
 > **v4.7.4-fork.1 — 管理面板「权益领取」页 + POST /quota/reset**
 >
 > - Web 管理面板新增「权益领取」独立页面：限时体验套餐列表（额度万/亿格式化、daily/one_time 周期、生效时间、发放窗口、优先级）+ 逐套餐领取与一键默认领取（自动求解阿里云验证码，结果横幅含 3.14.4 全字段，失败按错误码中文提示）。

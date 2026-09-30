@@ -206,9 +206,50 @@ export interface McpConfig {
   webReader: boolean;
   /** Inject the three `zread` tools as function tools. Default `false`. */
   zread: boolean;
+  /**
+   * MCP gateway usage quota (3.14.4 supplemental, v4.7.5-fork.1).
+   * When `true`, `GET /quota` fetches `/api/v1/mcp/usage` on the zcode plane
+   * and returns it in the `mcpUsage` field. Default `true`. Fail-open: any
+   * error → null (matches the desktop's usage:null tolerance).
+   * Env: `ZCODE_MCP_USAGE_ENABLED=false`.
+   */
+  usageEnabled?: boolean;
   /** Official plugin-MCP gateway relay (`/mcp/*`). Separate plane from the
    *  GLM hosted-tool fields above (those remain unwired). */
   gateway: McpGatewayConfig;
+}
+
+/**
+ * Remote provider-config delivery (3.14.4 supplemental, v4.7.5-fork.1).
+ * Mirrors the desktop `xnr` function: fetch `/api/v1/client/configs?app_version=X&platform=Y`
+ * to discover a CDN URL pointing to the latest `zcode-builtin.json`. The proxy
+ * merges the remote model list with the local `models:` field (remote wins);
+ * failures silently fall back to local-only.
+ */
+export interface ClientConfigConfig {
+  /** Refresh the remote model list on startup. Default `true`. */
+  refreshOnStart: boolean;
+  /** Base origin of the client-configs endpoint. Default `"https://zcode.z.ai"`. */
+  origin: string;
+  /** Request timeout in ms (desktop uses 20s in `xnr`). Default `20000`. */
+  timeoutMs: number;
+}
+
+/**
+ * Coding-plan subscription availability (3.14.4 supplemental, v4.7.5-fork.1).
+ * Mirrors the desktop `validateCodingPlanProviderAvailability` function:
+ * probe `/api/biz/subscription/list` to check whether the active credential
+ * has a usable coding-plan subscription. Used by the multi-account
+ * credential rotation loop to skip expired subscriptions without burning
+ * a credential-switch threshold on a 401.
+ */
+export interface SubscriptionConfig {
+  /** Probe subscription availability on credential switch. Default `true`. */
+  checkOnSwitch: boolean;
+  /** Base origin of the biz-plane subscription endpoint. Default `"https://api.z.ai"`. */
+  origin: string;
+  /** Request timeout in ms. Default `15000`. */
+  timeoutMs: number;
 }
 
 /**
@@ -363,6 +404,18 @@ export interface ProxyConfig {
   clientSigning: ClientSigningConfig;
   /** GLM MCP hosted-tool configuration. */
   mcp: McpConfig;
+  /**
+   * Remote provider-config delivery (3.14.4 supplemental, v4.7.5-fork.1).
+   * When present, the proxy may fetch a remote `zcode-builtin.json` to
+   * refresh `models` at runtime; absent field falls back to local-only.
+   */
+  clientConfig?: ClientConfigConfig;
+  /**
+   * Coding-plan subscription availability (3.14.4 supplemental, v4.7.5-fork.1).
+   * When present, the proxy probes `/api/biz/subscription/list` on credential
+   * switch; absent field falls back to no-availability-check.
+   */
+  subscription?: SubscriptionConfig;
   /** Async (off-peak / idle-plan) bridge configuration. */
   async: AsyncConfig;
   /** Manual claim ("weekend plan") configuration. */
