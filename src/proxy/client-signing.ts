@@ -30,6 +30,7 @@
 import type { UpstreamHeaderPair } from "./upstream.js";
 import { buildLlmIdentityHeaders, identityCacheKey } from "./identity.js";
 import type { ProxyIdentity } from "../config/types.js";
+import { hostSetTimeout, hostClearTimeout } from "../utils/host-timers.js";
 
 const DEFAULT_ORIGIN = "https://zcode.z.ai";
 const GATE_PATH = "/api/v1/agent/configs";
@@ -49,6 +50,8 @@ const GATE_FAILURE_COOLDOWN_MS = 60_000;
 const GATE_UNAVAILABLE_COOLDOWN_MS = 30_000;
 const GATE_TIMEOUT_MS = 15_000;
 const HANDSHAKE_TIMEOUT_MS = 10_000;
+/** Cap on cached per-(origin, credential) signer states / notes (leak guard: credentials rotate). */
+const MAX_SIGNER_STATES = 512;
 const VERIFY_SIGNATURE_INVALID = "VERIFY_SIGNATURE_INVALID";
 const VERIFY_APIKEY_EXPIRED = "VERIFY_APIKEY_EXPIRED";
 
@@ -419,6 +422,14 @@ export class ClientSigningManager {
     if (!state) {
       state = { gateEnabled: false, gateExpiresAt: 0, gateNegUntil: 0, epoch: 0, bypass: false };
       this.states.set(stateKey, state);
+      // Simple insertion-order eviction: the working set is bounded by the
+      // number of distinct (origin, credential) pairs actually in use, so
+      // dropping the oldest entries only affects long-rotated credentials.
+      while (this.states.size > MAX_SIGNER_STATES) {
+        const oldest = this.states.keys().next().value;
+        if (oldest === undefined) break;
+        this.states.delete(oldest);
+      }
     }
     return state;
   }
@@ -464,7 +475,9 @@ export class ClientSigningManager {
     // only `x-api-key` — no Accept header.
     const identityHeaders = buildLlmIdentityHeaders(this.identity);
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), GATE_TIMEOUT_MS);
+    // Host-safe timer (see utils/host-timers.ts): gate probes run concurrently
+    // with captcha solve epochs.
+    const timer = hostSetTimeout(() => controller.abort(), GATE_TIMEOUT_MS);
     try {
       const resp = await this.fetchImpl(this.gateUrl, {
         method: "GET",
@@ -472,7 +485,11 @@ export class ClientSigningManager {
         redirect: "manual",
         signal: controller.signal,
       });
-      if (!resp.ok) return "unavailable";
+      if (!resp.ok) {
+        // Release the error body — an unconsumed response holds its socket.
+        void resp.body?.cancel().catch(() => {});
+        return "unavailable";
+      }
       const parsed = await resp.json() as Record<string, unknown>;
       if (!parsed || parsed.code !== 0) return "unavailable";
       const data = parsed.data as Record<string, unknown> | undefined;
@@ -480,7 +497,7 @@ export class ClientSigningManager {
       const signature = data.codingPlanSignature as Record<string, unknown> | undefined;
       return signature?.enable === true ? "enabled" : "disabled";
     } finally {
-      clearTimeout(timer);
+      hostClearTimeout(timer);
     }
   }
 
@@ -515,7 +532,7 @@ export class ClientSigningManager {
     );
 
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), HANDSHAKE_TIMEOUT_MS);
+    const timer = hostSetTimeout(() => controller.abort(), HANDSHAKE_TIMEOUT_MS);
     try {
       const resp = await this.fetchImpl(`${origin}${HANDSHAKE_PATH}`, {
         method: "POST",
@@ -524,7 +541,10 @@ export class ClientSigningManager {
         redirect: "manual",
         signal: controller.signal,
       });
-      if (resp.status !== 200) throw new Error(`handshake_http_${resp.status}`);
+      if (resp.status !== 200) {
+        void resp.body?.cancel().catch(() => {});
+        throw new Error(`handshake_http_${resp.status}`);
+      }
       const envelope = await resp.json() as { code?: unknown; msg?: unknown; data?: { privateCipher?: unknown } };
       if (envelope.code === 500) throw new Error("handshake_server_500");
       if (envelope.code !== 200) throw new Error(`handshake_rejected: ${String(envelope.msg)}`);
@@ -532,13 +552,18 @@ export class ClientSigningManager {
       if (typeof cipher !== "string" || !cipher) throw new Error("handshake_omitted_privateCipher");
       return await decryptSigningPrivateKey(parsedCred.apiKeyId, parsedCred.apiKeySecret, cipher);
     } finally {
-      clearTimeout(timer);
+      hostClearTimeout(timer);
     }
   }
 
   private noteOnce(stateKey: string, message: string): void {
     if (this.notedKeys.has(stateKey)) return;
     this.notedKeys.add(stateKey);
+    while (this.notedKeys.size > MAX_SIGNER_STATES) {
+      const oldest = this.notedKeys.values().next().value;
+      if (oldest === undefined) break;
+      this.notedKeys.delete(oldest);
+    }
     this.onEvent?.(`client-signing: ${message}`);
   }
 }
@@ -570,10 +595,14 @@ export async function sendWithClientSigning(
 
   debug?.("401 VERIFY_SIGNATURE_* — invalidating signing key and retrying once");
   signer.invalidate(url, credential);
+  // The first response is discarded here — release its body so the socket
+  // doesn't dangle until GC.
+  await resp.body?.cancel().catch(() => {});
   const second = await signer.signWithStatus(url, headerPairs, { credential, appVersion });
   resp = await send(second.pairs);
   if (!second.signed || !await signer.isVerifyFailure(resp)) return resp;
 
+  await resp.body?.cancel().catch(() => {});
   signer.setBypass(url, credential);
   debug?.("401 VERIFY_SIGNATURE_* twice — sending unsigned (signing bypassed)");
   return send(headerPairs);

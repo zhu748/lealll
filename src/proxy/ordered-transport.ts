@@ -1,5 +1,6 @@
 import { connect as connectTcp, type Socket } from "node:net";
 import { connect as connectTls, type TLSSocket } from "node:tls";
+import { isSocksProxy, getSocksBridge } from "./socks-bridge.js";
 
 export type OrderedHeaderPair = [string, string];
 
@@ -11,6 +12,13 @@ export interface OrderedUpstreamRequest {
   decompress?: boolean;
   /** Client abort signal — destroys the socket the moment the client aborts. */
   signal?: AbortSignal;
+  /**
+   * Egress proxy URL (`http://` CONNECT proxy, or any SOCKS scheme routed
+   * transparently through the local socks-bridge). When set, the request is
+   * tunneled via an HTTP CONNECT handshake before the real request is written;
+   * unset/empty connects directly (unchanged behavior).
+   */
+  proxy?: string;
 }
 
 type WireSocket = Socket | TLSSocket;
@@ -18,6 +26,12 @@ type WireSocket = Socket | TLSSocket;
 const CRLF = "\r\n";
 const HEADER_END = new Uint8Array([13, 10, 13, 10]);
 const HEADER_NAME = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+/**
+ * Response-header accumulation ceiling: a misbehaving upstream streaming
+ * bytes without a blank line must not grow proxy memory unbounded. Real
+ * response heads are < 8 KB; 64 KB is generous.
+ */
+const MAX_HEADER_BUFFER_BYTES = 64 * 1024;
 
 /**
  * HTTP response content-coding → `DecompressionStream` format token.
@@ -71,7 +85,12 @@ export async function sendOrderedUpstreamRequest(req: OrderedUpstreamRequest): P
   const url = new URL(req.url);
   const bodyBytes = bodyToBytes(req.body);
   const requestHead = buildRequestHead(url, req.method ?? "POST", req.headers, bodyBytes.byteLength);
-  const socket = await openSocket(url);
+  // Fail fast on a pre-aborted signal: previously a pre-aborted request still
+  // opened a TCP/TLS connection before the promise rejected.
+  if (req.signal?.aborted) {
+    throw new Error("client aborted during ordered upstream request");
+  }
+  const socket = await openSocket(url, req.signal, req.proxy?.trim() || undefined);
 
   return await new Promise<Response>((resolve, reject) => {
     let headerBuffer: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
@@ -80,6 +99,7 @@ export async function sendOrderedUpstreamRequest(req: OrderedUpstreamRequest): P
     let bodyController: ReadableStreamDefaultController<Uint8Array> | null = null;
     let chunkedDecoder: ChunkedDecoder | null = null;
     let remainingContentLength: number | null = null;
+    let removeAbortListener: (() => void) | null = null;
 
     const bodyStream = new ReadableStream<Uint8Array>({
       start(controller) {
@@ -135,6 +155,7 @@ export async function sendOrderedUpstreamRequest(req: OrderedUpstreamRequest): P
       // request (the handler reuses the client signal across connect
       // attempts) does not accumulate listeners.
       socket.once("close", () => signal.removeEventListener("abort", onAbort));
+      removeAbortListener = () => signal.removeEventListener("abort", onAbort);
     }
 
     function finish(): void {
@@ -144,6 +165,10 @@ export async function sendOrderedUpstreamRequest(req: OrderedUpstreamRequest): P
         return;
       }
       try { bodyController?.close(); } catch {}
+      // The handler reuses the client signal across connect attempts — drop
+      // the abort listener on normal completion too (socket "close" may never
+      // fire if the upstream half-closes and lingers).
+      removeAbortListener?.();
     }
 
     function pushBody(bytes: Uint8Array): void {
@@ -169,7 +194,12 @@ export async function sendOrderedUpstreamRequest(req: OrderedUpstreamRequest): P
         if (!responseStarted) {
           headerBuffer = concatBytes(headerBuffer, bytes);
           const headerEnd = indexOfBytes(headerBuffer, HEADER_END);
-          if (headerEnd < 0) return;
+          if (headerEnd < 0) {
+            if (headerBuffer.byteLength > MAX_HEADER_BUFFER_BYTES) {
+              fail(new Error(`upstream response headers exceed ${MAX_HEADER_BUFFER_BYTES} bytes`));
+            }
+            return;
+          }
 
           const headerBytes = headerBuffer.slice(0, headerEnd);
           const rest = headerBuffer.slice(headerEnd + HEADER_END.byteLength);
@@ -183,7 +213,12 @@ export async function sendOrderedUpstreamRequest(req: OrderedUpstreamRequest): P
           } else {
             const contentLength = parsed.headers.get("content-length");
             remainingContentLength = contentLength ? Number.parseInt(contentLength, 10) : null;
-            if (!Number.isFinite(remainingContentLength as number)) remainingContentLength = null;
+            // NaN or non-integer → unknown length (rely on connection close).
+            // Negative values would corrupt slice arithmetic and never trigger
+            // finish() — treat them as unknown too.
+            if (!Number.isFinite(remainingContentLength as number) || (remainingContentLength as number) < 0) {
+              remainingContentLength = null;
+            }
           }
 
           let responseBody: ReadableStream<Uint8Array> = bodyStream;
@@ -227,22 +262,209 @@ export async function sendOrderedUpstreamRequest(req: OrderedUpstreamRequest): P
   });
 }
 
-function openSocket(url: URL): Promise<WireSocket> {
+function openSocket(url: URL, signal?: AbortSignal, proxyUrl?: string): Promise<WireSocket> {
   const isHttps = url.protocol === "https:";
   if (!isHttps && url.protocol !== "http:") {
     return Promise.reject(new Error(`Unsupported upstream protocol: ${url.protocol}`));
   }
+  if (proxyUrl) {
+    return openProxiedSocket(url, signal, proxyUrl);
+  }
+  return openDirectSocket(url, signal);
+}
+
+/** Direct (no-proxy) connect — the historical behavior. */
+function openDirectSocket(url: URL, signal?: AbortSignal): Promise<WireSocket> {
+  const isHttps = url.protocol === "https:";
   const port = Number(url.port || (isHttps ? 443 : 80));
 
   return new Promise((resolve, reject) => {
-    const onConnect = () => {
-      socket.off("error", reject);
+    // Abort during the CONNECT phase: destroy the connecting socket and
+    // reject. Previously the abort listener was wired only after connect
+    // resolved, so a client cancel during a slow/firewalled connect left the
+    // attempt running to completion (up to the OS-level timeout) with no way
+    // for the disconnect or the connect-retry ladder to break it.
+    let socket: WireSocket;
+    const cleanup = (): void => {
+      socket.off("error", onError);
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const onAbort = (): void => {
+      cleanup();
+      socket.destroy();
+      reject(new Error("client aborted during ordered upstream request (connect)"));
+    };
+    const onError = (err: Error): void => {
+      cleanup();
+      reject(err);
+    };
+    const onConnect = (): void => {
+      cleanup();
       resolve(socket);
     };
-    const socket: WireSocket = isHttps
+    socket = isHttps
       ? connectTls({ host: url.hostname, port, servername: url.hostname }, onConnect)
       : connectTcp({ host: url.hostname, port }, onConnect);
-    socket.once("error", reject);
+    socket.once("error", onError);
+    if (signal) {
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+  });
+}
+
+/** Response-head ceiling for the CONNECT handshake (malformed proxy guard). */
+const MAX_CONNECT_RESPONSE_BYTES = 16 * 1024;
+
+/**
+ * Connect through an egress proxy: `http://` proxies speak an HTTP CONNECT
+ * handshake directly; SOCKS schemes ride the local socks-bridge (whose
+ * endpoint IS an HTTP CONNECT proxy). The tunnel is then upgraded to TLS for
+ * https targets. The bridge handle (if any) is released when the tunnel
+ * socket closes — a streaming response must keep it alive until then.
+ */
+function openProxiedSocket(url: URL, signal: AbortSignal | undefined, proxyUrl: string): Promise<WireSocket> {
+  if (isSocksProxy(proxyUrl)) {
+    const bridge = getSocksBridge(proxyUrl);
+    return tunnelThroughHttpProxy(url, signal, bridge.httpProxyUrl, bridge.release);
+  }
+  const proxy = new URL(proxyUrl);
+  if (proxy.protocol === "https:") {
+    return Promise.reject(new Error(
+      "https:// CONNECT proxies are not supported by the ordered transport — use http:// or socks5:// for clientIdentity.enforce traffic",
+    ));
+  }
+  if (proxy.protocol !== "http:") {
+    return Promise.reject(new Error(`Unsupported ordered-transport proxy protocol: ${proxy.protocol}`));
+  }
+  return tunnelThroughHttpProxy(url, signal, proxyUrl);
+}
+
+function tunnelThroughHttpProxy(
+  url: URL,
+  signal: AbortSignal | undefined,
+  proxyUrl: string,
+  releaseTunnel?: () => void,
+): Promise<WireSocket> {
+  const isHttps = url.protocol === "https:";
+  const proxy = new URL(proxyUrl);
+  const proxyHost = proxy.hostname;
+  const proxyPort = Number(proxy.port || 80);
+  const targetPort = Number(url.port || (isHttps ? 443 : 80));
+  const authority = `${url.hostname}:${targetPort}`;
+
+  const proxyAuth = proxy.username
+    ? `Proxy-Authorization: Basic ${Buffer.from(
+        `${decodeURIComponent(proxy.username)}:${proxy.password ? decodeURIComponent(proxy.password) : ""}`,
+      ).toString("base64")}\r\n`
+    : "";
+  const connectHead = `CONNECT ${authority} HTTP/1.1\r\nHost: ${authority}\r\n${proxyAuth}Proxy-Connection: keep-alive\r\n\r\n`;
+
+  return new Promise<WireSocket>((resolve, reject) => {
+    let socket!: Socket | TLSSocket;
+    let buffer = Buffer.alloc(0);
+    let settled = false;
+    let headWritten = false;
+
+    const onAbort = (): void => {
+      cleanup();
+      try { socket.destroy(); } catch {}
+      reject(new Error("client aborted during proxy CONNECT"));
+    };
+    const onError = (err: Error): void => {
+      cleanup();
+      try { socket.destroy(); } catch {}
+      reject(err);
+    };
+    const cleanup = (): void => {
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const onConnect = (): void => {
+      if (signal?.aborted) {
+        onAbort();
+        return;
+      }
+      socket.write(connectHead);
+      headWritten = true;
+    };
+    const onData = (chunk: Buffer): void => {
+      if (!headWritten) return;
+      buffer = Buffer.concat([buffer, chunk]);
+      if (buffer.byteLength > MAX_CONNECT_RESPONSE_BYTES) {
+        socket.off("data", onData);
+        socket.off("error", onError);
+        cleanup();
+        try { socket.destroy(); } catch {}
+        reject(new Error(`proxy CONNECT response exceeds ${MAX_CONNECT_RESPONSE_BYTES} bytes`));
+        return;
+      }
+      const headEnd = buffer.indexOf("\r\n\r\n");
+      if (headEnd < 0) return;
+      socket.off("data", onData);
+      socket.off("error", onError);
+      cleanup();
+      const statusLine = buffer.subarray(0, buffer.indexOf("\r\n")).toString("latin1");
+      const match = /^HTTP\/\d(?:\.\d)?\s+(\d{3})/.exec(statusLine);
+      const status = match ? Number(match[1]) : 0;
+      if (status < 200 || status >= 300) {
+        try { socket.destroy(); } catch {}
+        releaseTunnel?.();
+        reject(new Error(`proxy CONNECT failed: ${statusLine || "no status line"}`));
+        return;
+      }
+      // Any bytes the proxy sent past the CONNECT response belong to the
+      // tunneled stream — push them back so the request reader sees them.
+      const leftover = buffer.subarray(headEnd + 4);
+      if (leftover.byteLength > 0 && !isHttps) {
+        try { socket.unshift(leftover); } catch { /* best-effort */ }
+      }
+      if (isHttps) {
+        // Upgrade the established tunnel to TLS toward the target.
+        let tlsSocket: TLSSocket;
+        try {
+          tlsSocket = connectTls({ socket, servername: url.hostname }, () => {
+            settle(tlsSocket);
+          });
+        } catch (err) {
+          try { socket.destroy(); } catch {}
+          releaseTunnel?.();
+          reject(err as Error);
+          return;
+        }
+        tlsSocket.once("error", (err: Error) => {
+          if (settled) return;
+          try { socket.destroy(); } catch {}
+          releaseTunnel?.();
+          reject(err);
+        });
+        return;
+      }
+      settle(socket);
+    };
+    const settle = (wire: WireSocket): void => {
+      if (settled) return;
+      settled = true;
+      // Keep the bridge handle alive for the whole tunneled exchange.
+      if (releaseTunnel) {
+        wire.once("close", releaseTunnel);
+        wire.once("error", releaseTunnel);
+      }
+      resolve(wire);
+    };
+
+    socket = connectTcp({ host: proxyHost, port: proxyPort }, onConnect);
+    socket.on("data", onData as (chunk: Buffer) => void);
+    socket.once("error", onError as (err: Error) => void);
+    if (signal) {
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
   });
 }
 
@@ -284,11 +506,20 @@ function parseResponseHeaders(bytes: Uint8Array): { status: number; statusText: 
     if (!line) continue;
     const idx = line.indexOf(":");
     if (idx <= 0) continue;
-    headers.append(line.slice(0, idx), line.slice(idx + 1).trimStart());
+    const name = line.slice(0, idx).trim();
+    if (!name) continue;
+    headers.append(name, line.slice(idx + 1).trimStart());
   }
 
   return { status: Number(match[1]), statusText: match[2] ?? "", headers };
 }
+
+/** Max bytes buffered while waiting for a complete chunk-size line (malformed upstream guard). */
+const MAX_CHUNK_SIZE_LINE_BYTES = 16 * 1024;
+/** Max declared size accepted for a single chunked body chunk (malformed upstream guard). */
+const MAX_CHUNK_SIZE_BYTES = 16 * 1024 * 1024;
+/** Hard cap on the decoder's total pending buffer (malformed upstream guard). */
+const MAX_CHUNK_BUFFER_BYTES = 32 * 1024 * 1024;
 
 class ChunkedDecoder {
   private buffer: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
@@ -302,11 +533,23 @@ class ChunkedDecoder {
     while (!this.done) {
       if (this.expectedSize === null) {
         const lineEnd = indexOfCrlf(this.buffer);
-        if (lineEnd < 0) return;
+        if (lineEnd < 0) {
+          // Waiting for the chunk-size line: without a cap, an upstream that
+          // streams bytes forever without a CRLF grows this.buffer unbounded.
+          if (this.buffer.byteLength > MAX_CHUNK_SIZE_LINE_BYTES) {
+            throw new Error(`chunk size line exceeds ${MAX_CHUNK_SIZE_LINE_BYTES} bytes`);
+          }
+          return;
+        }
         const line = new TextDecoder("latin1").decode(this.buffer.slice(0, lineEnd));
         const sizeHex = line.split(";", 1)[0].trim();
         const size = Number.parseInt(sizeHex, 16);
         if (!Number.isFinite(size)) throw new Error(`Invalid chunk size: ${line}`);
+        // A bogus huge declared size (e.g. FFFFFFFF) would make the payload
+        // wait below buffer up to that size — reject before waiting.
+        if (size > MAX_CHUNK_SIZE_BYTES) {
+          throw new Error(`chunk size ${size} exceeds ${MAX_CHUNK_SIZE_BYTES} bytes`);
+        }
         this.buffer = this.buffer.slice(lineEnd + 2);
         this.expectedSize = size;
         if (size === 0) {
@@ -315,7 +558,14 @@ class ChunkedDecoder {
         }
       }
 
-      if (this.buffer.byteLength < this.expectedSize + 2) return;
+      if (this.buffer.byteLength < this.expectedSize + 2) {
+        // Belt-and-braces: even a "valid" declared size must not let the
+        // total pending buffer run away (fast check, no per-byte work).
+        if (this.buffer.byteLength > MAX_CHUNK_BUFFER_BYTES) {
+          throw new Error(`chunked decode buffer exceeds ${MAX_CHUNK_BUFFER_BYTES} bytes`);
+        }
+        return;
+      }
       const chunk = this.buffer.slice(0, this.expectedSize);
       controller.enqueue(chunk);
       this.buffer = this.buffer.slice(this.expectedSize + 2);

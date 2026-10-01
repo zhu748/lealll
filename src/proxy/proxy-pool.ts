@@ -315,6 +315,13 @@ function normalizeRefreshResult(raw: unknown, fallbackAt?: number): RefreshResul
 
 const ALLOWED_SCHEMES = ["http:", "https:", "socks4:", "socks4a:", "socks5:", "socks5h:"];
 const DEFAULT_MAX_SOURCE_BYTES = 10 * 1024 * 1024;
+/**
+ * Hard cap on pool entries: a single 10MB source response can otherwise mint
+ * hundreds of thousands of unique proxies which then make every pickProxy O(n)
+ * under the state mutex and bloat test-all bookkeeping. Import/refresh
+ * truncate beyond the cap (manual entries survive first). Env-overridable.
+ */
+const PROXY_POOL_MAX_ENTRIES = Math.max(100, Number(process.env.ZCODE_PROXY_POOL_MAX_ENTRIES) || 5000);
 const PROXY_POOL_ERROR_MAX_CHARS = 500;
 const DEFAULT_SOURCE_FETCH_CONCURRENCY = 5;
 const MAX_SOURCE_FETCH_CONCURRENCY = 20;
@@ -535,6 +542,8 @@ const poolMutex = createMutex();
  * stats while still preserving sticky-proxy consistency.
  */
 const stateMutex = createMutex();
+/** Serializes test-job check-then-act (startTestJob duplicate-job guard). */
+const testJobMutex = createMutex();
 
 /**
  * v0.2.2+ PERF: debounced disk flush for `failures` counters.
@@ -1259,7 +1268,12 @@ async function refreshFromSourcesInner(
       if (!finalEntryIds.has(p.id)) actualRemoved++;
     }
 
-    finalPool.proxies = finalEntries;
+    finalPool.proxies = finalEntries.slice(0, PROXY_POOL_MAX_ENTRIES);
+    if (finalEntries.length > PROXY_POOL_MAX_ENTRIES) {
+      runtimeWarn(
+        `[proxy-pool] refresh truncated the pool to ${PROXY_POOL_MAX_ENTRIES} entries (${finalEntries.length - PROXY_POOL_MAX_ENTRIES} dropped — raise ZCODE_PROXY_POOL_MAX_ENTRIES if intentional)`,
+      );
+    }
     finalPool.lastRefreshAt = Date.now();
     const result: RefreshResult = {
       added: actualAdded,
@@ -1782,54 +1796,60 @@ export async function startTestJob(options: {
   testTarget?: string;
 }): Promise<TestJobState> {
   pruneExpiredTestJob();
-  // If a job is already running, return its state (don't start a duplicate).
-  if (currentTestJob && currentTestJob.running) {
-    return getTestJobState()!;
-  }
-  clearTestJobCleanupTimer();
+  // Serialize the check-then-act: the running-job check used to straddle an
+  // `await readPool()`, so two concurrent POST /test-all could BOTH pass it,
+  // spawn parallel jobs, and orphan the first job's AbortController (leaving
+  // it uncancellable). The job itself runs fire-and-forget outside the hold.
+  return testJobMutex.run(async () => {
+    // If a job is already running, return its state (don't start a duplicate).
+    if (currentTestJob && currentTestJob.running) {
+      return getTestJobState()!;
+    }
+    clearTestJobCleanupTimer();
 
-  const pool = await readPool();
-  const proxies = pool.proxies;
-  const batchSize = normalizeTestJobBatchSize(options.batchSize);
-  const autoRemove = options.autoRemove === true;
-  const jobAbort = new AbortController();
+    const pool = await readPool();
+    const proxies = pool.proxies;
+    const batchSize = normalizeTestJobBatchSize(options.batchSize);
+    const autoRemove = options.autoRemove === true;
+    const jobAbort = new AbortController();
 
-  const job: TestJobState = {
-    running: true,
-    total: proxies.length,
-    tested: 0,
-    okCount: 0,
-    failCount: 0,
-    removedCount: 0,
-    batchSize,
-    autoRemove,
-    startedAt: Date.now(),
-    results: {},
-    resultSeq: 0,
-  };
-  currentTestJob = job;
-  currentTestJobAbort = jobAbort;
-  currentTestJobResultIds = [];
+    const job: TestJobState = {
+      running: true,
+      total: proxies.length,
+      tested: 0,
+      okCount: 0,
+      failCount: 0,
+      removedCount: 0,
+      batchSize,
+      autoRemove,
+      startedAt: Date.now(),
+      results: {},
+      resultSeq: 0,
+    };
+    currentTestJob = job;
+    currentTestJobAbort = jobAbort;
+    currentTestJobResultIds = [];
 
-  // Fire-and-forget — run the job in the background. Errors are captured
-  // into job.error so the dashboard can surface them.
-  runTestJob(job, proxies, options.fetchImpl ?? fetch, options.testTarget, jobAbort.signal)
-    .catch(e => {
-      job.error = (e as Error).message;
-      job.running = false;
-      job.finishedAt = Date.now();
-    })
-    .finally(() => {
-      if (currentTestJob === job && currentTestJobAbort === jobAbort) {
-        currentTestJobAbort = null;
-      }
-      if (!job.running && job.finishedAt === undefined) {
+    // Fire-and-forget — run the job in the background. Errors are captured
+    // into job.error so the dashboard can surface them.
+    runTestJob(job, proxies, options.fetchImpl ?? fetch, options.testTarget, jobAbort.signal)
+      .catch(e => {
+        job.error = (e as Error).message;
+        job.running = false;
         job.finishedAt = Date.now();
-      }
-      scheduleCompletedTestJobCleanup(job);
-    });
+      })
+      .finally(() => {
+        if (currentTestJob === job && currentTestJobAbort === jobAbort) {
+          currentTestJobAbort = null;
+        }
+        if (!job.running && job.finishedAt === undefined) {
+          job.finishedAt = Date.now();
+        }
+        scheduleCompletedTestJobCleanup(job);
+      });
 
-  return getTestJobState()!;
+    return getTestJobState()!;
+  });
 }
 
 /**

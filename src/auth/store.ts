@@ -875,7 +875,16 @@ async function readStoreUncached(): Promise<StoreV2 | null> {
     const migrated: StoreV2 = { version: 2, activeId: account.id, accounts: [account] };
     normalizeStoreActiveId(migrated);
     try {
-      await writeStore(migrated);
+      // Serialize against other writers (the dashboard's withStoreLock saves).
+      // An unserialized migration write landing AFTER a concurrent save would
+      // silently roll it back (the migration holds a single stale account).
+      // Two subtleties handled by persistMigratedStore:
+      //  - non-reentrancy: when this read was triggered INSIDE a locked
+      //    operation, a nested mutex acquisition would deadlock — the
+      //    enclosing operation persists the migrated store itself;
+      //  - last-writer-wins: after acquiring the mutex, skip the write if a
+      //    concurrent op already persisted a v2 store.
+      await persistMigratedStore(migrated);
       runtimeLog(`[store] Migrated v1 credential store to v2 format on disk.`);
     } catch (e) {
       // If write fails (e.g. read-only fs), at least return the in-memory copy
@@ -998,6 +1007,43 @@ function cleanupOldBrokenBackups(): void {
  * the full-sequence serialization for every mutating public API.
  */
 const storeWriteMutex = createMutex();
+/** Depth of in-progress storeWriteMutex.run callbacks (reentrancy guard). */
+let storeWriteLockedDepth = 0;
+
+/** True when credentials.json on disk is already a v2 store (plaintext envelope check, no decrypt). */
+function diskStoreIsAlreadyV2(): boolean {
+  try {
+    const raw = readFileSync(STORE_FILE, "utf-8");
+    const parsed = JSON.parse(raw) as { version?: unknown } | null;
+    return parsed?.version === 2;
+  } catch {
+    return false; // unreadable / gone / v1-shaped — caller decides
+  }
+}
+
+/**
+ * Persist the v1→v2 migration safely (see the call site in readStoreUncached).
+ * Returns false when the write was intentionally skipped (nested lock context,
+ * or a newer v2 store already on disk).
+ */
+async function persistMigratedStore(migrated: StoreV2): Promise<boolean> {
+  if (storeWriteLockedDepth > 0) {
+    // readStoreUncached was re-entered from inside withStoreLock*/
+    // clearCredentialAsync — the enclosing locked operation re-reads and
+    // persists the (migrated) store itself; nesting would deadlock.
+    return false;
+  }
+  await storeWriteMutex.run(async () => {
+    storeWriteLockedDepth++;
+    try {
+      if (diskStoreIsAlreadyV2()) return; // concurrent op already saved a v2 store
+      await writeStore(migrated);
+    } finally {
+      storeWriteLockedDepth--;
+    }
+  });
+  return true;
+}
 
 const CROSS_PROCESS_LOCK_STALE_MS = 60_000;
 const CROSS_PROCESS_LOCK_WAIT_MS = 10_000;
@@ -1005,7 +1051,7 @@ const CROSS_PROCESS_LOCK_WAIT_MS = 10_000;
 async function withCrossProcessStoreLock<T>(fn: () => Promise<T>): Promise<T> {
   refreshStorePathFromEnv();
   try {
-    mkdirSync(dirname(STORE_FILE), { recursive: true });
+    mkdirSync(dirname(STORE_FILE), { recursive: true, mode: 0o700 });
   } catch (err) {
     const message = (err as Error).message;
     throw new Error(
@@ -1101,7 +1147,9 @@ async function withStoreLock<T>(
   fn: (store: StoreV2) => Promise<T> | T,
 ): Promise<T> {
   return storeWriteMutex.run(async () => {
-    return withCrossProcessStoreLock(async () => {
+    storeWriteLockedDepth++;
+    try {
+      return await withCrossProcessStoreLock(async () => {
     // ALWAYS re-read inside the lock — the in-memory cache may be stale if
     // another process (CLI) wrote to the file. The cost is one disk read +
     // decrypt per mutation, acceptable for the low write frequency of a
@@ -1134,6 +1182,9 @@ async function withStoreLock<T>(
     await writeStore(store);
     return result;
     });
+    } finally {
+      storeWriteLockedDepth--;
+    }
   });
 }
 
@@ -1168,7 +1219,9 @@ async function withExistingStoreLock<T>(
   opts: { allowEmptyWrite?: boolean } = {},
 ): Promise<T | null> {
   return storeWriteMutex.run(async () => {
-    return withCrossProcessStoreLock(async () => {
+    storeWriteLockedDepth++;
+    try {
+      return await withCrossProcessStoreLock(async () => {
     const store = await readStore();
     if (!store) {
       // Distinguish "file doesn't exist" (genuine empty store → 404) from
@@ -1198,6 +1251,9 @@ async function withExistingStoreLock<T>(
     await writeStore(store, { allowEmpty: opts.allowEmptyWrite });
     return result;
     });
+    } finally {
+      storeWriteLockedDepth--;
+    }
   });
 }
 
@@ -1285,7 +1341,15 @@ async function writeStore(store: StoreV2, opts: { allowEmpty?: boolean } = {}): 
     // Calling storeWriteMutex.run() here would deadlock (the mutex is not
     // reentrant). Direct write is safe because all mutations go through
     // withStoreLock which serializes the full read-modify-write sequence.
-    await atomicWriteFile(STORE_FILE, JSON.stringify({ version: 2, encrypted }));
+    await atomicWriteFile(
+      STORE_FILE,
+      JSON.stringify({ version: 2, encrypted }),
+      "utf-8",
+      // Owner-only: the store holds OAuth API keys / JWTs. The documented
+      // encryption is obfuscation-grade (fixed key shipped in the source), so
+      // file permissions are the real at-rest control on multi-user hosts.
+      0o600,
+    );
   } catch (err) {
     // Read-only filesystem (e.g. Render container without a persistent disk
     // mounted at STORE_DIR), OR Windows EPERM/EBUSY that exhausted the
@@ -1410,7 +1474,9 @@ export async function loadCredential(): Promise<Credential | null> {
 export async function clearCredentialAsync(): Promise<void> {
   refreshStorePathFromEnv();
   await storeWriteMutex.run(async () => {
-    await withCrossProcessStoreLock(async () => {
+    storeWriteLockedDepth++;
+    try {
+      await withCrossProcessStoreLock(async () => {
     if (!existsSync(STORE_FILE)) {
       // File already gone — just reset state.
       cachedStore = null;
@@ -1457,6 +1523,9 @@ export async function clearCredentialAsync(): Promise<void> {
     undecryptableFilePresent = false;
     lastReadStoreNullReason = "missing";
     });
+    } finally {
+      storeWriteLockedDepth--;
+    }
   });
 }
 

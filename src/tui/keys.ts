@@ -29,8 +29,17 @@ export type KeyAction =
   /** Recognized but without a binding (Enter, Tab, bare Esc, Alt+key, drag/release, …). */
   | { type: "ignore" };
 
+/**
+ * Inter-byte budget for escape sequences: a lone ESC pending longer than
+ * this is treated as a bare ESC keypress (flushed) instead of a sequence
+ * prefix waiting for its continuation.
+ */
+const ESC_LONE_FLUSH_MS = 50;
+
 export class KeyParser {
   private pending = "";
+  /** Wall-clock ms when the current pending tail became a lone ESC (0 = none). */
+  private pendingEscAt = 0;
 
   /** Consume a raw stdin chunk and return the actions it completes. */
   feed(chunk: string): KeyAction[] {
@@ -38,9 +47,29 @@ export class KeyParser {
     // ~16), so a pending tail this long means the parser is stuck on garbage.
     // Drop it — otherwise the stuck prefix would swallow every future chunk
     // and the TUI would stop responding to keys and clicks for good.
-    if (this.pending.length > 64) this.pending = "";
-    const buf = this.pending + chunk;
+    if (this.pending.length > 64) {
+      this.pending = "";
+      this.pendingEscAt = 0;
+    }
     const actions: KeyAction[] = [];
+    let buf: string;
+    if (
+      this.pending === "\x1b" &&
+      this.pendingEscAt > 0 &&
+      Date.now() - this.pendingEscAt >= ESC_LONE_FLUSH_MS
+    ) {
+      // A lone ESC that has outlived the escape-sequence inter-byte budget is
+      // a BARE ESC keypress: flush it instead of merging the incoming chunk
+      // into Alt+key (which silently swallowed the user's next keypress —
+      // ESC then q did not quit). Genuine split sequences complete in well
+      // under the budget, so the cross-chunk contract is preserved.
+      actions.push({ type: "ignore" });
+      buf = chunk;
+      this.pending = "";
+    } else {
+      buf = this.pending + chunk;
+    }
+    this.pendingEscAt = 0;
     let i = 0;
 
     while (i < buf.length) {
@@ -86,6 +115,9 @@ export class KeyParser {
     }
 
     this.pending = buf.slice(i);
+    // Track a lone trailing ESC so a LATER feed can age it out (see above);
+    // incomplete sequences ("\x1b[", "\x1bOA") keep waiting indefinitely.
+    if (this.pending === "\x1b") this.pendingEscAt = Date.now();
     return actions;
   }
 }

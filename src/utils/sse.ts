@@ -52,8 +52,13 @@ function warnMalformedSseJson(message: string, payload: string): void {
  */
 export function parseSSEChunk(raw: string): ParsedSSE[] {
   const results: ParsedSSE[] = [];
+  // Strip a leading UTF-8 BOM (SSE spec requirement): an upstream that emits
+  // one would otherwise corrupt the first frame's `data:` prefix match.
+  const bomStripped = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
   // Normalize CRLF -> LF so delimiter scanning works for all common line endings.
-  const normalized = raw.indexOf("\r") >= 0 ? raw.replace(/\r\n/g, "\n").replace(/\r/g, "\n") : raw;
+  const normalized = bomStripped.indexOf("\r") >= 0
+    ? bomStripped.replace(/\r\n/g, "\n").replace(/\r/g, "\n")
+    : bomStripped;
 
   let start = 0;
   for (;;) {

@@ -25,6 +25,8 @@ export interface LogView {
 
 export class LogPane {
   private lines: LogLine[] = [];
+  /** Logical start of live entries — the evicted dead prefix (ring amortization). */
+  private head = 0;
   private nextSeq = 0;
   /** Lines hidden below the viewport. 0 = follow the tail. */
   private offset = 0;
@@ -35,6 +37,11 @@ export class LogPane {
    * Append a log record. ANSI escape sequences are stripped (proxy logs carry
    * color codes; the pane applies its own) and embedded newlines split into
    * separate rows so multi-line records scroll naturally.
+   *
+   * Eviction is amortized: overflows advance a `head` cursor (O(1)) and the
+   * dead prefix is physically spliced out only when it grows to `capacity`
+   * entries. The previous shape spliced(0,1) on EVERY line past capacity —
+   * an O(n) memmove per pushed row at high log volume.
    */
   push(text: string, level: LogLevel = "info"): void {
     const clean = stripAnsi(String(text)).replace(/\r/g, "");
@@ -43,13 +50,18 @@ export class LogPane {
     for (const part of parts) {
       this.lines.push({ seq: this.nextSeq++, level, text: part });
     }
-    if (this.lines.length > this.capacity) {
-      this.lines.splice(0, this.lines.length - this.capacity);
+    const live = this.lines.length - this.head;
+    if (live > this.capacity) {
+      this.head += live - this.capacity;
+      if (this.head >= this.capacity) {
+        this.lines.splice(0, this.head);
+        this.head = 0;
+      }
     }
   }
 
   get count(): number {
-    return this.lines.length;
+    return this.lines.length - this.head;
   }
 
   /** True when the viewport is pinned to the newest lines. */
@@ -58,7 +70,7 @@ export class LogPane {
   }
 
   scrollUp(n: number): void {
-    this.offset = Math.min(this.lines.length, this.offset + Math.max(0, n));
+    this.offset = Math.min(this.count, this.offset + Math.max(0, n));
   }
 
   scrollDown(n: number): void {
@@ -72,20 +84,22 @@ export class LogPane {
 
   clear(): void {
     this.lines = [];
+    this.head = 0;
     this.offset = 0;
   }
 
   /** Slice of lines currently visible in a viewport `height` rows tall. */
   view(height: number): LogView {
     const rows = Math.max(1, height);
-    // At max scrollback (offset === length) the viewport pins to the oldest
+    const total = this.lines.length - this.head;
+    // At max scrollback (offset === total) the viewport pins to the oldest
     // rows instead of going empty.
-    const end = Math.max(Math.min(rows, this.lines.length), this.lines.length - this.offset);
+    const end = Math.max(Math.min(rows, total), total - this.offset);
     const start = Math.max(0, end - rows);
     return {
-      lines: this.lines.slice(start, end),
-      total: this.lines.length,
-      fromBottom: this.lines.length - end,
+      lines: this.lines.slice(this.head + start, this.head + end),
+      total,
+      fromBottom: total - end,
     };
   }
 }

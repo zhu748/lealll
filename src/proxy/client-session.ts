@@ -43,7 +43,13 @@ interface ExplicitTraceContext {
 }
 
 export interface ClientSessionResolver {
-  resolve(req: Request, body: string | undefined, format: Format, model: string, config: ClientIdentityConfig): ClientSessionResult;
+  /**
+   * `parsed` (optional): the request body already parsed by the caller —
+   * the proxy hot path parses each body exactly once and threads the object
+   * here, so the resolver never re-parses. When omitted, the legacy
+   * parse-on-demand behavior applies (tests, non-proxy callers).
+   */
+  resolve(req: Request, body: string | undefined, format: Format, model: string, config: ClientIdentityConfig, parsed?: Record<string, unknown>): ClientSessionResult;
 }
 
 export function createClientSessionResolver(now: () => number = () => Date.now()): ClientSessionResolver {
@@ -87,14 +93,14 @@ export function createClientSessionResolver(now: () => number = () => Date.now()
   }
 
   return {
-    resolve(req, body, format, model, config) {
+    resolve(req, body, format, model, config, parsed) {
       if (config.mode === "off") return { source: "none", action: "off", confidence: 0 };
 
       prune(config);
-      const explicitTrace = requestTraceContext(req, body);
+      const explicitTrace = requestTraceContext(req, body, parsed);
       if (explicitTrace.sessionId) return explicitResult(explicitTrace, config);
 
-      const canonical = canonicalize(body, format, model);
+      const canonical = canonicalize(body, format, model, parsed);
       if (!canonical) {
         if (hasTraceContext(explicitTrace)) return explicitResult(explicitTrace, config);
         return { source: "none", action: action(config), confidence: 0 };
@@ -132,8 +138,8 @@ function result(source: ClientSessionSource, action: ClientSessionAction, node: 
   };
 }
 
-function requestTraceContext(req: Request, body: string | undefined): ExplicitTraceContext {
-  const bodyTrace = bodyMetadataTrace(body);
+function requestTraceContext(req: Request, body: string | undefined, parsed?: Record<string, unknown>): ExplicitTraceContext {
+  const bodyTrace = bodyMetadataTrace(body, parsed);
   return {
     requestId: firstHeader(req.headers, ["x-request-id"]) ?? bodyTrace.requestId,
     traceId: firstHeader(req.headers, ["x-zcode-trace-id"]) ?? bodyTrace.traceId,
@@ -177,21 +183,24 @@ function firstHeader(headers: Headers, names: string[]): string | null {
   return null;
 }
 
-function bodyMetadataTrace(body: string | undefined): ExplicitTraceContext {
-  if (!body) return {};
-  try {
-    const parsed = JSON.parse(body) as Record<string, unknown>;
-    const metadata = parsed?.metadata as Record<string, unknown> | undefined;
-    if (!metadata || typeof metadata !== "object") return {};
-    return {
-      requestId: stringProperty(metadata, ["requestId", "request_id"]),
-      traceId: stringProperty(metadata, ["traceId", "trace_id"]),
-      queryId: stringProperty(metadata, ["queryId", "query_id"]),
-      sessionId: stringProperty(metadata, ["sessionId", "session_id", "conversationId", "conversation_id"]),
-    };
-  } catch {
-    return {};
+function bodyMetadataTrace(body: string | undefined, parsed?: Record<string, unknown>): ExplicitTraceContext {
+  if (!body && !parsed) return {};
+  let obj: Record<string, unknown> | undefined = parsed;
+  if (!obj) {
+    try {
+      obj = JSON.parse(body as string) as Record<string, unknown>;
+    } catch {
+      return {};
+    }
   }
+  const metadata = obj?.metadata as Record<string, unknown> | undefined;
+  if (!metadata || typeof metadata !== "object") return {};
+  return {
+    requestId: stringProperty(metadata, ["requestId", "request_id"]),
+    traceId: stringProperty(metadata, ["traceId", "trace_id"]),
+    queryId: stringProperty(metadata, ["queryId", "query_id"]),
+    sessionId: stringProperty(metadata, ["sessionId", "session_id", "conversationId", "conversation_id"]),
+  };
 }
 
 function stringProperty(obj: Record<string, unknown>, names: string[]): string | undefined {
@@ -202,27 +211,29 @@ function stringProperty(obj: Record<string, unknown>, names: string[]): string |
   return undefined;
 }
 
-function canonicalize(body: string | undefined, format: Format, fallbackModel: string): CanonicalRequest | null {
-  if (!body) return null;
-  let parsed: Record<string, unknown>;
-  try {
-    parsed = JSON.parse(body);
-  } catch {
-    return null;
+function canonicalize(body: string | undefined, format: Format, fallbackModel: string, parsed?: Record<string, unknown>): CanonicalRequest | null {
+  if (!body && !parsed) return null;
+  let obj: Record<string, unknown> | undefined = parsed;
+  if (!obj) {
+    try {
+      obj = JSON.parse(body as string) as Record<string, unknown>;
+    } catch {
+      return null;
+    }
   }
-  if (!parsed || typeof parsed !== "object") return null;
+  if (!obj || typeof obj !== "object") return null;
 
-  const model = typeof parsed.model === "string" ? parsed.model : fallbackModel;
-  const messages = Array.isArray(parsed.messages) ? parsed.messages : [];
+  const model = typeof obj.model === "string" ? obj.model : fallbackModel;
+  const messages = Array.isArray(obj.messages) ? obj.messages : [];
   if (messages.length === 0) return null;
 
   const identity = {
     format,
     model,
-    system: parsed.system,
+    system: obj.system,
     developer: messages.filter((m: unknown) => typeof m === "object" && m !== null && (m as Record<string, unknown>).role === "developer"),
-    tools: parsed.tools,
-    tool_choice: parsed.tool_choice,
+    tools: obj.tools,
+    tool_choice: obj.tool_choice,
     messages,
   };
   return { model, identity, messages };

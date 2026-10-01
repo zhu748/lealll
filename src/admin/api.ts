@@ -64,6 +64,7 @@ import {
 } from "./request-body.js";
 import {
   clearVerifyFailure,
+  isCrossOriginMutation,
   isVerifyLocked,
   jsonResp,
   recordVerifyFailure,
@@ -966,7 +967,7 @@ let logFileFlushLastWarnAt = 0;
 let logFileDroppedSinceWarn = 0;
 let logFileDropLastWarnAt = 0;
 let logFileDropWarnInProgress = false;
-import { appendFile as appendFileAsync } from "node:fs/promises";
+import { appendFile as appendFileAsync, stat as statAsync, rename as renameAsync, rm as rmAsync } from "node:fs/promises";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 // v0.3.7.1: host-captured timers — dashboard/admin timers (activation
@@ -977,6 +978,35 @@ import { dirname } from "node:path";
 import { hostSetTimeout, hostSetInterval, hostClearTimeout, hostClearInterval } from "../utils/host-timers.js";
 
 let appendLogFile = appendFileAsync;
+
+// --- log rotation (unbounded log-file growth guard) ---
+// `logging.file` appends forever; a busy proxy can produce multi-GB JSONL
+// files and fill a container disk. Size is checked (throttled to once per
+// minute) inside the flush loop; when the cap is hit the current file is
+// renamed to `.1` and older rotations are shifted/dropped.
+const LOG_ROTATE_CHECK_INTERVAL_MS = 60_000;
+const LOG_ROTATE_MAX_BYTES = 64 * 1024 * 1024;
+const LOG_ROTATE_KEEP = 2;
+let lastRotateCheckAt = 0;
+
+async function maybeRotateLogFile(path: string): Promise<void> {
+  const now = Date.now();
+  if (now - lastRotateCheckAt < LOG_ROTATE_CHECK_INTERVAL_MS) return;
+  lastRotateCheckAt = now;
+  try {
+    const st = await statAsync(path);
+    if (st.size < LOG_ROTATE_MAX_BYTES) return;
+    // Shift rotations: .{KEEP-1} -> .{KEEP}, ... , current -> .1
+    try { await rmAsync(`${path}.${LOG_ROTATE_KEEP}`, { force: true }); } catch { /* best-effort */ }
+    for (let i = LOG_ROTATE_KEEP - 1; i >= 1; i--) {
+      try { await renameAsync(`${path}.${i}`, `${path}.${i + 1}`); } catch { /* no such rotation */ }
+    }
+    try { await renameAsync(path, `${path}.1`); } catch { /* best-effort */ }
+  } catch {
+    // stat failed (file missing/locked) — nothing to rotate; the next
+    // appendFile recreates the file.
+  }
+}
 
 function warnLogFileFlushFailure(path: string, message: string): void {
   const now = Date.now();
@@ -1015,6 +1045,7 @@ function warnLogFileBufferDrop(path: string): void {
  */
 async function appendLogFileBatch(path: string, lines: string[]): Promise<void> {
   try {
+    await maybeRotateLogFile(path);
     await appendLogFile(path, lines.join(""));
     logFileFlushWarnKey = undefined;
     logFileFlushLastWarnAt = 0;
@@ -1356,6 +1387,29 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
   // short-circuit every wrong token to 401 and the verify route's
   // rate-limit counter would never increment.
   const isVerifyRouteWithAuth = path === "/admin/api/verify" && opts.config.auth.proxyApiKey;
+
+  // CSRF guard for mutating admin requests (cross-site blind POST protection).
+  //
+  // POST is a CORS-simple method: a malicious webpage in the operator's browser
+  // can fire `fetch("http://127.0.0.1:8080/admin/api/credentials", {method:
+  // "POST", ...})` without any preflight, and the mutation executes
+  // server-side even though the attacker can never READ the response. The
+  // loopback gate below does not help here — the attacker's request comes FROM
+  // the operator's own machine. Browsers always attach Origin on cross-site
+  // (and same-site) mutating fetches; non-browser clients (curl, CLI, SDKs)
+  // attach none and are the only callers unaffected by CSRF. So: if an
+  // Origin/Referer is present it must be loopback or match the request's own
+  // Host; a request with neither header is treated as non-browser and passes.
+  // (Logic lives in admin/security.ts — shared with the /quota mutations.)
+  if (path.startsWith("/admin/api/") && method !== "GET" && method !== "HEAD" && method !== "OPTIONS" && isCrossOriginMutation(req)) {
+    return errorResponse(
+      403,
+      "cross_origin_blocked",
+      `Admin API rejects cross-site ${method} requests (Origin/Referer host mismatch). ` +
+      "If you manage the dashboard through a reverse proxy on another origin, add a matching Host header or access it via loopback.",
+    );
+  }
+
   if (path.startsWith("/admin/api/") && !isVerifyRouteWithAuth) {
     // Allow SSE endpoints to receive the token via query parameter, since
     // EventSource cannot set custom HTTP headers.

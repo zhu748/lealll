@@ -166,7 +166,8 @@ async function readChunkWithTimeout(
   return result;
 }
 
-async function readJsonLimited(resp: Response, maxBytes = MAX_QUOTA_JSON_BYTES, timeoutMs = REQUEST_TIMEOUT_MS): Promise<any> {
+/** Shared byte/time-capped JSON body reader (also used by client-config's CDN fetch). */
+export async function readJsonLimited(resp: Response, maxBytes = MAX_QUOTA_JSON_BYTES, timeoutMs = REQUEST_TIMEOUT_MS): Promise<any> {
   const limit = Math.max(1, Math.floor(maxBytes));
   const readTimeoutMs = normalizeTimerMs(timeoutMs);
   const declaredLength = parseContentLength(resp.headers);

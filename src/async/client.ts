@@ -22,6 +22,7 @@ import type {
   TicketStatusResult,
 } from "./types.js";
 import { OffPeakServerError } from "./types.js";
+import { hostSetTimeout, hostClearTimeout } from "../utils/host-timers.js";
 
 export interface OffPeakClientOptions {
   origin: string;
@@ -75,7 +76,10 @@ export function createOffPeakClient(opts: OffPeakClientOptions): OffPeakClient {
     settleAsSuccess: boolean,
   ): Promise<unknown> {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    // Host-safe timer: control-plane calls run concurrently with captcha solve
+    // epochs — a bare setTimeout into an aliased window registry is cancelled
+    // silently when that window closes, and the fetch then hangs forever.
+    const timer = hostSetTimeout(() => controller.abort(), timeoutMs);
     const onExternalAbort = (): void => controller.abort();
     if (externalSignal) {
       if (externalSignal.aborted) controller.abort();
@@ -105,7 +109,7 @@ export function createOffPeakClient(opts: OffPeakClientOptions): OffPeakClient {
       }
       raw = await resp.text();
     } finally {
-      clearTimeout(timer);
+      hostClearTimeout(timer);
       externalSignal?.removeEventListener("abort", onExternalAbort);
     }
 

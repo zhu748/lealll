@@ -99,6 +99,28 @@ import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
 
+    /**
+     * False while the activity is stopped (Home/recents/another app): the UI
+     * poll loop checks this and skips its 1.5s status+logs round-trips. The
+     * old loop ran `while(true)` from composition — the FGS keeps the process
+     * alive, so polling (2 sockets per tick) continued INDEFINITELY in the
+     * background, burning battery/data for a UI nobody is watching.
+     */
+    @Volatile
+    var uiVisible: Boolean = false
+
+    override fun onStart() {
+        super.onStart()
+        uiVisible = true
+        isUiVisible = true
+    }
+
+    override fun onStop() {
+        uiVisible = false
+        isUiVisible = false
+        super.onStop()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -119,6 +141,9 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         var controlClient: ControlClient? = null
+        /** Snapshot mirror of the instance flag for the composable loop. */
+        @Volatile
+        var isUiVisible: Boolean = false
     }
 }
 
@@ -190,13 +215,16 @@ private fun AppScreen(themeMode: ThemeMode, onThemeModeChange: (ThemeMode) -> Un
         }
     }
 
-    // 轮询：status + 增量 getLogs（协议与旧版一致，1.5s）
+    // 轮询：status + 增量 getLogs（协议与旧版一致，1.5s）。
+    // Activity stopped（按 Home/切后台）时跳过网络轮询——FGS 让进程常驻，
+    // 旧的无条件 while(true) 会在后台持续打 socket 直到进程死亡。
     LaunchedEffect(Unit) {
         while (true) {
-            val cc = MainActivity.controlClient
-            if (cc == null) {
-                reachable = false
-            } else {
+            if (MainActivity.isUiVisible) {
+                val cc = MainActivity.controlClient
+                if (cc == null) {
+                    reachable = false
+                } else {
                 val resp = cc.status()
                 if (resp != null) {
                     reachable = true
@@ -228,6 +256,7 @@ private fun AppScreen(themeMode: ThemeMode, onThemeModeChange: (ThemeMode) -> Un
                         }
                     }
                     logCursor = next
+                }
                 }
             }
             delay(POLL_INTERVAL_MS)

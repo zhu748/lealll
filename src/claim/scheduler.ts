@@ -14,6 +14,7 @@
  * client compares them against `Date.now()/1e3`).
  */
 import type { ClaimOutcome, ClaimablePlan } from "./types.js";
+import { formatUnixSeconds } from "./types.js";
 import { ClaimPreviewError } from "./client.js";
 
 interface ClaimGateway {
@@ -45,6 +46,11 @@ export type TickResult =
   | { action: "failed"; outcome: Extract<ClaimOutcome, { ok: false }>; holdMs: number }
   | { action: "error"; message: string; holdMs: number };
 
+/** Upper bound on any hold (success or failure): a bogus upstream `ends_at`
+ * (unit drift, epoch-ms mistake) must not silently stop the scheduler for
+ * decades. Matches the failure-path cap. */
+const MAX_HOLD_MS = 24 * 60 * 60 * 1000;
+
 export class ClaimScheduler {
   private stopped = false;
   private holdUntil = 0;
@@ -62,7 +68,9 @@ export class ClaimScheduler {
   }
 
   start(): void {
-    if (this.stopped) return;
+    // Re-entrancy guard: a second start() while a tick timer is live would
+    // orphan the first timer and double-poll.
+    if (this.stopped || this.timer !== null) return;
     this.scheduleNext(0);
   }
 
@@ -93,7 +101,14 @@ export class ClaimScheduler {
       return this.errorBackoff("no JWT available (oauth login pending)");
     }
 
-    const client = this.deps.createClient(jwt);
+    let client: ClaimGateway;
+    try {
+      client = this.deps.createClient(jwt);
+    } catch (err) {
+      // A throwing factory used to escape as an unhandled rejection (it sat
+      // outside every try/catch in this method).
+      return this.errorBackoff(`claim client construction failed: ${(err as Error).message}`);
+    }
     let plans: ClaimablePlan[];
     try {
       plans = await client.getPreviews();
@@ -134,8 +149,9 @@ export class ClaimScheduler {
 
     if (outcome.ok) {
       const endsAtMs = outcome.endsAt !== undefined ? outcome.endsAt * 1000 : undefined;
-      this.holdUntil = endsAtMs ?? nowMs + this.deps.config.pollIntervalMs;
-      this.log(`claim: claimed plan ${target.planId}${outcome.startsAt !== undefined ? ` (activates ${new Date(outcome.startsAt * 1000).toISOString()})` : ""}`);
+      // Clamp the success hold like the failure path — see MAX_HOLD_MS.
+      this.holdUntil = Math.min(endsAtMs ?? nowMs + this.deps.config.pollIntervalMs, nowMs + MAX_HOLD_MS);
+      this.log(`claim: claimed plan ${target.planId}${outcome.startsAt !== undefined ? ` (activates ${formatUnixSeconds(outcome.startsAt)})` : ""}`);
       return { action: "claimed", planId: target.planId, startsAt: outcome.startsAt, endsAt: outcome.endsAt };
     }
 
@@ -175,8 +191,20 @@ export class ClaimScheduler {
     if (this.stopped) return;
     this.timer = setTimeout(() => {
       this.timer = null;
-      void this.tick().finally(() => this.scheduleNext(this.nextDelay()));
+      // .catch before .finally: any unexpected tick() throw (a bad upstream
+      // payload, a deps.log crash) must surface as a logged error, not as an
+      // unhandled rejection that TERMINATES the process.
+      void this.tick()
+        .catch((err) => {
+          try {
+            this.log(`claim: tick crashed: ${(err as Error)?.message ?? String(err)}`);
+          } catch { /* logging must never throw */ }
+        })
+        .finally(() => this.scheduleNext(this.nextDelay()));
     }, delayMs);
+    // Unref: a live hold (up to the 24h cap) must not keep the event loop —
+    // and therefore the process — alive after SIGINT on the Android entry.
+    this.timer.unref?.();
   }
 
   private nextDelay(): number {

@@ -30,6 +30,7 @@ import type { Credential } from "./types.js";
 import type { ProxyIdentity } from "../config/types.js";
 import { DEFAULT_APP_VERSION } from "../config/loader.js";
 import { buildIdentityHeaders } from "../proxy/identity.js";
+import { hostSetTimeout, hostClearTimeout } from "../utils/host-timers.js";
 
 /** Default origin of the zcode control plane. */
 export const DEFAULT_MCP_USAGE_ORIGIN = "https://zcode.z.ai";
@@ -105,57 +106,62 @@ export async function fetchMcpUsage(
   };
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  let resp: Response;
+  // Host-safe timer (see utils/host-timers.ts), kept armed until BODY
+  // consumption finishes: the abort previously disarmed on header arrival,
+  // so a stalled response body hung the /quota aggregate with no timeout.
+  const timer = hostSetTimeout(() => controller.abort(), timeoutMs);
   try {
-    resp = await fetchImpl(`${origin}/api/v1/mcp/usage`, {
-      method: "GET",
-      headers,
-      signal: controller.signal,
-    });
-  } catch {
-    return null;
+    let resp: Response;
+    try {
+      resp = await fetchImpl(`${origin}/api/v1/mcp/usage`, {
+        method: "GET",
+        headers,
+        signal: controller.signal,
+      });
+    } catch {
+      return null;
+    }
+    if (!resp.ok) {
+      void resp.body?.cancel().catch(() => {});
+      return null;
+    }
+    let envelope: { code?: unknown; msg?: unknown; data?: unknown };
+    try {
+      envelope = await resp.json();
+    } catch {
+      return null;
+    }
+    if (
+      typeof envelope !== "object" ||
+      envelope === null ||
+      typeof (envelope as { code?: unknown }).code !== "number"
+    ) {
+      return null;
+    }
+    const code = envelope.code as number;
+    if (code !== 0) return null;
+    const data = (envelope as { data?: unknown }).data;
+    if (data == null) return null;
+    const d = data as Record<string, unknown>;
+    const serverTime = toFinite(d.server_time);
+    if (serverTime === undefined) return null;
+    const totalUsage = d.total_usage as Record<string, unknown> | undefined;
+    const used = toFinite(totalUsage?.used) ?? 0;
+    const limit = toFinite(totalUsage?.limit) ?? 0;
+    const remaining = toFinite(totalUsage?.remaining) ?? 0;
+    const nextRefreshAt = toFinite(d.next_refresh_at);
+    const level = typeof d.level === "string" ? d.level.trim() : undefined;
+    return {
+      serverTime: serverTime * 1000,
+      used,
+      limit,
+      remaining,
+      ...(nextRefreshAt !== undefined ? { nextRefreshAt: nextRefreshAt * 1000 } : {}),
+      ...(level ? { level } : {}),
+    };
   } finally {
-    clearTimeout(timer);
+    hostClearTimeout(timer);
   }
-  if (!resp.ok) {
-    void resp.body?.cancel().catch(() => {});
-    return null;
-  }
-  let envelope: { code?: unknown; msg?: unknown; data?: unknown };
-  try {
-    envelope = await resp.json();
-  } catch {
-    return null;
-  }
-  if (
-    typeof envelope !== "object" ||
-    envelope === null ||
-    typeof (envelope as { code?: unknown }).code !== "number"
-  ) {
-    return null;
-  }
-  const code = envelope.code as number;
-  if (code !== 0) return null;
-  const data = (envelope as { data?: unknown }).data;
-  if (data == null) return null;
-  const d = data as Record<string, unknown>;
-  const serverTime = toFinite(d.server_time);
-  if (serverTime === undefined) return null;
-  const totalUsage = d.total_usage as Record<string, unknown> | undefined;
-  const used = toFinite(totalUsage?.used) ?? 0;
-  const limit = toFinite(totalUsage?.limit) ?? 0;
-  const remaining = toFinite(totalUsage?.remaining) ?? 0;
-  const nextRefreshAt = toFinite(d.next_refresh_at);
-  const level = typeof d.level === "string" ? d.level.trim() : undefined;
-  return {
-    serverTime: serverTime * 1000,
-    used,
-    limit,
-    remaining,
-    ...(nextRefreshAt !== undefined ? { nextRefreshAt: nextRefreshAt * 1000 } : {}),
-    ...(level ? { level } : {}),
-  };
 }
 
 function toFinite(v: unknown): number | undefined {

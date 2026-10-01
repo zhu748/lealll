@@ -87,9 +87,12 @@ export function buildUpstreamURL(format: Format, provider: ProviderDef, plan: "c
     return `${STARTPLAN_ANTHROPIC_BASE}/anthropic/v1/messages`;
   }
   if (format === "anthropic") {
-    return `${provider.anthropicBaseURL}/v1/messages`;
+    // Strip trailing slashes from the configured base — a user-entered
+    // "https://api.z.ai/api/anthropic/" would otherwise produce a
+    // double-slash path (`//v1/messages`) upstream.
+    return `${provider.anthropicBaseURL.replace(/\/+$/, "")}/v1/messages`;
   }
-  return `${provider.openaiBaseURL}/chat/completions`;
+  return `${provider.openaiBaseURL.replace(/\/+$/, "")}/chat/completions`;
 }
 
 /**

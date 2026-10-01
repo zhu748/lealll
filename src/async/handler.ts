@@ -28,6 +28,7 @@ import { transformRequestBody } from "../proxy/body-transformer.js";
 import { buildAnthropicMetadataUserId } from "../proxy/trace-headers.js";
 import { inflateWithCap } from "../proxy/inflate.js";
 import { translateRequestOpenAIToAnthropic, translateResponseAnthropicToOpenAI } from "../translator/openai-to-anthropic.js";
+import { parseSSEChunk } from "../utils/sse.js";
 import { anthropicSseToOpenaiSseWithKeepalive } from "./openai-stream-adapter.js";
 import type { AnthropicMessagesRequest, OpenAIChatRequest, AnthropicMessagesResponse } from "../translator/types.js";
 import { createOffPeakClient, type OffPeakClient } from "./client.js";
@@ -73,9 +74,12 @@ async function readBody(req: Request): Promise<{ ok: true; body: string } | { ok
   if (contentLength) {
     const cl = parseInt(contentLength, 10);
     if (Number.isFinite(cl) && cl > MAX_REQUEST_BODY_BYTES) {
-      // Cancel the request body stream so the underlying socket releases; otherwise
-      // the client can keep the connection alive despite the 413 response.
-      req.body?.cancel().catch(() => {});
+      // NOTE: deliberately NOT cancelling the body stream — cancelling aborts
+      // Readable.toWeb(req)'s source, and Bun's node:http shim then finalizes
+      // the response itself (client sees a default empty 200, not our 413).
+      // Leaving the stream unconsumed is still memory-safe: the connection is
+      // destroyed once the 413 response is written; unread bytes stay in the
+      // kernel socket buffer under TCP backpressure, never in proxy memory.
       return { ok: false, response: errorResponse(413, "request_too_large", `body exceeds ${MAX_REQUEST_BODY_BYTES} byte cap`) };
     }
   }
@@ -91,7 +95,7 @@ async function readBody(req: Request): Promise<{ ok: true; body: string } | { ok
       if (done) break;
       total += value.byteLength;
       if (total > MAX_REQUEST_BODY_BYTES) {
-        await reader.cancel().catch(() => {});
+        // Stop consuming, surface the 413 — do NOT cancel (see note above).
         return { ok: false, response: errorResponse(413, "request_too_large", `body exceeds ${MAX_REQUEST_BODY_BYTES} byte cap`) };
       }
       chunks.push(value);
@@ -259,7 +263,13 @@ export async function handleAsyncChat(req: Request, opts: AsyncHandlerOptions): 
 
   let openaiReq: OpenAIChatRequest;
   try {
-    openaiReq = JSON.parse(bodyResult.body) as OpenAIChatRequest;
+    const raw = JSON.parse(bodyResult.body) as unknown;
+    // JSON.parse("null") is legal — guard before field access, mirroring
+    // handleAsyncMessages, so a literal `null` body is a 400 not a 500.
+    if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+      return errorResponse(400, "invalid_request_error", "request body must be a JSON object");
+    }
+    openaiReq = raw as OpenAIChatRequest;
   } catch {
     return errorResponse(400, "invalid_request_error", "request body is not valid JSON");
   }
@@ -337,6 +347,10 @@ function nonStreamChunkedJson(
           try {
             controller.enqueue(SINGLE_SPACE);
           } catch {
+            // Consumer vanished mid-wait: stop the upstream bridge stream too,
+            // otherwise it keeps consuming the LLM stream until req.signal
+            // fires indirectly (wasted upstream tokens + memory).
+            await reader.cancel().catch(() => {});
             return;
           }
           sseBuffer += decoder.decode(value, { stream: true });
@@ -376,11 +390,15 @@ function nonStreamChunkedJson(
  * Reconstruct a synthetic `AnthropicMessagesResponse` from a stream of Anthropic SSE bytes.
  * Handles message_start, content_block_start/delta/stop, message_delta, message_stop.
  *
+ * Uses the shared `parseSSEChunk` (multi-line data, CRLF, frame-splitting edge
+ * cases) instead of a lossy inline line-scanner. Note the bridge already
+ * normalizes newlines to LF and emits complete frames, but reusing the shared
+ * parser keeps this path correct if that invariant ever changes.
+ *
  * Fail-closed: returns null if `message_stop` not seen, or on `event: error`.
  * Preserves `signature_delta` for thinking blocks. No production `any`.
  */
 function reconstructAnthropicBatch(sseText: string): AnthropicMessagesResponse | null {
-  const blocks = sseText.split("\n\n");
   type ContentBlock =
     | { type: "text"; text: string }
     | { type: "thinking"; thinking: string; signature?: string }
@@ -392,23 +410,12 @@ function reconstructAnthropicBatch(sseText: string): AnthropicMessagesResponse |
   let sawMessageStop = false;
   let sawError = false;
 
-  for (const block of blocks) {
-    const lines = block.split("\n");
-    let eventType: string | undefined;
-    let data: string | undefined;
-    for (const line of lines) {
-      if (line.startsWith("event:")) eventType = line.slice(6).trim();
-      else if (line.startsWith("data:")) data = line.slice(5).trim();
-    }
-    if (!data) continue;
-    let parsed: Record<string, unknown>;
-    try {
-      parsed = JSON.parse(data) as Record<string, unknown>;
-    } catch {
-      continue;
-    }
+  for (const evt of parseSSEChunk(sseText)) {
+    const data = evt.data;
+    if (typeof data !== "object" || data === null) continue;
+    const parsed = data as Record<string, unknown>;
 
-    const type = (eventType ?? parsed.type) as string;
+    const type = evt.event || (typeof parsed.type === "string" ? parsed.type : "");
     switch (type) {
       case "message_start": {
         const msg = parsed.message as Partial<AnthropicMessagesResponse> | undefined;
@@ -456,7 +463,7 @@ function reconstructAnthropicBatch(sseText: string): AnthropicMessagesResponse |
         break;
       }
       case "message_delta": {
-        const delta = parsed.delta as Partial<AnthropicMessagesResponse> | undefined;
+        const delta = parsed.delta as { stop_reason?: string | null; stop_sequence?: string | null } | undefined;
         const usage = parsed.usage as Record<string, number> | undefined;
         if (delta && message) Object.assign(message, delta);
         if (usage && message) message.usage = { ...(message.usage ?? { input_tokens: 0, output_tokens: 0 }), ...usage } as AnthropicMessagesResponse["usage"];

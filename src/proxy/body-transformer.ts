@@ -59,26 +59,39 @@ export function transformRequestBody(body: string | undefined, ctx: TransformCon
   }
   if (typeof parsed !== "object" || parsed === null) return body;
 
+  return transformParsedBody(parsed as Record<string, unknown>, ctx) ?? body;
+}
+
+/**
+ * Object-form transform for callers that ALREADY hold the parsed body (the
+ * hot path parses each request body exactly once — see handler.ts). Mutates
+ * `parsed` in place and returns the re-serialized body ONLY when something
+ * changed; returns undefined when no mutation was needed (the caller keeps
+ * its existing string form). Callers that must re-transform the same logical
+ * body twice (e.g. a start-plan flip mid-retry) pass a fresh copy — the
+ * in-place mutations (system-block prepend, marker cleanup) are not
+ * idempotent-safe against double application.
+ */
+export function transformParsedBody(parsed: Record<string, unknown>, ctx: TransformContext): string | undefined {
   let modified = false;
 
   if (ctx.format === "openai") {
     if (ctx.startPlan) {
-      modified = applyStartPlanOpenAISystem(parsed as Record<string, unknown>, ctx.provider) || modified;
+      modified = applyStartPlanOpenAISystem(parsed, ctx.provider) || modified;
     }
-    modified = applyStreamOptionsIncludeUsage(parsed as Record<string, unknown>) || modified;
+    modified = applyStreamOptionsIncludeUsage(parsed) || modified;
   }
   if (ctx.format === "anthropic") {
-    const obj = parsed as Record<string, unknown>;
     if (ctx.startPlan) {
-      modified = applyStartPlanSystem(obj, ctx.provider) || modified;
+      modified = applyStartPlanSystem(parsed, ctx.provider) || modified;
     }
-    modified = applyAnthropicCacheControl(obj) || modified;
+    modified = applyAnthropicCacheControl(parsed) || modified;
     if (ctx.metadataUserId) {
-      modified = applyAnthropicUserId(obj, ctx.metadataUserId) || modified;
+      modified = applyAnthropicUserId(parsed, ctx.metadataUserId) || modified;
     }
   }
 
-  return modified ? JSON.stringify(parsed) : body;
+  return modified ? JSON.stringify(parsed) : undefined;
 }
 
 /** OpenAI streaming: ensure `stream_options.include_usage: true`. */

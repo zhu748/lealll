@@ -7,6 +7,7 @@ import type {
   OpenAIChatResponse,
   OpenAIUsage,
   OpenAIMessage,
+  OpenAIContentPart,
   OpenAIToolDefinition,
   AnthropicMessagesRequest,
   AnthropicMessagesResponse,
@@ -50,7 +51,14 @@ export function translateRequestOpenAIToAnthropic(req: OpenAIChatRequest): Anthr
   if (req.temperature !== undefined) result.temperature = req.temperature;
   if (req.top_p !== undefined) result.top_p = req.top_p;
   if (req.stream !== undefined) result.stream = req.stream;
-  if (req.stop) result.stop_sequences = Array.isArray(req.stop) ? req.stop : [req.stop];
+  if (req.stop) {
+    // Anthropic rejects empty stop_sequences arrays and empty-string entries;
+    // OpenAI clients commonly send `stop: []` or `stop: [""]` (e.g. some SDK
+    // defaults) — drop the empties instead of provoking an upstream 400.
+    const stops = (Array.isArray(req.stop) ? req.stop : [req.stop])
+      .filter((s): s is string => typeof s === "string" && s.length > 0);
+    if (stops.length > 0) result.stop_sequences = stops;
+  }
   if (isGlm53Model(req.model)) {
     const { thinking, output_config } = translateGlm53Reasoning(req);
     result.thinking = thinking;
@@ -63,7 +71,10 @@ export function translateRequestOpenAIToAnthropic(req: OpenAIChatRequest): Anthr
   if (req.tools?.length && req.tool_choice !== "none") {
     result.tools = req.tools.map(translateToolOpenAIToAnthropic);
   }
-  if (req.tool_choice !== undefined && req.tool_choice !== "none") {
+  // tool_choice is only legal alongside tools on the Anthropic upstream —
+  // forwarding a lone `"auto"` (an SDK default on some clients) produced a
+  // guaranteed 400 when the request carried no tools.
+  if (result.tools && req.tool_choice !== undefined && req.tool_choice !== "none") {
     const translated = translateToolChoice(req.tool_choice);
     if (translated) result.tool_choice = translated;
   }
@@ -288,13 +299,27 @@ function toolResultContent(msg: OpenAIMessage): string | AnthropicContentBlock[]
     const joined = msg.content.map((c) => c.text ?? "").join("");
     return joined;
   }
-  return msg.content.map((c) => {
-    if (c.type === "text") return { type: "text" as const, text: c.text ?? "" };
-    if (c.type === "image_url" && c.image_url?.url) {
-      return imageUrlToAnthropicBlock(c.image_url.url);
-    }
-    return { type: "text" as const, text: "" };
-  });
+  return dropEmptyTextBlocks(msg.content.map(contentPartToAnthropicBlock));
+}
+
+/**
+ * Translate one OpenAI content part. Unknown part types (OpenAI's
+ * `input_audio`, `file`, future additions) degrade to a VISIBLE placeholder
+ * text block — the old shape emitted a silent empty text block, which the
+ * Anthropic upstream rejects ("text: String should have at least 1 character")
+ * and which hid the dropped content from the user.
+ */
+function contentPartToAnthropicBlock(c: OpenAIContentPart): AnthropicContentBlock {
+  if (c.type === "text") return { type: "text", text: c.text ?? "" };
+  if (c.type === "image_url" && c.image_url?.url) {
+    return imageUrlToAnthropicBlock(c.image_url.url);
+  }
+  return { type: "text", text: `[unsupported content part: ${c.type}]` };
+}
+
+/** Remove empty text blocks — the Anthropic upstream rejects them. */
+function dropEmptyTextBlocks(blocks: AnthropicContentBlock[]): AnthropicContentBlock[] {
+  return blocks.filter((b) => !(b.type === "text" && b.text === ""));
 }
 
 function parseDataUrl(url: string): { mediaType: string; data: string } | undefined {
@@ -303,23 +328,32 @@ function parseDataUrl(url: string): { mediaType: string; data: string } | undefi
   return { mediaType: m[1], data: m[2] };
 }
 
+/** Base64 image media types the Anthropic upstream accepts (everything else 400s). */
+const ANTHROPIC_IMAGE_MEDIA_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
+
 /**
  * Map an OpenAI `image_url` string to an Anthropic image block.
  *
- * `data:` base64 URLs become inline base64 sources; http(s) URLs become
- * url-source image blocks — the same two shapes the ZCode client emits
- * (`image-data` → base64 source, `image-url` → url source). Anything else
- * (non-base64 data URLs, exotic schemes) degrades to a text block carrying
- * the URL verbatim rather than emitting a block the upstream would reject.
+ * `data:` base64 URLs with an ACCEPTED media type (jpeg/png/gif/webp) become
+ * inline base64 sources; http(s) URLs become url-source image blocks — the
+ * same two shapes the ZCode client emits (`image-data` → base64 source,
+ * `image-url` → url source). Anything else (unsupported media types like
+ * svg/bmp, non-base64 data URLs, exotic schemes) degrades to a text block
+ * rather than emitting a block the upstream would reject with a 400.
  * OpenAI's `detail` hint has no Anthropic equivalent and is dropped.
  */
 function imageUrlToAnthropicBlock(url: string): AnthropicContentBlock {
   const parsed = parseDataUrl(url);
   if (parsed) {
-    return {
-      type: "image",
-      source: { type: "base64", media_type: parsed.mediaType, data: parsed.data },
-    };
+    const mediaType = parsed.mediaType.toLowerCase();
+    if (ANTHROPIC_IMAGE_MEDIA_TYPES.has(mediaType)) {
+      return {
+        type: "image",
+        source: { type: "base64", media_type: mediaType, data: parsed.data },
+      };
+    }
+    // Unsupported media type — degrade visibly instead of a guaranteed 400.
+    return { type: "text", text: `[unsupported image media type: ${parsed.mediaType}]` };
   }
   if (/^https?:\/\//i.test(url)) {
     return { type: "image", source: { type: "url", url } };
@@ -417,17 +451,16 @@ function extractText(msg: OpenAIMessage): string {
 
 function translateContentOpenAIToAnthropic(msg: OpenAIMessage): string | AnthropicContentBlock[] {
   if (typeof msg.content === "string") return msg.content;
-  if (msg.content === null) return "";
+  // `content: null` / non-array shapes: a placeholder keeps role pairing
+  // alive — an empty string or empty block list is rejected by the upstream
+  // with a 400 ("all messages must have non-empty content"). Assistant
+  // tool-call placeholders take the dedicated branch in
+  // translateMessageOpenAIToAnthropic and never reach this fallback.
+  if (msg.content === null) return "[empty message]";
   if (Array.isArray(msg.content)) {
-    return msg.content.map((c) => {
-      if (c.type === "text") return { type: "text" as const, text: c.text ?? "" };
-      if (c.type === "image_url" && c.image_url?.url) {
-        return imageUrlToAnthropicBlock(c.image_url.url);
-      }
-      return { type: "text" as const, text: "" };
-    });
+    return dropEmptyTextBlocks(msg.content.map(contentPartToAnthropicBlock));
   }
-  return "";
+  return "[empty message]";
 }
 
 function translateToolOpenAIToAnthropic(tool: OpenAIToolDefinition): AnthropicToolDefinition {

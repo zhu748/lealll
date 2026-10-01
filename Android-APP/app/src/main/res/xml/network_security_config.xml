@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Cleartext HTTP is only ever needed for the loopback control channel
+    (127.0.0.1) and the OAuth callback redirect landing on localhost. The old
+    blanket android:usesCleartextTraffic="true" also allowed the OAuth WebView
+    session cookies and the update check to be downgraded to http mid-redirect.
+    Everything else is HTTPS-only.
+-->
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
+    </domain-config>
+</network-security-config>

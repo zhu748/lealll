@@ -4,6 +4,7 @@ dist
 .github
 *.log
 config.yaml
+config.test.yaml
 .DS_Store
 zcode-proxy.exe
 zcode-proxy-linux-*
@@ -11,3 +12,8 @@ zcode-proxy-darwin-*
 docs
 _reverse
 .omo
+# Companion Android app + its ~200MB nested-copy accident and native libs are
+# irrelevant to the container image — keeps the Render build context small.
+Android-APP
+release
+*.md

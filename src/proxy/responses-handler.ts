@@ -17,7 +17,7 @@
  * State management: in-memory only (process restart clears the store); see
  * `responses/store.ts`.
  */
-import { transformRequestBody } from "./body-transformer.js";
+import { transformRequestBody, transformParsedBody } from "./body-transformer.js";
 import { getProvider } from "../provider/providers.js";
 import type { ProxyConfig } from "../config/types.js";
 import type { AuthManager } from "../auth/manager.js";
@@ -37,7 +37,10 @@ async function loadCaptcha(): Promise<CaptchaModule> {
 }
 import { getDefaultEndpointRouting, type EndpointRoutingService } from "./endpoint-routing.js";
 import { getDefaultClientSigning, sendWithClientSigning, type ClientSigningManager } from "./client-signing.js";
+import { pickProxy } from "./proxy-pool.js";
+import { makeProxiedFetcher } from "./proxied-fetch.js";
 import { buildAnthropicMetadataUserId } from "./trace-headers.js";
+import { recordHeaders } from "../utils/header-debug.js";
 import { credentialString } from "../auth/types.js";
 import { translateRequestOpenAIToAnthropic, translateResponseAnthropicToOpenAI } from "../translator/openai-to-anthropic.js";
 import { anthropicSseToOpenaiSse } from "../translator/sse-translator.js";
@@ -63,7 +66,7 @@ import {
   type ResponsesOutputItem,
 } from "../translator/responses-types.js";
 import { ResponseStore, type StoredResponse } from "../responses/store.js";
-import { errorResponse, readBody, InflatedBodyTooLargeError } from "./handler.js";
+import { errorResponse, readBody, InflatedBodyTooLargeError, RequestBodyTooLargeError } from "./handler.js";
 
 export interface ResponsesHandlerOptions {
   config: ProxyConfig;
@@ -94,9 +97,9 @@ export async function handleResponses(
   // ── 1. parse body ──
   let rawBody: string;
   try {
-    rawBody = (await readBody(clientReq)) ?? "";
+    rawBody = (await readBody(clientReq, opts.config.server?.maxRequestBodyBytes)) ?? "";
   } catch (err) {
-    if (err instanceof InflatedBodyTooLargeError) {
+    if (err instanceof InflatedBodyTooLargeError || err instanceof RequestBodyTooLargeError) {
       return errorResponse(413, "request_too_large", err.message);
     }
     return errorResponse(400, "invalid_request", `could not read request body: ${(err as Error).message}`);
@@ -163,7 +166,14 @@ export async function handleResponses(
   // Both plans post Anthropic upstream (mirrors handler.ts): the start-plan
   // OpenAI gateway was retired server-side (404 as of 2026-08-28), so the
   // Responses → Chat → Anthropic translator chain runs unconditionally.
-  const startPlan = opts.config.plan === "start-plan";
+  // Plan resolution mirrors handler.ts effectivePlanForCred: the credential's
+  // own plan (or a start-plan JWT) wins over config.plan — request-local,
+  // never mutating the shared config object. `currentPlan` (not config.plan)
+  // must feed buildUpstreamHeaderPairs/buildUpstreamRequest too, otherwise a
+  // start-plan credential would carry start-plan body transforms but a
+  // coding-plan URL/auth scheme.
+  const currentPlan = cred.plan ?? (cred.jwt ? "start-plan" : opts.config.plan);
+  const startPlan = currentPlan === "start-plan";
   const upstreamFormat: "openai" | "anthropic" = "anthropic";
   let upstreamRequestBody: string;
   {
@@ -178,7 +188,10 @@ export async function handleResponses(
     // same device/session blob as coding-plan. The /v1/responses path has no
     // client-session resolution — session_id falls back to "" (a legal `bnt`
     // output in the bundle).
-    upstreamRequestBody = transformRequestBody(JSON.stringify(anthropicReq), {
+    // Object path: the translator just produced anthropicReq — mutate it in
+    // place instead of the old stringify→parse→stringify round trip.
+    // anthropicReq is not read after this block, so in-place mutation is safe.
+    upstreamRequestBody = transformParsedBody(anthropicReq as unknown as Record<string, unknown>, {
       format: "anthropic",
       metadataUserId: buildAnthropicMetadataUserId(opts.config.identity.deviceMid, undefined),
       startPlan,
@@ -202,12 +215,26 @@ export async function handleResponses(
       // Fall through: the 3007 retry below solves on demand.
     }
   }
-  const upstreamHeaders = buildUpstreamHeaderPairs(clientReq, upstreamFormat, cred, opts.config.identity, opts.config.plan, captchaHeaders, undefined);
-  const upstreamReq = buildUpstreamRequest(clientReq, upstreamFormat, providerDef, cred, transformedBody, opts.config.identity, opts.config.plan, captchaHeaders, undefined);
+  const upstreamHeaders = buildUpstreamHeaderPairs(clientReq, upstreamFormat, cred, opts.config.identity, currentPlan, captchaHeaders, undefined);
+  const upstreamReq = buildUpstreamRequest(clientReq, upstreamFormat, providerDef, cred, transformedBody, opts.config.identity, currentPlan, captchaHeaders, undefined);
   if (debug) console.log(`[responses] → POST ${upstreamReq.url}`);
+
+  // Egress proxy wiring (mirrors handler.ts): per-credential override wins,
+  // then the global pool. Null → direct fetch (unchanged behavior for
+  // unconfigured setups).
+  let egressProxy: string | null = cred.proxy?.trim() || null;
+  if (!egressProxy) {
+    try {
+      egressProxy = await pickProxy();
+    } catch { /* pool unreadable → direct */ }
+  }
+  const egressFetch = egressProxy ? makeProxiedFetcher(egressProxy, fetchImpl) : fetchImpl;
 
   const routing = opts.endpointRouting !== undefined ? opts.endpointRouting : getDefaultEndpointRouting(opts.config);
   const signer = opts.clientSigning !== undefined ? opts.clientSigning : getDefaultClientSigning(opts.config);
+  // header-debug wiring (mirrors handler.ts): first dispatch attempt only.
+  const headerDebugOn = opts.config.logging?.headerDebug === true;
+  let headerDebugRecorded = false;
   const dispatch = async (pairs: UpstreamHeaderPair[]): Promise<Response> => {
     const routed = routing ? await routing.resolve(upstreamReq.url, credentialString(cred)) : null;
     const sendUrl = routed?.routed ? routed.url : upstreamReq.url;
@@ -226,7 +253,11 @@ export async function handleResponses(
           headers: Object.fromEntries(finalPairs),
           body: transformedBody ?? undefined,
         });
-        return fetchImpl(req, { method: "POST", headers: Object.fromEntries(finalPairs), body: transformedBody ?? undefined, signal: clientReq.signal });
+        if (headerDebugOn && !headerDebugRecorded) {
+          headerDebugRecorded = true;
+          recordHeaders(clientReq, req, "responses", "openai-responses", transformedBody, rawBody);
+        }
+        return egressFetch(req, { method: "POST", headers: Object.fromEntries(finalPairs), body: transformedBody ?? undefined, signal: clientReq.signal });
       },
     });
   };
@@ -257,7 +288,7 @@ export async function handleResponses(
         challengedResp: upstreamResp,
         debug: debug ? (message) => console.log(`[responses] ${message}`) : undefined,
         solveAndRetry: (retryHeaders) => dispatch(
-          buildUpstreamHeaderPairs(clientReq, upstreamFormat, cred, opts.config.identity, opts.config.plan, retryHeaders, undefined),
+          buildUpstreamHeaderPairs(clientReq, upstreamFormat, cred, opts.config.identity, currentPlan, retryHeaders, undefined),
         ),
         mapError: (err, phase) =>
           phase === "solver"

@@ -40,6 +40,7 @@ import type { Credential } from "./types.js";
 import type { ProxyIdentity } from "../config/types.js";
 import { DEFAULT_APP_VERSION } from "../config/loader.js";
 import { buildIdentityHeaders } from "../proxy/identity.js";
+import { hostSetTimeout, hostClearTimeout } from "../utils/host-timers.js";
 
 /** Default origin of the zcode control plane (reset endpoints live on zcode.z.ai, not api.z.ai). */
 export const DEFAULT_RESET_ORIGIN = "https://zcode.z.ai";
@@ -188,7 +189,9 @@ export function createResetClient(cred: Credential, opts: ResetClientOptions = {
     acceptedBusinessCodes: readonly number[] = [],
   ): Promise<{ code: number; msg?: string; data: unknown }> {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    // Host-safe timer, armed until BODY consumption finishes (a stalled body
+    // previously had no timeout once headers arrived). See utils/host-timers.ts.
+    const timer = hostSetTimeout(() => controller.abort(), timeoutMs);
     let resp: Response;
     try {
       resp = await fetchImpl(`${base}${path}`, {
@@ -197,10 +200,13 @@ export function createResetClient(cred: Credential, opts: ResetClientOptions = {
         ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
         signal: controller.signal,
       });
-    } finally {
-      clearTimeout(timer);
+    } catch (err) {
+      hostClearTimeout(timer);
+      throw err;
     }
+    // Keep the timer armed through resp.json() below; disarmed at each exit.
     if (!resp.ok) {
+      hostClearTimeout(timer);
       void resp.body?.cancel().catch(() => {});
       throw new ResetApiError(resp.status, `reset ${path} HTTP ${resp.status}`);
     }
@@ -208,8 +214,10 @@ export function createResetClient(cred: Credential, opts: ResetClientOptions = {
     try {
       envelope = await resp.json();
     } catch {
+      hostClearTimeout(timer);
       throw new ResetApiError(-1, "coding_plan_reset_invalid_response");
     }
+    hostClearTimeout(timer);
     if (
       typeof envelope !== "object" ||
       envelope === null ||

@@ -57,12 +57,22 @@ jobs:
 
       - name: Resolve version
         id: ver
+        env:
+          # Env-indirection: never text-interpolate workflow_dispatch input
+          # into `run:` (classic GitHub command injection surface).
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          if [ -n "${{ inputs.version }}" ]; then
-            V="${{ inputs.version }}"
+          if [ -n "$INPUT_VERSION" ]; then
+            V="$INPUT_VERSION"
           else
             # tag-triggered: strip the leading "v"
             V="${GITHUB_REF_NAME#v}"
+          fi
+          # Injection gate: V flows into shell args, file names and the
+          # gh-release inputs below — strict digits.dots only.
+          if ! printf '%s' "$V" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([.0-9]*)?$'; then
+            echo "::error::Invalid version '$V' — expected digits.dots form."
+            exit 1
           fi
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "Resolved version: $V"
@@ -226,11 +236,17 @@ jobs:
 
       - name: Resolve version
         id: ver
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          if [ -n "${{ inputs.version }}" ]; then
-            V="${{ inputs.version }}"
+          if [ -n "$INPUT_VERSION" ]; then
+            V="$INPUT_VERSION"
           else
             V="${GITHUB_REF_NAME#v}"
+          fi
+          if ! printf '%s' "$V" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([.0-9]*)?$'; then
+            echo "::error::Invalid version '$V' — expected digits.dots form."
+            exit 1
           fi
           echo "version=$V" >> "$GITHUB_OUTPUT"
 
@@ -290,11 +306,17 @@ jobs:
 
       - name: Resolve version and versionCode
         id: ver
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          if [ -n "${{ inputs.version }}" ]; then
-            V="${{ inputs.version }}"
+          if [ -n "$INPUT_VERSION" ]; then
+            V="$INPUT_VERSION"
           else
             V="${GITHUB_REF_NAME#v}"
+          fi
+          if ! printf '%s' "$V" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([.0-9]*)?$'; then
+            echo "::error::Invalid version '$V' — expected digits.dots form."
+            exit 1
           fi
           echo "version=$V" >> "$GITHUB_OUTPUT"
           # Android versionCode must be a monotonic integer; derive from

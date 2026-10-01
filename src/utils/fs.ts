@@ -12,7 +12,7 @@
  * EPERM if the target is briefly locked by antivirus / file indexer —
  * we retry a few times with backoff before giving up.
  */
-import { writeFile, rename, unlink } from "node:fs/promises";
+import { writeFile, rename, unlink, chmod } from "node:fs/promises";
 import { dirname, join } from "node:path";
 // v0.3.7.1: host-captured timer — retry delays must not resolve through the
 // captcha window alias during solve epochs.
@@ -68,16 +68,27 @@ async function safeRename(tmp: string, target: string): Promise<void> {
  * @param path Final destination path.
  * @param content File contents (string or Buffer).
  * @param encoding Text encoding when `content` is a string. Defaults to "utf-8".
+ * @param mode Optional POSIX permissions for the created file (e.g. 0o600 for
+ *   secret-bearing files). Windows ignores this. Applied to the temp file
+ *   before rename AND re-chmodded onto the target after rename, so an
+ *   existing more-permissive target is tightened too.
  */
 export async function atomicWriteFile(
   path: string,
   content: string | Uint8Array,
   encoding: BufferEncoding = "utf-8",
+  mode?: number,
 ): Promise<void> {
   const tmp = join(dirname(path), `.${process.pid}.tmp-${Date.now()}-${++atomicTmpCounter}`);
-  await writeFile(tmp, content, encoding);
+  await writeFile(tmp, content, mode !== undefined ? { encoding, mode } : encoding);
   try {
     await safeRename(tmp, path);
+    if (mode !== undefined) {
+      // rename(2) replaces the target with the temp file (temp's mode wins),
+      // but belt-and-suspenders: enforce the mode on the final path in case a
+      // umask or platform quirk loosened the temp file's permissions.
+      await chmod(path, mode).catch(() => {});
+    }
   } catch (err) {
     // Best-effort cleanup of the temp file if rename failed.
     try { await unlink(tmp); } catch {}

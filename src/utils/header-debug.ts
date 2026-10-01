@@ -168,14 +168,27 @@ function maxConcurrentWrites(): number {
 }
 
 function truncateBodyPreview(value: string): string {
-  const bytes = utf8Encoder.encode(value);
-  if (bytes.byteLength <= MAX_BODY_PREVIEW_BYTES) return value;
-  let end = MAX_BODY_PREVIEW_BYTES;
+  // Cheap char-domain pre-slice bounds the preview encoder's input: the byte
+  // budget needs at most MAX UTF-16 code units (UTF-8 is ≥1 byte per code
+  // unit), so one extra char suffices to enter the truncation branch. The
+  // previous shape encoded the FULL body first — O(n) over up to
+  // maxRequestBodyBytes (64MB default) on every debug-recorded request.
+  const coarse = value.length > MAX_BODY_PREVIEW_BYTES
+    ? value.slice(0, MAX_BODY_PREVIEW_BYTES + 1)
+    : value;
+  const bytes = utf8Encoder.encode(coarse);
+  if (coarse === value && bytes.byteLength <= MAX_BODY_PREVIEW_BYTES) return value;
+  // Exact total without allocating: Buffer.byteLength scans (no copy) where
+  // encoding the full body would allocate a full-size scratch buffer.
+  const total = Buffer.byteLength(value);
+  // Cap the preview at the byte budget, then walk back over UTF-8
+  // continuation bytes so the cut never splits a code point.
+  let end = Math.min(MAX_BODY_PREVIEW_BYTES, bytes.byteLength);
   while (end > 0 && bytes[end] !== undefined && (bytes[end] & 0xc0) === 0x80) {
     end--;
   }
   const preview = utf8Decoder.decode(bytes.subarray(0, end));
-  return `${preview}...(truncated, total ${bytes.byteLength} bytes)`;
+  return `${preview}...(truncated, total ${total} bytes)`;
 }
 
 type HeaderDebugRequestSnapshot = {

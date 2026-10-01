@@ -93,7 +93,8 @@ function isEntryUnavailableError(err: unknown): boolean {
   const e = err as { code?: string; message?: string };
   return (
     e?.code === "ERR_MODULE_NOT_FOUND" ||
-    /cannot find module|module not found/i.test(String(e?.message ?? ""))
+    // \s* tolerates Bun's zero-space phrasing ("ModuleNotFound resolving ...")
+    /cannot find module|module\s*not\s*found/i.test(String(e?.message ?? ""))
   );
 }
 

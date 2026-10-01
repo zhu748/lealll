@@ -407,6 +407,45 @@ export interface QuotaResetActionBody {
  * Business verdicts (`ResetApiError`) come back as 200 `{ok:false,...}` so the
  * dashboard can render the upstream reason verbatim; transport failures use
  * the error envelope. `resetClientImpl` is a DI seam for tests. */
+const MAX_QUOTA_BODY_BYTES = 64 * 1024;
+
+/**
+ * Bounded body read for the /quota POST routes: the payloads here are tiny
+ * JSON objects, but `req.text()` alone would let a single chunked POST buffer
+ * the process to OOM (these routes run before/outside maxRequestBodyBytes).
+ */
+async function readBoundedQuotaBody(req: Request): Promise<{ ok: true; text: string } | { ok: false; resp: Response }> {
+  const declared = Number.parseInt(req.headers.get("content-length") ?? "", 10);
+  if (Number.isFinite(declared) && declared > MAX_QUOTA_BODY_BYTES) {
+    return { ok: false, resp: errorResponse(413, "payload_too_large", `quota request body exceeds ${MAX_QUOTA_BODY_BYTES} bytes`) };
+  }
+  const reader = req.body?.getReader();
+  if (!reader) return { ok: true, text: "" };
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > MAX_QUOTA_BODY_BYTES) {
+        void reader.cancel().catch(() => {});
+        return { ok: false, resp: errorResponse(413, "payload_too_large", `quota request body exceeds ${MAX_QUOTA_BODY_BYTES} bytes`) };
+      }
+      chunks.push(value);
+    }
+  } catch {
+    return { ok: false, resp: errorResponse(400, "invalid_request_error", "failed to read request body") };
+  }
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return { ok: true, text: new TextDecoder().decode(merged) };
+}
+
 export async function handleQuotaResetAction(
   req: Request,
   config: ProxyConfig,
@@ -416,8 +455,9 @@ export async function handleQuotaResetAction(
 ): Promise<Response> {
   let body: QuotaResetActionBody = {};
   try {
-    const text = await req.text();
-    if (text.trim() !== "") body = JSON.parse(text) as typeof body;
+    const read = await readBoundedQuotaBody(req);
+    if (!read.ok) return read.resp;
+    if (read.text.trim() !== "") body = JSON.parse(read.text) as typeof body;
   } catch {
     return errorResponse(400, "reset_invalid_body", "request body must be JSON");
   }
@@ -577,8 +617,9 @@ export async function handleQuotaClaimSubmit(
 ): Promise<Response> {
   let body: { plan_id?: unknown } = {};
   try {
-    const text = await req.text();
-    if (text.trim() !== "") body = JSON.parse(text) as typeof body;
+    const read = await readBoundedQuotaBody(req);
+    if (!read.ok) return read.resp;
+    if (read.text.trim() !== "") body = JSON.parse(read.text) as typeof body;
   } catch {
     return errorResponse(400, "claim_invalid_body", "request body must be JSON");
   }

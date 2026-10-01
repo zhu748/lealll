@@ -342,7 +342,10 @@ function handleChoice(choice: OpenAIStreamChoice, state: ResponsesStreamState): 
   const delta = choice.delta ?? {};
 
   // ── reasoning ──
-  if (delta.reasoning_content && delta.reasoning_content.length > 0) {
+  // reasoningDone (already closed via output_item.done) late deltas are
+  // DROPPED: the old shape kept emitting deltas against the closed item's
+  // index, and the done-event text diverged from final output[] text.
+  if (delta.reasoning_content && delta.reasoning_content.length > 0 && !state.reasoningDone) {
     events.push(...ensureReasoningItem(state));
     state.reasoningText += delta.reasoning_content;
     events.push(seq(state, {
@@ -767,24 +770,37 @@ function closeToolItems(state: ResponsesStreamState): ResponsesStreamEvent[] {
   return events;
 }
 
-/** Reconstruct the final `output[]` array for `response.completed`. Order: reasoning → message → tool_calls. */
+/** Reconstruct the final `output[]` array for `response.completed`, ordered
+ * by each item's streaming `output_index` — the events allocate indices in
+ * first-appearance order (a tool call can legitimately precede the message),
+ * so a fixed reasoning → message → tool_calls array order misaligns
+ * position-indexed clients. */
 function buildFinalOutput(state: ResponsesStreamState): ResponsesOutputItem[] {
-  const out: ResponsesOutputItem[] = [];
+  const tagged: Array<{ index: number; item: ResponsesOutputItem }> = [];
   if (state.reasoningDone && state.reasoningText.length > 0) {
-    out.push({
-      type: "reasoning",
-      id: state.reasoningItemId!,
-      summary: [{ type: "summary_text", text: state.reasoningText }],
-      status: "completed",
+    tagged.push({
+      index: state.reasoningIndex,
+      item: {
+        type: "reasoning",
+        id: state.reasoningItemId!,
+        summary: [{ type: "summary_text", text: state.reasoningText }],
+        status: "completed",
+      },
     });
   }
   if (state.messageItemId || state.toolCalls.size === 0) {
-    out.push({
-      type: "message",
-      id: state.messageItemId ?? generateItemId(),
-      role: "assistant",
-      content: [{ type: "output_text", text: state.text }],
-      status: "completed",
+    tagged.push({
+      // Never-opened message (text-only fallback): nextOutputIndex is
+      // strictly greater than every allocated index, so the synthesized
+      // message lands after all streamed items.
+      index: state.messageIndex >= 0 ? state.messageIndex : state.nextOutputIndex,
+      item: {
+        type: "message",
+        id: state.messageItemId ?? generateItemId(),
+        role: "assistant",
+        content: [{ type: "output_text", text: state.text }],
+        status: "completed",
+      },
     });
   }
   const sortedKeys = [...state.toolCalls.keys()].sort((a, b) => a - b);
@@ -799,47 +815,59 @@ function buildFinalOutput(state: ResponsesStreamState): ResponsesOutputItem[] {
     const finalArgs = entry.args.trim().length === 0 ? "{}" : entry.args;
 
     if (isCustom) {
-      out.push({
-        type: "custom_tool_call",
-        id: entry.itemId,
-        call_id: entry.id,
-        name: entry.name,
-        input: extractCustomToolInput(finalArgs),
-        status: "completed",
+      tagged.push({
+        index: entry.outputIndex,
+        item: {
+          type: "custom_tool_call",
+          id: entry.itemId,
+          call_id: entry.id,
+          name: entry.name,
+          input: extractCustomToolInput(finalArgs),
+          status: "completed",
+        },
       });
     } else if (isToolSearch) {
       let argsObj: Record<string, unknown> = {};
       try { argsObj = JSON.parse(finalArgs); } catch { argsObj = {}; }
-      out.push({
-        type: "tool_search_call",
-        id: entry.itemId,
-        call_id: entry.id,
-        arguments: argsObj,
-        execution: "client",
-        status: "completed",
+      tagged.push({
+        index: entry.outputIndex,
+        item: {
+          type: "tool_search_call",
+          id: entry.itemId,
+          call_id: entry.id,
+          arguments: argsObj,
+          execution: "client",
+          status: "completed",
+        },
       });
     } else if (ns) {
-      out.push({
-        type: "function_call",
-        id: entry.itemId,
-        call_id: entry.id,
-        name: ns.name,
-        namespace: ns.namespace,
-        arguments: finalArgs,
-        status: "completed",
+      tagged.push({
+        index: entry.outputIndex,
+        item: {
+          type: "function_call",
+          id: entry.itemId,
+          call_id: entry.id,
+          name: ns.name,
+          namespace: ns.namespace,
+          arguments: finalArgs,
+          status: "completed",
+        },
       });
     } else {
-      out.push({
-        type: "function_call",
-        id: entry.itemId,
-        call_id: entry.id,
-        name: entry.name,
-        arguments: finalArgs,
-        status: "completed",
+      tagged.push({
+        index: entry.outputIndex,
+        item: {
+          type: "function_call",
+          id: entry.itemId,
+          call_id: entry.id,
+          name: entry.name,
+          arguments: finalArgs,
+          status: "completed",
+        },
       });
     }
   }
-  return out;
+  return tagged.sort((a, b) => a.index - b.index).map((t) => t.item);
 }
 
 // ─────────────────────────────────────────────

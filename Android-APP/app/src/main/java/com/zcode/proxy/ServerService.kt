@@ -54,7 +54,7 @@ class ServerService : Service() {
                     startForeground("Node failed: ${t.message ?: t.javaClass.simpleName}")
                     return@launch
                 }
-                controlClient = ControlClient(runner.controlPort).also { it.connect() }
+                controlClient = ControlClient(runner.controlPort, runner.controlToken).also { it.connect() }
                 MainActivity.controlClient = controlClient
             }
         }
@@ -63,9 +63,32 @@ class ServerService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    /**
+     * Android 15 (targetSdk 35) enforces a 6h/day runtime cap on `dataSync`
+     * foreground services — when it hits, the system calls `onTimeout()` and
+     * then stops the service. The default implementation just lets that
+     * happen silently: the proxy dies with no user-visible reason. Stop the
+     * Node process cleanly here so the ports are released and the state is
+     * consistent; the notification (posted by the system) explains the stop.
+     */
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        Log.w(TAG, "foreground service timeout (type=$fgsType) — stopping Node cleanly")
+        nodeJob?.cancel()
+        controlClient?.close()
+        MainActivity.controlClient = null
+        nodeRunner?.stop()
+        scope.cancel()
+        stopSelf(startId)
+        super.onTimeout(startId, fgsType)
+    }
+
     override fun onDestroy() {
         nodeJob?.cancel()
         controlClient?.close()
+        // Drop the Activity's static reference too — otherwise polling against
+        // a dead port reports "Node not responding" until a new service start
+        // replaces the client.
+        MainActivity.controlClient = null
         nodeRunner?.stop()
         scope.cancel()
         super.onDestroy()

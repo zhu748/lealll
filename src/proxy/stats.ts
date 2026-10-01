@@ -126,6 +126,14 @@ export function printRow(
  * reader, no shared buffer, no back-pressure stall. Bytes flow through and
  * are parsed in-place.
  */
+/** Debug/observability hooks for createStatsTransform. */
+export interface StatsTransformHooks {
+  /** Debug-only per-chunk probe (dump mode). Invoked before enqueue; keep off on the hot path. */
+  onChunk?: (chunk: Uint8Array) => void;
+  /** Invoked once from finalize() with the computed stream stats. */
+  onDone?: (info: { tokens: number; inputTokens: number; thinkingTokens: number; ttfbMs: number; totalMs: number }) => void;
+}
+
 export function createStatsTransform(
   reqId: string,
   format: Format,
@@ -136,6 +144,7 @@ export function createStatsTransform(
   credKey: string | undefined,
   captchaMs: number,
   retried: boolean = false,
+  hooks?: StatsTransformHooks,
 ): { transform: TransformStream<Uint8Array, Uint8Array>; done: Promise<void>; finalize: () => void } {
   const compressed = isCompressedContentEncoding(contentEncoding);
   const state = {
@@ -172,6 +181,13 @@ export function createStatsTransform(
       const totalMs = endAt - requestSentAt;
       const avgTps = state.tokens > 0 && totalMs > 0 ? state.tokens / (totalMs / 1000) : 0;
       printRow(reqId, format, meta, status, requestSentAt, requestSentAt + ttfbMs, state.tokens, avgTps, endAt, retried, state.inputTokens, credKey, captchaMs, state.cacheReadTokens, state.thinkingTokens);
+      hooks?.onDone?.({
+        tokens: state.tokens,
+        inputTokens: state.inputTokens,
+        thinkingTokens: state.thinkingTokens,
+        ttfbMs,
+        totalMs,
+      });
     } finally {
       resolveDone();
     }
@@ -180,6 +196,7 @@ export function createStatsTransform(
   const transform = new TransformStream<Uint8Array, Uint8Array>({
     transform(chunk, controller) {
       if (state.firstChunkAt === 0) state.firstChunkAt = Date.now();
+      hooks?.onChunk?.(chunk);
       if (!compressed && !state.statsParsingDisabled) {
         state.sseBuffer += decoder!.decode(chunk, { stream: true });
         const idx = state.sseBuffer.lastIndexOf("\n");

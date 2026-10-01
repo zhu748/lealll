@@ -27,6 +27,7 @@ import type { ProviderId } from "../provider/types.js";
 import { DEFAULT_APP_VERSION } from "../config/loader.js";
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomBytes } from "node:crypto";
+import { hostSetTimeout, hostClearTimeout } from "../utils/host-timers.js";
 
 // ---------------------------------------------------------------------------
 // Constants (from bundle)
@@ -214,7 +215,12 @@ export class PollOAuthClient extends OAuthFlowClient {
     super(provider, fetchImpl);
   }
 
+  /** Set by close(); checked every poll iteration so abandonment stops the loop. */
+  private cancelled = false;
+
+  /** Re-arm a fresh flow: start() clears the cancellation from any prior close(). */
   start(): Promise<OAuthFlowStart> {
+    this.cancelled = false;
     this.flow = null;
     this.pollToken = randomBytes(32).toString("hex");
     return (async () => {
@@ -259,6 +265,14 @@ export class PollOAuthClient extends OAuthFlowClient {
     const intervalMs = Math.max(1_000, flow.poll_interval_sec * 1000);
 
     for (;;) {
+      // A close() during an in-flight poll (TUI logout, control-channel
+      // teardown) aborts the loop — previously close() only nulled `flow`,
+      // and the local `const flow` kept polling to the deadline, letting an
+      // abandoned browser authorization RESURRECT the just-deleted
+      // credential (TUI analog of the fixed "file resurrection" race).
+      if (this.cancelled) {
+        throw new Error(`${this.provider} login cancelled`);
+      }
       if (Date.now() >= deadlineMs) {
         throw new Error("Authorization timed out. Please retry login.");
       }
@@ -327,6 +341,7 @@ export class PollOAuthClient extends OAuthFlowClient {
   }
 
   async close(): Promise<void> {
+    this.cancelled = true;
     this.flow = null;
   }
 }
@@ -435,6 +450,11 @@ export class AuthCodeOAuthClient extends OAuthFlowClient {
   start(): Promise<OAuthFlowStart> {
     const state = randomBytes(32).toString("hex");
     const requestedPort = Number(process.env.ZCODE_OAUTH_CALLBACK_PORT ?? 0) || 0;
+    // Fresh session state: a reused instance must not hand back the PREVIOUS
+    // login's code (all current call sites one-shot the instance, but the
+    // class contract shouldn't depend on that).
+    this.callbackResult = null;
+    this.callbackWaiters = [];
 
     return new Promise((resolve, reject) => {
       this.server = createServer((req: IncomingMessage, res: ServerResponse) => {
@@ -442,12 +462,20 @@ export class AuthCodeOAuthClient extends OAuthFlowClient {
       });
 
       this.server.on("error", (err) => {
+        // Close the underlying handle, not just drop the reference — the
+        // listener server must not outlive a failed start().
+        try { this.server?.closeAllConnections?.(); } catch { /* best-effort */ }
+        try { this.server?.close(); } catch { /* best-effort */ }
         this.server = null;
         reject(err);
       });
       this.server.listen(requestedPort, "127.0.0.1", () => {
         const addr = this.server!.address();
         if (!addr || typeof addr !== "object") {
+          // Same leak guard as the error path above.
+          try { this.server?.closeAllConnections?.(); } catch { /* best-effort */ }
+          try { this.server?.close(); } catch { /* best-effort */ }
+          this.server = null;
           reject(new Error("Failed to bind localhost callback server"));
           return;
         }
@@ -498,12 +526,16 @@ export class AuthCodeOAuthClient extends OAuthFlowClient {
     }
 
     return new Promise<string>((resolve, reject) => {
-      const timer = setTimeout(() => {
+      // Host-safe timer (see utils/host-timers.ts): the login poll can run
+      // while a captcha solve epoch aliases the global timer names — a bare
+      // setTimeout registered there is cancelled silently when that window
+      // closes, hanging the login forever.
+      const timer = hostSetTimeout(() => {
         reject(new Error("Authorization timed out. Please retry login."));
       }, timeoutMs);
 
       this.callbackWaiters.push((result) => {
-        clearTimeout(timer);
+        hostClearTimeout(timer);
         if (result.error) {
           reject(new Error(result.error));
         } else {
@@ -661,7 +693,9 @@ export function parsePastedCallbackUrl(raw: string, expectedState: string): stri
 // ---------------------------------------------------------------------------
 
 function defaultSleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  // Host-safe sleep: the login poll sleeps between token-endpoint retries
+  // while captcha solve epochs may alias the global timer names.
+  return new Promise((resolve) => hostSetTimeout(resolve, ms));
 }
 
 function safeJsonParse(text: string): unknown {

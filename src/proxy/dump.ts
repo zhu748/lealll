@@ -20,12 +20,23 @@
  *
  * Pair lines by `reqId` to reconstruct a full request timeline.
  */
-import { appendFileSync } from "node:fs";
+import { appendFileSync, statSync } from "node:fs";
 
 const DUMP_PATH = process.env.ZCODE_DUMP_UPSTREAM;
+/**
+ * Total-bytes budget for the dump file: debug mode previously appended full
+ * request/response bodies with NO ceiling and no rotation — a long debug
+ * session could fill the disk (and every append is synchronous, on the hot
+ * path). Once the budget is hit, dumping stops for the rest of the process
+ * lifetime and one warning is emitted.
+ */
+const DUMP_MAX_TOTAL_BYTES = Math.max(
+  1_048_576,
+  Number(process.env.ZCODE_DUMP_UPSTREAM_MAX_BYTES) || 256 * 1024 * 1024,
+);
 
-/** Header names whose values must be masked before dumping. */
-const SENSITIVE_HEADERS = new Set([
+/** Header names whose values must be masked before dumping/logging. */
+export const SENSITIVE_HEADERS = new Set([
   "authorization",
   "x-api-key",
   "proxy-authorization",
@@ -33,6 +44,7 @@ const SENSITIVE_HEADERS = new Set([
   "x-zcode-captcha-verify-param",
   "x-zcode-captcha-verify-region",
   "cookie",
+  "set-cookie",
 ]);
 
 function maskHeaderValue(key: string, value: string): string {
@@ -68,12 +80,16 @@ interface DumpLine {
   [k: string]: unknown;
 }
 
+let dumpBytesWritten = 0;
+let dumpStopped = false;
+
 /**
  * Append one dump line. No-op when `ZCODE_DUMP_UPSTREAM` is unset.
  * All errors are swallowed — dumping must never break request handling.
  */
 export function dumpPhase(reqId: string, phase: string, data: Record<string, unknown>): void {
   if (!DUMP_PATH) return;
+  if (dumpStopped) return;
   try {
     const line: DumpLine = {
       ts: new Date().toISOString(),
@@ -81,7 +97,19 @@ export function dumpPhase(reqId: string, phase: string, data: Record<string, unk
       phase,
       ...data,
     };
-    appendFileSync(DUMP_PATH, JSON.stringify(line) + "\n", "utf-8");
+    const json = JSON.stringify(line) + "\n";
+    // Seed the counter from the existing file so restarting the process
+    // against an existing dump doesn't silently double the budget.
+    if (dumpBytesWritten === 0) {
+      try { dumpBytesWritten = statSync(DUMP_PATH).size; } catch { dumpBytesWritten = 0; }
+    }
+    if (dumpBytesWritten + json.length > DUMP_MAX_TOTAL_BYTES) {
+      dumpStopped = true;
+      console.warn(`[dump] byte budget (${DUMP_MAX_TOTAL_BYTES}) reached — dumping paused for the rest of this process`);
+      return;
+    }
+    dumpBytesWritten += json.length;
+    appendFileSync(DUMP_PATH, json, "utf-8");
   } catch {
     // intentional swallow — see header comment
   }

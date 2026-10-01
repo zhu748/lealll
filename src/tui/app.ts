@@ -17,7 +17,7 @@ import { updateConfigYaml, ensureConfigFile } from "../config/edit.js";
 import { AuthManager } from "../auth/manager.js";
 import { startServer, type ProxyServer } from "../server/server.js";
 import { buildServerOptions } from "../server/server-options.js";
-import { loadCredential, saveCredential, clearCredential } from "../auth/store.js";
+import { loadCredential, saveCredential, clearCredentialAsync } from "../auth/store.js";
 import { ZaiOAuthClient, BigmodelOAuthClient, BigmodelPollOAuthClient, LOGIN_TIMEOUT_MS, parsePastedCallbackUrl, type OAuthFlowClient, type OAuthFlowStart, type OAuthFlowTokens } from "../auth/oauth.js";
 import { KeyResolver } from "../auth/resolver.js";
 import { openBrowser } from "../runtime/open-browser.js";
@@ -342,7 +342,14 @@ export async function runTui(args: ServeArgs): Promise<void> {
   }
 
   function toggleProxy(): void {
-    if (state.serverStatus === "running" || state.serverStatus === "starting") stopProxy();
+    // "starting" has no server to stop yet (serverRef is null) — previously
+    // the keypress fell through to a silent no-op. Acknowledge it instead;
+    // the user can stop once the start attempt settles.
+    if (state.serverStatus === "starting") {
+      setToast("proxy is starting — wait for it to finish before stopping", "info");
+      return;
+    }
+    if (state.serverStatus === "running") stopProxy();
     else void startProxy();
   }
 
@@ -383,10 +390,15 @@ export async function runTui(args: ServeArgs): Promise<void> {
       setToast("stop the proxy before switching (press s)", "err");
       return;
     }
-    config.provider = provider;
-    config.plan = plan;
+    // Disk-first ordering: writing the YAML BEFORE mutating the in-memory
+    // config keeps the three views (disk / config / UI state) consistent
+    // when the write fails — the old order left config updated but the UI
+    // (and disk) stale, so a subsequent Start would use the new provider
+    // while the panel showed the old one.
     try {
       updateConfigYaml(path, { provider, plan });
+      config.provider = provider;
+      config.plan = plan;
       state.provider = provider;
       state.plan = plan;
       setToast(message, "ok");
@@ -413,16 +425,23 @@ export async function runTui(args: ServeArgs): Promise<void> {
 
     if (provider === "bigmodel" && opts.paste) {
       const client = new BigmodelOAuthClient();
+      // Set the guard BEFORE the first await — the old shape only set it
+      // after client.start() returned, so two rapid keypresses spawned two
+      // concurrent OAuth clients (two browser tabs, two competing
+      // settleLogin writers, last-writer-wins on credentials.json).
+      state.loginInFlight = true;
+      scheduleRender();
       let started: Awaited<ReturnType<BigmodelOAuthClient["start"]>>;
       try {
         started = await client.start();
       } catch (err) {
+        state.loginInFlight = false;
         void client.close().catch(() => {});
         setToast(`login failed: ${(err as Error).message}`, "err");
+        scheduleRender();
         return;
       }
       activeOauth = { client, provider };
-      state.loginInFlight = true;
       console.log(`OAuth: opening ${started.authorizeUrl}`);
       console.log("If the browser did not open, copy the URL above into a browser.");
       openBrowser(started.authorizeUrl);
@@ -435,16 +454,20 @@ export async function runTui(args: ServeArgs): Promise<void> {
     // Both providers: server-mediated poll login (ZCode 3.12.3 default) — no
     // local callback, works headless with the URL opened on any device.
     const client: OAuthFlowClient = provider === "bigmodel" ? new BigmodelPollOAuthClient() : new ZaiOAuthClient();
+    // Guard before the first await (see the paste branch above).
+    state.loginInFlight = true;
+    scheduleRender();
     let started: Awaited<ReturnType<OAuthFlowClient["start"]>>;
     try {
       started = await client.start();
     } catch (err) {
+      state.loginInFlight = false;
       void client.close().catch(() => {});
       setToast(`login failed: ${(err as Error).message}`, "err");
+      scheduleRender();
       return;
     }
     activeOauth = { client, provider };
-    state.loginInFlight = true;
     state.loginHint = "waiting for browser authorization…";
     console.log(`OAuth: opening ${started.authorizeUrl}`);
     console.log("If the browser did not open, copy the URL above into a browser (any device works).");
@@ -473,6 +496,13 @@ export async function runTui(args: ServeArgs): Promise<void> {
   /** Shared completion tail: resolve key, save, and ALWAYS close the client. */
   function settleLogin(pending: Promise<OAuthFlowTokens>, client: OAuthFlowClient, provider: ProviderId): void {
     pending.then(async (tokens) => {
+      // Logout-during-login guard: if this client was closed (activeOauth
+      // cleared/replaced), the user abandoned the flow — saving here would
+      // resurrect the credential they just deleted.
+      if (activeOauth?.client !== client) {
+        console.log(`OAuth flow for ${provider} was cancelled — ignoring late result`);
+        return;
+      }
       const resolver = new KeyResolver();
       const cred = await resolver.resolveCodingPlanCredential(tokens.accessToken, provider, tokens.userId);
       if (tokens.jwt) cred.jwt = tokens.jwt;
@@ -541,7 +571,10 @@ export async function runTui(args: ServeArgs): Promise<void> {
       state.loginHint = "";
     }
     try {
-      clearCredential();
+      // Mutex-safe logout: the TUI can run an in-process proxy whose requests
+      // hold the store write lock — the sync variant could race a withStoreLock
+      // save and resurrect the credentials file after the unlink.
+      await clearCredentialAsync();
     } catch { /* best-effort logout */ }
     await refreshAuth();
     if (serverRef.current) setToast("logged out — restart the proxy to apply", "info");

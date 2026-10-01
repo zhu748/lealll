@@ -6,6 +6,7 @@
 import type { AuthManager } from "../auth/manager.js";
 import type { ProxyConfig } from "../config/types.js";
 import type { ClaimablePlan, ClaimOutcome } from "./types.js";
+import { formatUnixSeconds } from "./types.js";
 import { createClaimClient, ClaimPreviewError } from "./client.js";
 import { ClaimScheduler } from "./scheduler.js";
 import { getCaptchaToken } from "../proxy/captcha.js";
@@ -121,7 +122,7 @@ function printPlans(plans: ClaimablePlan[]): void {
     console.log(`  - ${p.planId}  "${p.name}"  priority=${p.priority}${window ? `  ${window}` : ""}`);
     for (const e of p.entitlements) {
       const quota = e.grantUnits > 0 ? ` ${e.grantUnits} ${e.unitType}` : "";
-      const activate = e.effectiveAt !== undefined ? ` (activates ${new Date(e.effectiveAt * 1000).toISOString()})` : "";
+      const activate = e.effectiveAt !== undefined ? ` (activates ${formatUnixSeconds(e.effectiveAt)})` : "";
       console.log(`      · ${e.showName || e.entitlementId}${quota}${activate}`);
     }
   }
@@ -132,11 +133,11 @@ function printOutcome(outcome: ClaimOutcome): void {
     console.log(`\nClaimed: ${outcome.planId}`);
     if (outcome.userPlanId !== undefined) console.log(`  user-plan: ${outcome.userPlanId}`);
     if (outcome.status !== undefined) console.log(`  status:    ${outcome.status}`);
-    if (outcome.startsAt !== undefined) console.log(`  activates: ${new Date(outcome.startsAt * 1000).toISOString()}`);
-    if (outcome.endsAt !== undefined) console.log(`  expires:   ${new Date(outcome.endsAt * 1000).toISOString()}`);
+    if (outcome.startsAt !== undefined) console.log(`  activates: ${formatUnixSeconds(outcome.startsAt)}`);
+    if (outcome.endsAt !== undefined) console.log(`  expires:   ${formatUnixSeconds(outcome.endsAt)}`);
     if (outcome.startsAt === undefined && outcome.endsAt === undefined) console.log("  active immediately");
     for (const g of outcome.entitlements ?? []) {
-      const at = g.effectiveAt !== undefined ? ` (activates ${new Date(g.effectiveAt * 1000).toISOString()})` : "";
+      const at = g.effectiveAt !== undefined ? ` (activates ${formatUnixSeconds(g.effectiveAt)})` : "";
       console.log(`  · ${g.showName || g.entitlementId}${at}`);
     }
     return;
@@ -144,10 +145,10 @@ function printOutcome(outcome: ClaimOutcome): void {
   const label = FAILURE_LABELS[outcome.failureKind] ?? FAILURE_LABELS.unknown;
   console.error(`\nClaim failed: ${label} (code ${String(outcome.code)}) — ${outcome.message}`);
   if (outcome.failureEndsAt !== undefined) {
-    console.error(`  retry window opens: ${new Date(outcome.failureEndsAt * 1000).toISOString()}`);
+    console.error(`  retry window opens: ${formatUnixSeconds(outcome.failureEndsAt)}`);
   }
 }
 
 function fmtTime(sec: number | undefined): string {
-  return sec === undefined ? "" : new Date(sec * 1000).toISOString();
+  return formatUnixSeconds(sec);
 }

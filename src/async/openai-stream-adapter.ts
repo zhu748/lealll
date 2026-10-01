@@ -20,6 +20,7 @@
  * duplicate finish reasons.
  */
 import { initState, parseSSEChunk, translateEvent, SSE_FRAME_SPLIT, type TranslationState, type ParsedSSE } from "../translator/sse-translator.js";
+import { waitForBackpressure } from "../utils/sse.js";
 
 export function anthropicSseToOpenaiSseWithKeepalive(
   upstream: ReadableStream<Uint8Array>,
@@ -31,10 +32,14 @@ export function anthropicSseToOpenaiSseWithKeepalive(
   let doneSent = false;
   let errored = false;
 
-  function emit(out: string): void {
+  async function emit(out: string): Promise<void> {
     if (errored) return;
     try {
       controller0.enqueue(encoder.encode(out));
+      // Mirror the shared translator's backpressure contract: a slow (but
+      // connected) OpenAI client must slow the pump down instead of letting
+      // the translated queue grow unbounded for the whole generation.
+      await waitForBackpressure(controller0);
     } catch {
       // controller closed by consumer
     }
@@ -43,17 +48,20 @@ export function anthropicSseToOpenaiSseWithKeepalive(
   // Hoisted controller reference so `emit()` can be defined above the ReadableStream
   // constructor without forward-let noise.
   let controller0: ReadableStreamDefaultController<Uint8Array>;
+  // Hoisted upstream reader so cancel() can stop the pump immediately.
+  let upstreamReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
 
   return new ReadableStream<Uint8Array>({
     start(controller) {
       controller0 = controller;
       const reader = upstream.getReader();
+      upstreamReader = reader;
       let buffer = "";
 
-      reader.read().then(function pump({ done, value }): Promise<unknown> | undefined {
+      reader.read().then(async function pump({ done, value }): Promise<unknown | undefined> {
         if (done) {
           // Flush trailing buffer
-          if (buffer.trim()) processBlock(buffer, state);
+          if (buffer.trim()) await processBlock(buffer, state);
           buffer = "";
           emitDone();
           try { controller.close(); } catch {}
@@ -63,8 +71,12 @@ export function anthropicSseToOpenaiSseWithKeepalive(
         const blocks = buffer.split(SSE_FRAME_SPLIT);
         buffer = blocks.pop() ?? "";
         for (const block of blocks) {
-          processBlock(block, state);
+          await processBlock(block, state);
           if (errored) {
+            // Early exit: stop draining the upstream bridge stream — leaving
+            // it open would keep consuming the LLM stream until req.signal
+            // fires indirectly.
+            await reader.cancel().catch(() => {});
             try { controller.close(); } catch {}
             return;
           }
@@ -73,23 +85,35 @@ export function anthropicSseToOpenaiSseWithKeepalive(
       }).catch((err) => {
         if (!errored) {
           const errPayload = JSON.stringify({ error: { message: `async stream error: ${(err as Error).message}`, type: "server_error" } });
-          emit(`data: ${errPayload}\n\n`);
+          void emit(`data: ${errPayload}\n\n`);
           emitDone();
         }
         try { controller.close(); } catch {}
       }).finally(() => {
+        if (upstreamReader === reader) upstreamReader = undefined;
         reader.releaseLock?.();
       });
     },
+
+    cancel() {
+      // Consumer disconnected mid-stream: flip errored so the pending pump
+      // iteration stops, and cancel the upstream reader.
+      errored = true;
+      upstreamReader?.cancel().catch(() => {});
+    },
   });
 
-  function processBlock(block: string, st: TranslationState): void {
+  async function processBlock(block: string, st: TranslationState): Promise<void> {
     const trimmed = block.trim();
     if (trimmed === "") return;
 
-    // Pure comment frame — pass through unchanged
-    if (trimmed.startsWith(":")) {
-      emit(block + "\n\n");
+    // Pure comment frame — pass through unchanged. Only when EVERY non-empty
+    // line is a comment: a frame mixing comments with data fields must go
+    // through parseSSEChunk below (verbatim passthrough would leak raw
+    // Anthropic JSON into the OpenAI stream).
+    const lines = block.split("\n").filter((l) => l.trim() !== "");
+    if (lines.length > 0 && lines.every((l) => l.trimStart().startsWith(":"))) {
+      await emit(block + "\n\n");
       return;
     }
 
@@ -110,7 +134,7 @@ export function anthropicSseToOpenaiSseWithKeepalive(
         }
       }
       const oaiPayload = JSON.stringify({ error: { message: anthropicMsg, type: anthropicType } });
-      emit(`data: ${oaiPayload}\n\n`);
+      await emit(`data: ${oaiPayload}\n\n`);
       emitDone();
       errored = true;
       return;
@@ -120,7 +144,7 @@ export function anthropicSseToOpenaiSseWithKeepalive(
     const parsed = parseSSEChunk(block);
     for (const p of parsed) {
       const out = translateEvent(st, p);
-      if (out) emit(out);
+      if (out) await emit(out);
     }
   }
 

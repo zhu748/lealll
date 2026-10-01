@@ -51,6 +51,19 @@ describe("KeyParser", () => {
     expect(p.feed("[B")).toEqual([{ type: "down" }]);
   });
 
+  test("a bare ESC ages out of the buffer and does not swallow the next key", () => {
+    const p = new KeyParser();
+    expect(p.feed("\x1b")).toEqual([]); // still within the inter-byte budget
+    const realNow = Date.now;
+    Date.now = () => realNow() + 200; // simulate the budget elapsing
+    try {
+      // The stale ESC flushes as "ignore" and the q is delivered as a char.
+      expect(p.feed("q")).toEqual([{ type: "ignore" }, { type: "char", key: "q" }]);
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
   test("incomplete CSI with params waits for the final byte", () => {
     const p = new KeyParser();
     expect(p.feed("\x1b[5")).toEqual([]);

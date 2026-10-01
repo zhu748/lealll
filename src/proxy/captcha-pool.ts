@@ -10,6 +10,11 @@ import {
   shutdownCaptchaSolver,
 } from "./captcha-solver.js";
 import { isCaptchaDuplicateError, isCaptchaIpBlockError, parseCertifyId } from "./captcha-token.js";
+// Host-captured timers: pool loops/deadlines run concurrently with captcha
+// solve epochs; during one, the bare globals resolve through the solver
+// window alias and are cancelled on window destruction (the take-deadline
+// never-fires hang). See utils/host-timers.ts.
+import { hostClearInterval, hostClearTimeout, hostSetInterval, hostSetTimeout } from "../utils/host-timers.js";
 
 export interface CaptchaPoolOptions {
   /** @deprecated Use poolSizeMax — kept as max cap alias. */
@@ -88,8 +93,8 @@ const DEFAULT_STAGGER_MS = Number(process.env.CAPTCHA_SOLVE_STAGGER_MS || 0);
 // 3 lanes ≈ 4-6 mints/s — an order of magnitude above the 5-concurrency
 // start-plan demand (≤0.5/s). ZCODE_CAPTCHA_LOW_CPU=0 restores 8 lanes.
 const DEFAULT_SOLVE_CONCURRENCY = Number(
-	process.env.CAPTCHA_SOLVE_CONCURRENCY ||
-		(process.env.ZCODE_CAPTCHA_LOW_CPU === "0" ? 8 : 3),
+        process.env.CAPTCHA_SOLVE_CONCURRENCY ||
+                (process.env.ZCODE_CAPTCHA_LOW_CPU === "0" ? 8 : 3),
 );
 const DEFAULT_SCALE_DOWN_IDLE_MS = Number(process.env.CAPTCHA_POOL_SCALE_DOWN_IDLE_MS || 120_000);
 const DEFAULT_IDLE_FLOOR = Number(process.env.CAPTCHA_POOL_IDLE_FLOOR || 1);
@@ -226,7 +231,7 @@ export class CaptchaTokenPool {
     this.stopBackgroundRefill();
     this.governor?.start();
     void this.refill({ urgent: false });
-    this.refillTimer = setInterval(() => {
+    this.refillTimer = hostSetInterval(() => {
       void this.refill({ urgent: false });
     }, this.opts.refillIntervalMs);
   }
@@ -234,7 +239,7 @@ export class CaptchaTokenPool {
   stopBackgroundRefill(): void {
     this.governor?.stop();
     if (this.refillTimer) {
-      clearInterval(this.refillTimer);
+      hostClearInterval(this.refillTimer);
       this.refillTimer = null;
     }
   }
@@ -260,15 +265,21 @@ export class CaptchaTokenPool {
       // grind through its retry budget (~30-45s) — cap the client-facing wait
       // and let the background waves finish the job instead.
       const raceDeadlineMs = Number(process.env.CAPTCHA_SOLVE_RACE_DEADLINE_MS || 25_000);
-      param = await Promise.race([
-        this.solveRaced(cfg),
-        new Promise<never>((_, rej) =>
-          setTimeout(
-            () => rej(new Error(`captcha take deadline (${raceDeadlineMs}ms)`)),
-            Math.max(1_000, raceDeadlineMs),
-          ),
-        ),
-      ]);
+      let raceAbandoned = false;
+      let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        param = await Promise.race([
+          this.solveRaced(cfg, () => raceAbandoned),
+          new Promise<never>((_, rej) => {
+            deadlineTimer = hostSetTimeout(() => {
+              raceAbandoned = true;
+              rej(new Error(`captcha take deadline (${raceDeadlineMs}ms)`));
+            }, Math.max(1_000, raceDeadlineMs));
+          }),
+        ]);
+      } finally {
+        if (deadlineTimer) hostClearTimeout(deadlineTimer);
+      }
     } catch (err) {
       // Mints fail in clusters (pe-stall storms, F008 velocity). Background
       // refill waves keep retrying — give them a short window to land a
@@ -277,7 +288,7 @@ export class CaptchaTokenPool {
       const graceMs = Number(process.env.CAPTCHA_TAKE_GRACE_MS || 10_000);
       const deadline = Date.now() + Math.max(0, graceMs);
       while (Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 400));
+        await new Promise((r) => hostSetTimeout(r, 400));
         const token = this.popFresh();
         if (token) {
           this.markParamIssued(token);
@@ -529,7 +540,7 @@ export class CaptchaTokenPool {
     const elapsed = Date.now() - this.lastSolveAt;
     const wait = this.opts.staggerMs - elapsed;
     if (wait > 0) {
-      await new Promise((r) => setTimeout(r, wait));
+      await new Promise((r) => hostSetTimeout(r, wait));
     }
   }
 
@@ -623,7 +634,7 @@ export class CaptchaTokenPool {
    * sequential retry chain. Extra successes are banked into the pool instead
    * of being wasted; the race only rejects when every racer fails.
    */
-  private solveRaced(cfg: CaptchaConfig): Promise<string> {
+  private solveRaced(cfg: CaptchaConfig, isAbandoned?: () => boolean): Promise<string> {
     const racers = Math.max(1, Math.min(this.opts.emptyTakeRace, this.opts.solveConcurrency));
     if (racers <= 1) return this.solveFresh(cfg);
 
@@ -634,8 +645,10 @@ export class CaptchaTokenPool {
       for (let i = 0; i < racers; i += 1) {
         this.solveFresh(cfg).then(
           (param) => {
-            if (served) {
-              // Lost the race but minted a valid token — bank it.
+            // After the caller's take-deadline gave up, a winning token can
+            // no longer be handed over — resolve() would no-op and silently
+            // discard a valid (quota-costed) mint. Bank it instead.
+            if (served || isAbandoned?.()) {
               this.pushToken(param);
             } else {
               served = true;

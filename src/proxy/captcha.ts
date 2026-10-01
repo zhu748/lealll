@@ -14,6 +14,7 @@
  * flags it as `verifyCode: F001`. See captcha-happy.ts.
  */
 import { shutdownCaptchaSolver } from "./captcha-solver.js";
+import { readJsonLimited } from "../auth/quota.js";
 import {
   configureCaptchaPool,
   getCaptchaPoolStats,
@@ -58,7 +59,13 @@ async function fetchCaptchaConfig(appVersion: string): Promise<FetchedCaptchaCon
     } finally {
       clearTimeout(timer);
     }
-    const json = (await resp.json()) as { data?: { configs?: { captcha?: FetchedCaptchaConfig } } };
+    if (!resp.ok) {
+      try { await resp.body?.cancel(); } catch {}
+      throw new Error(`captcha_config_http_${resp.status}`);
+    }
+    // Byte-capped read: an abnormal CDN response can otherwise balloon memory
+    // on the hot path (fail-open below keeps requests moving).
+    const json = (await readJsonLimited(resp, 2 * 1024 * 1024)) as { data?: { configs?: { captcha?: FetchedCaptchaConfig } } };
     const cfg = json?.data?.configs?.captcha ?? null;
     cachedConfig = { value: cfg, expiresAt: Date.now() + 60000 };
     if (!cfg) cfgNegUntil = Date.now() + 15_000;

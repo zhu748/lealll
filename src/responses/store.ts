@@ -35,10 +35,28 @@ export interface ResponseStoreOptions {
   maxEntries?: number;
   /** TTL in ms before an entry is considered stale. Default 24h. */
   ttlMs?: number;
+  /** Approximate total byte budget across all entries. Default 256 MiB.
+   *  Entry-count bounds alone let 1000 long-context conversations occupy
+   *  hundreds of MB of RSS; this evicts by size as well. */
+  maxTotalBytes?: number;
 }
 
 const DEFAULT_MAX_ENTRIES = 1000;
 const DEFAULT_TTL_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_MAX_TOTAL_BYTES = 256 * 1024 * 1024;
+
+/**
+ * Rough per-entry size estimate (the two history arrays dominate; fixed
+ * overhead is folded into a constant). One stringify per set() — request
+ * frequency — is cheap next to unbounded RSS growth.
+ */
+function estimateEntryBytes(entry: StoredResponse): number {
+  try {
+    return JSON.stringify(entry.input).length + JSON.stringify(entry.output).length + 256;
+  } catch {
+    return 4096; // circular/unserializable — assume a modest size
+  }
+}
 
 /**
  * Bounded LRU + TTL cache of stored responses. Iteration order = insertion
@@ -48,24 +66,41 @@ const DEFAULT_TTL_MS = 24 * 60 * 60 * 1000;
 export class ResponseStore {
   private readonly maxEntries: number;
   private readonly ttlMs: number;
+  private readonly maxTotalBytes: number;
   private readonly map = new Map<string, StoredResponse>();
+  private readonly bytesById = new Map<string, number>();
+  private totalBytes = 0;
 
   constructor(opts: ResponseStoreOptions = {}) {
     this.maxEntries = opts.maxEntries ?? DEFAULT_MAX_ENTRIES;
     this.ttlMs = opts.ttlMs ?? DEFAULT_TTL_MS;
+    this.maxTotalBytes = opts.maxTotalBytes ?? DEFAULT_MAX_TOTAL_BYTES;
   }
 
-  /** Store a response. Overwrites on duplicate id. Evicts LRU entries on overflow. */
+  /** Store a response. Overwrites on duplicate id. Evicts LRU entries on overflow (count OR bytes). */
   set(entry: StoredResponse): void {
     const now = Date.now();
     entry.createdAt = now;
     entry.lastAccessedAt = now;
-    if (this.map.has(entry.id)) this.map.delete(entry.id);
+    if (this.map.has(entry.id)) {
+      this.totalBytes -= this.bytesById.get(entry.id) ?? 0;
+      this.bytesById.delete(entry.id);
+      this.map.delete(entry.id);
+    }
+    const bytes = estimateEntryBytes(entry);
+    this.bytesById.set(entry.id, bytes);
+    this.totalBytes += bytes;
     this.map.set(entry.id, entry);
-    while (this.map.size > this.maxEntries) {
+    while (this.map.size > 0 && (this.map.size > this.maxEntries || this.totalBytes > this.maxTotalBytes)) {
       const oldestKey = this.map.keys().next().value;
       if (oldestKey === undefined) break;
+      // Always keep the just-inserted entry even if it alone busts the
+      // budget — the bytes are already spent; evicting it would lose the
+      // response the client is about to reference by id.
+      if (oldestKey === entry.id && this.map.size === 1) break;
       this.map.delete(oldestKey);
+      this.totalBytes -= this.bytesById.get(oldestKey) ?? 0;
+      this.bytesById.delete(oldestKey);
     }
   }
 
@@ -79,6 +114,8 @@ export class ResponseStore {
     const now = Date.now();
     if (now - entry.createdAt > this.ttlMs) {
       this.map.delete(id);
+      this.totalBytes -= this.bytesById.get(id) ?? 0;
+      this.bytesById.delete(id);
       return undefined;
     }
     entry.lastAccessedAt = now;
@@ -89,14 +126,26 @@ export class ResponseStore {
   }
 
   delete(id: string): boolean {
-    return this.map.delete(id);
+    const removed = this.map.delete(id);
+    if (removed) {
+      this.totalBytes -= this.bytesById.get(id) ?? 0;
+      this.bytesById.delete(id);
+    }
+    return removed;
   }
 
   clear(): void {
     this.map.clear();
+    this.bytesById.clear();
+    this.totalBytes = 0;
   }
 
   size(): number {
     return this.map.size;
+  }
+
+  /** Approximate total bytes held across all entries (for tests/monitoring). */
+  totalBytesUsed(): number {
+    return this.totalBytes;
   }
 }

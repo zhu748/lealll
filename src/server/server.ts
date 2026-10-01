@@ -20,6 +20,7 @@ import { handleAsyncMessagesRoute, handleAsyncChatRoute, handleAsyncHealthRoute 
 import { handleMcpListingRoute, handleMcpRelayRoute, type McpRouteOptions } from "./routes-mcp.js";
 import { handleQuota, handleQuotaReset, handleQuotaResetAction, handleQuotaClaim, handleQuotaClaimSubmit } from "./routes-quota.js";
 import { handleAdminRoute, type AdminOptions } from "../admin/api.js";
+import { withSecurityHeaders, isCrossOriginMutation } from "../admin/security.js";
 import { errorResponse } from "../proxy/handler.js";
 import type { ResponseStore } from "../responses/store.js";
 
@@ -104,7 +105,11 @@ export function createFetchHandler(opts: ServerOptions): (req: Request) => Promi
     const url = new URL(req.url);
     const path = url.pathname;
     const method = req.method;
-    const cors = corsHeaders(Boolean(config.auth.proxyApiKey));
+    const cors = corsHeaders(
+      Boolean(config.auth.proxyApiKey),
+      req.headers.get("origin"),
+      config.corsAllowList,
+    );
 
     // CORS preflight
     if (method === "OPTIONS") {
@@ -112,10 +117,13 @@ export function createFetchHandler(opts: ServerOptions): (req: Request) => Promi
     }
 
     if (method === "GET" && (path === "/webui" || path.startsWith("/webui/"))) {
-      return new Response(webuiHtml, {
+      // Same hardening the admin dashboard gets: the page keeps endpoint URLs
+      // and API keys in localStorage — without X-Frame-Options/CSP it could
+      // be iframed (clickjacking to extract or mutate that state).
+      return withSecurityHeaders(new Response(webuiHtml, {
         status: 200,
         headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-cache" },
-      });
+      }));
     }
 
     // Fork multi-account layer: admin dashboard routes — intercepted BEFORE
@@ -149,6 +157,19 @@ export function createFetchHandler(opts: ServerOptions): (req: Request) => Promi
 
     if (path === "/quota" && method === "GET") {
       return handleQuota(config, opts.fetchImpl);
+    }
+
+    // /quota mutations are browser-reachable state changes (burn a stockpiled
+    // reset / trigger a captcha-claim that spends quota). In a keyless local
+    // deployment the proxyApiKey gate is absent, so apply the same cross-site
+    // guard the admin API uses — a stray webpage in the operator's browser
+    // must not be able to blind-POST here.
+    if ((path === "/quota/reset" || path === "/quota/claim") && method === "POST" && isCrossOriginMutation(req)) {
+      return errorResponse(
+        403,
+        "cross_origin_blocked",
+        `Cross-site ${method} requests to ${path} are rejected (Origin/Referer host mismatch).`,
+      );
     }
 
     if (path === "/quota/reset" && method === "GET") {
@@ -253,7 +274,6 @@ export function startServer(opts: ServerOptions): Promise<ProxyServer> {
   };
   const handler = createFetchHandler({ ...opts, adminOpts, resolveClientIp });
   const { port: requestedPort, host } = opts.config.server;
-  const cors = corsHeaders(Boolean(opts.config.auth.proxyApiKey));
 
   const server: Server = createServer(async (req, res) => {
     const abortController = new AbortController();
@@ -261,6 +281,15 @@ export function startServer(opts: ServerOptions): Promise<ProxyServer> {
       if (!res.writableEnded) abortController.abort();
     };
     res.on("close", onClientClose);
+
+    // Per-request (the allowlist can be hot-applied via the admin dashboard —
+    // it replaces the array on opts.config — and the echoed origin depends
+    // on the request's Origin header).
+    const cors = corsHeaders(
+      Boolean(opts.config.auth.proxyApiKey),
+      req.headers.origin,
+      opts.config.corsAllowList,
+    );
 
     // `/async/*` routes can hold the connection open for minutes-to-hours while
     // waiting for an off-peak ticket. Lift the per-request socket timeout from
@@ -439,14 +468,48 @@ function addCorsHeaders(resp: Response, cors: Record<string, string>): Response 
  * and drive those routes cross-origin (MCP JSON POSTs are preflighted, so
  * withholding the headers blocks the browser before the request fires).
  * Local CLI/curl tools and the same-origin /webui never needed CORS.
+ *
+ * `corsAllowList` (config top level / ZCODE_PROXY_CORS_ALLOWLIST) narrows
+ * this further: when non-empty, only the listed origins get CORS headers
+ * (echoed, not `*`), so the documented restriction actually takes effect.
+ * Matching is exact after trim/lowercase/trailing-slash normalization.
+ * An empty list keeps the legacy allow-all behavior for backward
+ * compatibility. Read per request — the dashboard hot-applies this field.
  */
-function corsHeaders(corsEnabled: boolean): Record<string, string> {
+function corsHeaders(
+  corsEnabled: boolean,
+  origin: string | null | undefined,
+  allowList: readonly string[] | undefined,
+): Record<string, string> {
   if (!corsEnabled) return {};
+  const methods = "GET, POST, DELETE, OPTIONS";
+  const allowHeaders = "Content-Type, Authorization, x-api-key, anthropic-version, anthropic-beta, mcp-session-id, mcp-protocol-version, last-event-id";
+  const exposeHeaders = "mcp-session-id, mcp-protocol-version";
+  const entries = (allowList ?? []).map((entry) => normalizeOrigin(entry)).filter(Boolean);
+  if (entries.length > 0) {
+    const requested = normalizeOrigin(origin ?? "");
+    if (!requested || !entries.includes(requested)) return {};
+    return {
+      "access-control-allow-origin": requested,
+      // The allowed origin varies per request once an allowlist is in play.
+      "access-control-allow-methods": methods,
+      "access-control-allow-headers": allowHeaders,
+      "access-control-expose-headers": exposeHeaders,
+      "access-control-max-age": "86400",
+      vary: "Origin",
+    };
+  }
   return {
     "access-control-allow-origin": "*",
-    "access-control-allow-methods": "GET, POST, DELETE, OPTIONS",
-    "access-control-allow-headers": "Content-Type, Authorization, x-api-key, anthropic-version, anthropic-beta, mcp-session-id, mcp-protocol-version, last-event-id",
-    "access-control-expose-headers": "mcp-session-id, mcp-protocol-version",
+    "access-control-allow-methods": methods,
+    "access-control-allow-headers": allowHeaders,
+    "access-control-expose-headers": exposeHeaders,
     "access-control-max-age": "86400",
   };
+}
+
+/** Normalize an origin for allowlist comparison (trim, lowercase, no trailing slash). */
+function normalizeOrigin(origin: string): string {
+  const trimmed = origin.trim().toLowerCase().replace(/\/+$/, "");
+  return trimmed.length > 0 ? trimmed : "";
 }

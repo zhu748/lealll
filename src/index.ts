@@ -6,14 +6,14 @@ import { loadConfig } from "./config/loader.js";
 import { AuthManager } from "./auth/manager.js";
 import { startServer, type ProxyServer } from "./server/server.js";
 import { startControlListener, LogBuffer, type ControlState } from "./android/control.js";
-import { loadCredential, saveCredential, clearCredential, getStorePath, exportAccounts, listAccounts } from "./auth/store.js";
+import { loadCredential, saveCredential, clearCredentialAsync, getStorePath, exportAccounts, listAccounts } from "./auth/store.js";
 import { readZCodeImport } from "./auth/zcode-config.js";
 import { ZaiOAuthClient, BigmodelOAuthClient, BigmodelPollOAuthClient, LOGIN_TIMEOUT_MS, parsePastedCallbackUrl, type OAuthResult } from "./auth/oauth.js";
 import { KeyResolver } from "./auth/resolver.js";
 import type { Credential, PlanId } from "./auth/types.js";
 import type { ProviderId } from "./provider/types.js";
 import type { ProxyConfig } from "./config/types.js";
-import { updateConfigYaml, ensureConfigFile } from "./config/edit.js";
+import { updateConfigYaml, ensureConfigFile, atomicWriteFileSync } from "./config/edit.js";
 import { openBrowser } from "./runtime/open-browser.js";
 import { pasteLoginInstructions, readPastedLine, boldIfTTY } from "./runtime/paste-login.js";
 import { buildServerOptions } from "./server/server-options.js";
@@ -115,7 +115,13 @@ function dispatchCli(args: string[]): void {
     const serveArgs = cmd === "serve"
       ? parseServeArgs(args.slice(1))
       : parseServeArgs(args);
-    serve(serveArgs.configPath, serveArgs.debug);
+    serve(serveArgs.configPath, serveArgs.debug).catch((err: unknown) => {
+      // Same contract as the android entry: a startup failure (bad YAML,
+      // EADDRINUSE, …) must exit non-zero deterministically instead of
+      // surfacing as an unhandled rejection.
+      process.stderr.write(`zcode-proxy: serve failed: ${(err as Error).stack ?? String(err)}\n`);
+      process.exit(1);
+    });
   } else if (cmd === "version" || cmd === "--version" || cmd === "-v") {
     console.log(`zcode-proxy ${VERSION}`);
   } else if (cmd === "help" || cmd === "--help" || cmd === "-h") {
@@ -334,15 +340,28 @@ async function serve(configPath: string | undefined, debug: boolean): Promise<vo
     console.warn(`[proxy-pool] init failed (non-fatal): ${(e as Error).message}`);
   }
 
-  process.on("SIGINT", () => {
-    console.log("\nShutting down...");
-    void flushLogFileForShutdown().catch(() => {});
-    server.stop(true);
-  });
-  process.on("SIGTERM", () => {
-    void flushLogFileForShutdown().catch(() => {});
-    server.stop(true);
-  });
+  // Graceful shutdown: stop accepting new connections, then give the buffered
+  // file log a bounded window to drain before exiting. The old path called
+  // process.exit(0) synchronously inside server.stop(true), which raced (and
+  // usually lost against) the pending async appendFile — buffered JSONL log
+  // lines were lost on every restart. A second signal force-exits immediately.
+  let shuttingDown = false;
+  const shutdown = (signal: string): void => {
+    if (shuttingDown) {
+      process.exit(0);
+    }
+    shuttingDown = true;
+    console.log(`\n${signal} received — shutting down...`);
+    server.stop(false);
+    // Bounded drain window: never let a hung appendFile block shutdown.
+    const force = setTimeout(() => process.exit(0), 5000);
+    if (typeof force.unref === "function") force.unref();
+    void flushLogFileForShutdown()
+      .catch(() => {})
+      .finally(() => process.exit(0));
+  };
+  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
 }
 
 /**
@@ -430,10 +449,11 @@ async function runAndroid(): Promise<void> {
 
   console.log("control listener ready; proxy stopped — use startProxy command to start");
 
+  let claimScheduler: import("./claim/scheduler.js").ClaimScheduler | null = null;
   if (config.claim.enabled && config.claim.auto) {
     import("./claim/runtime.js")
       .then((m) => {
-        m.startAutoClaim(config, auth);
+        claimScheduler = m.startAutoClaim(config, auth);
         console.log(`[claim] auto ON (poll ${Math.round(config.claim.pollIntervalMs / 1000)}s; waits for login)`);
       })
       .catch((err) => console.error(`[claim] scheduler failed to start: ${(err as Error).message}`));
@@ -453,7 +473,19 @@ async function runAndroid(): Promise<void> {
     onStopProxy: stopProxy,
     onSetConfig: setConfig,
     onShutdown: async () => {
-      serverRef.current?.stop(true);
+      // The control protocol's `shutdown` promises a process exit (the Kotlin
+      // shell uses it as a full stop). Previously it only stopped the proxy
+      // server, leaving a Node process that still held the control/callback
+      // ports — a semantic trap. Mirror the SIGINT path: stop everything,
+      // flush the log, exit.
+      try { claimScheduler?.stop(); } catch { /* best-effort */ }
+      try { serverRef.current?.stop(true); } catch { /* best-effort */ }
+      const { flushLogFileForShutdown } = await import("./admin/api.js");
+      const force = setTimeout(() => process.exit(0), 5000);
+      if (typeof force.unref === "function") force.unref();
+      void flushLogFileForShutdown()
+        .catch(() => {})
+        .finally(() => process.exit(0));
     },
   });
 
@@ -461,12 +493,14 @@ async function runAndroid(): Promise<void> {
   console.log(`provider: ${config.provider}`);
   console.log(`plan: ${config.plan}`);
 
-  process.on("SIGINT", () => {
+  const shutdown = (): void => {
+    // Stop the claim scheduler too — its (now unref'd) hold timer would
+    // otherwise let a SIGINT'd process linger until the next tick.
+    try { claimScheduler?.stop(); } catch { /* best-effort */ }
     void controlListener.close().then(() => serverRef.current?.stop(true));
-  });
-  process.on("SIGTERM", () => {
-    void controlListener.close().then(() => serverRef.current?.stop(true));
-  });
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
 }
 
 function printDebugBanner(config: ProxyConfig, path: string, cred: Credential | null): void {
@@ -500,7 +534,7 @@ function authCommand(args: string[]): void {
   if (sub === "login") {
     authLogin(args.slice(1)).catch(fail);
   } else if (sub === "logout") {
-    authLogout();
+    authLogout().catch(fail);
   } else if (sub === "status") {
     authStatus().catch(fail);
   } else if (sub === "export") {
@@ -849,17 +883,20 @@ export function ensureDeviceMidInConfig(path: string): string {
     const block = `identity:\n  deviceMid: "${mid}"\n`;
     updated = raw.endsWith("\n") || raw.length === 0 ? raw + block : raw + "\n" + block;
   }
-  writeFileSync(path, updated, "utf-8");
+  atomicWriteFileSync(path, updated);
   console.log(`Device identity generated: ${mid.slice(0, 8)}… (stored in ${path})`);
   return mid;
 }
 
-function authLogout(): void {
+async function authLogout(): Promise<void> {
   if (!existsSync(getStorePath())) {
     console.log("Not logged in.");
     return;
   }
-  clearCredential();
+  // Async variant: acquires the store write mutex (and the cross-process
+  // lock) so a concurrently running serve process can't "resurrect" the
+  // credentials file after the unlink.
+  await clearCredentialAsync();
   console.log("Logged out. Credentials removed.");
 }
 

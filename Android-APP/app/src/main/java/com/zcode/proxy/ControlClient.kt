@@ -10,7 +10,7 @@ import java.io.OutputStream
 import java.net.InetAddress
 import java.net.Socket
 
-class ControlClient(private val controlPort: Int) {
+class ControlClient(private val controlPort: Int, private val controlToken: String) {
 
     suspend fun connect() = withContext(Dispatchers.IO) {
         try {
@@ -97,6 +97,9 @@ class ControlClient(private val controlPort: Int) {
     }
 
     fun close() {
+        // No persistent resources: every request() opens a fresh socket and
+        // closes it in `finally`. Kept as an explicit no-op so onDestroy
+        // call sites stay symmetric.
     }
 
     private fun request(body: JSONObject): JSONObject {
@@ -106,6 +109,7 @@ class ControlClient(private val controlPort: Int) {
             val bodyBytes = body.toString().toByteArray(Charsets.UTF_8)
             val req = "POST /control HTTP/1.1\r\n" +
                 "Host: 127.0.0.1\r\n" +
+                "Authorization: Bearer $controlToken\r\n" +
                 "Content-Type: application/json\r\n" +
                 "Content-Length: ${bodyBytes.size}\r\n" +
                 "Connection: close\r\n\r\n"

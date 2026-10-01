@@ -148,7 +148,16 @@ const _DEBUG = /^(1|true|yes)$/i.test(
 );
 
 const proxyUrl = process.env.HTTP_PROXY || process.env.HTTPS_PROXY;
-if (proxyUrl) {
+// undici dispatcher ONLY in the fork-worker (thread-isolated) case: when this
+// module is dynamically imported into the MAIN process (in-process fallback
+// — the Android bundle always), a global ProxyAgent would clobber the main
+// fetch stack's deliberately unbounded timeouts (node-fetch-compat.ts) and
+// silently re-route ALL main-process fetches (LLM SSE, admin, quota) through
+// the env proxy with undici's default 300s headers timeout.
+const _isWorkerThread = (() => {
+  try { return require("node:worker_threads").isMainThread === false; } catch (_) { return false; }
+})();
+if (proxyUrl && _isWorkerThread) {
   try {
     setGlobalDispatcher(new ProxyAgent(proxyUrl));
   } catch (_) {}
@@ -246,6 +255,52 @@ function patchPeBundle(buf, url) {
 }
 
 // -- CDN cache access --------------------------------------------------------
+/** Cap for a single cached CDN response — an abnormal CDN reply can otherwise balloon memory. */
+const CDN_FETCH_MAX_BYTES = 5 * 1024 * 1024;
+/** Disk-cache hygiene: entries older than this are swept at solve-module load. */
+const CDN_CACHE_FILE_TTL_MS = 14 * 24 * 60 * 60 * 1000;
+/** Sweep the disk cache down to this total size, oldest first. */
+const CDN_CACHE_DIR_MAX_BYTES = 64 * 1024 * 1024;
+
+function sweepCdnDiskCache(): void {
+  try {
+    let entries = [];
+    try {
+      entries = fs.readdirSync(CDN_CACHE_DIR)
+        .map((name) => {
+          const full = path.join(CDN_CACHE_DIR, name);
+          try {
+            const st = fs.statSync(full);
+            return st.isFile() ? { full, size: st.size, mtimeMs: st.mtimeMs } : null;
+          } catch (_) { return null; }
+        })
+        .filter(Boolean);
+    } catch (_) { return; }
+    const now = Date.now();
+    let total = entries.reduce((acc, e) => acc + e.size, 0);
+    // Age-out first (per-pe-version rotation leaves one file per rotation —
+    // previously UNBOUNDED for the process lifetime).
+    for (const e of entries) {
+      if (now - e.mtimeMs > CDN_CACHE_FILE_TTL_MS) {
+        try { fs.unlinkSync(e.full); } catch (_) {}
+        total -= e.size;
+        e.size = 0;
+      }
+    }
+    // Then size-cap, oldest first.
+    if (total > CDN_CACHE_DIR_MAX_BYTES) {
+      const live = entries.filter((e) => e.size > 0).sort((a, b) => a.mtimeMs - b.mtimeMs);
+      for (const e of live) {
+        if (total <= CDN_CACHE_DIR_MAX_BYTES) break;
+        try { fs.unlinkSync(e.full); } catch (_) {}
+        total -= e.size;
+        e.size = 0;
+      }
+    }
+  } catch (_) { /* cache hygiene is best-effort */ }
+}
+try { sweepCdnDiskCache(); } catch (_) {}
+
 function getCachedBody(url) {
   const mem = _memCdnCache.get(url);
   if (mem) return mem;
@@ -263,7 +318,19 @@ function getCachedBody(url) {
 async function fetchAndStore(url) {
   try {
     const res = await fetch(url, { headers: { "user-agent": fp.userAgent } });
+    // Size guard BEFORE buffering: arrayBuffer() on an abnormal (or hostile)
+    // CDN response would otherwise allocate the full payload in memory.
+    const declared = Number(res.headers.get("content-length") || 0);
+    if (declared > CDN_FETCH_MAX_BYTES) {
+      try { await res.body?.cancel(); } catch (_) {}
+      if (_DEBUG) process.stderr.write(`[cache-fetch-too-large] ${url}: ${declared}b\n`);
+      return null;
+    }
     const buf = Buffer.from(await res.arrayBuffer());
+    if (buf.length > CDN_FETCH_MAX_BYTES) {
+      if (_DEBUG) process.stderr.write(`[cache-fetch-too-large] ${url}: ${buf.length}b (streamed)\n`);
+      return null;
+    }
     if (buf.length > 0) {
       rememberCdnBody(url, buf);
       try {
@@ -2315,12 +2382,23 @@ function takeReusableWindow() {
   if (!p.window) return null;
   if (p.solves >= REUSE_MAX_SOLVES) { discardReusableWindow(); return null; }
   if (Date.now() - p.lastUsedAt > REUSE_MAX_IDLE_MS) { discardReusableWindow(); return null; }
-  return { window: p.window, browserFrame: p.browserFrame, reused: true };
+  // TAKE semantics: the window leaves the pool while a solve holds it. With
+  // worker-less in-process runs, parallel solveBatch waves / solveRaced could
+  // otherwise hand the SAME window to 2+ concurrent solves and interleave
+  // their DOM/cookie/request-log state — exactly what the per-solve isolation
+  // design is meant to prevent. The holder re-stages on success (with the
+  // solves count carried through so the generation cap stays accurate); a
+  // failure path destroys it and the pool simply stays empty.
+  const taken = { window: p.window, browserFrame: p.browserFrame, reused: true, solves: p.solves };
+  p.window = null;
+  p.browserFrame = null;
+  p.solves = 0;
+  return taken;
 }
-function stageReusableWindow(window, browserFrame) {
+function stageReusableWindow(window, browserFrame, solves = 0) {
   _reusePool.window = window;
   _reusePool.browserFrame = browserFrame;
-  _reusePool.solves = 0;
+  _reusePool.solves = solves;
   _reusePool.lastUsedAt = Date.now();
 }
 function discardReusableWindow() {
@@ -2331,10 +2409,6 @@ function discardReusableWindow() {
   p.window = null;
   p.browserFrame = null;
   p.solves = 0;
-}
-function noteWindowSolved() {
-  _reusePool.solves += 1;
-  _reusePool.lastUsedAt = Date.now();
 }
 
 // -- Guest error capture (read side) ----------------------------------------
@@ -2483,8 +2557,11 @@ async function solveTraceless(opts) {
     solveSucceeded = true;
     const out = extractVerifyParam(param);
     if (wantReuse) {
-      if (reused) noteWindowSolved();
-      else stageReusableWindow(w, browserFrame);
+      // Return the window to the pool (take-semantics checkout, see
+      // takeReusableWindow): a reused window carries its solved-generation
+      // count forward so REUSE_MAX_SOLVES still caps its lifetime; a fresh
+      // window starts generation 0.
+      stageReusableWindow(w, browserFrame, reused ? (dom.solves ?? 0) + 1 : 0);
       keepWindow = true;
     }
     return out;

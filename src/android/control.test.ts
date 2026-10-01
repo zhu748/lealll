@@ -15,12 +15,17 @@ function makeStubRequest(opts: {
   url?: string;
   body?: string;
   remoteAddress?: string;
+  headers?: Record<string, string>;
 }): import("node:http").IncomingMessage {
   const body = opts.body ?? "";
   const stream = Readable.from([Buffer.from(body, "utf-8")]) as unknown as import("node:http").IncomingMessage;
   stream.method = opts.method ?? "POST";
   stream.url = opts.url ?? "/control";
-  stream.headers = { "content-type": "application/json", "content-length": String(Buffer.byteLength(body)) };
+  stream.headers = {
+    "content-type": "application/json",
+    "content-length": String(Buffer.byteLength(body)),
+    ...opts.headers,
+  };
   stream.socket = { remoteAddress: opts.remoteAddress ?? "127.0.0.1" } as never;
   return stream;
 }
@@ -84,6 +89,72 @@ describe("android control listener", () => {
     });
     const result = await handleControlRequestForTest(req, baseState);
     expect(result.status).toBe(200);
+  });
+
+  // ---- bearer-token gate (production startControlListener always sets it) ----
+
+  it("returns 401 when authToken is configured and the request carries no token", async () => {
+    const req = makeStubRequest({ body: JSON.stringify({ cmd: "status" }) });
+    const result = await handleControlRequestWithHooksForTest(req, baseState, {
+      logBuffer: new LogBuffer(),
+      authToken: "test-token-0123456789abcdef",
+    });
+    expect(result.status).toBe(401);
+    expect(result.body.ok).toBe(false);
+  });
+
+  it("returns 401 for a wrong bearer token", async () => {
+    const req = makeStubRequest({
+      body: JSON.stringify({ cmd: "status" }),
+      headers: { authorization: "Bearer wrong-token-0123456789" },
+    });
+    const result = await handleControlRequestWithHooksForTest(req, baseState, {
+      logBuffer: new LogBuffer(),
+      authToken: "test-token-0123456789abcdef",
+    });
+    expect(result.status).toBe(401);
+  });
+
+  it("accepts a valid bearer token and still answers the command", async () => {
+    const req = makeStubRequest({
+      body: JSON.stringify({ cmd: "status" }),
+      headers: { authorization: "Bearer test-token-0123456789abcdef" },
+    });
+    const result = await handleControlRequestWithHooksForTest(req, baseState, {
+      logBuffer: new LogBuffer(),
+      authToken: "test-token-0123456789abcdef",
+    });
+    expect(result.status).toBe(200);
+    expect(result.body.ok).toBe(true);
+  });
+
+  it("returns 415 for a non-JSON content type (no-cors CSRF shape)", async () => {
+    const req = makeStubRequest({
+      body: JSON.stringify({ cmd: "logout" }),
+      headers: { "content-type": "text/plain", authorization: "Bearer test-token-0123456789abcdef" },
+    });
+    const result = await handleControlRequestWithHooksForTest(req, baseState, {
+      logBuffer: new LogBuffer(),
+      authToken: "test-token-0123456789abcdef",
+    });
+    expect(result.status).toBe(415);
+  });
+
+  it("returns 413 when the body exceeds the 64KB control cap", async () => {
+    const req = makeStubRequest({
+      body: JSON.stringify({ cmd: "status", pad: "x".repeat(65 * 1024) }),
+    });
+    const result = await handleControlRequestWithHooksForTest(req, baseState, {
+      logBuffer: new LogBuffer(),
+    });
+    expect(result.status).toBe(413);
+  });
+
+  it("resolveControlToken prefers a sufficient env token and otherwise generates one", () => {
+    const { resolveControlToken } = require("./control.js") as typeof import("./control.js");
+    expect(resolveControlToken({ ZCODE_CONTROL_TOKEN: "env-supplied-token-0123456789" })).toBe("env-supplied-token-0123456789");
+    const generated = resolveControlToken({});
+    expect(generated).toMatch(/^[0-9a-f]{32}$/);
   });
 
   it("returns 404 for non-/control paths", async () => {

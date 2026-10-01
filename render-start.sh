@@ -57,11 +57,11 @@ echo "[render-start] ZCODE_PROXY_STORE_DIR=${ZCODE_PROXY_STORE_DIR}"
 # so the failure mode is visible at startup, not buried in a request handler.
 if [ ! -f "$ZCODE_PROXY_CONFIG" ]; then
   echo "[render-start] Seeding $ZCODE_PROXY_CONFIG from config.example.yaml"
-  # Strip the placeholder API key — we want env vars (ZCODE_API_KEY /
-  # ZCODE_PROXY_API_KEY) to be the single source of truth on Render.
-  # Keeping an empty apiKey in YAML forces env-var resolution.
-  sed 's|apiKey: "YOUR_API_KEY_HERE"|apiKey: ""|' \
-      "$APP_DIR/config.example.yaml" > "$ZCODE_PROXY_CONFIG"
+  # Copy the template verbatim: its apiKey line is commented out already, so
+  # env vars (ZCODE_API_KEY / ZCODE_PROXY_API_KEY) are the single source of
+  # truth on Render (an older sed here targeted a placeholder that no longer
+  # exists and never changed anything).
+  cp "$APP_DIR/config.example.yaml" "$ZCODE_PROXY_CONFIG"
 fi
 
 # --- 4. Sanity checks --------------------------------------------------------
@@ -125,13 +125,18 @@ if [ "${ZCODE_AUTH_MODE:-}" = "oauth" ]; then
     # ZCODE_PROXY_ALLOW_PLAINTEXT_STORE=1.
     CRED_FILE="$ZCODE_PROXY_STORE_DIR/credentials.json"
     mkdir -p "$ZCODE_PROXY_STORE_DIR"
+    # Credential material lands here — 0600 on the file (store standard, same
+    # as the app's own writers) and a private umask for any other file the
+    # script creates. Previously the umask default (usually 022) left
+    # credentials.json world-readable on the persistent disk.
+    umask 077
     echo "[render-start] Decoding ZCODE_OAUTH_CREDENTIAL → $CRED_FILE"
     CRED_JSON="$(echo "$ZCODE_OAUTH_CREDENTIAL" | base64 -d)"
     # Validate it's JSON
     if ! echo "$CRED_JSON" | bun -e 'const fs=require("fs");JSON.parse(fs.readFileSync(0,"utf8"))' 2>/dev/null; then
       echo "[render-start] ERROR: ZCODE_OAUTH_CREDENTIAL is not valid base64-encoded JSON."
-      echo "[render-start]   Decoded preview (first 200 chars):"
-      echo "$CRED_JSON" | head -c 200
+      # Never print the decoded payload — its prefix contains the upstream
+      # apiKey and would leak the credential into deploy logs.
       exit 1
     fi
 
@@ -166,7 +171,10 @@ if [ "${ZCODE_AUTH_MODE:-}" = "oauth" ]; then
         # Fallback: bun-native random string (works everywhere bun runs).
         ACCOUNT_ID="$(bun -e 'console.log(Math.random().toString(36).slice(2,18))')"
       fi
-      NOW_MS="$(date +%s%3N)"
+      # GNU `date +%s%3N` is a Linux extension: on macOS it emits a literal
+      # trailing "N" ("1712345678901N" → invalid JSON in the store below).
+      # bun is a hard dependency of this script — use it for epoch millis.
+      NOW_MS="$(bun -e 'console.log(Date.now())')"
       echo "[render-start] Detected single credential — wrapping as single-account v2 store."
       cat > "$CRED_FILE" <<EOF
 {
@@ -183,6 +191,9 @@ if [ "${ZCODE_AUTH_MODE:-}" = "oauth" ]; then
 }
 EOF
     fi
+    # Tighten regardless of write path (echo/cat above inherited the umask of
+    # the pre-umask shell on some platforms).
+    chmod 600 "$CRED_FILE" 2>/dev/null || true
     export ZCODE_PROXY_ALLOW_PLAINTEXT_STORE=1
     echo "[render-start] OAuth credential installed. (Plaintext store enabled for this session.)"
   fi
@@ -205,27 +216,9 @@ if [ -z "${ZCODE_PROXY_API_KEY:-}" ]; then
   echo "[render-start]   Set ZCODE_PROXY_API_KEY in Render's Environment tab."
 fi
 
-# --- 5. Browser runtime for start-plan captcha -------------------------------
-# Render containers do not provide a desktop display. The Docker image includes
-# Chromium + Xvfb so on-demand start-plan captcha challenges can use the same
-# Chrome CDP path as local runs instead of falling back to JSDOM.
-if [ -z "${DISPLAY:-}" ] && [ "${ZCODE_CAPTCHA_SOLVER:-auto}" != "jsdom" ] && command -v Xvfb >/dev/null 2>&1; then
-  export DISPLAY="${ZCODE_XVFB_DISPLAY:-:99}"
-  XVFB_WHD="${ZCODE_XVFB_WHD:-1280x720x24}"
-  echo "[render-start] Starting Xvfb on DISPLAY=$DISPLAY ($XVFB_WHD) for Chromium captcha challenges."
-  Xvfb "$DISPLAY" -screen 0 "$XVFB_WHD" -nolisten tcp >/tmp/zcode-xvfb.log 2>&1 &
-  sleep 1
-fi
-
-if [ "${ZCODE_CAPTCHA_SOLVER:-auto}" != "jsdom" ]; then
-  if [ -n "${ZCODE_CAPTCHA_CHROME_PATH:-}" ]; then
-    echo "[render-start] ZCODE_CAPTCHA_CHROME_PATH=${ZCODE_CAPTCHA_CHROME_PATH}"
-  elif command -v chromium >/dev/null 2>&1; then
-    export ZCODE_CAPTCHA_CHROME_PATH="$(command -v chromium)"
-    echo "[render-start] ZCODE_CAPTCHA_CHROME_PATH=${ZCODE_CAPTCHA_CHROME_PATH}"
-  fi
-fi
-
-# --- 6. Launch ---------------------------------------------------------------
+# --- 5. Launch ---------------------------------------------------------------
+# (The old Xvfb/Chromium section was removed: no code in src/ reads
+# ZCODE_CAPTCHA_SOLVER / ZCODE_CAPTCHA_CHROME_PATH, and the alpine image
+# ships no browser — captcha solving uses the built-in worker path.)
 echo "[render-start] Starting zcode-proxy..."
 exec bun run src/index.ts serve "$ZCODE_PROXY_CONFIG"

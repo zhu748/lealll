@@ -28,6 +28,7 @@
  * @see https://modelcontextprotocol.io/specification/2025-06-18/server/tools
  */
 import type { ProviderId } from "../provider/types.js";
+import { hostSetTimeout, hostClearTimeout } from "../utils/host-timers.js";
 
 /** MCP tool definition (subset we care about). */
 export interface McpToolDef {
@@ -98,6 +99,8 @@ export class McpClient {
   private sessionId: string | undefined;
   private nextId = 1;
   private initialized = false;
+  /** In-flight handshake (concurrent-safe initialize). */
+  private initPromise?: Promise<void>;
 
   constructor(opts: McpClientOptions) {
     this.url = opts.url;
@@ -111,9 +114,25 @@ export class McpClient {
    * Perform the MCP handshake: `initialize` (captures session id) +
    * `notifications/initialized`. Idempotent — subsequent calls are no-ops.
    * Called lazily by `listTools` / `callTool`.
+   *
+   * Concurrent-safe: the in-flight handshake promise is cached so parallel
+   * first calls don't open two upstream sessions (the second session id
+   * would be silently dropped by the `if (!this.sessionId)` guard).
    */
   async initialize(): Promise<void> {
     if (this.initialized) return;
+    this.initPromise ??= this.doInitialize().finally(() => {
+      this.initPromise = undefined;
+    });
+    try {
+      await this.initPromise;
+    } catch (err) {
+      // Don't cache failures — the next caller retries the handshake.
+      throw err;
+    }
+  }
+
+  private async doInitialize(): Promise<void> {
     const initResp = await this.postRpc("initialize", {
       protocolVersion: this.protocolVersion,
       capabilities: {},
@@ -173,8 +192,13 @@ export class McpClient {
     });
 
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    // Host-safe timer, armed until BODY consumption finishes: the abort
+    // previously disarmed on header arrival, so a stalled SSE body hung the
+    // call with no timeout. Host-safe = immune to captcha-solve window
+    // aliasing (see utils/host-timers.ts).
+    const timer = hostSetTimeout(() => controller.abort(), this.timeoutMs);
     let httpResp: Response;
+    let raw: string;
     try {
       httpResp = await this.fetchImpl(this.url, {
         method: "POST",
@@ -187,27 +211,29 @@ export class McpClient {
         body,
         signal: controller.signal,
       });
+
+      if (!httpResp.ok) {
+        // Release the error body — an unconsumed response holds its socket.
+        void httpResp.body?.cancel().catch(() => {});
+        throw new McpRpcError(-32000, `HTTP ${httpResp.status} ${httpResp.statusText}`);
+      }
+
+      // Capture the session id on the FIRST response (initialize).
+      if (!this.sessionId) {
+        const sid = httpResp.headers.get("mcp-session-id");
+        if (sid) this.sessionId = sid;
+      }
+
+      const contentType = httpResp.headers.get("content-type") ?? "";
+      raw = await httpResp.text();
+
+      // GLM's auth failures are HTTP 200 + a non-JSON-RPC envelope.
+      if (!contentType.includes("event-stream") && !contentType.includes("application/json")) {
+        // Still inspect the body — some auth failures come back without a proper CT.
+        throw this.classifyEnvelope(raw);
+      }
     } finally {
-      clearTimeout(timer);
-    }
-
-    if (!httpResp.ok) {
-      throw new McpRpcError(-32000, `HTTP ${httpResp.status} ${httpResp.statusText}`);
-    }
-
-    // Capture the session id on the FIRST response (initialize).
-    if (!this.sessionId) {
-      const sid = httpResp.headers.get("mcp-session-id");
-      if (sid) this.sessionId = sid;
-    }
-
-    const contentType = httpResp.headers.get("content-type") ?? "";
-    const raw = await httpResp.text();
-
-    // GLM's auth failures are HTTP 200 + a non-JSON-RPC envelope.
-    if (!contentType.includes("event-stream") && !contentType.includes("application/json")) {
-      // Still inspect the body — some auth failures come back without a proper CT.
-      throw this.classifyEnvelope(raw);
+      hostClearTimeout(timer);
     }
 
     // Empty body (notifications/initialized) → no JSON-RPC payload to return.
@@ -215,7 +241,7 @@ export class McpClient {
       return { json: { jsonrpc: "2.0" }, headers: httpResp.headers };
     }
 
-    const payload = contentType.includes("event-stream")
+    const payload = httpResp.headers.get("content-type")?.includes("event-stream")
       ? parseSseFrame(raw)
       : safeParseJson(raw);
 

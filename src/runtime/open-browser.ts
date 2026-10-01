@@ -2,10 +2,19 @@
  * Cross-platform default-browser launcher, shared by the CLI auth flows and
  * the TUI login action. Best-effort: a failure leaves the URL on screen for
  * the user to copy manually.
+ *
+ * Defense-in-depth URL gate: the authorize URL comes from a server response
+ * (oauth.ts). The Windows path shells out through cmd.exe, where `%VAR%`
+ * expansion and quote-breaks are the classic injection vector — the WHATWG
+ * URL parser already percent-encodes `"` and rejects control characters, so
+ * the scheme+control check below closes the rest.
  */
 import { spawn, type SpawnOptions } from "node:child_process";
 
 export function openBrowser(url: string): void {
+  if (!/^https?:\/\//i.test(url) || /[\r\n\0"<>%\\^]/.test(url)) {
+    return; // not a plain http(s) URL — leave it on screen for manual copy
+  }
   try {
     if (process.platform === "win32") {
       spawnDetached("cmd.exe", ["/c", `start "" "${url}"`], {

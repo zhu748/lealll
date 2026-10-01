@@ -13,6 +13,7 @@
  * cooldown. See `_reverse/NOTEPAD.md` "Server-side endpoint remapping".
  */
 import { buildIdentityHeaders, identityCacheKey } from "./identity.js";
+import { readJsonLimited } from "../auth/quota.js";
 import type { ProxyIdentity } from "../config/types.js";
 
 const DEFAULT_ORIGIN = "https://zcode.z.ai";
@@ -52,7 +53,10 @@ function normalizePath(pathname: string): string {
 }
 
 function routingKey(url: URL): string {
-  const port = url.port || "443";
+  // Default port follows the protocol — an http upstream (default 80) must
+  // not be keyed as :443 (it could then never match a mapping).
+  const defaultPort = url.protocol === "https:" ? "443" : "80";
+  const port = url.port || defaultPort;
   return `${url.protocol}//${url.hostname.toLowerCase()}:${port}${normalizePath(url.pathname)}`;
 }
 
@@ -156,8 +160,14 @@ export class EndpointRoutingService {
         redirect: "manual",
         signal: controller.signal,
       });
-      if (resp.status < 200 || resp.status >= 300) throw new Error(`agent_configs_http_${resp.status}`);
-      const parsed = await resp.json() as unknown;
+      if (resp.status < 200 || resp.status >= 300) {
+        try { await resp.body?.cancel(); } catch {}
+        throw new Error(`agent_configs_http_${resp.status}`);
+      }
+      // Byte-capped read (2MB) instead of a bare resp.json(): a hijacked or
+      // misbehaving upstream could otherwise stream arbitrary bytes into
+      // memory before the MAX_MAPPING_ENTRIES check ever runs.
+      const parsed = await readJsonLimited(resp, 2 * 1024 * 1024) as unknown;
       const envelope = parsed as { code?: unknown; data?: unknown };
       if (!envelope || typeof envelope !== "object" || envelope.code !== 0) {
         throw new Error("agent_configs_nonzero_code");

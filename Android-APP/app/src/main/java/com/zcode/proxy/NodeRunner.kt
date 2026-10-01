@@ -9,6 +9,7 @@ import java.io.File
 import java.io.FileOutputStream
 import java.io.InputStreamReader
 import java.net.ServerSocket
+import java.util.UUID
 import java.util.concurrent.ConcurrentLinkedDeque
 
 class NodeRunner(private val context: Context) {
@@ -19,6 +20,14 @@ class NodeRunner(private val context: Context) {
     // `control-port` (one port per line; a legacy single-int file is migrated).
     val controlPort: Int
     val callbackPort: Int
+
+    /**
+     * Per-start bearer token for the localhost control channel. 127.0.0.1 is
+     * shared by every app on the device, so the Node listener rejects any
+     * /control request without `Authorization: Bearer <token>` — and a custom
+     * header cannot be forged by a no-cors browser fetch either.
+     */
+    val controlToken: String = UUID.randomUUID().toString().replace("-", "")
     private var process: Process? = null
 
     /** Set by stop(); a process that spawns after this self-destructs. */
@@ -85,6 +94,7 @@ class NodeRunner(private val context: Context) {
             environment()["LD_LIBRARY_PATH"] = nativeDir
             environment()["NODE_PATH"] = File(serverBundle, "node_modules").absolutePath
             environment()["ZCODE_CONTROL_PORT"] = controlPort.toString()
+            environment()["ZCODE_CONTROL_TOKEN"] = controlToken
             environment()["ZCODE_OAUTH_CALLBACK_PORT"] = callbackPort.toString()
             environment()["ZCODE_PROXY_CREDENTIAL_SECRET"] = credentialSeed
             environment()["ZCODE_IDENTITY_PLATFORM"] = "linux"

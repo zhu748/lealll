@@ -74,25 +74,36 @@ function normalizeOsCategory(platform: NodeJS.Platform): string {
 }
 
 /** Mirrors the bundle's `lsa()` / `V8i()`: Intl locale, wrapped in try/catch. */
+// Memoized: Intl.DateTimeFormat().resolvedOptions() is surprisingly expensive
+// and these values cannot change for the lifetime of the process — they were
+// previously re-computed 2-3× per request (headers + signing gate).
+let cachedClientLanguage: string | undefined | null = null;
 function resolveClientLanguage(): string | undefined {
   const override = normalizePrintableHeaderValue(process.env.ZCODE_IDENTITY_CLIENT_LANGUAGE);
   if (override) return override;
-  try {
-    return Intl.DateTimeFormat().resolvedOptions().locale || undefined;
-  } catch {
-    return undefined;
+  if (cachedClientLanguage === null) {
+    try {
+      cachedClientLanguage = Intl.DateTimeFormat().resolvedOptions().locale || undefined;
+    } catch {
+      cachedClientLanguage = undefined;
+    }
   }
+  return cachedClientLanguage;
 }
 
 /** Mirrors the bundle's `csa()`: Intl timezone, wrapped in try/catch. */
+let cachedClientTimezone: string | undefined | null = null;
 function resolveClientTimezone(): string | undefined {
   const override = normalizePrintableHeaderValue(process.env.ZCODE_IDENTITY_CLIENT_TIMEZONE);
   if (override) return override;
-  try {
-    return Intl.DateTimeFormat().resolvedOptions().timeZone || undefined;
-  } catch {
-    return undefined;
+  if (cachedClientTimezone === null) {
+    try {
+      cachedClientTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || undefined;
+    } catch {
+      cachedClientTimezone = undefined;
+    }
   }
+  return cachedClientTimezone;
 }
 
 interface ResolvedIdentityValues {

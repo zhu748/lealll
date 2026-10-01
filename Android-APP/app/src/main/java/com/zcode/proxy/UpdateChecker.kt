@@ -54,9 +54,15 @@ object UpdateChecker {
         if (tag.isBlank()) {
             null
         } else {
+            // Scheme whitelist for server-controlled URLs: html_url /
+            // browser_download_url come from the API payload and end up in
+            // an Intent / download request — reject anything that is not
+            // plain https so a compromised or spoofed payload cannot bounce
+            // the user to an app:// or http:// target.
+            fun httpsOnly(raw: String): String? = if (raw.startsWith("https://")) raw else null
             UpdateInfo(
                 tag = tag,
-                htmlUrl = json.optString("html_url", RELEASES_PAGE).ifBlank { RELEASES_PAGE },
+                htmlUrl = httpsOnly(json.optString("html_url", RELEASES_PAGE).ifBlank { RELEASES_PAGE }) ?: RELEASES_PAGE,
                 apkUrl = json.optJSONArray("assets")?.let { arr ->
                     (0 until arr.length())
                         .map { arr.getJSONObject(it) }
@@ -66,6 +72,7 @@ object UpdateChecker {
                         .firstOrNull()
                         ?.optString("browser_download_url")
                         ?.ifBlank { null }
+                        ?.let { httpsOnly(it) }
                 },
                 notes = json.optString("body").ifBlank { null },
             )

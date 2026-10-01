@@ -72,7 +72,9 @@ export function translateRequestAnthropicToOpenAI(req: AnthropicMessagesRequest)
     }));
   }
 
-  if (req.tool_choice) {
+  // OpenAI rejects tool_choice unless tools are present ("tool_choice only
+  // allowed when tools specified") — gate on the translated tools array.
+  if (result.tools && req.tool_choice) {
     const translated = mapToolChoiceAnthropicToOpenAI(req.tool_choice);
     if (translated !== undefined) result.tool_choice = translated;
   }

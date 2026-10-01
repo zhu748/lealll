@@ -22,7 +22,9 @@ import { getDefaultEndpointRouting, type EndpointRoutingService } from "./endpoi
 import { getDefaultClientSigning, sendWithClientSigning, type ClientSigningManager } from "./client-signing.js";
 import { credentialString } from "../auth/types.js";
 import { sendOrderedUpstreamRequest, orderedAdvertisedCodings } from "./ordered-transport.js";
-import { transformRequestBody } from "./body-transformer.js";
+import { pickProxy, markProxyFailed, getMaxRotations } from "./proxy-pool.js";
+import { makeProxiedFetcher } from "./proxied-fetch.js";
+import { transformRequestBody, transformParsedBody } from "./body-transformer.js";
 import { isCaptchaChallenged, retryOnCaptchaChallenge } from "./captcha-retry.js";
 import { type ClientSessionResult } from "./client-session.js";
 import { resolveSessionContext } from "./session-context.js";
@@ -48,7 +50,9 @@ import { translateRequestOpenAIToAnthropic, translateResponseAnthropicToOpenAI }
 import { translateRequestAnthropicToOpenAI, translateResponseOpenAIToAnthropic } from "../translator/anthropic-to-openai.js";
 import { anthropicSseToOpenaiSse, openaiSseToAnthropicSse } from "../translator/sse-translator.js";
 import type { OpenAIChatRequest, OpenAIChatResponse, AnthropicMessagesRequest, AnthropicMessagesResponse } from "../translator/types.js";
-import { dumpPhase, dumpHeaders, dumpBody, dumpEnabled } from "./dump.js";
+import { dumpPhase, dumpHeaders, dumpBody, dumpEnabled, SENSITIVE_HEADERS as SENSITIVE_HEADER_NAMES } from "./dump.js";
+import { createStatsTransform, observeStatsStream } from "./stats.js";
+import { recordHeaders } from "../utils/header-debug.js";
 import { inflateWithCap } from "./inflate.js";
 import { buildAnthropicMetadataUserId } from "./trace-headers.js";
 
@@ -99,15 +103,32 @@ export async function proxyRequest(
 
   let body: string | undefined;
   try {
-    body = await readBody(clientReq);
+    body = await readBody(clientReq, config.server?.maxRequestBodyBytes);
   } catch (err) {
-    if (err instanceof InflatedBodyTooLargeError) {
+    if (err instanceof InflatedBodyTooLargeError || err instanceof RequestBodyTooLargeError) {
       return errorResponse(413, "request_too_large", err.message);
     }
     return errorResponse(400, "invalid_request_error", (err as Error).message);
   }
 
-  const meta = peekBody(body);
+  // ---- single-parse contract ----
+  // The raw body is parsed EXACTLY ONCE here and the resulting object is
+  // threaded to every consumer (peek/session-resolution/translation/transform).
+  // Previously each site re-parsed independently (4-5 parses per request on
+  // the default path, each O(body)). Invalid or non-object JSON leaves
+  // parsedBody undefined and every consumer falls back to its legacy
+  // string-path behavior — same outcomes, one parse.
+  let parsedBody: Record<string, unknown> | undefined;
+  if (body !== undefined && body.length > 0) {
+    try {
+      const raw = JSON.parse(body) as unknown;
+      if (raw !== null && typeof raw === "object" && !Array.isArray(raw)) {
+        parsedBody = raw as Record<string, unknown>;
+      }
+    } catch { /* consumers see undefined and fall back */ }
+  }
+
+  const meta = peekBody(parsedBody);
 
   if (dumpEnabled()) {
     dumpPhase(reqId, "client_in", {
@@ -143,6 +164,7 @@ export async function proxyRequest(
     backoffFactor: config.retry?.backoffFactor ?? 2,
     retryableStatuses: config.retry?.retryableStatuses ?? [529, 429],
     credentialSwitchThreshold: config.retry?.credentialSwitchThreshold ?? 2,
+    emptyStreamSwitchThreshold: config.retry?.emptyStreamSwitchThreshold ?? 3,
     totalDeadlineMs: config.retry?.totalDeadlineMs ?? 300000,
   };
 
@@ -154,8 +176,12 @@ export async function proxyRequest(
     c.plan ?? (c.jwt ? "start-plan" : config.plan);
   let currentPlan = effectivePlanForCred(cred);
   if (currentPlan !== config.plan) {
-    if (debug) debugLine(reqId, `plan ${config.plan} → ${currentPlan} (from credential)`);
-    config.plan = currentPlan;
+    // Request-local only: do NOT write back to config.plan. The config object is
+    // shared by every in-flight request plus the /async + /mcp plan gates and
+    // the dashboard — mutating it here let one credential's plan flip the
+    // globally visible plan mid-flight (nondeterministic gating for
+    // concurrently dispatched requests).
+    if (debug) debugLine(reqId, `plan ${config.plan} → ${currentPlan} (from credential, request-local)`);
   }
 
   // v2.6: both plans use the Anthropic upstream. coding-plan mirrors the real
@@ -168,23 +194,23 @@ export async function proxyRequest(
   const translateAnthropicToOpenAI = false;
   const translateOpenAIToAnthropic = format === "openai";
   const upstreamFormat: Format = "anthropic";
-  const clientSession = resolveSessionContext({ clientReq, body, upstreamFormat, model: meta.model, config });
+  const clientSession = resolveSessionContext({ clientReq, body, parsedBody, upstreamFormat, model: meta.model, config });
   if (debug && clientSession) {
     const shortSession = clientSession.sessionId ? clientSession.sessionId.slice(0, 10) : "-";
     debugLine(reqId, `clientIdentity source=${clientSession.source} action=${clientSession.action} confidence=${clientSession.confidence.toFixed(2)} session=${shortSession}`);
   }
 
   let upstreamBody = body;
+  // Object form matching `upstreamBody` (undefined when the body isn't a
+  // JSON object or is empty) — lets the transformer mutate in place instead
+  // of a stringify→parse→stringify round trip.
+  let upstreamParsed = parsedBody;
   if (translateOpenAIToAnthropic) {
-    const translated = translateOpenAIBody(body);
+    const translated = translateOpenAIBody(parsedBody, body);
     if (translated instanceof Response) return translated;
-    upstreamBody = translated;
+    upstreamParsed = translated;
+    upstreamBody = JSON.stringify(translated);
     if (debug) debugLine(reqId, `translated OpenAI→Anthropic (bytes=${upstreamBody?.length ?? 0})`);
-  } else if (translateAnthropicToOpenAI) {
-    const translated = translateAnthropicBody(body);
-    if (translated instanceof Response) return translated;
-    upstreamBody = translated;
-    if (debug) debugLine(reqId, `translated Anthropic→OpenAI (bytes=${upstreamBody?.length ?? 0})`);
   }
 
   // Bundle `E2e` fires for EVERY anthropic-kind request (both plans) — the
@@ -192,10 +218,27 @@ export async function proxyRequest(
   const metadataUserId = buildAnthropicMetadataUserId(config.identity.deviceMid, clientSession?.sessionId);
   // fork: rebuildable — a mid-retry credential switch can flip startPlan,
   // which changes the injected system-prompt block / metadata shape.
+  const applyBodyTransform = (startPlanFlag: boolean): string | undefined => {
+    if (upstreamParsed) {
+      // Object path: mutate the already-parsed body, re-serialize only when
+      // something changed. NOTE: mutations accumulate on upstreamParsed —
+      // rebuilds (plan flips) must pass a FRESH copy (see below).
+      return transformParsedBody(upstreamParsed, { format: upstreamFormat, metadataUserId, startPlan: startPlanFlag, provider: config.provider }) ?? upstreamBody;
+    }
+    return transformRequestBody(upstreamBody, { format: upstreamFormat, metadataUserId, startPlan: startPlanFlag, provider: config.provider });
+  };
   const rebuildTransformedBody = (): void => {
+    if (upstreamParsed) {
+      // Plan flip re-injects the start-plan system block — rebuild from a
+      // fresh copy so the first transform's mutations aren't applied twice.
+      // Rare path (credential switch mid-retry): the clone cost is fine.
+      const fresh = structuredClone(upstreamParsed) as Record<string, unknown>;
+      transformedBody = transformParsedBody(fresh, { format: upstreamFormat, metadataUserId, startPlan, provider: config.provider }) ?? upstreamBody;
+      return;
+    }
     transformedBody = transformRequestBody(upstreamBody, { format: upstreamFormat, metadataUserId, startPlan, provider: config.provider });
   };
-  let transformedBody = transformRequestBody(upstreamBody, { format: upstreamFormat, metadataUserId, startPlan, provider: config.provider });
+  let transformedBody = applyBodyTransform(startPlan);
   if (debug && transformedBody !== upstreamBody) {
     debugLine(reqId, `body transformed (upstreamFormat=${upstreamFormat}, startPlan=${startPlan}, bytes=${transformedBody?.length ?? 0})`);
   }
@@ -224,6 +267,29 @@ export async function proxyRequest(
   const routing = opts.endpointRouting !== undefined ? opts.endpointRouting : getDefaultEndpointRouting(config);
   const signer = opts.clientSigning !== undefined ? opts.clientSigning : getDefaultClientSigning(config);
 
+  // ---- egress proxy wiring (per-credential override → global pool) ----
+  // Previously the pool's pickProxy/markProxyFailed/setCurrentWorkingProxy
+  // had no consumer on the LLM egress path: main traffic always connected
+  // directly, defeating the documented per-account proxy feature and the
+  // whole SOCKS-bridge/rotation design. Now every dispatch resolves an
+  // egress proxy: the credential's own `proxy` override wins; otherwise the
+  // global pool is consulted (null when disabled/empty → direct connection,
+  // byte-for-byte unchanged behavior and zero overhead for unconfigured
+  // setups — including every test with an injected fetchImpl).
+  const poolExcluded = new Set<string>();
+  let poolRotationsExhausted = false;
+  // The pool-served proxy of the most recent dispatch (per-cred overrides
+  // never rotate). Read by the 405-rotation / connect-failure hooks below.
+  let lastPoolProxy: string | null = null;
+
+  // ---- header-debug wiring ----
+  // logging.headerDebug promises "two files per request" in the dashboard,
+  // but recordHeaders had zero production callers (dead code). Record the
+  // FIRST dispatch attempt only — retries/re-solves stay unrecorded so the
+  // output stays one pair per request (diff-friendly), per the module docs.
+  const headerDebugOn = config.logging?.headerDebug === true;
+  let headerDebugRecorded = false;
+
   /** Start-plan captcha preflight: a fresh one-shot Aliyun verify param.
    * Failure falls back to the 403-challenge solve path downstream. */
   const buildCaptchaHeaders = async (): Promise<Record<string, string> | undefined> => {
@@ -243,6 +309,16 @@ export async function proxyRequest(
    * call — a reused Request has its body stream marked used after the first
    * fetch. */
   const dispatch = async (credNow: Credential, captchaHeaders: Record<string, string> | undefined): Promise<Response> => {
+    // Egress resolution per dispatch: per-credential override → pool pick
+    // (sticky via pickProxy; excluded proxies are skipped during rotation).
+    const perCredProxy = credNow.proxy?.trim() || null;
+    let egressProxy: string | null = perCredProxy;
+    if (!egressProxy && !poolRotationsExhausted && !useOrderedTransport) {
+      try {
+        egressProxy = await pickProxy(poolExcluded.size > 0 ? poolExcluded : undefined);
+      } catch { /* pool unreadable → direct */ }
+    }
+    lastPoolProxy = egressProxy && !perCredProxy ? egressProxy : null;
     let pairs = buildUpstreamHeaderPairs(clientReq, upstreamFormat, credNow, config.identity, currentPlan, captchaHeaders, clientSession);
     // When the ordered transport must READ the upstream body (translate mode),
     // it has to inflate whatever coding the upstream picks — cap the advertised
@@ -283,7 +359,11 @@ export async function proxyRequest(
               headers: Object.fromEntries(finalPairs),
               body: transformedBody ?? undefined,
             });
-        return sendUpstreamRequest(sendReq, finalPairs, transformedBody, translateMode, useOrderedTransport, fetchImpl, clientReq.signal, hasCustomFetchImpl);
+        if (headerDebugOn && !headerDebugRecorded) {
+          headerDebugRecorded = true;
+          recordHeaders(clientReq, req, reqId, format, transformedBody, body);
+        }
+        return sendUpstreamRequest(sendReq, finalPairs, transformedBody, translateMode, useOrderedTransport, fetchImpl, clientReq.signal, hasCustomFetchImpl, egressProxy);
       },
     });
   };
@@ -324,7 +404,7 @@ export async function proxyRequest(
     if (newPlan !== currentPlan) {
       console.log(`${reqId} plan synced to ${newPlan} (from new credential ${maskApiKey(newCred.apiKey)})`);
       currentPlan = newPlan;
-      config.plan = newPlan;
+      // request-local: see the comment on the initial plan resolution above
       startPlan = newPlan === "start-plan";
       rebuildTransformedBody();
     }
@@ -377,9 +457,80 @@ export async function proxyRequest(
     return { retried: hadRetryAttempt, ...(credentialKey ? { credentialKey } : {}) };
   };
 
+  // Wire an SSE response body through the inline stats transform (see
+  // createStatsTransform): per-chunk parsing runs on the client pump — this
+  // replaces the old `body.tee()` + fire-and-forget observeStream pattern
+  // whose shared queue buffered entire long streams in memory (≈2× peak) and
+  // throttled the client branch to the stats reader's pace.
+  const wireStats = (body: ReadableStream<Uint8Array>, status: number, contentEncoding: string | null): ReadableStream<Uint8Array> => {
+    const dumpOn = dumpEnabled();
+    let totalBytes = 0;
+    let firstBytesSample = "";
+    const dumpDecoder = dumpOn ? new TextDecoder() : null;
+    const hooked = createStatsTransform(
+      reqId, format, meta, status, started, contentEncoding,
+      rowStats().credentialKey, 0, hadRetryAttempt,
+      {
+        ...(dumpOn
+          ? {
+              onChunk: (value: Uint8Array): void => {
+                totalBytes += value.byteLength;
+                if (dumpDecoder && firstBytesSample.length < 4096) {
+                  firstBytesSample += dumpDecoder.decode(value.slice(0, 4096 - firstBytesSample.length), { stream: true });
+                }
+              },
+            }
+          : {}),
+        onDone: (info): void => {
+          if (dumpOn) {
+            dumpPhase(reqId, "upstream_stream_summary", {
+              status,
+              contentEncoding,
+              compressed: contentEncoding !== null,
+              totalBytes,
+              tokensObserved: info.tokens,
+              ttfbMs: info.ttfbMs,
+              totalMs: info.totalMs,
+              firstBytesSample: firstBytesSample.length > 0 ? firstBytesSample.slice(0, 4096) : "(empty stream)",
+            });
+          }
+          // emptyStreamSwitchThreshold (finally wired — was dead config since
+          // vceshi0.0.5): a 200 SSE stream with ZERO content events is the
+          // gateway's silent quota-exhaustion shape. Track the per-credential
+          // streak; once it reaches the threshold (0 = off) with an
+          // alternative account available, switch the active credential for
+          // future requests.
+          const isEmptyStream = status === 200 && info.tokens === 0 && info.thinkingTokens === 0 && info.inputTokens === 0;
+          const emptyStreak = bumpEmptyStreamStreak(credentialStatsKey(cred), isEmptyStream);
+          if (
+            isEmptyStream &&
+            retryCfg.emptyStreamSwitchThreshold > 0 &&
+            emptyStreak === retryCfg.emptyStreamSwitchThreshold &&
+            totalAvailableCredentials > 1
+          ) {
+            console.log(`${reqId} credential ${maskApiKey(cred.apiKey)} returned ${emptyStreak} consecutive empty 200 streams — rotating account for future requests`);
+            auth.switchToNextCredential(new Set([cred.apiKey]))
+              .then((next) => {
+                if (next) console.log(`${reqId} empty-stream failover: active credential → ${maskApiKey(next.apiKey)}`);
+              })
+              .catch(() => { /* best-effort — streak persists for the next request */ });
+          }
+        },
+      },
+    );
+    return observeStatsStream(body, hooked);
+  };
+
   let upstreamResp!: Response;
   let headersAt = 0;
   let attempt = 0;
+
+  // Dropped (undrained) upstream responses hold their socket open until GC —
+  // on a 429-retry storm that's one leaked connection per retry cycle. Cancel
+  // the body explicitly on every path that discards the response.
+  const discardUpstreamBody = (): void => {
+    try { void upstreamResp?.body?.cancel().catch(() => {}); } catch { /* best-effort */ }
+  };
 
   // ============================================================
   // fork resilience loop: attempt → captcha-challenge replay →
@@ -436,7 +587,15 @@ export async function proxyRequest(
         },
       );
     } catch (err) {
-      // Connect-level failure after the internal ladder. fork behavior:
+      // Connect-level failure after the internal ladder while riding a pool
+      // proxy: mark it failed so the cooldown skips it on the next pick (the
+      // sticky state is cleared synchronously inside markProxyFailed).
+      if (lastPoolProxy) {
+        const failedUrl = lastPoolProxy;
+        lastPoolProxy = null;
+        void markProxyFailed(failedUrl).catch(() => {});
+      }
+      // fork behavior:
       // count it toward the credential-switch threshold and retry with a
       // different account when available — otherwise surface the 502.
       consecutiveCredFailures++;
@@ -472,6 +631,7 @@ export async function proxyRequest(
 
     if (upstreamResp.status === 401 && startPlan) {
       if (debug) debugError(reqId, "start_plan_jwt_invalid", "JWT rejected upstream");
+      discardUpstreamBody();
       printRow(reqId, format, meta, 401, started, headersAt, 0, 0, 0, rowStats());
       return errorResponse(401, "start_plan_jwt_invalid", "Start-plan JWT was rejected. Re-run: zcode-proxy auth login");
     }
@@ -508,8 +668,39 @@ export async function proxyRequest(
           return errorResponse(502, "upstream_unreachable", err.message);
         },
       });
-      if (!outcome.ok) return outcome.resp;
+      if (!outcome.ok) {
+        discardUpstreamBody();
+        return outcome.resp;
+      }
       upstreamResp = outcome.resp;
+    }
+
+    // ---- pool rotation on gateway block (405): the proxy that got WAF-
+    // intercepted is marked failed and the request is re-dispatched through
+    // a different one while rotations remain (mirrors the proxy-pool.ts
+    // header docs). Only pool-served proxies rotate — a per-credential
+    // `proxy` override is user-pinned and never rotated here.
+    if (lastPoolProxy && PROXY_ROTATE_STATUSES.has(upstreamResp.status)) {
+      const failedUrl = lastPoolProxy;
+      lastPoolProxy = null;
+      void markProxyFailed(failedUrl).catch(() => {});
+      const maxRotations = await getMaxRotations();
+      if (
+        maxRotations > 0 &&
+        attempt < MAX_TOTAL_ATTEMPTS &&
+        !(retryCfg.totalDeadlineMs > 0 && Date.now() - retryLoopStartedAt > retryCfg.totalDeadlineMs)
+      ) {
+        poolExcluded.add(failedUrl);
+        hadRetryAttempt = true;
+        discardUpstreamBody();
+        if (poolExcluded.size >= maxRotations) {
+          poolRotationsExhausted = true;
+          console.log(`${reqId} proxy rotation exhausted (${poolExcluded.size}/${maxRotations}) — falling back to direct`);
+        } else {
+          console.log(`${reqId} proxy ${egressHost(failedUrl)} gateway-blocked (${upstreamResp.status}) — rotating (${poolExcluded.size}/${maxRotations})`);
+        }
+        continue;
+      }
     }
 
     // ---- fork: retryable-status handling (529/429/…). Upstream 4.x simply
@@ -524,6 +715,7 @@ export async function proxyRequest(
       // immediate client retry against a still-overloaded upstream).
       if (retryCfg.totalDeadlineMs > 0 && Date.now() - retryLoopStartedAt > retryCfg.totalDeadlineMs) {
         console.log(`${reqId} retry total deadline (${retryCfg.totalDeadlineMs}ms) exceeded after ${attempt} attempt(s) — returning 503`);
+        discardUpstreamBody();
         printRow(reqId, format, meta, 503, started, Date.now(), 0, 0, 0, rowStats());
         return new Response(
           JSON.stringify({
@@ -543,6 +735,7 @@ export async function proxyRequest(
       // Respect Retry-After (delta-seconds or HTTP-date), capped by maxDelayMs.
       const delayMs = computeRetryDelayMs(attempt, upstreamResp.headers.get("retry-after"));
       console.log(`${reqId} upstream returned ${upstreamResp.status}, retry ${attempt} in ${delayMs}ms${totalAvailableCredentials > 1 ? ` (credential failover available: ${triedApiKeys.size}/${totalAvailableCredentials} tried)` : ""}...`);
+      discardUpstreamBody();
       await sleep(delayMs);
 
       // Client disconnected during backoff — every further attempt is wasted.
@@ -567,6 +760,7 @@ export async function proxyRequest(
   // tells clients to STOP hammering.
   if (allCredentialsExhausted && retryCfg.retryableStatuses.includes(upstreamResp.status)) {
     console.log(`${reqId} all credentials exhausted (${triedApiKeys.size}/${totalAvailableCredentials} tried) — returning 503 all_credentials_exhausted`);
+    discardUpstreamBody();
     printRow(reqId, format, meta, 503, started, headersAt, 0, 0, 0, rowStats());
     return errorResponse(
       503,
@@ -586,9 +780,7 @@ export async function proxyRequest(
     }
     if (isSSE && upstreamResp.body) {
       const translated = anthropicSseToOpenaiSse(upstreamResp.body, meta.model);
-      const [clientBody, statsBody] = translated.tee();
-      observeStream(reqId, format, meta, upstreamResp.status, started, statsBody, null);
-      return translatedSseResponse(clientBody);
+      return translatedSseResponse(wireStats(translated, upstreamResp.status, null));
     }
     return await translatedBatchResponse(clientReq, upstreamResp, meta.model, reqId, format, meta, started, headersAt);
   }
@@ -601,17 +793,13 @@ export async function proxyRequest(
     }
     if (isSSE && upstreamResp.body) {
       const translated = openaiSseToAnthropicSse(upstreamResp.body, meta.model);
-      const [clientBody, statsBody] = translated.tee();
-      observeStream(reqId, format, meta, upstreamResp.status, started, statsBody, null);
-      return translatedSseResponse(clientBody);
+      return translatedSseResponse(wireStats(translated, upstreamResp.status, null));
     }
     return await translatedOpenAIToAnthropicBatchResponse(clientReq, upstreamResp, reqId, format, meta, started, headersAt);
   }
 
   if (isSSE && upstreamResp.body) {
-    const [clientBody, statsBody] = upstreamResp.body.tee();
-    observeStream(reqId, format, meta, upstreamResp.status, started, statsBody, upstreamResp.headers.get("content-encoding"));
-    return passthroughResponse(upstreamResp, clientAcceptsGzip(clientReq), clientBody);
+    return passthroughResponse(upstreamResp, clientAcceptsGzip(clientReq), wireStats(upstreamResp.body, upstreamResp.status, upstreamResp.headers.get("content-encoding")));
   }
 
   printRow(reqId, format, meta, upstreamResp.status, started, headersAt, 0, 0, 0, rowStats());
@@ -718,6 +906,39 @@ export function stripAutoDecodedEncoding(resp: Response): Response {
   });
 }
 
+/**
+ * Upstream statuses treated as a gateway/WAF block for proxy-pool rotation.
+ * A 405 from the CDN edge is the documented interception signature (see
+ * proxy-pool.ts header docs).
+ */
+const PROXY_ROTATE_STATUSES = new Set([405]);
+
+/** Host-only rendering of a proxy URL for logs (userinfo never logged). */
+function egressHost(proxyUrl: string): string {
+  try { return new URL(proxyUrl).host; } catch { return "proxy"; }
+}
+
+// ---- emptyStreamSwitchThreshold runtime state ----
+// Per-credential streak of consecutive "200 + zero content events" SSE
+// streams — the gateway's silent quota-exhaustion shape. Module-level so the
+// count survives across requests; cleared on any stream that produced
+// content. Bounded: one entry per credential ever seen (pruned at 256).
+const emptyStreamStreak = new Map<string, number>();
+
+function bumpEmptyStreamStreak(credKey: string, isEmpty: boolean): number {
+  if (!isEmpty) {
+    emptyStreamStreak.delete(credKey);
+    return 0;
+  }
+  const next = (emptyStreamStreak.get(credKey) ?? 0) + 1;
+  emptyStreamStreak.set(credKey, next);
+  if (emptyStreamStreak.size > 256) {
+    const oldest = emptyStreamStreak.keys().next().value;
+    if (oldest !== undefined) emptyStreamStreak.delete(oldest);
+  }
+  return next;
+}
+
 async function sendUpstreamRequest(
   upstreamReq: Request,
   headerPairs: UpstreamHeaderPair[],
@@ -727,6 +948,7 @@ async function sendUpstreamRequest(
   fetchImpl: typeof fetch,
   abortSignal?: AbortSignal,
   hasCustomFetchImpl = false,
+  egressProxy?: string | null,
 ): Promise<Response> {
   if (useOrderedTransport) {
     return sendOrderedUpstreamRequest({
@@ -736,11 +958,13 @@ async function sendUpstreamRequest(
       body,
       decompress: translateMode,
       signal: abortSignal,
+      proxy: egressProxy ?? undefined,
     });
   }
   const fetchOpts: RequestInit & { decompress?: boolean } = translateMode ? {} : { decompress: false };
   if (abortSignal) fetchOpts.signal = abortSignal;
-  const resp = await fetchImpl(upstreamReq, fetchOpts);
+  const egressFetch = egressProxy ? makeProxiedFetcher(egressProxy, fetchImpl) : fetchImpl;
+  const resp = await egressFetch(upstreamReq, fetchOpts);
   // Passthrough on a runtime whose fetch auto-decompresses (Node/undici in the
   // Android bundle): the body arrives inflated while its headers still claim
   // compression. Drop the stale labels so the body/header pairing downstream
@@ -759,17 +983,78 @@ async function sendUpstreamRequest(
  * that send them got a misleading "body is not valid JSON" 400). Corrupt gzip
  * throws a descriptive Error; inflation past `MAX_INFLATED_BODY_BYTES` throws
  * `InflatedBodyTooLargeError` (streamed + aborted early, so a small wire
- * payload cannot expand into unbounded proxy memory).
+ * payload cannot expand into unbounded proxy memory). When a positive
+ * `maxBytes` cap is supplied (from `server.maxRequestBodyBytes`), plain bodies
+ * past the cap throw `RequestBodyTooLargeError` (streamed + aborted early).
  */
-export async function readBody(req: Request): Promise<string | undefined> {
+export async function readBody(req: Request, maxBytes?: number): Promise<string | undefined> {
   if (req.method === "GET" || req.method === "HEAD") return undefined;
-  const bytes = new Uint8Array(await req.arrayBuffer());
-  if (bytes.byteLength === 0) return undefined;
   const encoding = req.headers.get("content-encoding")?.toLowerCase().trim() ?? "";
+  const bytes = await readBodyBytes(req, maxBytes);
+  if (bytes.byteLength === 0) return undefined;
   if (encoding === "gzip" || encoding === "x-gzip") {
     return new TextDecoder().decode(await inflateGzipBody(bytes));
   }
   return new TextDecoder().decode(bytes);
+}
+
+/**
+ * Thrown when a request body exceeds the configured `server.maxRequestBodyBytes` cap.
+ */
+export class RequestBodyTooLargeError extends Error {
+  constructor(limit: number) {
+    super(`request body exceeds ${limit} byte cap (server.maxRequestBodyBytes; 0 disables)`);
+    this.name = "RequestBodyTooLargeError";
+  }
+}
+
+/**
+ * Read the raw request body bytes, honoring an optional byte cap.
+ * With a cap active, oversized Content-Length is rejected up front and chunked
+ * bodies are drained incrementally so a body with no declared length cannot
+ * grow proxy memory unbounded (mirrors async/handler.ts readBody).
+ * `maxBytes` undefined/0/NaN → uncapped (legacy behavior; long-context LLM
+ * requests legitimately reach several MB).
+ */
+async function readBodyBytes(req: Request, maxBytes?: number): Promise<Uint8Array> {
+  const cap = typeof maxBytes === "number" && Number.isFinite(maxBytes) && maxBytes > 0 ? maxBytes : 0;
+  if (cap === 0) return new Uint8Array(await req.arrayBuffer());
+
+  const contentLength = req.headers.get("content-length");
+  if (contentLength) {
+    const cl = parseInt(contentLength, 10);
+    if (Number.isFinite(cl) && cl > cap) {
+      // NOTE: deliberately NOT cancelling the body stream. Cancelling the Web
+      // body aborts Readable.toWeb(req)'s source, and Bun's node:http shim
+      // then finalizes the response by itself — the client gets a default
+      // empty 200 instead of our 413. Leaving the stream unconsumed is still
+      // memory-safe: node:http destroys the connection once the (413)
+      // response is written, and unread request bytes only ever sit in the
+      // kernel socket buffer (TCP backpressure), never in proxy memory.
+      throw new RequestBodyTooLargeError(cap);
+    }
+  }
+  if (!req.body) return new Uint8Array(0);
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > cap) {
+      // Same as above: stop consuming, surface the 413 — do NOT cancel.
+      throw new RequestBodyTooLargeError(cap);
+    }
+    chunks.push(value);
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
 }
 
 /**
@@ -862,20 +1147,18 @@ function passthroughResponse(
 import { errorResponse } from "./translated-response.js";
 export { errorResponse };
 
-/** Translate an OpenAI request body string to Anthropic JSON. Returns error Response on failure. */
-function translateOpenAIBody(body: string | undefined): Response | string | undefined {
-  if (body === undefined || body.length === 0) {
+/** Translate a parsed OpenAI request object to Anthropic. Returns error Response on
+ * failure. `parsed` comes from the caller's single parse; `rawBody` is only
+ * used for the empty-body check and error text. */
+function translateOpenAIBody(parsed: Record<string, unknown> | undefined, rawBody: string | undefined): Response | Record<string, unknown> {
+  if (rawBody === undefined || rawBody.length === 0) {
     return errorResponse(400, "translation_failed", "OpenAI request body is empty; cannot translate.");
   }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(body);
-  } catch (err) {
-    return errorResponse(400, "translation_failed", `OpenAI request body is not valid JSON: ${(err as Error).message}`);
+  if (!parsed) {
+    return errorResponse(400, "translation_failed", "OpenAI request body is not valid JSON");
   }
   try {
-    const translated = translateRequestOpenAIToAnthropic(parsed as OpenAIChatRequest);
-    return JSON.stringify(translated);
+    return translateRequestOpenAIToAnthropic(parsed as unknown as OpenAIChatRequest) as unknown as Record<string, unknown>;
   } catch (err) {
     return errorResponse(400, "translation_failed", `OpenAI→Anthropic translation failed: ${(err as Error).message}`);
   }
@@ -980,24 +1263,6 @@ async function translatedOpenAIToAnthropicBatchResponse(
   });
 }
 
-function translateAnthropicBody(body: string | undefined): Response | string | undefined {
-  if (body === undefined || body.length === 0) {
-    return errorResponse(400, "translation_failed", "Anthropic request body is empty; cannot translate.");
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(body);
-  } catch (err) {
-    return errorResponse(400, "translation_failed", `Anthropic request body is not valid JSON: ${(err as Error).message}`);
-  }
-  try {
-    const translated = translateRequestAnthropicToOpenAI(parsed as AnthropicMessagesRequest);
-    return JSON.stringify(translated);
-  } catch (err) {
-    return errorResponse(400, "translation_failed", `Anthropic→OpenAI translation failed: ${(err as Error).message}`);
-  }
-}
-
 function isAnthropicMessagesResponse(value: unknown): value is AnthropicMessagesResponse {
   if (typeof value !== "object" || value === null) return false;
   const candidate = value as Partial<AnthropicMessagesResponse>;
@@ -1031,17 +1296,12 @@ interface RequestMeta {
   stream: boolean;
 }
 
-function peekBody(body: string | undefined): RequestMeta {
-  if (!body) return { model: "-", stream: false };
-  try {
-    const p = JSON.parse(body) as Record<string, unknown>;
-    return {
-      model: typeof p.model === "string" ? p.model : "-",
-      stream: p.stream === true,
-    };
-  } catch {
-    return { model: "-", stream: false };
-  }
+function peekBody(parsed: Record<string, unknown> | undefined): RequestMeta {
+  if (!parsed) return { model: "-", stream: false };
+  return {
+    model: typeof parsed.model === "string" ? parsed.model : "-",
+    stream: parsed.stream === true,
+  };
 }
 
 let reqCounter = 0;
@@ -1061,7 +1321,10 @@ function nextReqId(): string {
 }
 
 const DEBUG_BODY_PREVIEW = 200;
-const SENSITIVE_HEADERS = new Set(["authorization", "x-api-key", "cookie", "set-cookie", "proxy-authorization"]);
+// Shared with dump.ts so debug logs and dump files mask the SAME set —
+// the captcha verify params in particular were previously leaked in plain
+// text by the debug formatter while the dumper masked them.
+const SENSITIVE_HEADERS = SENSITIVE_HEADER_NAMES;
 
 function debugLine(reqId: string, msg: string): void {
   console.log(`${reqId} debug: ${msg}`);
@@ -1193,85 +1456,4 @@ function fmtMs(ms: number): string {
   if (ms < 1000) return `${ms}ms`;
   if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
   return `${Math.floor(ms / 60_000)}m${Math.floor((ms % 60_000) / 1000)}s`;
-}
-
-function observeStream(
-  reqId: string,
-  format: Format,
-  meta: RequestMeta,
-  status: number,
-  requestSentAt: number,
-  body: ReadableStream<Uint8Array>,
-  contentEncoding: string | null,
-): void {
-  const compressed = contentEncoding !== null;
-  const dumpOn = dumpEnabled();
-  let tokens = 0;
-  let sseBuffer = "";
-  let firstChunkAt = 0;
-  let totalBytes = 0;
-  let firstBytesSample = "";
-
-  function parseSse(text: string): void {
-    for (const line of text.split("\n")) {
-      if (!line.startsWith("data:") || line.includes("[DONE]")) continue;
-      try {
-        const j = JSON.parse(line.slice(5).trim());
-        if (j.usage?.completion_tokens) { tokens = j.usage.completion_tokens; continue; }
-        if (j.usage?.output_tokens) { tokens = j.usage.output_tokens; continue; }
-        // OpenAI content delta: choices[0].delta.content
-        const oai = j.choices?.[0]?.delta?.content;
-        if (typeof oai === "string" && oai.length > 0) { tokens++; continue; }
-        // Anthropic content delta: type=content_block_delta, delta.type=text_delta
-        if (j.type === "content_block_delta" && j.delta?.type === "text_delta") {
-          const t = j.delta?.text;
-          if (typeof t === "string" && t.length > 0) tokens++;
-        }
-      } catch {}
-    }
-  }
-
-  (async () => {
-    const reader = body.getReader();
-    const decoder = new TextDecoder();
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (firstChunkAt === 0) firstChunkAt = Date.now();
-        if (dumpOn && value) {
-          totalBytes += value.byteLength;
-          if (firstBytesSample.length < 4096) {
-            firstBytesSample += decoder.decode(value.slice(0, 4096 - firstBytesSample.length), { stream: true });
-          }
-        }
-        if (!compressed) {
-          sseBuffer += decoder.decode(value, { stream: true });
-          const idx = sseBuffer.lastIndexOf("\n");
-          if (idx >= 0) {
-            parseSse(sseBuffer.slice(0, idx));
-            sseBuffer = sseBuffer.slice(idx + 1);
-          }
-        }
-      }
-      if (!compressed && sseBuffer) parseSse(sseBuffer);
-    } catch {}
-    const endAt = Date.now();
-    const ttfbMs = (firstChunkAt > 0 ? firstChunkAt : endAt) - requestSentAt;
-    const totalMs = endAt - requestSentAt;
-    const avgTps = tokens > 0 && totalMs > 0 ? tokens / (totalMs / 1000) : 0;
-    printRow(reqId, format, meta, status, requestSentAt, requestSentAt + ttfbMs, tokens, avgTps, endAt);
-    if (dumpOn) {
-      dumpPhase(reqId, "upstream_stream_summary", {
-        status,
-        contentEncoding,
-        compressed,
-        totalBytes,
-        tokensObserved: tokens,
-        ttfbMs,
-        totalMs,
-        firstBytesSample: firstBytesSample.length > 0 ? firstBytesSample.slice(0, 4096) : "(empty stream)",
-      });
-    }
-  })().catch(() => {});
 }

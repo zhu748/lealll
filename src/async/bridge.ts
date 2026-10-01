@@ -23,6 +23,7 @@ import { isTicketExpired, isTicketReady } from "./types.js";
 import { keepaliveFrame } from "./keepalive.js";
 import { buildIdentityHeaders } from "../proxy/identity.js";
 import type { ProxyIdentity } from "../config/types.js";
+import { hostSetInterval, hostClearInterval, hostSetTimeout, hostClearTimeout } from "../utils/host-timers.js";
 
 const EXPIRED_MARKER = "off-peak-ticket-expired";
 
@@ -210,11 +211,15 @@ export function runAsyncBridge(opts: BridgeOptions): { stream: ReadableStream<Ui
       let keepAliveTimer: ReturnType<typeof setInterval> | undefined;
       function startKeepalive(): void {
         if (keepAliveTimer) return;
-        keepAliveTimer = setInterval(() => emitKeepalive(controller), opts.keepAliveIntervalMs);
+        // Host-safe interval: the bridge queue wait can span captcha solve
+        // epochs — a bare setInterval registered into an aliased window
+        // registry would be silently cancelled when that window closes,
+        // killing keepalives (and eventually the client's idle timeout).
+        keepAliveTimer = hostSetInterval(() => emitKeepalive(controller), opts.keepAliveIntervalMs);
       }
       function stopKeepalive(): void {
         if (keepAliveTimer) {
-          clearInterval(keepAliveTimer);
+          hostClearInterval(keepAliveTimer);
           keepAliveTimer = undefined;
         }
       }
@@ -358,6 +363,12 @@ export function runAsyncBridge(opts: BridgeOptions): { stream: ReadableStream<Ui
             const reader = resp.body.getReader();
             const streamDecoder = new TextDecoder();
             let pending = "";
+            // A CRLF pair split across network chunks (this chunk ends with
+            // "\r", next starts with "\n") would normalize into TWO "\n"s —
+            // a phantom blank line that tears one SSE frame in two and drops
+            // the event type. Carry a lone trailing "\r" into the next chunk
+            // before normalizing (mirrors TextDecoder's multibyte holdback).
+            let crCarry = "";
             const MAX_PENDING_FRAME_BYTES = 1 * 1024 * 1024;
             try {
               while (true) {
@@ -385,7 +396,14 @@ export function runAsyncBridge(opts: BridgeOptions): { stream: ReadableStream<Ui
                   break;
                 }
                 if (aborted) break;
-                pending += streamDecoder.decode(value, { stream: true }).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+                let decoded = crCarry + streamDecoder.decode(value, { stream: true });
+                crCarry = "";
+                if (decoded.endsWith("\r")) {
+                  crCarry = "\r";
+                  decoded = decoded.slice(0, -1);
+                }
+                // Single pass: CRLF (or a lone CR) → LF.
+                pending += decoded.replace(/\r\n|\r/g, "\n");
 
                 // Bounded buffer: if pending exceeds the cap without a frame boundary,
                 // the upstream is malformed or malicious — terminate.
@@ -428,6 +446,12 @@ export function runAsyncBridge(opts: BridgeOptions): { stream: ReadableStream<Ui
               }
               // Flush decoder (no stream flag) to release internal partial-byte state.
               streamDecoder.decode();
+              // A trailing lone "\r" held back across the final chunk can never
+              // form CRLF — flush it as a normalized line ending.
+              if (crCarry) {
+                pending += "\n";
+                crCarry = "";
+              }
             } finally {
               reader.releaseLock?.();
             }
@@ -511,12 +535,12 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
       resolve();
       return;
     }
-    const t = setTimeout(() => {
+    const t = hostSetTimeout(() => {
       signal?.removeEventListener("abort", onAbort);
       resolve();
     }, ms);
     const onAbort = (): void => {
-      clearTimeout(t);
+      hostClearTimeout(t);
       resolve();
     };
     signal?.addEventListener("abort", onAbort, { once: true });

@@ -10,6 +10,7 @@
  * strict SDK parsers (e.g. `@ai-sdk/anthropic` zod schemas throw on unknown
  * `type` values, killing the stream — see plan §3.6 anti-pattern #1).
  */
+import { hostSetTimeout, hostClearTimeout } from "../utils/host-timers.js";
 
 export interface KeepaliveOptions {
   /** Interval between comment frames in ms. */
@@ -45,7 +46,7 @@ export function keepaliveStream(opts: KeepaliveOptions): ReadableStream<Uint8Arr
         opts.signal.addEventListener("abort", () => {
           aborted = true;
           if (timer) {
-            clearTimeout(timer);
+            hostClearTimeout(timer);
             timer = undefined;
           }
           try { controller.close(); } catch { /* already closed */ }
@@ -59,19 +60,21 @@ export function keepaliveStream(opts: KeepaliveOptions): ReadableStream<Uint8Arr
         } catch {
           // Controller closed by consumer; stop the timer.
           if (timer) {
-            clearTimeout(timer);
+            hostClearTimeout(timer);
             timer = undefined;
           }
           return;
         }
-        timer = setTimeout(tick, opts.intervalMs);
+        // Host-safe timer: keepalives run while captcha solve epochs may be
+        // aliasing the global timer names (see utils/host-timers.ts).
+        timer = hostSetTimeout(tick, opts.intervalMs);
       };
-      timer = setTimeout(tick, opts.intervalMs);
+      timer = hostSetTimeout(tick, opts.intervalMs);
     },
     cancel() {
       aborted = true;
       if (timer) {
-        clearTimeout(timer);
+        hostClearTimeout(timer);
         timer = undefined;
       }
     },

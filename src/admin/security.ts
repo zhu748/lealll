@@ -8,10 +8,14 @@ export type AdminRateLimitOptions = {
 export function withSecurityHeaders(resp: Response): Response {
   const headers = new Headers(resp.headers);
   if (!headers.has("content-security-policy")) {
+    // script-src/style-src include the two CDNs the bundled /webui page loads
+    // (marked + DOMPurify from jsdelivr, highlight.js + its stylesheet from
+    // cdnjs). Without them the CSP added for hardening silently broke the
+    // page's own markdown/code-highlighting stack.
     headers.set("content-security-policy",
       "default-src 'self'; " +
-      "script-src 'self' 'unsafe-inline'; " +
-      "style-src 'self' 'unsafe-inline'; " +
+      "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; " +
+      "style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; " +
       "connect-src 'self' https://zcode.z.ai https://api.z.ai https://open.bigmodel.cn; " +
       "img-src 'self' data:; " +
       "font-src 'self' data:; " +
@@ -104,4 +108,37 @@ export function resolveIpForRateLimit(req: Request, opts: AdminRateLimitOptions)
     if (xff) return xff.split(",")[0].trim();
   }
   return "unknown";
+}
+
+/**
+ * Cross-site mutation guard (CSRF) for state-changing HTTP routes.
+ *
+ * For non-GET/HEAD/OPTIONS requests that carry an Origin or Referer header,
+ * the source host must be a loopback form or match the request's own Host
+ * header. A request with neither header is treated as non-browser (curl/CLI)
+ * and passes. Returns true when the mutation must be rejected.
+ *
+ * Shared by the /admin/api/* gate and the /quota/* mutation routes (whose
+ * POSTs burn a stockpiled reset / trigger a captcha claim — equally
+ * browser-reachable state changes).
+ */
+export function isCrossOriginMutation(req: Request): boolean {
+  const originHeader = req.headers.get("origin");
+  const referer = req.headers.get("referer");
+  const source = originHeader ?? referer;
+  if (!source) return false;
+  try {
+    const srcHost = new URL(source).hostname; // "127.0.0.1" / "[::1]" / "localhost" / "evil.example"
+    const loopbackForms = new Set(["127.0.0.1", "[::1]", "::1", "localhost", "[::ffff:127.0.0.1]"]);
+    const isLoopbackOrigin = loopbackForms.has(srcHost) || /^(\[)?::ffff:127\./.test(srcHost);
+    const rawHost = req.headers.get("host") ?? "";
+    const hostName = rawHost.startsWith("[")
+      ? rawHost.slice(1, rawHost.indexOf("]"))
+      : rawHost.split(":")[0];
+    const matchesHostHeader = hostName !== "" && (srcHost === hostName || srcHost === `[${hostName}]`);
+    return !isLoopbackOrigin && !matchesHostHeader;
+  } catch {
+    // Unparseable Origin/Referer on a mutating request — refuse.
+    return true;
+  }
 }

@@ -12,21 +12,27 @@
  */
 import { describe, it, expect } from "bun:test";
 import { createServer, type Server } from "node:http";
-import type { AddressInfo } from "node:net";
+import { createServer as createNetServer, type Server as NetServer, type AddressInfo } from "node:net";
 import { sendOrderedUpstreamRequest, orderedAdvertisedCodings } from "./ordered-transport.js";
 import { proxyRequest, capOrderedAcceptEncoding } from "./handler.js";
 import { AuthManager } from "../auth/manager.js";
 import type { ProxyConfig, ProxyIdentity } from "../config/types.js";
 
 interface SilentServer {
-  server: Server;
+  server: NetServer;
   url: string;
   requests: () => number;
   serverSocketClosed: () => number;
   requestSeen: Promise<void>;
 }
 
-/** HTTP server that accepts requests and holds them open (never responds). */
+/**
+ * Raw-TCP server that reads the request head and holds the connection open
+ * (never responds). Built on node:net instead of node:http because Bun's
+ * node:http shim never delivers socket close/end events on client abort
+ * (observed on Bun 1.3.x — the fd lingers in CLOSE-WAIT with zero events),
+ * while the raw net layer reports the FIN immediately on both runtimes.
+ */
 async function startSilentServer(): Promise<SilentServer> {
   let requests = 0;
   let closed = 0;
@@ -34,14 +40,17 @@ async function startSilentServer(): Promise<SilentServer> {
   const requestSeen = new Promise<void>((r) => {
     requestSeenResolve = r;
   });
-  const server = createServer((req, res) => {
-    requests += 1;
-    req.socket.on("close", () => {
+  const server = createNetServer((sock) => {
+    sock.on("close", () => {
       closed += 1;
     });
-    requestSeenResolve();
-    // intentionally never respond
-    void res;
+    let head = "";
+    sock.on("data", (chunk: Buffer) => {
+      if (!head) requests += 1;
+      head += chunk.toString("latin1");
+      if (head.includes("\r\n\r\n")) requestSeenResolve();
+      // intentionally never respond
+    });
   });
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
   const addr = server.address() as AddressInfo;

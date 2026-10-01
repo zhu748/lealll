@@ -31,6 +31,7 @@
  */
 import type { ClaimablePlan, ClaimOutcome, PlanEntitlement } from "./types.js";
 import { classifyClaimCode } from "./types.js";
+import { hostSetTimeout, hostClearTimeout } from "../utils/host-timers.js";
 
 export interface ClaimClientOptions {
   origin: string;
@@ -148,7 +149,9 @@ export function createClaimClient(opts: ClaimClientOptions): ClaimClient {
     init: { body?: unknown; headers?: Record<string, string>; signal?: AbortSignal },
   ): Promise<{ status: number; json: Record<string, unknown> | undefined; text: string }> {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    // Host-safe timer (see utils/host-timers.ts): claim calls run concurrently
+    // with captcha solve epochs.
+    const timer = hostSetTimeout(() => controller.abort(), timeoutMs);
     const onExternalAbort = (): void => controller.abort();
     if (init.signal) {
       if (init.signal.aborted) controller.abort();
@@ -170,7 +173,7 @@ export function createClaimClient(opts: ClaimClientOptions): ClaimClient {
       } catch { /* non-JSON body surfaced via text */ }
       return { status: resp.status, json, text };
     } finally {
-      clearTimeout(timer);
+      hostClearTimeout(timer);
       init.signal?.removeEventListener("abort", onExternalAbort);
     }
   }
@@ -191,7 +194,10 @@ export function createClaimClient(opts: ClaimClientOptions): ClaimClient {
       const headers: Record<string, string> = jwt ? { Authorization: `Bearer ${jwt}` } : {};
       if (deviceMid) headers["X-Device-Mid"] = deviceMid;
       const { status, json, text } = await request("GET", url, { headers, signal });
-      if (status < 200 || status >= 300 || (json?.code !== undefined && json.code !== 0) || json?.data === undefined) {
+      // `data === null` (a {code:0,data:null} envelope) must surface as a
+      // structured ClaimPreviewError — the old `=== undefined` check let null
+      // through and `data.plans` then threw a bare TypeError.
+      if (status < 200 || status >= 300 || (json?.code !== undefined && json.code !== 0) || json?.data === undefined || json?.data === null) {
         const { code, message } = unwrapError(json, status, text);
         throw new ClaimPreviewError(`claim preview failed (${code}): ${message}`, status, code);
       }

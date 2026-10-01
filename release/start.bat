@@ -1,4 +1,8 @@
 @echo off
+rem Always run from the script's own directory: when invoked via a full path
+rem from Task Scheduler / another CWD, the relative config.yaml and
+rem zcode-proxy.exe below would resolve against the caller's directory.
+cd /d "%~dp0"
 echo.
 echo ============================================
 echo          zcode-proxy Manager

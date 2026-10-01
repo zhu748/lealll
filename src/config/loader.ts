@@ -139,7 +139,13 @@ export function loadConfig(path: string): ProxyConfig {
   const parsed = parse(raw) ?? {};
 
   // --- server ---
-  const port = resolvePort(process.env[ENV.PORT] ?? parsed?.server?.port);
+  // Port precedence: ZCODE_PROXY_PORT > $PORT (Render containers only — the
+  // Dockerfile CMD never runs render-start.sh, so without this the proxy
+  // would bind its default 8080 instead of Render's assigned port) > YAML >
+  // default. Gated on RENDER so an unrelated local $PORT never hijacks the
+  // configured port.
+  const renderPort = process.env.RENDER ? process.env.PORT : undefined;
+  const port = resolvePort(process.env[ENV.PORT] ?? renderPort ?? parsed?.server?.port);
   const host = typeof parsed?.server?.host === "string" ? parsed.server.host : DEFAULTS.HOST;
 
   // --- server (fork extensions) ---
@@ -219,12 +225,15 @@ export function loadConfig(path: string): ProxyConfig {
   const routingRules = resolveRoutingRules(parsed?.routingRules);
   const modelMappings = resolveModelMappings(parsed?.modelMappings);
   const responsesThinking = resolveResponsesThinking(parsed?.responsesThinking);
-  const verboseLogging = process.env.ZCODE_PROXY_VERBOSE_LOGGING === "1"
-    || (typeof parsed?.logging === "object" && parsed?.logging?.verbose === true);
-  const debugLogging = process.env.ZCODE_PROXY_DEBUG_LOGGING === "1"
-    || (typeof parsed?.logging === "object" && parsed?.logging?.debug === true);
-  const headerDebug = process.env.ZCODE_PROXY_HEADER_DEBUG === "1"
-    || (typeof parsed?.logging === "object" && parsed?.logging?.headerDebug === true);
+  const verboseLogging = process.env.ZCODE_PROXY_VERBOSE_LOGGING !== undefined
+    ? resolveBool(process.env.ZCODE_PROXY_VERBOSE_LOGGING, false)
+    : resolveBool(parsed?.logging?.verbose, false);
+  const debugLogging = process.env.ZCODE_PROXY_DEBUG_LOGGING !== undefined
+    ? resolveBool(process.env.ZCODE_PROXY_DEBUG_LOGGING, false)
+    : resolveBool(parsed?.logging?.debug, false);
+  const headerDebug = process.env.ZCODE_PROXY_HEADER_DEBUG !== undefined
+    ? resolveBool(process.env.ZCODE_PROXY_HEADER_DEBUG, false)
+    : resolveBool(parsed?.logging?.headerDebug, false);
   const logFile = process.env.ZCODE_PROXY_LOG_FILE
     ?? (typeof parsed?.logging?.file === "string" ? parsed.logging.file : undefined);
   const corsAllowList = resolveCorsAllowList(
@@ -450,14 +459,39 @@ function resolveClientSigningConfig(raw: unknown): ClientSigningConfig {
 
 function resolveBool(raw: unknown, fallback: boolean): boolean {
   if (typeof raw === "boolean") return raw;
-  if (typeof raw === "string") return raw === "true" || raw === "1";
+  if (typeof raw === "number") {
+    if (raw === 1) return true;
+    if (raw === 0) return false;
+    return fallback;
+  }
+  if (typeof raw === "string") {
+    // Case-insensitive + common truthy spellings: YAML `enabled: "True"`,
+    // `"yes"`, `"on"` and env `ZCODE_MCP_GATEWAY=TRUE` previously fell to the
+    // fallback — silently DISABLING switches whose default was true.
+    const s = raw.trim().toLowerCase();
+    if (s === "true" || s === "1" || s === "yes" || s === "on") return true;
+    if (s === "false" || s === "0" || s === "no" || s === "off") return false;
+    return fallback;
+  }
   return fallback;
+}
+
+/** Strict integer coercion: `"100abc"` / `5.7` / `""` are rejected, not truncated. */
+function toStrictInt(raw: unknown): number | null {
+  if (typeof raw === "number") return Number.isInteger(raw) && Number.isSafeInteger(raw) ? raw : null;
+  if (typeof raw === "string") {
+    const s = raw.trim();
+    if (s === "" || !/^[+-]?\d+$/.test(s)) return null;
+    const n = Number(s);
+    return Number.isSafeInteger(n) ? n : null;
+  }
+  return null;
 }
 
 function resolvePositiveInt(raw: unknown, fallback: number, name?: string): number {
   if (raw === undefined || raw === null) return fallback;
-  const n = typeof raw === "number" ? raw : parseInt(String(raw), 10);
-  if (!Number.isInteger(n) || n < 1) {
+  const n = toStrictInt(raw);
+  if (n === null || n < 1) {
     if (name) throw new Error(`${name} must be a positive integer`);
     return fallback;
   }
@@ -466,8 +500,8 @@ function resolvePositiveInt(raw: unknown, fallback: number, name?: string): numb
 
 function resolveNonNegativeInt(raw: unknown, fallback: number, name?: string): number {
   if (raw === undefined || raw === null) return fallback;
-  const n = typeof raw === "number" ? raw : parseInt(String(raw), 10);
-  if (!Number.isInteger(n) || n < 0) {
+  const n = toStrictInt(raw);
+  if (n === null || n < 0) {
     if (name) throw new Error(`${name} must be a non-negative integer`);
     return fallback;
   }
@@ -477,9 +511,11 @@ function resolveNonNegativeInt(raw: unknown, fallback: number, name?: string): n
 /** Resolve port from raw value (YAML or env), defaulting to 8080. */
 function resolvePort(raw: unknown): number {
   if (raw === undefined || raw === null) return DEFAULTS.PORT;
-  const n = typeof raw === "number" ? raw : parseInt(String(raw), 10);
-  if (!Number.isFinite(n)) {
-    throw new Error("server.port must be a valid number");
+  // An empty env string (`ZCODE_PROXY_PORT=`) is treated as unset, not NaN-thrown.
+  if (typeof raw === "string" && raw.trim() === "") return DEFAULTS.PORT;
+  const n = toStrictInt(raw);
+  if (n === null || n <= 0) {
+    throw new Error("server.port must be a positive integer");
   }
   return n;
 }
@@ -592,9 +628,9 @@ function validate(config: ProxyConfig): void {
 function resolveRetry(raw?: unknown): RetryConfig {
   const r = (typeof raw === "object" && raw !== null) ? raw as Record<string, unknown> : {};
 
-  const maxRetries = resolveNonNegativeInt(process.env[ENV.RETRY_MAX] ?? r.maxRetries, DEFAULTS.RETRY_MAX_RETRIES);
-  const initialDelayMs = resolvePositiveInt(process.env[ENV.RETRY_INITIAL_DELAY_MS] ?? r.initialDelayMs, DEFAULTS.RETRY_INITIAL_DELAY_MS);
-  const maxDelayMs = resolvePositiveInt(process.env[ENV.RETRY_MAX_DELAY_MS] ?? r.maxDelayMs, DEFAULTS.RETRY_MAX_DELAY_MS);
+  const maxRetries = resolveNonNegativeInt(process.env[ENV.RETRY_MAX] ?? r.maxRetries, DEFAULTS.RETRY_MAX_RETRIES, "retry.maxRetries");
+  const initialDelayMs = resolvePositiveInt(process.env[ENV.RETRY_INITIAL_DELAY_MS] ?? r.initialDelayMs, DEFAULTS.RETRY_INITIAL_DELAY_MS, "retry.initialDelayMs");
+  const maxDelayMs = resolvePositiveInt(process.env[ENV.RETRY_MAX_DELAY_MS] ?? r.maxDelayMs, DEFAULTS.RETRY_MAX_DELAY_MS, "retry.maxDelayMs");
   const backoffFactor = resolvePositiveFloat(process.env[ENV.RETRY_BACKOFF_FACTOR] ?? r.backoffFactor, DEFAULTS.RETRY_BACKOFF_FACTOR);
 
   // retryableStatuses: env var is comma-separated (e.g. "529,429,503"), YAML is array
@@ -609,14 +645,17 @@ function resolveRetry(raw?: unknown): RetryConfig {
   const credentialSwitchThreshold = resolveNonNegativeInt(
     process.env[ENV.RETRY_CREDENTIAL_SWITCH_THRESHOLD] ?? r.credentialSwitchThreshold,
     DEFAULTS.RETRY_CREDENTIAL_SWITCH_THRESHOLD,
+    "retry.credentialSwitchThreshold",
   );
   const emptyStreamSwitchThreshold = resolveNonNegativeInt(
     process.env[ENV.RETRY_EMPTY_STREAM_SWITCH_THRESHOLD] ?? r.emptyStreamSwitchThreshold,
     DEFAULTS.RETRY_EMPTY_STREAM_SWITCH_THRESHOLD,
+    "retry.emptyStreamSwitchThreshold",
   );
   const totalDeadlineMs = resolveNonNegativeInt(
     process.env[ENV.RETRY_TOTAL_DEADLINE_MS] ?? r.totalDeadlineMs,
     DEFAULTS.RETRY_TOTAL_DEADLINE_MS,
+    "retry.totalDeadlineMs",
   );
 
   return { maxRetries, initialDelayMs, maxDelayMs, backoffFactor, retryableStatuses, credentialSwitchThreshold, emptyStreamSwitchThreshold, totalDeadlineMs };

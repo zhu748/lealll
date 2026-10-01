@@ -9,6 +9,24 @@
  * @see _reverse/NOTEPAD.md "Manual Claim Plan" section.
  */
 
+/**
+ * Safe unix-seconds → ISO formatting for UPSTREAM timestamps.
+ *
+ * The claim endpoints only promise finite numbers — the unit is not
+ * contractually guaranteed (a µs-drifted value ≈1.7e15 produces an Invalid
+ * Date, and `toISOString()` then throws RangeError). The old inline
+ * `new Date(sec * 1000).toISOString()` calls turned a cosmetic log line
+ * into a thrown exception inside tick() — whose fire-and-forget driver
+ * chain had no .catch, so the default UNHANDLED-REJECTION path KILLED the
+ * whole process (serve and TUI alike). Mirror tui/frame.ts's guard: an
+ * out-of-range timestamp falls back to the raw number.
+ */
+export function formatUnixSeconds(sec: number | undefined): string {
+  if (sec === undefined || !Number.isFinite(sec)) return "";
+  const d = new Date(sec * 1000);
+  return Number.isNaN(d.getTime()) ? String(sec) : d.toISOString();
+}
+
 /** One entitlement inside a claimable plan (normalized from snake_case upstream). */
 export interface PlanEntitlement {
   entitlementId: string;

@@ -16,6 +16,7 @@
  * (provider/plan), poll logs, and shut down the Node process.
  */
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import type { ProviderId } from "../provider/types.js";
 import type { Credential } from "../auth/types.js";
 import {
@@ -25,7 +26,7 @@ import {
   type OAuthFlowClient,
 } from "../auth/oauth.js";
 import { KeyResolver } from "../auth/resolver.js";
-import { saveCredential, clearCredential, loadCredential } from "../auth/store.js";
+import { saveCredential, clearCredentialAsync, loadCredential } from "../auth/store.js";
 
 /** Supported plan tiers. Mirrors `ProxyConfig.plan`. */
 export type PlanTier = "coding-plan" | "start-plan";
@@ -144,9 +145,43 @@ export class LogBuffer {
   }
 }
 
+/**
+ * Bearer-token gate for the control channel.
+ *
+ * Loopback-only is NOT sufficient on Android: 127.0.0.1 is shared by every
+ * app on the device, so any app with the INTERNET permission (or any web
+ * page the user visits, via no-cors POST to the well-known port file) could
+ * previously drive logout/shutdown/setConfig/getLogs. The Kotlin shell now
+ * generates a fresh 128-bit token per Node start and passes it via
+ * `ZCODE_CONTROL_TOKEN`; every /control request must carry
+ * `Authorization: Bearer <token>` (constant-time compared). A custom header
+ * cannot be sent by a no-cors browser fetch, so this also blocks web-page
+ * CSRF. Desktop/manual runs without the env get a process-local random
+ * token (unusable by remote callers — by design, the CLI is the only
+ * client there).
+ */
+export function resolveControlToken(env: NodeJS.ProcessEnv = process.env): string {
+  const fromEnv = env.ZCODE_CONTROL_TOKEN?.trim();
+  if (fromEnv && fromEnv.length >= 16) return fromEnv;
+  return randomBytes(16).toString("hex");
+}
+
+function tokenMatches(expected: string, provided: string): boolean {
+  const a = Buffer.from(expected, "utf-8");
+  const b = Buffer.from(provided, "utf-8");
+  if (a.length !== b.length) {
+    // Still burn a comparison so length probes don't shortcut timing.
+    timingSafeEqual(a, a);
+    return false;
+  }
+  return timingSafeEqual(a, b);
+}
+
 /** Start the control listener bound to 127.0.0.1. Resolves once listening. */
 export function startControlListener(opts: StartControlOpts): Promise<{ close(): Promise<void> }> {
   const logBuffer = opts.logBuffer ?? new LogBuffer();
+  // Resolved once per listener lifetime; shared with every request handler.
+  const authToken = resolveControlToken();
   const server: Server = createServer(async (req, res) => {
     try {
       const result = await handleControlRequest(req, opts.state, {
@@ -155,6 +190,7 @@ export function startControlListener(opts: StartControlOpts): Promise<{ close():
         onSetConfig: opts.onSetConfig,
         onShutdown: opts.onShutdown,
         logBuffer,
+        authToken,
       });
       writeJson(res, result.status, result.body);
     } catch (err) {
@@ -184,6 +220,12 @@ export interface HandlerContext {
   logBuffer: LogBuffer;
   /** Overrides login-client construction (tests inject offline clients). */
   createLoginClient?: (provider: ProviderId) => OAuthFlowClient;
+  /**
+   * Expected `Authorization: Bearer <token>` value. Production
+   * (startControlListener) always sets it; the *ForTest entry points leave
+   * it undefined which skips the check (documented test-only behavior).
+   */
+  authToken?: string;
 }
 
 export function handleControlRequestForTest(
@@ -222,7 +264,28 @@ async function handleControlRequest(
     return { status: 404, body: { ok: false, error: `not_found: ${req.method} ${parsed.pathname}` } };
   }
 
-  const body = await readBody(req);
+  // Bearer-token gate (see resolveControlToken for the threat model).
+  if (ctx.authToken !== undefined) {
+    const provided = req.headers.authorization ?? "";
+    const bearer = provided.startsWith("Bearer ") ? provided.slice("Bearer ".length).trim() : "";
+    if (!bearer || !tokenMatches(ctx.authToken, bearer)) {
+      return { status: 401, body: { ok: false, error: "unauthorized: missing or invalid bearer token" } };
+    }
+  }
+
+  // application/json only: a no-cors browser POST (the CSRF shape) always
+  // sends text/plain or form-urlencoded — this rejects it before body read.
+  const contentType = (req.headers["content-type"] ?? "").split(";")[0]?.trim().toLowerCase() ?? "";
+  if (contentType !== "application/json") {
+    return { status: 415, body: { ok: false, error: `unsupported_media_type: ${contentType || "(none)"}` } };
+  }
+
+  let body: string;
+  try {
+    body = await readBody(req, CONTROL_MAX_BODY_BYTES);
+  } catch {
+    return { status: 413, body: { ok: false, error: "request_too_large" } };
+  }
   let cmd: ControlCommand;
   try {
     cmd = JSON.parse(body) as ControlCommand;
@@ -326,7 +389,11 @@ async function dispatch(
     }
 
     case "logout": {
-      await clearCredential();
+      // Mutex-safe logout: the in-process proxy may be serving requests that
+      // hold the store write lock; the sync variant's `await` here was a no-op
+      // (sync function) and could race a withStoreLock save ("resurrected"
+      // credentials.json).
+      await clearCredentialAsync();
       return { ok: true, event: "loggedOut" };
     }
 
@@ -384,11 +451,35 @@ function writeJson(res: ServerResponse, status: number, body: unknown): void {
   res.end(json);
 }
 
-function readBody(req: IncomingMessage): Promise<string> {
+/** Body ceiling for control commands (the largest real command is a few hundred bytes). */
+const CONTROL_MAX_BODY_BYTES = 64 * 1024;
+
+function readBody(req: IncomingMessage, maxBytes: number): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on("data", (c: Buffer) => chunks.push(c));
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
-    req.on("error", reject);
+    let total = 0;
+    let settled = false;
+    req.on("data", (c: Buffer) => {
+      if (settled) return;
+      total += c.byteLength;
+      if (total > maxBytes) {
+        settled = true;
+        // Destroy the socket so an oversized upload cannot keep streaming.
+        req.destroy();
+        reject(new Error("body_too_large"));
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on("end", () => {
+      if (settled) return;
+      settled = true;
+      resolve(Buffer.concat(chunks).toString("utf-8"));
+    });
+    req.on("error", (err: Error) => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    });
   });
 }

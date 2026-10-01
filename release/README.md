@@ -1,5 +1,16 @@
 # zcode-proxy 使用说明
 
+> **v4.7.6-fork.1 — 全仓可靠性 / 安全加固轮**
+>
+> - 进程生命周期更可靠：`serve` 启动失败（坏 YAML、端口占用等）现在确定性地以非零码退出，不再以未处理 Promise 拒绝的形式挂死；优雅停机改为先停止接收新连接、再给缓冲文件日志一个有界的落盘窗口后退出（再次收到信号立即强退）。修复了此前每次重启都可能丢失缓冲 JSONL 日志行的问题。
+> - 凭证存储写入安全：v1→v2 迁移写盘与面板并发保存串行化（防死锁 + last-writer-wins 检测——迁移写不会晚到回滚已保存的多账号数据）；配置写路径统一走原子写（先写临时文件再 rename），断电/中断不再产生半截 credentials.json / config.yaml。
+> - 安全面加固：新增跨站变更防护（CSRF）——非 GET 请求带 Origin/Referer 时校验源主机，`/admin/api/*` 与 `/quota/*` 全部变更路由共用；CSP 修复为精确放行 webui 实际加载的两个 CDN（jsdelivr / cdnjs），加固不再误伤面板自身的 markdown 渲染与代码高亮。
+> - 代理热路径守卫加固：handler 请求守卫与遥测重写，新增 handler-guards 回归测试组；对畸形分块响应、客户端提前断开等边界场景行为更明确。
+> - Android：以 `network_security_config.xml`（按域放行明文）取代全局 `usesCleartextTraffic="true"`；清理仓库内重复嵌套的 `Android-APP/Android-APP/` 目录与已无引用的 `OAuthWebViewActivity.kt` 死代码，APK 体积与维护面同步减小。
+> - 全仓 250+ 文件的类型安全与错误处理一致性梳理；测试规模扩至 1458 例（本轮新增 async handler 守卫、存储迁移串行化等回归）。
+>
+> 升级建议：直接替换二进制；无需重新登录，凭证文件自动兼容迁移。
+
 > **v4.7.5-fork.1 — 对齐桌面端 3.14.4 补充端点（MCP 用量 / 远程 provider 配置 / 套餐可用性）**
 >
 > - 基于 ZCode 桌面端 3.14.4（build 10bbcea5, 2026-09-29）解包验证：八大核心模块（system prompt / identity / reset / claim / async / quota / signing / routing）逐符号、逐端点、逐 wire casing 与上游一致。

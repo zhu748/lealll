@@ -30,6 +30,8 @@
  */
 import type { ProxyIdentity } from "../config/types.js";
 import { DEFAULT_APP_VERSION } from "../config/loader.js";
+import { hostSetTimeout, hostClearTimeout } from "../utils/host-timers.js";
+import { readJsonLimited } from "./quota.js";
 
 /** Default origin of the zcode control plane. */
 export const DEFAULT_CLIENT_CONFIG_ORIGIN = "https://zcode.z.ai";
@@ -107,62 +109,70 @@ export async function fetchRemoteProviderConfig(
   url.searchParams.set("platform", platform);
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  let resp: Response;
+  // Host-safe timer, armed until BODY consumption finishes (a stalled body
+  // previously had no timeout once headers arrived). See utils/host-timers.ts.
+  const timer = hostSetTimeout(() => controller.abort(), timeoutMs);
   try {
-    resp = await fetchImpl(url.toString(), {
-      method: "GET",
-      headers: { accept: "application/json" },
-      signal: controller.signal,
-    });
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timer);
-  }
-  if (!resp.ok) {
-    void resp.body?.cancel().catch(() => {});
-    return null;
-  }
-  let envelope: { data?: unknown };
-  try {
-    envelope = await resp.json();
-  } catch {
-    return null;
-  }
-  const data = (envelope as { data?: unknown } | null)?.data;
-  if (data == null) return null;
-  const configs = (data as { configs?: unknown }).configs;
-  if (configs == null) return null;
-  const cdnUrl = (configs as { builtin_provider_config_json?: unknown }).builtin_provider_config_json;
-  if (typeof cdnUrl !== "string" || cdnUrl.trim() === "") return null;
+    let resp: Response;
+    try {
+      resp = await fetchImpl(url.toString(), {
+        method: "GET",
+        headers: { accept: "application/json" },
+        signal: controller.signal,
+      });
+    } catch {
+      return null;
+    }
+    if (!resp.ok) {
+      void resp.body?.cancel().catch(() => {});
+      return null;
+    }
+    let envelope: { data?: unknown };
+    try {
+      envelope = await resp.json();
+    } catch {
+      return null;
+    }
+    const data = (envelope as { data?: unknown } | null)?.data;
+    if (data == null) return null;
+    const configs = (data as { configs?: unknown }).configs;
+    if (configs == null) return null;
+    const cdnUrl = (configs as { builtin_provider_config_json?: unknown }).builtin_provider_config_json;
+    if (typeof cdnUrl !== "string" || cdnUrl.trim() === "") return null;
 
-  // Step 2: fetch the CDN URL.
-  const controller2 = new AbortController();
-  const timer2 = setTimeout(() => controller2.abort(), timeoutMs);
-  let resp2: Response;
-  try {
-    resp2 = await fetchImpl(cdnUrl, {
-      method: "GET",
-      headers: { accept: "application/json" },
-      signal: controller2.signal,
-    });
-  } catch {
-    return null;
+    // Step 2: fetch the CDN URL.
+    const controller2 = new AbortController();
+    const timer2 = hostSetTimeout(() => controller2.abort(), timeoutMs);
+    try {
+      let resp2: Response;
+      try {
+        resp2 = await fetchImpl(cdnUrl, {
+          method: "GET",
+          headers: { accept: "application/json" },
+          signal: controller2.signal,
+        });
+      } catch {
+        return null;
+      }
+      if (!resp2.ok) {
+        void resp2.body?.cancel().catch(() => {});
+        return null;
+      }
+      // Byte-capped read (shared with quota.ts): the URL comes from upstream
+      // response data and would otherwise buffer an arbitrary body in full.
+      let config: BuiltinProviderConfig;
+      try {
+        config = (await readJsonLimited(resp2)) as BuiltinProviderConfig;
+      } catch {
+        return null;
+      }
+      return { sourceUrl: cdnUrl, config };
+    } finally {
+      hostClearTimeout(timer2);
+    }
   } finally {
-    clearTimeout(timer2);
+    hostClearTimeout(timer);
   }
-  if (!resp2.ok) {
-    void resp2.body?.cancel().catch(() => {});
-    return null;
-  }
-  let config: BuiltinProviderConfig;
-  try {
-    config = (await resp2.json()) as BuiltinProviderConfig;
-  } catch {
-    return null;
-  }
-  return { sourceUrl: cdnUrl, config };
 }
 
 /**

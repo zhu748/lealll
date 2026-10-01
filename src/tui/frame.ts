@@ -364,8 +364,9 @@ export function buildFrame(s: FrameState): Frame {
   if (s.loginInFlight && s.loginHint) {
     // High-contrast attention chip (black on bright yellow): the headless
     // paste fallback hint must not be missed — plain amber text reads as
-    // ordinary on many terminal palettes.
-    emit((composeRow(w, lines.length, "Login", [{ t: ` ▸ ${s.loginHint} `, c: HINT_CHIP }])).line);
+    // ordinary on many terminal palettes. Truncated to the row budget for
+    // the same wholesale-drop reason as the Error row below.
+    emit((composeRow(w, lines.length, "Login", [{ t: truncateToWidth(` ▸ ${s.loginHint} `, Math.max(0, w - LABEL_W - 6)), c: HINT_CHIP }])).line);
   }
 
   emit(renderBottomBorder(w));
@@ -488,7 +489,10 @@ export function buildFrame(s: FrameState): Frame {
   regions.push(...serverButtonsRow.regions);
 
   if (s.serverStatus === "error" && s.serverError) {
-    emit((composeRow(w, lines.length, "Error", [{ t: s.serverError, c: RED }])).line);
+    // Truncate to the row budget — composeRow DROPS a part that crosses it
+    // wholesale, so a long error message previously rendered as an EMPTY
+    // Error row (the quota-error row already truncates; mirror it).
+    emit((composeRow(w, lines.length, "Error", [{ t: truncateToWidth(s.serverError, Math.max(0, w - LABEL_W - 6)), c: RED }])).line);
   }
   emit(renderBottomBorder(w));
   emit("");
