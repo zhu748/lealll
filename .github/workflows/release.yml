@@ -69,9 +69,11 @@ jobs:
             V="${GITHUB_REF_NAME#v}"
           fi
           # Injection gate: V flows into shell args, file names and the
-          # gh-release inputs below — strict digits.dots only.
-          if ! printf '%s' "$V" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([.0-9]*)?$'; then
-            echo "::error::Invalid version '$V' — expected digits.dots form."
+          # gh-release inputs below. Accept the project's release scheme:
+          # digits.dots with an optional -fork.N suffix (v4.7.6-fork.1) —
+          # the char class stays [0-9.]-, no shell metacharacters possible.
+          if ! printf '%s' "$V" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([.0-9]*)?(-fork\.[0-9]+)?$'; then
+            echo "::error::Invalid version '$V' — expected digits.dots form with optional -fork.N suffix."
             exit 1
           fi
           echo "version=$V" >> "$GITHUB_OUTPUT"
@@ -244,8 +246,8 @@ jobs:
           else
             V="${GITHUB_REF_NAME#v}"
           fi
-          if ! printf '%s' "$V" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([.0-9]*)?$'; then
-            echo "::error::Invalid version '$V' — expected digits.dots form."
+          if ! printf '%s' "$V" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([.0-9]*)?(-fork\.[0-9]+)?$'; then
+            echo "::error::Invalid version '$V' — expected digits.dots form with optional -fork.N suffix."
             exit 1
           fi
           echo "version=$V" >> "$GITHUB_OUTPUT"
@@ -314,8 +316,8 @@ jobs:
           else
             V="${GITHUB_REF_NAME#v}"
           fi
-          if ! printf '%s' "$V" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([.0-9]*)?$'; then
-            echo "::error::Invalid version '$V' — expected digits.dots form."
+          if ! printf '%s' "$V" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([.0-9]*)?(-fork\.[0-9]+)?$'; then
+            echo "::error::Invalid version '$V' — expected digits.dots form with optional -fork.N suffix."
             exit 1
           fi
           echo "version=$V" >> "$GITHUB_OUTPUT"
