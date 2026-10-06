@@ -52,9 +52,9 @@ const DEFAULT_MAX_TOTAL_BYTES = 256 * 1024 * 1024;
  */
 function estimateEntryBytes(entry: StoredResponse): number {
   try {
-    return JSON.stringify(entry.input).length + JSON.stringify(entry.output).length + 256;
+    return Buffer.byteLength(JSON.stringify(entry), "utf8") + 256;
   } catch {
-    return 4096; // circular/unserializable — assume a modest size
+    return Infinity; // Unserializable histories cannot be safely retained.
   }
 }
 
@@ -80,6 +80,10 @@ export class ResponseStore {
   /** Store a response. Overwrites on duplicate id. Evicts LRU entries on overflow (count OR bytes). */
   set(entry: StoredResponse): void {
     const now = Date.now();
+    // Expired entries must not force eviction of a still-live LRU entry.
+    for (const [id, stored] of this.map) {
+      if (now - stored.createdAt > this.ttlMs) this.delete(id);
+    }
     entry.createdAt = now;
     entry.lastAccessedAt = now;
     if (this.map.has(entry.id)) {
@@ -88,16 +92,13 @@ export class ResponseStore {
       this.map.delete(entry.id);
     }
     const bytes = estimateEntryBytes(entry);
+    if (bytes > this.maxTotalBytes || this.maxEntries < 1) return;
     this.bytesById.set(entry.id, bytes);
     this.totalBytes += bytes;
     this.map.set(entry.id, entry);
     while (this.map.size > 0 && (this.map.size > this.maxEntries || this.totalBytes > this.maxTotalBytes)) {
       const oldestKey = this.map.keys().next().value;
       if (oldestKey === undefined) break;
-      // Always keep the just-inserted entry even if it alone busts the
-      // budget — the bytes are already spent; evicting it would lose the
-      // response the client is about to reference by id.
-      if (oldestKey === entry.id && this.map.size === 1) break;
       this.map.delete(oldestKey);
       this.totalBytes -= this.bytesById.get(oldestKey) ?? 0;
       this.bytesById.delete(oldestKey);

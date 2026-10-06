@@ -17,6 +17,38 @@ import type { ProxyIdentity } from "../config/types.js";
 const CRED: OffPeakCredentials = { jwt: "jwt-x", codingPlanApiKey: "key-y" };
 const TEST_IDENTITY: ProxyIdentity = { appVersion: "test-1.0.0", sourceTitle: "cli", refererOrigin: "https://zcode.z.ai" };
 
+describe("restored bridge cancellation", () => {
+  function options(client: OffPeakClient) {
+    return { client, credentials: CRED, origin: "https://offline.test", identity: TEST_IDENTITY, llmRequestBody: "{}",
+      initialTicket: { ticketId: "cancel-ticket", state: "ready" as const, registeredAt: Date.now() }, taskId: "cancel-task",
+      pollIntervalMs: 5000, keepAliveIntervalMs: 5000, maxRetries: 0, maxWaitMs: 0 };
+  }
+  it("aborts a pending LLM fetch and settles once on consumer cancellation", async () => {
+    const client = makeMockClient({ initialTicketState: "ready" }); let signal!: AbortSignal; let entered!: () => void;
+    const fetching = new Promise<void>(r => { entered = r; });
+    let lateResponse!: (response: Response) => void;
+    const result = runAsyncBridge({ ...options(client), fetchImpl: async (_url, init) => { signal = init!.signal!; entered(); return new Promise<Response>(r => { lateResponse = r; }); } });
+    await fetching; await result.stream.cancel(); expect(signal.aborted).toBe(true);
+    expect((await result.outcome).terminalPhase).toBe("abort"); expect(client.settleCalls).toEqual(["cancel-ticket"]);
+    let cancelled = false; lateResponse(new Response(new ReadableStream({ cancel() { cancelled = true; } })));
+    await new Promise(r => setTimeout(r, 0)); expect(cancelled).toBe(true);
+  });
+  it("cancels a stalled upstream reader without waiting for another frame", async () => {
+    const client = makeMockClient({ initialTicketState: "ready" }); let cancelled = false;
+    const upstream = new ReadableStream<Uint8Array>({ cancel() { cancelled = true; } });
+    const result = runAsyncBridge({ ...options(client), fetchImpl: async () => new Response(upstream) });
+    await new Promise(r => setTimeout(r, 0)); await result.stream.cancel(); await new Promise(r => setTimeout(r, 0));
+    expect(cancelled).toBe(true); expect(upstream.locked).toBe(false); expect((await result.outcome).terminalPhase).toBe("abort");
+  });
+  it("interrupts the queue-poll delay immediately when the client signal aborts", async () => {
+    const client = makeMockClient({ initialTicketState: "queued" }); const controller = new AbortController();
+    const result = runAsyncBridge({ ...options(client), initialTicket: { ticketId: "cancel-ticket", state: "queued", registeredAt: Date.now() }, clientSignal: controller.signal,
+      fetchImpl: async () => { throw new Error("must not dispatch LLM during queue wait"); } });
+    await new Promise(r => setTimeout(r, 0)); controller.abort();
+    expect((await result.outcome).terminalPhase).toBe("abort"); await new Response(result.stream).text(); expect(client.settleCalls).toEqual(["cancel-ticket"]);
+  });
+});
+
 function makeMockClient(behaviour: {
   initialTicketState?: TicketState;
   queueProgression?: TicketState[];   // states returned on successive batchStatus calls for the initial ticket

@@ -126,6 +126,17 @@ function configToYaml(config: ProxyConfig): string {
     defaultModel: config.defaultModel,
     models: config.models,
     identity: { ...config.identity },
+    // Keep upstream feature gates across any dashboard save/restart.
+    // Omitting these sections silently re-enabled their loader defaults.
+    clientIdentity: { ...config.clientIdentity },
+    responses: { enabled: config.responses.enabled, store: { maxEntries: config.responses.storeMaxEntries, ttlMs: config.responses.storeTtlMs } },
+    endpointRouting: { ...config.endpointRouting },
+    clientSigning: { ...config.clientSigning },
+    mcp: { ...config.mcp, gateway: { ...config.mcp.gateway } },
+    async: { ...config.async },
+    claim: { ...config.claim },
+    ...(config.clientConfig ? { clientConfig: { ...config.clientConfig } } : {}),
+    ...(config.subscription ? { subscription: { ...config.subscription } } : {}),
     logging: { ...config.logging },
     retry: config.retry ? { ...config.retry, retryableStatuses: [...config.retry.retryableStatuses] } : { ...RETRY_DEFAULTS, retryableStatuses: [...RETRY_DEFAULTS.retryableStatuses] },
     ...(config.corsAllowList && config.corsAllowList.length > 0

@@ -3,6 +3,7 @@
  * @see .omo/plans/zcode-proxy.md Task 4
  */
 import type { AuthMode, Credential, PlanId } from "./types.js";
+import { isExpired } from "./types.js";
 import { createApiKeyCredential } from "./apikey.js";
 import type { ProviderId } from "../provider/types.js";
 
@@ -14,6 +15,7 @@ export interface AuthManagerOptions {
   provider?: ProviderId;
   /** Raw credential string for apikey mode (`{apiKey}` or `{apiKey}.{secret}`). */
   apiKey?: string;
+  plan?: PlanId;
   /**
    * Optional: returns all stored credentials (for multi-account credential
    * switching on repeated upstream failures). When omitted, credential
@@ -38,13 +40,14 @@ export class AuthManager {
   private cachedApiKeyCred: Credential | null = null;
   private oauthCred: Credential | null = null;
   private listAllCredentials?: () => Promise<Credential[]>;
+  private revision = 0;
 
   constructor(opts: AuthManagerOptions = {}) {
     this.mode = opts.mode ?? "oauth";
     this.provider = opts.provider ?? "zai";
     this.listAllCredentials = opts.listAllCredentials;
     if (this.mode === "apikey" && opts.apiKey) {
-      this.cachedApiKeyCred = createApiKeyCredential(this.provider, opts.apiKey);
+      this.cachedApiKeyCred = createApiKeyCredential(this.provider, opts.apiKey, opts.plan);
     }
   }
 
@@ -70,6 +73,8 @@ export class AuthManager {
 
   /** Set the OAuth credential (used by T9/T10 OAuth flow). */
   setOAuthCredential(cred: Credential): void {
+    if (this.mode !== "oauth") return;
+    this.revision++;
     this.oauthCred = cloneCredential(cred);
   }
 
@@ -82,6 +87,7 @@ export class AuthManager {
    * defeating the purpose of the clear action.
    */
   clearOAuthCredential(): void {
+    this.revision++;
     this.oauthCred = null;
   }
 
@@ -94,6 +100,8 @@ export class AuthManager {
    * while requests keep using the old credential until process restart.
    */
   updateConfig(opts: { mode: AuthMode; provider: ProviderId; apiKey?: string; plan?: PlanId }): void {
+    this.revision++;
+    if (this.mode !== opts.mode || this.provider !== opts.provider) this.oauthCred = null;
     this.mode = opts.mode;
     this.provider = opts.provider;
     if (opts.mode === "apikey") {
@@ -118,14 +126,16 @@ export class AuthManager {
    * if it wants the dashboard to reflect the switch.
    */
   async switchToNextCredential(excludeApiKeys?: Set<string>): Promise<Credential | null> {
+    if (this.mode !== "oauth") return null;
     if (!this.listAllCredentials) return null;
+    const revision = this.revision;
     let all: Credential[];
     try {
       all = await this.listAllCredentials();
     } catch {
       return null;
     }
-    if (all.length <= 1) return null;
+    if (revision !== this.revision || this.mode !== "oauth") return null;
 
     const current = this.cachedApiKeyCred ?? this.oauthCred;
     const currentKey = current?.apiKey;
@@ -135,7 +145,7 @@ export class AuthManager {
     const excluded = new Set<string>(excludeApiKeys);
     if (currentKey) excluded.add(currentKey);
 
-    const candidates = all.filter(c => !excluded.has(c.apiKey) && !c.disabled);
+    const candidates = all.filter(c => !excluded.has(c.apiKey) && !c.disabled && !isExpired(c) && c.provider === (current?.provider ?? this.provider));
     if (candidates.length === 0) return null;
 
     // Pick the first candidate. A round-robin based on a stored index could be
@@ -165,10 +175,11 @@ export class AuthManager {
    * Returns 0 if listAllCredentials is not configured or throws.
    */
   async getAvailableCredentialCount(): Promise<number> {
+    if (this.mode !== "oauth") return this.cachedApiKeyCred ? 1 : 0;
     if (!this.listAllCredentials) return 0;
     try {
       const all = await this.listAllCredentials();
-      return all.filter(c => !c.disabled).length;
+      return all.filter(c => !c.disabled && !isExpired(c) && c.provider === (this.oauthCred?.provider ?? this.provider)).length;
     } catch {
       return 0;
     }

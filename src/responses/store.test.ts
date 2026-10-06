@@ -64,4 +64,35 @@ describe("ResponseStore", () => {
     s.clear();
     expect(s.size()).toBe(0);
   });
+
+  it("accounts for UTF-8 history bytes and instructions", () => {
+    const s = new ResponseStore(); const value = entry("unicode"); value.instructions = "中文😀".repeat(100);
+    s.set(value);
+    expect(s.totalBytesUsed()).toBe(Buffer.byteLength(JSON.stringify(value), "utf8") + 256);
+    expect(s.totalBytesUsed()).toBeGreaterThan(JSON.stringify(value).length + 256);
+  });
+  it("removes expired entries before evicting a live LRU entry", () => {
+    const s = new ResponseStore({ maxEntries: 2, ttlMs: 500 });
+    const expired = entry("expired"); s.set(expired); s.set(entry("live"));
+    s.get("expired"); expired.createdAt -= 1000; // expired entry is most recently accessed
+    s.set(entry("new"));
+    expect(s.get("expired")).toBeUndefined();
+    expect(s.get("live")).toBeDefined(); expect(s.get("new")).toBeDefined();
+  });
+  it("declines an oversized entry without evicting live histories", () => {
+    const s = new ResponseStore({ maxTotalBytes: 1000 }); s.set(entry("live"));
+    const huge = entry("huge"); huge.instructions = "中".repeat(1000); s.set(huge);
+    expect(s.get("live")).toBeDefined(); expect(s.get("huge")).toBeUndefined();
+    expect(s.totalBytesUsed()).toBeLessThanOrEqual(1000);
+  });
+  it("tracks replacement and removal bytes without accumulating old sizes", () => {
+    const s = new ResponseStore(); const old = entry("same"); old.instructions = "abc".repeat(100); s.set(old);
+    const replacement = entry("same"); s.set(replacement);
+    expect(s.totalBytesUsed()).toBe(Buffer.byteLength(JSON.stringify(replacement)) + 256);
+    s.delete("same"); expect(s.totalBytesUsed()).toBe(0);
+  });
+  it("does not retain entries with a disabled cache budget", () => {
+    const s = new ResponseStore({ maxTotalBytes: 0 }); s.set(entry("a"));
+    expect(s.size()).toBe(0); expect(s.totalBytesUsed()).toBe(0);
+  });
 });

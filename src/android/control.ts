@@ -27,6 +27,8 @@ import {
 } from "../auth/oauth.js";
 import { KeyResolver } from "../auth/resolver.js";
 import { saveCredential, clearCredentialAsync, loadCredential } from "../auth/store.js";
+import { createSerialQueue } from "../utils/serial.js";
+import type { OAuthFlowTokens } from "../auth/oauth.js";
 import type { QuotaSnapshot } from "../server/routes-quota.js";
 
 /** Supported plan tiers. Mirrors `ProxyConfig.plan`. */
@@ -103,6 +105,8 @@ interface StartControlOpts {
   onShutdown?: () => Promise<void> | void;
   /** Live quota snapshot for the `quota` command (wired to collectQuotaSnapshot). */
   onQuota?: () => Promise<QuotaSnapshot>;
+  getCredential?: () => Promise<Credential | null>;
+  onCredentialChange?: (credential: Credential | null) => void;
   /** Log buffer polled by `getLogs`. If omitted, an internal one is used. */
   logBuffer?: LogBuffer;
 }
@@ -183,7 +187,7 @@ function tokenMatches(expected: string, provided: string): boolean {
 }
 
 /** Start the control listener bound to 127.0.0.1. Resolves once listening. */
-export function startControlListener(opts: StartControlOpts): Promise<{ close(): Promise<void> }> {
+export function startControlListener(opts: StartControlOpts): Promise<{ port: number; close(): Promise<void> }> {
   const logBuffer = opts.logBuffer ?? new LogBuffer();
   // Resolved once per listener lifetime; shared with every request handler.
   const authToken = resolveControlToken();
@@ -193,8 +197,13 @@ export function startControlListener(opts: StartControlOpts): Promise<{ close():
         onStartProxy: opts.onStartProxy,
         onStopProxy: opts.onStopProxy,
         onSetConfig: opts.onSetConfig,
-        onShutdown: opts.onShutdown,
+        // The process may exit in this hook; wait until the reply is flushed.
+        onShutdown: () => { res.once("finish", () => {
+          setTimeout(() => { void Promise.resolve().then(() => opts.onShutdown?.()).catch(console.error); }, 0);
+        }); },
         onQuota: opts.onQuota,
+        getCredential: opts.getCredential,
+        onCredentialChange: opts.onCredentialChange,
         logBuffer,
         authToken,
       });
@@ -207,6 +216,7 @@ export function startControlListener(opts: StartControlOpts): Promise<{ close():
   return new Promise((resolve, reject) => {
     server.on("error", reject);
     server.listen(opts.port, "127.0.0.1", () => resolve({
+      port: (server.address() as import("node:net").AddressInfo).port,
       close: () => new Promise<void>((r) => server.close(() => r())),
     }));
   });
@@ -241,9 +251,12 @@ export interface HandlerContext {
   onSetConfig?: (changes: { provider?: ProviderId; plan?: PlanTier }) => Promise<ConfigUpdateResult>;
   onShutdown?: () => Promise<void> | void;
   onQuota?: () => Promise<QuotaSnapshot>;
+  getCredential?: () => Promise<Credential | null>;
+  onCredentialChange?: (credential: Credential | null) => void;
   logBuffer: LogBuffer;
   /** Overrides login-client construction (tests inject offline clients). */
   createLoginClient?: (provider: ProviderId) => OAuthFlowClient;
+  resolveLoginCredential?: (tokens: OAuthFlowTokens, provider: ProviderId) => Promise<Credential>;
   /**
    * Expected `Authorization: Bearer <token>` value. Production
    * (startControlListener) always sets it; the *ForTest entry points leave
@@ -321,14 +334,39 @@ async function handleControlRequest(
   return { status: 200, body: result };
 }
 
-async function dispatch(
-  cmd: ControlCommand,
-  state: ControlState,
-  ctx: HandlerContext,
-): Promise<ControlResponse> {
+interface ControlSession {
+  epoch: number;
+  run: ReturnType<typeof createSerialQueue>;
+}
+const sessions = new WeakMap<ControlState, ControlSession>();
+
+function dispatch(cmd: ControlCommand, state: ControlState, ctx: HandlerContext): Promise<ControlResponse> {
+  let session = sessions.get(state);
+  if (!session) { session = { epoch: 0, run: createSerialQueue() }; sessions.set(state, session); }
+  if (cmd.cmd === "logout" || cmd.cmd === "startOAuth" || cmd.cmd === "shutdown") {
+    session.epoch++;
+    const active = state.activeOauth;
+    state.activeOauth = undefined;
+    void active?.client.close().catch(() => {});
+  }
+  const epoch = session.epoch;
+  const execute = () => dispatchCommand(cmd, state, ctx, session!, epoch);
+  return cmd.cmd === "status" || cmd.cmd === "getLogs" || cmd.cmd === "quota"
+    ? execute() : session.run(execute);
+}
+
+async function resolveLogin(ctx: HandlerContext, tokens: OAuthFlowTokens, provider: ProviderId): Promise<Credential> {
+  const credential = ctx.resolveLoginCredential
+    ? await ctx.resolveLoginCredential(tokens, provider)
+    : await new KeyResolver().resolveCodingPlanCredential(tokens.accessToken, provider, tokens.userId);
+  if (tokens.jwt) credential.jwt = tokens.jwt;
+  return credential;
+}
+
+async function dispatchCommand(cmd: ControlCommand, state: ControlState, ctx: HandlerContext, session: ControlSession, epoch: number): Promise<ControlResponse> {
   switch (cmd.cmd) {
     case "status": {
-      const cred = await loadCredential().catch(() => null);
+      const cred = await (ctx.getCredential ?? loadCredential)().catch(() => null);
       return {
         ok: true,
         state: "running",
@@ -340,49 +378,40 @@ async function dispatch(
     }
 
     case "startOAuth": {
-      // Tear down any previous in-flight flow so its callback port is released.
-      if (state.activeOauth) {
-        await state.activeOauth.client.close().catch(() => {});
-        state.activeOauth = undefined;
-      }
-      // Both providers use the server-mediated poll login (ZCode 3.12.3
-      // default) — no local callback; the flow completes server-side.
-      const client: OAuthFlowClient = ctx.createLoginClient
-        ? ctx.createLoginClient(cmd.provider)
-        : cmd.provider === "bigmodel"
-          ? new BigmodelPollOAuthClient()
-          : new ZaiOAuthClient();
-      const started = await client.start();
-      const callbackPort = started.callbackUrl
-        ? Number(new URL(started.callbackUrl).port) || 80
-        : 0;
-      state.activeOauth = {
-        client,
-        callbackUrl: started.callbackUrl,
-        state: started.state,
-      };
-      client.complete(started).then(async (tokens) => {
-        const resolver = new KeyResolver();
-        const cred: Credential = await resolver.resolveCodingPlanCredential(tokens.accessToken, cmd.provider, tokens.userId);
-        if (tokens.jwt) cred.jwt = tokens.jwt;
-        await saveCredential(cred);
-        console.log(`OAuth completed for ${cmd.provider}`);
-      }).catch((err: unknown) => {
-        // Timeouts / rejections are expected when the user abandons the
-        // browser; nothing to surface beyond the log buffer.
-        console.error(`OAuth flow ended without success: ${(err as Error)?.message ?? String(err)}`);
-      }).finally(() => {
-        // MUST run on rejection too — otherwise the callback port leaks until
-        // process death (Android: only a device reboot clears it).
+      if (epoch !== session.epoch) return { ok: false, error: "oauth_cancelled" };
+      const client = ctx.createLoginClient?.(cmd.provider)
+        ?? (cmd.provider === "bigmodel" ? new BigmodelPollOAuthClient() : new ZaiOAuthClient());
+      // Register before start() so logout can close a still-starting client.
+      state.activeOauth = { client, callbackUrl: "", state: "" };
+      let started: Awaited<ReturnType<OAuthFlowClient["start"]>>;
+      try { started = await client.start(); }
+      catch (err) {
         void client.close().catch(() => {});
-        if (state.activeOauth?.state === started.state) state.activeOauth = undefined;
+        if (state.activeOauth?.client === client) state.activeOauth = undefined;
+        return { ok: false, error: `oauth_start_failed: ${(err as Error).message}` };
+      }
+      if (epoch !== session.epoch) {
+        void client.close().catch(() => {});
+        return { ok: false, error: "oauth_cancelled" };
+      }
+      const callbackPort = started.callbackUrl ? Number(new URL(started.callbackUrl).port) || 80 : 0;
+      state.activeOauth = { client, callbackUrl: started.callbackUrl, state: started.state };
+      client.complete(started).then(async (tokens) => {
+        if (epoch !== session.epoch || state.activeOauth?.client !== client) return;
+        const cred = await resolveLogin(ctx, tokens, cmd.provider);
+        await session.run(async () => {
+          if (epoch !== session.epoch || state.activeOauth?.client !== client) return;
+          await saveCredential(cred);
+          if (epoch === session.epoch) ctx.onCredentialChange?.(cred);
+          console.log(`OAuth completed for ${cmd.provider}`);
+        });
+      }).catch((err: unknown) => {
+        if (epoch === session.epoch) console.error(`OAuth flow ended without success: ${(err as Error)?.message ?? String(err)}`);
+      }).finally(() => {
+        void client.close().catch(() => {});
+        if (state.activeOauth?.client === client) state.activeOauth = undefined;
       });
-      return {
-        ok: true,
-        event: "oauthUrl",
-        authorizeUrl: started.authorizeUrl,
-        callbackPort,
-      };
+      return { ok: true, event: "oauthUrl", authorizeUrl: started.authorizeUrl, callbackPort };
     }
 
     case "deliverOAuthCode": {
@@ -393,15 +422,12 @@ async function dispatch(
         return { ok: false, error: "no_matching_oauth_flow" };
       }
       try {
-        const { accessToken, userId, jwt } = await active.client.exchangeCode(
-          cmd.code,
-          active.callbackUrl,
-          cmd.state,
-        );
-        const resolver = new KeyResolver();
-        const cred: Credential = await resolver.resolveCodingPlanCredential(accessToken, cmd.provider, userId);
-        if (jwt) cred.jwt = jwt;
+        const tokens = await active.client.exchangeCode(cmd.code, active.callbackUrl, cmd.state);
+        if (epoch !== session.epoch || state.activeOauth?.client !== active.client) return { ok: false, error: "oauth_cancelled" };
+        const cred = await resolveLogin(ctx, tokens, cmd.provider);
+        if (epoch !== session.epoch || state.activeOauth?.client !== active.client) return { ok: false, error: "oauth_cancelled" };
         await saveCredential(cred);
+        if (epoch === session.epoch) ctx.onCredentialChange?.(cred);
         state.activeOauth = undefined;
         await active.client.close().catch(() => {});
         return { ok: true, event: "loginOk", provider: cmd.provider };
@@ -418,6 +444,7 @@ async function dispatch(
       // (sync function) and could race a withStoreLock save ("resurrected"
       // credentials.json).
       await clearCredentialAsync();
+      ctx.onCredentialChange?.(null);
       return { ok: true, event: "loggedOut" };
     }
 

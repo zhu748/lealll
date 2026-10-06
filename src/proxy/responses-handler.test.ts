@@ -67,6 +67,17 @@ function makeReq(body: unknown): Request {
 }
 
 describe("handleResponses", () => {
+  it("cancels and unlocks a stalled upstream stream without storing a completed response", async () => {
+    let cancelled = false;
+    const upstream = new ReadableStream<Uint8Array>({ cancel() { cancelled = true; } });
+    const store = new ResponseStore();
+    const response = await handleResponses(makeReq({ model: "glm-5.2", input: "hello", stream: true }), {
+      config: CONFIG, auth, endpointRouting: null, clientSigning: null, responseStore: store,
+      fetchImpl: (async () => new Response(upstream, { headers: { "content-type": "text/event-stream" } })) as unknown as typeof fetch,
+    });
+    await new Promise(r => setTimeout(r, 0)); await response.body!.cancel(); await new Promise(r => setTimeout(r, 0));
+    expect(cancelled).toBe(true); expect(upstream.locked).toBe(false); expect(store.size()).toBe(0);
+  });
   it("sends easy input messages to the Anthropic upstream", async () => {
     let sent = "";
     const response = await handleResponses(makeReq({ model: "glm-5.2", input: [{ role: "user", content: "easy question" }] }), {

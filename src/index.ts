@@ -4,6 +4,8 @@
  */
 import { loadConfig } from "./config/loader.js";
 import { AuthManager } from "./auth/manager.js";
+import { configuredAuthOptions, createConfiguredAuthManager, resolveConfiguredCredential } from "./auth/selection.js";
+import { createSerialQueue } from "./utils/serial.js";
 import { startServer, type ProxyServer } from "./server/server.js";
 import { startControlListener, createControlDispatcher, LogBuffer, type ControlState } from "./android/control.js";
 import { loadCredential, saveCredential, clearCredentialAsync, getStorePath, exportAccounts, listAccounts } from "./auth/store.js";
@@ -205,14 +207,9 @@ Examples:
  * is a no-op (switchToNextCredential returns null) — that's fine.
  */
 function buildAuthManager(config: ProxyConfig): AuthManager {
-  return new AuthManager({
-    mode: config.auth.mode ?? "oauth",
-    provider: config.provider,
-    apiKey: config.auth.apiKey ?? config.providers[config.provider].credential,
-    listAllCredentials: async () => {
-      const accounts = await exportAccounts();
-      return accounts.map(a => a.credential);
-    },
+  return createConfiguredAuthManager(config, async () => {
+    const accounts = await exportAccounts();
+    return accounts.map(a => a.credential);
   });
 }
 
@@ -270,10 +267,10 @@ async function startServePanel(
   // auto-claim serving the account that was just replaced (issue #58 review,
   // P2). Fingerprint the store and re-sync after every panel command: the
   // page polls `getLogs` every 2s, so a background login lands within one poll.
-  let authFingerprint = JSON.stringify((await loadCredential().catch(() => null)) ?? null);
+  let authFingerprint = JSON.stringify((await resolveConfiguredCredential(config).catch(() => null)) ?? null);
 
   async function syncAuthWithDisk(): Promise<void> {
-    const onDisk = await loadCredential().catch(() => null);
+    const onDisk = await resolveConfiguredCredential(config).catch(() => null);
     const fingerprint = JSON.stringify(onDisk ?? null);
     if (fingerprint === authFingerprint) return;
     authFingerprint = fingerprint;
@@ -292,9 +289,11 @@ async function startServePanel(
     proxyPort: serverRef.current?.port ?? 0,
   };
 
+  const runLifecycle = createSerialQueue();
+
   async function startProxy(): Promise<{ ok: true; port: number } | { ok: false; error: string }> {
     if (serverRef.current) return { ok: false, error: "already_running" };
-    const cred = await loadCredential().catch(() => null);
+    const cred = await resolveConfiguredCredential(config).catch(() => null);
     if (!cred) return { ok: false, error: "not_logged_in" };
     auth.setOAuthCredential(cred);
     authFingerprint = JSON.stringify(cred);
@@ -312,7 +311,7 @@ async function startServePanel(
     const s = serverRef.current;
     if (!s) return { ok: false, error: "not_running" };
     try {
-      s.stop(false);
+      await s.stop(false);
       serverRef.current = null;
       console.log("zcode-proxy stopped");
       return { ok: true };
@@ -326,9 +325,12 @@ async function startServePanel(
     plan?: "coding-plan" | "start-plan";
   }): Promise<{ ok: true; provider: ProviderId; plan: "coding-plan" | "start-plan" } | { ok: false; error: string }> {
     if (serverRef.current) return { ok: false, error: "stop_proxy_first" };
-    if (changes.provider) config.provider = changes.provider;
-    if (changes.plan) config.plan = changes.plan;
-    updateConfigYaml(path, { provider: config.provider, plan: config.plan });
+    const provider = changes.provider ?? config.provider;
+    const plan = changes.plan ?? config.plan;
+    updateConfigYaml(path, { provider, plan });
+    config.provider = provider;
+    config.plan = plan;
+    auth.updateConfig(configuredAuthOptions(config));
     console.log(`config updated: provider=${config.provider} plan=${config.plan}`);
     return { ok: true, provider: config.provider, plan: config.plan };
   }
@@ -339,10 +341,15 @@ async function startServePanel(
   // thing to clean up when the panel fails to start (P2, now structurally gone).
   const dispatchControl = createControlDispatcher(controlState, {
     logBuffer,
-    onStartProxy: startProxy,
-    onStopProxy: stopProxy,
-    onSetConfig: setConfig,
+    onStartProxy: () => runLifecycle(startProxy),
+    onStopProxy: () => runLifecycle(stopProxy),
+    onSetConfig: changes => runLifecycle(() => setConfig(changes)),
+    onCredentialChange: cred => {
+      if (cred && cred.provider === config.provider) auth.setOAuthCredential(cred);
+      else auth.clearOAuthCredential();
+    },
     onQuota: () => collectQuotaSnapshot(config),
+    getCredential: () => resolveConfiguredCredential(config),
   });
 
   /** Grace period for the `shutdown` reply before `process.exit()` runs. */
@@ -371,7 +378,7 @@ async function startServePanel(
     if (!res.ok) return res;
     await syncAuthWithDisk();
     if (cmd.cmd === "logout" && serverRef.current) {
-      await stopProxy();
+      await runLifecycle(stopProxy);
       controlState.proxyPort = 0;
       console.log("panel: logout cleared the live credential — proxy stopped");
     }
@@ -406,7 +413,7 @@ async function serve(configPath: string | undefined, debug: boolean): Promise<vo
   const auth = buildAuthManager(config);
 
   if ((config.auth.mode ?? "oauth") === "oauth") {
-    const cred = await loadCredential();
+    const cred = await resolveConfiguredCredential(config);
     if (!cred) {
       // Fork behavior — DON'T throw / exit: let the server start so the user
       // can open the dashboard and log in via OAuth. The old behavior (exit
@@ -439,7 +446,7 @@ async function serve(configPath: string | undefined, debug: boolean): Promise<vo
     }
   }
 
-  if (debug) printDebugBanner(config, path, await loadCredential().catch(() => null));
+  if (debug) printDebugBanner(config, path, await resolveConfiguredCredential(config).catch(() => null));
 
   // Intercept console.log for admin dashboard log streaming (fork layer).
   // Wrapped so a logging failure never breaks the actual console output.
@@ -456,9 +463,8 @@ async function serve(configPath: string | undefined, debug: boolean): Promise<vo
   };
   const logLevelRank = (level: string | undefined): number =>
     level === "debug" ? 0 : level === "info" ? 1 : level === "warn" ? 2 : level === "error" ? 3 : 1;
-  const minRank = logLevelRank(config.logging?.level);
   const safeAppend = (level: string, levelRank: number, args: unknown[]) => {
-    if (levelRank < minRank) return; // below configured minimum — skip
+    if (levelRank < logLevelRank(config.logging?.level)) return; // below configured minimum — skip
     try { appendLog(level, args.map(serialize).join(" ")); }
     catch { /* appendLog may throw if log buffer is full; never let it kill the request */ }
   };
@@ -605,9 +611,11 @@ async function runAndroid(): Promise<void> {
 
   const serverRef: { current: ProxyServer | null } = { current: null };
 
+  const runLifecycle = createSerialQueue();
+
   async function startProxy(): Promise<{ ok: true; port: number } | { ok: false; error: string }> {
     if (serverRef.current) return { ok: false, error: "already_running" };
-    const cred = await loadCredential().catch(() => null);
+    const cred = await resolveConfiguredCredential(config).catch(() => null);
     if (!cred) return { ok: false, error: "not_logged_in" };
     auth.setOAuthCredential(cred);
     try {
@@ -624,7 +632,7 @@ async function runAndroid(): Promise<void> {
     const s = serverRef.current;
     if (!s) return { ok: false, error: "not_running" };
     try {
-      s.stop(false);
+      await s.stop(false);
       serverRef.current = null;
       console.log("zcode-proxy stopped");
       return { ok: true };
@@ -638,9 +646,12 @@ async function runAndroid(): Promise<void> {
     plan?: "coding-plan" | "start-plan";
   }): Promise<{ ok: true; provider: ProviderId; plan: "coding-plan" | "start-plan" } | { ok: false; error: string }> {
     if (serverRef.current) return { ok: false, error: "stop_proxy_first" };
-    if (changes.provider) config.provider = changes.provider;
-    if (changes.plan) config.plan = changes.plan;
-    updateConfigYaml(path, { provider: config.provider, plan: config.plan });
+    const provider = changes.provider ?? config.provider;
+    const plan = changes.plan ?? config.plan;
+    updateConfigYaml(path, { provider, plan });
+    config.provider = provider;
+    config.plan = plan;
+    auth.updateConfig(configuredAuthOptions(config));
     console.log(`config updated: provider=${config.provider} plan=${config.plan}`);
     return { ok: true, provider: config.provider, plan: config.plan };
   }
@@ -667,10 +678,20 @@ async function runAndroid(): Promise<void> {
     port: controlPort,
     state: controlState,
     logBuffer,
-    onStartProxy: startProxy,
-    onStopProxy: stopProxy,
-    onSetConfig: setConfig,
+    onStartProxy: () => runLifecycle(startProxy),
+    onStopProxy: () => runLifecycle(stopProxy),
+    onSetConfig: changes => runLifecycle(() => setConfig(changes)),
+    onCredentialChange: cred => {
+      if (cred && cred.provider === config.provider) auth.setOAuthCredential(cred);
+      else auth.clearOAuthCredential();
+    },
     onQuota: () => collectQuotaSnapshot(config),
+    getCredential: async () => {
+      const cred = await resolveConfiguredCredential(config);
+      if (cred) auth.setOAuthCredential(cred);
+      else auth.clearOAuthCredential();
+      return cred;
+    },
     onShutdown: async () => {
       // The control protocol's `shutdown` promises a process exit (the Kotlin
       // shell uses it as a full stop). Previously it only stopped the proxy
@@ -857,7 +878,7 @@ async function resetCommand(args: string[]): Promise<void> {
     process.exit(1);
   }
   const config = loadConfig(path);
-  const cred = await loadCredential();
+  const cred = await resolveConfiguredCredential(config);
   if (!cred) {
     console.error("Not logged in. Run: zcode-proxy auth login");
     process.exit(1);

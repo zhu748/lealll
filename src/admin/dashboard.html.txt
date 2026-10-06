@@ -2421,11 +2421,15 @@ function checkImportFileSize(file,maxBytes,label){
   return false;
 }
 let dashboardAbortController=new AbortController();
+const dashboardJsonInFlight=new Map();
+let dashboardReadGeneration=0;
 function resetDashboardAbortController(){
   if(dashboardAbortController.signal.aborted)dashboardAbortController=new AbortController();
   return dashboardAbortController;
 }
 function abortDashboardRequests(){
+  dashboardReadGeneration++;
+  dashboardJsonInFlight.clear();
   try{dashboardAbortController.abort()}catch{}
   dashboardAbortController=new AbortController();
 }
@@ -2453,29 +2457,53 @@ function createDashboardFetchContext(input,init={},timeoutMs=8000){
   }
   linkSignal(upstreamSignal);
   if(dashboardSignal&&dashboardSignal!==upstreamSignal)linkSignal(dashboardSignal);
+  let rejectCancelled;
+  const cancelled=new Promise((_,reject)=>{rejectCancelled=reject});
+  // Handle cancellation even when an injected transport ignores AbortSignal.
+  cancelled.catch(()=>{});
+  const rejectAbort=()=>rejectCancelled(new Error('request cancelled'));
+  ctrl.signal.addEventListener('abort',rejectAbort,{once:true});
+  if(ctrl.signal.aborted)rejectAbort();
   const cleanup=()=>{
+    ctrl.signal.removeEventListener('abort',rejectAbort);
     clearTimeout(timer);
     for(const signal of linkedSignals)signal.removeEventListener('abort',onAbort);
   };
-  return {ctrl,timeout,cleanup,get timedOut(){return timedOut;}};
+  return {ctrl,timeout,cleanup,race:pending=>Promise.race([pending,cancelled]),get timedOut(){return timedOut;}};
 }
 function dashboardFetchTimeoutError(timeout){
   return new Error(`request timeout after ${timeout}ms`);
 }
 function fetchWithTimeout(input,init={},timeoutMs=8000){
   const ctx=createDashboardFetchContext(input,init,timeoutMs);
-  return fetch(input,{...init,signal:ctx.ctrl.signal}).catch(err=>{
+  return ctx.race(fetch(input,{...init,signal:ctx.ctrl.signal})).catch(err=>{
     if(ctx.timedOut)throw dashboardFetchTimeoutError(ctx.timeout);
     throw err;
   }).finally(ctx.cleanup);
 }
 async function fetchJsonWithTimeout(input,init={},timeoutMs=8000){
+  const readonly=dashboardAbortApplies(input,init);
+  const requestAuthToken=authToken;
+  const requestInitGeneration=dashboardInitGeneration;
+  const readGeneration=dashboardReadGeneration;
+  const key=readonly&&!init.signal?JSON.stringify([String(input),[...new Headers(init.headers).entries()].sort(),timeoutMs,requestAuthToken,requestInitGeneration,readGeneration]):null;
+  if(key&&dashboardJsonInFlight.has(key))return cloneJson(await dashboardJsonInFlight.get(key));
+  const pending=fetchDashboardJson(input,init,timeoutMs).then(data=>{
+    if(readonly&&(readGeneration!==dashboardReadGeneration||requestAuthToken!==authToken||requestInitGeneration!==dashboardInitGeneration))throw new Error('stale dashboard response');
+    if(!readonly){dashboardReadGeneration++;dashboardJsonInFlight.clear()}
+    return data;
+  });
+  if(key)dashboardJsonInFlight.set(key,pending);
+  try{return cloneJson(await pending)}
+  finally{if(key&&dashboardJsonInFlight.get(key)===pending)dashboardJsonInFlight.delete(key)}
+}
+async function fetchDashboardJson(input,init={},timeoutMs=8000){
   const ctx=createDashboardFetchContext(input,init,timeoutMs);
   try{
-    const r=await fetch(input,{...init,signal:ctx.ctrl.signal});
+    const r=await ctx.race(fetch(input,{...init,signal:ctx.ctrl.signal}));
     let d={};
     try{
-      d=await r.json();
+      d=await ctx.race(r.json());
     }catch(err){
       if(ctx.ctrl.signal.aborted)throw err;
       if(r.ok)throw new Error('Invalid JSON response');
@@ -2720,6 +2748,8 @@ function syncConfigModelsForUi(models){
   window.__config={...(window.__config||{}),models:[...models]};
 }
 function invalidateConfigSnapshot(){
+  dashboardReadGeneration++;
+  dashboardJsonInFlight.clear();
   _configSnapshotGeneration++;
   _configSnapshotCache=null;
   _configSnapshotTs=0;
@@ -2920,13 +2950,27 @@ function formatDurationMs(ms){
   return `${m}m ${String(ss).padStart(2,'0')}s`;
 }
 
+let settingsDirty=false,settingsDraftVersion=0,endpointsDirty=false,endpointsDraftVersion=0;
+document.addEventListener('input',event=>{
+  const id=event.target&&event.target.id||'';
+  if(/^cfg[A-Z]/.test(id)){settingsDirty=true;settingsDraftVersion++}
+  if(/^proxy(Zai|Bm)/.test(id)){endpointsDirty=true;endpointsDraftVersion++}
+});
+document.addEventListener('change',event=>{
+  const id=event.target&&event.target.id||'';
+  if(/^cfg[A-Z]/.test(id)){settingsDirty=true;settingsDraftVersion++}
+  if(/^proxy(Zai|Bm)/.test(id)){endpointsDirty=true;endpointsDraftVersion++}
+});
 // --- Settings ---
 async function loadSettings(force=false){
+  const draftVersion=settingsDraftVersion;
   const requestAuthToken=authToken;
   const requestInitGeneration=dashboardInitGeneration;
   try{
     const c=await fetchConfigSnapshot({force});
     if(!dashboardCanUpdate()||!dashboardActionCurrent(requestInitGeneration,requestAuthToken))return;
+    if(draftVersion!==settingsDraftVersion||(settingsDirty&&!force))return;
+    settingsDirty=false;
     // Note: use ?? for port — `||` would treat a legitimately configured
     // port of 0 (which on some systems means "let the OS pick a random
     // free port") as falsy and silently overwrite it with 8080.
@@ -2986,6 +3030,7 @@ function readSettingsNumberInput(id,label,opts={}){
   return n;
 }
 async function saveSettings(){
+  const draftVersion=settingsDraftVersion;
   if(!beginExclusiveAction('settingsSave','设置保存正在进行中，请稍候'))return;
   const requestAuthToken=authToken;
   const requestInitGeneration=dashboardInitGeneration;
@@ -3047,6 +3092,7 @@ async function saveSettings(){
     const d=await fetchJsonMutationWithTimeout(API+'/admin/api/config',{method:'PUT',headers:authHeaders(),body:JSON.stringify(cfg)});
     if(!dashboardActionCurrent(requestInitGeneration,requestAuthToken))return;
     invalidateConfigSnapshot();
+    if(settingsDraftVersion===draftVersion)settingsDirty=false;
     syncConfigModelsForUi(cfg.models);
     renderModelMappings();
     if(d.requiresRestart){
@@ -4639,11 +4685,13 @@ document.getElementById('logSearch').addEventListener('input',scheduleLogFilterR
 
 // --- Proxy ---
 async function loadProxyEndpoints(){
+  const draftVersion=endpointsDraftVersion;
   const requestAuthToken=authToken;
   const requestInitGeneration=dashboardInitGeneration;
   try{
     const c=await fetchConfigSnapshot();
     if(!dashboardCanUpdate()||!dashboardActionCurrent(requestInitGeneration,requestAuthToken))return;
+    if(endpointsDirty||draftVersion!==endpointsDraftVersion)return;
     document.getElementById('proxyZaiAnthropic').value=c.providers?.zai?.anthropicBase||'';
     document.getElementById('proxyZaiOpenai').value=c.providers?.zai?.openaiBase||'';
     document.getElementById('proxyBmAnthropic').value=c.providers?.bigmodel?.anthropicBase||'';
@@ -4651,6 +4699,7 @@ async function loadProxyEndpoints(){
   }catch(e){if(dashboardCanUpdate()&&dashboardActionCurrent(requestInitGeneration,requestAuthToken)){console.error('loadProxyEndpoints failed:',e);toast('加载端点失败','error')}}
 }
 async function saveProxyEndpoints(){
+  const draftVersion=endpointsDraftVersion;
   if(!beginExclusiveAction('proxyEndpointsSave','端点保存正在进行中，请稍候'))return;
   const requestAuthToken=authToken;
   const requestInitGeneration=dashboardInitGeneration;
@@ -4662,6 +4711,7 @@ async function saveProxyEndpoints(){
     await fetchJsonMutationWithTimeout(API+'/admin/api/endpoints',{method:'PUT',headers:authHeaders(),body:JSON.stringify(endpoints)});
     if(!dashboardActionCurrent(requestInitGeneration,requestAuthToken))return;
     invalidateConfigSnapshot();
+    if(endpointsDraftVersion===draftVersion)endpointsDirty=false;
     toast('端点已保存','success');
   }catch(e){
     if(dashboardActionCurrent(requestInitGeneration,requestAuthToken)){

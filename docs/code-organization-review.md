@@ -186,3 +186,8 @@ git apply /path/to/lealll-code-organization.patch
 - `recordDebugDump`
 - `recordStat`
 - `setLogFilePath`
+
+
+## 前两轮恢复完成（v4.7.8-fork.1）
+
+此前未提交工作区的原始代码仍无法取回；已在本轮分类提交之上，按上游 `17933d2` 与恢复记录重新实现功能对齐及第二轮优化。此次发布包含三个阶段的最终成果；早先关于未恢复和基线测试的描述是当时的记录。当前实现与验证见 [功能恢复记录](upstream-parity.md) 和 [优化记录](optimization-review.md)。

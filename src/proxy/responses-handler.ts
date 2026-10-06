@@ -1,3 +1,5 @@
+import { createBackpressuredStream } from "../utils/stream.js";
+import { waitForBackpressure } from "../utils/sse.js";
 /**
  * POST /v1/responses request handler.
  *
@@ -388,18 +390,27 @@ function streamResponse(upstreamResp: Response, context: StreamResponseContext):
   }
   const state = newResponsesStreamState(context.model, { meta: context.meta, responseId: context.responseId });
 
-  const stream = new ReadableStream<Uint8Array>({
+  let upstreamReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  let cancelled = false;
+  const stream = createBackpressuredStream({
     async start(controller) {
       const encoder = new TextEncoder();
-      const send = (evt: ResponsesStreamEvent) => controller.enqueue(encoder.encode(responsesEventToSse(evt)));
+      const send = async (evt: ResponsesStreamEvent) => {
+        await waitForBackpressure(controller);
+        if (cancelled) return;
+        controller.enqueue(encoder.encode(responsesEventToSse(evt)));
+      };
       try {
+        if (cancelled) return;
         const reader = upstreamResp.body!.getReader();
+        upstreamReader = reader;
         const decoder = new TextDecoder();
         let buffer = "";
         let errored = false;
         for (;;) {
           if (errored) break;
           const { done, value } = await reader.read();
+          if (cancelled) return;
           if (done) break;
           buffer += decoder.decode(value, { stream: true });
           // SSE chunks are separated by `\n\n`; process complete frames.
@@ -411,7 +422,7 @@ function streamResponse(upstreamResp: Response, context: StreamResponseContext):
             if (!dataLine || dataLine === "[DONE]") continue;
             try {
               const chunk = JSON.parse(dataLine);
-              for (const evt of chatChunkToResponsesEvents(chunk, state)) send(evt);
+              for (const evt of chatChunkToResponsesEvents(chunk, state)) await send(evt);
             } catch (err) {
               errored = true;
               // Release the upstream reader too — without the cancel the
@@ -425,26 +436,36 @@ function streamResponse(upstreamResp: Response, context: StreamResponseContext):
             }
           }
         }
+        if (cancelled) return;
         const finalEvents = finalizeResponsesStream(state);
-        for (const evt of finalEvents) send(evt);
+        for (const evt of finalEvents) await send(evt);
+        if (cancelled) return;
         const finalEvent = finalEvents.find((evt) => evt.type === "response.completed" || evt.type === "response.incomplete");
         if (finalEvent && context.request.store !== false && context.options.responseStore) {
           context.options.responseStore.set(buildStoredResponse(finalEvent.response, context.input, context.request.instructions));
         }
         try { controller.close(); } catch {}
       } catch (err) {
+        if (cancelled) return;
         try {
           for (const evt of failResponsesStream(state, {
             code: err instanceof AnthropicStreamError ? err.code : "upstream_error",
             message: err instanceof Error ? err.message : String(err),
-          })) send(evt);
+          })) await send(evt);
           controller.close();
         } catch { try { controller.error(err); } catch {} }
+      } finally {
+        if (upstreamReader) {
+          void upstreamReader.cancel().catch(() => {});
+          try { upstreamReader.releaseLock(); } catch {}
+          upstreamReader = undefined;
+        }
       }
     },
     cancel(reason) {
       context.options.debug === true && console.log(`[responses] stream cancelled: ${String(reason)}`);
-      try { upstreamResp.body?.cancel(); } catch {}
+      cancelled = true;
+      void (upstreamReader ? upstreamReader.cancel(reason) : upstreamResp.body?.cancel(reason))?.catch(() => {});
     },
   });
 

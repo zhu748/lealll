@@ -61,6 +61,48 @@ const fakeCred: Credential = { apiKey: "key-x.secret-y", provider: "zai", jwt: m
 const loadFake = async (): Promise<Credential> => fakeCred;
 const loadNone = async (): Promise<Credential | null> => null;
 
+describe("restored quota concurrency", () => {
+  it("starts all five enabled quota planes concurrently and shares overlapping refreshes", async () => {
+    const c = makeConfig(); c.mcp.usageEnabled = true; c.subscription = { checkOnSwitch: true, origin: "https://subscription.test", timeoutMs: 500 };
+    const cred = { ...fakeCred, plan: "coding-plan" as const, maasToken: "subscription-token" };
+    const urls: string[] = []; let release!: () => void;
+    const barrier = new Promise<void>(resolve => { release = resolve; });
+    const transport = (async (input: RequestInfo | URL) => { urls.push(String(input)); await barrier; return Response.json({ code: 0, data: {} }); }) as unknown as typeof fetch;
+    const first = collectQuotaSnapshot(c, transport, async () => cred);
+    const second = collectQuotaSnapshot(c, transport, async () => cred);
+    await new Promise(r => setTimeout(r, 0));
+    expect(urls.length).toBe(5);
+    expect(urls.some(url => url.endsWith("/mcp/usage"))).toBe(true);
+    expect(urls.some(url => url.endsWith("/subscription/list"))).toBe(true);
+    release(); expect(await first).toEqual(await second);
+    await collectQuotaSnapshot(c, transport, async () => cred);
+    expect(urls.length).toBe(10); // Only pending work is shared; results stay fresh.
+  });
+  it("does not coalesce different account credentials", async () => {
+    let calls = 0;
+    const transport = (async () => { calls++; await Promise.resolve(); return Response.json({ code: 0, data: {} }); }) as unknown as typeof fetch;
+    await Promise.all([
+      collectQuotaSnapshot(makeConfig(), transport, async () => fakeCred),
+      collectQuotaSnapshot(makeConfig(), transport, async () => ({ ...fakeCred, apiKey: "other" })),
+    ]);
+    expect(calls).toBe(8);
+  });
+  it("uses the configured static key instead of a stored OAuth account", async () => {
+    const c = makeConfig({ auth: { mode: "apikey", apiKey: "configured.secret" } });
+    const headers: Headers[] = [];
+    await collectQuotaSnapshot(c, (async (_url: RequestInfo | URL, init?: RequestInit) => { headers.push(new Headers(init?.headers)); return Response.json({ code: 0, data: {} }); }) as unknown as typeof fetch,
+      async () => { throw new Error("must not read OAuth storage"); });
+    expect(headers.length).toBe(1);
+    expect(headers[0].get("authorization")).toBe("configured.secret");
+  });
+  it("forwards the account proxy to quota transports", async () => {
+    const proxies: unknown[] = [];
+    await collectQuotaSnapshot(makeConfig(), (async (_url: RequestInfo | URL, init?: RequestInit) => { proxies.push((init as any).proxy); return Response.json({ code: 0, data: {} }); }) as unknown as typeof fetch,
+      async () => ({ ...fakeCred, proxy: "http://offline-proxy.test:8080" }));
+    expect(proxies).toEqual(Array(4).fill("http://offline-proxy.test:8080"));
+  });
+});
+
 interface BillingCall {
   url: string;
   headers: Record<string, string>;
@@ -94,7 +136,7 @@ function makeBillingFetch(opts: {
       return new Response(JSON.stringify({ code, msg: "ok", data: opts.body ?? { server_time: 1720000000, balances: [], plans: [] } }), { status: 200 });
     }
     return new Response(JSON.stringify({ error: { type: "not_found", message: u } }), { status: 404 });
-  }) as typeof fetch;
+  }) as unknown as typeof fetch;
   return { fetchImpl, calls };
 }
 
@@ -354,7 +396,7 @@ describe("quota reset snapshot (collectResetSnapshot)", () => {
         );
       }
       return new Response("unexpected", { status: 404 });
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
     const snap = await collectResetSnapshot(makeConfig(), fetchImpl, loadResetCred);
     expect(snap.available).toBe(true);
     expect(snap.status?.availableFiveHourResets).toEqual([{ expireAt: 1000 }]);
@@ -367,7 +409,7 @@ describe("quota reset snapshot (collectResetSnapshot)", () => {
     // any network call; the snapshot layer converts it into a soft failure.
     const fetchImpl = (async (_url: string | URL | Request) => {
       throw new Error("network must not be reached");
-    }) as unknown as typeof fetch;
+    }) as unknown as unknown as typeof fetch;
     const snap = await collectResetSnapshot(makeConfig(), fetchImpl, loadJwtLessReset);
     expect(snap.available).toBe(false);
     expect(snap.status).toBeNull();
@@ -376,7 +418,7 @@ describe("quota reset snapshot (collectResetSnapshot)", () => {
 
   it("upstream failure degrades to available:false, reason carries the message", async () => {
     const fetchImpl: typeof fetch = (async (_url: string | URL | Request) =>
-      new Response(JSON.stringify({ code: 3103, msg: "quota exhausted" }), { status: 200 })) as unknown as typeof fetch;
+      new Response(JSON.stringify({ code: 3103, msg: "quota exhausted" }), { status: 200 })) as unknown as unknown as typeof fetch;
     const snap = await collectResetSnapshot(makeConfig(), fetchImpl, loadResetCred);
     expect(snap.available).toBe(false);
     // Upstream error reader prefers the server msg over the raw code string.
@@ -437,7 +479,7 @@ describe("quota claim routes (collectClaimSnapshot / handleQuotaClaim*)", () => 
     const fetchImpl: typeof fetch = (async (url: string | URL | Request) => {
       calls.push(String(url instanceof Request ? url.url : url));
       return new Response(JSON.stringify(previewBody), { status: 200 });
-    }) as unknown as typeof fetch;
+    }) as unknown as unknown as typeof fetch;
     const snap = await collectClaimSnapshot(makeConfig(), fetchImpl, loadClaimCred);
     expect(snap.available).toBe(true);
     expect(snap.plans).toHaveLength(1);
@@ -455,7 +497,7 @@ describe("quota claim routes (collectClaimSnapshot / handleQuotaClaim*)", () => 
 
   it("preview 404 (off-season) degrades to available:false with an empty list", async () => {
     const fetchImpl: typeof fetch = (async (_url: string | URL | Request) =>
-      new Response("404 page not found", { status: 404 })) as unknown as typeof fetch;
+      new Response("404 page not found", { status: 404 })) as unknown as unknown as typeof fetch;
     const snap = await collectClaimSnapshot(makeConfig(), fetchImpl, loadClaimCred);
     expect(snap.available).toBe(false);
     expect(snap.plans).toEqual([]);
@@ -522,7 +564,7 @@ describe("quota claim routes (collectClaimSnapshot / handleQuotaClaim*)", () => 
         }),
         { status: 200 },
       );
-    }) as unknown as typeof fetch;
+    }) as unknown as unknown as typeof fetch;
     const resp = await handleQuotaClaimSubmit(
       new Request("http://x/quota/claim", { method: "POST", body: JSON.stringify({ plan_id: "wk-campaign" }) }),
       makeConfig(),
@@ -553,7 +595,7 @@ describe("quota claim routes (collectClaimSnapshot / handleQuotaClaim*)", () => 
         JSON.stringify({ code: 1005, msg: "quota exhausted", data: { plan: { ends_at: 1759100000 } } }),
         { status: 200 },
       );
-    }) as unknown as typeof fetch;
+    }) as unknown as unknown as typeof fetch;
     const resp = await handleQuotaClaimSubmit(
       new Request("http://x/quota/claim", { method: "POST", body: JSON.stringify({ plan_id: "wk-campaign" }) }),
       makeConfig(),
@@ -620,7 +662,7 @@ describe("POST /quota/reset (handleQuotaResetAction)", () => {
     const fetchImpl: typeof fetch = (async () => {
       upstreamCalls++;
       return new Response("{}", { status: 200 });
-    }) as unknown as typeof fetch;
+    }) as unknown as unknown as typeof fetch;
     const resp = await handleQuotaResetAction(
       new Request("http://x/quota/reset", { method: "POST", body: JSON.stringify({ action: "use", type: "yearly" }) }),
       makeConfig(),
@@ -638,7 +680,7 @@ describe("POST /quota/reset (handleQuotaResetAction)", () => {
     const fetchImpl: typeof fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
       postCalls.push(typeof init?.body === "string" ? init.body : undefined);
       return new Response(JSON.stringify({ code: 0, msg: "ok", data: { used: true } }), { status: 200 });
-    }) as unknown as typeof fetch;
+    }) as unknown as unknown as typeof fetch;
     const resp = await handleQuotaResetAction(
       new Request("http://x/quota/reset", { method: "POST", body: JSON.stringify({ action: "use", type: "five_hour", idempotency_key: " key-1 " }) }),
       makeConfig(),
@@ -662,7 +704,7 @@ describe("POST /quota/reset (handleQuotaResetAction)", () => {
     const fetchImpl: typeof fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
       postCalls.push(typeof init?.body === "string" ? init.body : undefined);
       return new Response(JSON.stringify({ code: 0, msg: "ok", data: { used: true } }), { status: 200 });
-    }) as unknown as typeof fetch;
+    }) as unknown as unknown as typeof fetch;
     const resp = await handleQuotaResetAction(
       new Request("http://x/quota/reset", { method: "POST", body: JSON.stringify({ action: "use", type: "week" }) }),
       makeConfig(),
@@ -677,7 +719,7 @@ describe("POST /quota/reset (handleQuotaResetAction)", () => {
 
   it("action=opportunity maps business 3301 to granted:false with nextTryAt", async () => {
     const fetchImpl: typeof fetch = (async () =>
-      new Response(JSON.stringify({ code: 3301, msg: "no opportunity", data: { next_try_at: 1759009999 } }), { status: 200 })) as unknown as typeof fetch;
+      new Response(JSON.stringify({ code: 3301, msg: "no opportunity", data: { next_try_at: 1759009999 } }), { status: 200 })) as unknown as unknown as typeof fetch;
     const resp = await handleQuotaResetAction(
       new Request("http://x/quota/reset", { method: "POST", body: JSON.stringify({ action: "opportunity" }) }),
       makeConfig(),
@@ -693,7 +735,7 @@ describe("POST /quota/reset (handleQuotaResetAction)", () => {
 
   it("action=opportunity maps a grant to granted:true", async () => {
     const fetchImpl: typeof fetch = (async () =>
-      new Response(JSON.stringify({ code: 0, msg: "ok", data: { granted: true } }), { status: 200 })) as unknown as typeof fetch;
+      new Response(JSON.stringify({ code: 0, msg: "ok", data: { granted: true } }), { status: 200 })) as unknown as unknown as typeof fetch;
     const resp = await handleQuotaResetAction(
       new Request("http://x/quota/reset", { method: "POST", body: JSON.stringify({ action: "opportunity" }) }),
       makeConfig(),
@@ -708,7 +750,7 @@ describe("POST /quota/reset (handleQuotaResetAction)", () => {
 
   it("ResetApiError business verdicts come back as 200 {ok:false} with the upstream message", async () => {
     const fetchImpl: typeof fetch = (async () =>
-      new Response(JSON.stringify({ code: 1204, msg: "no available reset stock" }), { status: 200 })) as unknown as typeof fetch;
+      new Response(JSON.stringify({ code: 1204, msg: "no available reset stock" }), { status: 200 })) as unknown as unknown as typeof fetch;
     const resp = await handleQuotaResetAction(
       new Request("http://x/quota/reset", { method: "POST", body: JSON.stringify({ action: "use", type: "week" }) }),
       makeConfig(),

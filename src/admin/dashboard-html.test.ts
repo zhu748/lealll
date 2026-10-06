@@ -84,8 +84,8 @@ describe("dashboard HTML inline scripts", () => {
     expect(html).toContain("function createDashboardFetchContext(input,init={},timeoutMs=8000)");
     expect(html).toContain("async function fetchJsonWithTimeout(input,init={},timeoutMs=8000)");
     expect(html).toContain("const ctx=createDashboardFetchContext(input,init,timeoutMs);");
-    expect(html).toContain("const r=await fetch(input,{...init,signal:ctx.ctrl.signal});");
-    expect(html).toContain("d=await r.json();");
+    expect(html).toContain("const r=await ctx.race(fetch(input,{...init,signal:ctx.ctrl.signal}));");
+    expect(html).toContain("d=await ctx.race(r.json());");
     expect(html).toContain("if(r.ok)throw new Error('Invalid JSON response');");
     expect(html).toContain("if(ctx.timedOut)throw dashboardFetchTimeoutError(ctx.timeout);");
     expect(html).toContain("ctx.cleanup();");
@@ -179,7 +179,7 @@ describe("dashboard HTML inline scripts", () => {
     expect(html).toContain("let _configSnapshotInFlightKey=''");
     expect(html).toContain("let _configSnapshotGeneration=0");
     expect(html).toContain("function applyConfigSnapshotCache(config)");
-    expect(html).toContain("function invalidateConfigSnapshot(){\n  _configSnapshotGeneration++;");
+    expect(html).toContain("function invalidateConfigSnapshot(){\n  dashboardReadGeneration++;\n  dashboardJsonInFlight.clear();\n  _configSnapshotGeneration++;");
     expect(html).toContain("async function fetchConfigSnapshot(options={})");
     expect(html).toContain("const request=fetchJsonWithTimeout(API+'/admin/api/config',{headers:authHeaders()},5000)");
     expect(html).toContain("const requestAuthToken=authToken;");
@@ -194,7 +194,7 @@ describe("dashboard HTML inline scripts", () => {
     expect(html).toContain("const c=await fetchConfigSnapshot();");
     expect(html).toContain("async function loadSettings(force=false)");
     expect(html).toContain("const cfg=await fetchConfigSnapshot({force:true});");
-    expect(html).toContain("invalidateConfigSnapshot();\n    toast('端点已保存','success');");
+    expect(html).toContain("invalidateConfigSnapshot();\n    if(endpointsDraftVersion===draftVersion)endpointsDirty=false;\n    toast('端点已保存','success');");
   });
 
   it("bounds first-paint overview requests with timeouts", () => {
@@ -218,7 +218,7 @@ describe("dashboard HTML inline scripts", () => {
     expect(html).toContain("linkSignal(upstreamSignal);");
     expect(html).toContain("if(dashboardSignal&&dashboardSignal!==upstreamSignal)linkSignal(dashboardSignal);");
     expect(html).toContain("for(const signal of linkedSignals)signal.removeEventListener('abort',onAbort);");
-    expect(html).toContain("return {ctrl,timeout,cleanup,get timedOut(){return timedOut;}};");
+    expect(html).toContain("return {ctrl,timeout,cleanup,race:pending=>Promise.race([pending,cancelled]),get timedOut(){return timedOut;}};");
     expect(html).toContain("function dashboardFetchTimeoutError(timeout)");
     expect(html).toContain("dashboardInitGeneration++;\n  abortDashboardRequests();\n  authToken='';");
     expect(html).toContain("clearAccountFilterTimer();\n    clearLogRenderTimer();\n    clearLogFilterTimer();\n    abortDashboardRequests();");

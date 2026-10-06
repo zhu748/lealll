@@ -17,7 +17,10 @@
  *      zcode.z.ai desktop bundle `getSnapshotForQuery`/`BigModelUsageQuotaProvider`)
  */
 import os from "node:os";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
+import { resolveConfiguredCredential } from "../auth/selection.js";
+import { fetchJsonWithDeadline, JsonHttpError } from "../utils/fetch-json.js";
+import { proxiedFetch } from "../proxy/proxied-fetch.js";
 import { loadCredential } from "../auth/store.js";
 import { buildIdentityHeaders, normalizePrintableHeaderValue } from "../proxy/identity.js";
 import { inspectJwt } from "../auth/jwt-age.js";
@@ -123,15 +126,9 @@ async function fetchBilling(
   fetchImpl: typeof fetch,
 ): Promise<{ code?: number; msg?: string; data?: unknown; success?: unknown } | null> {
   try {
-    const resp = await fetchImpl(`${origin.replace(/\/+$/, "")}${path}`, { headers });
-    const text = await resp.text();
-    try {
-      return JSON.parse(text) as { code?: number; msg?: string; data?: unknown; success?: unknown };
-    } catch {
-      return { code: resp.status, msg: text.slice(0, 120) };
-    }
+    return await fetchJsonWithDeadline(`${origin.replace(/\/+$/, "")}${path}`, { headers }, fetchImpl);
   } catch (e) {
-    return { code: -1, msg: String(e).slice(0, 120) };
+    return { code: e instanceof JsonHttpError ? e.status : -1, msg: String(e).slice(0, 120) };
   }
 }
 
@@ -176,16 +173,35 @@ function toFiniteNumber(v: unknown): number | undefined {
   return Number.isFinite(n) ? n : undefined;
 }
 
-/** Build the quota snapshot. Exported for tests. `loadCredentialImpl` is injectable for tests. */
+const quotaInFlight = new WeakMap<typeof fetch, Map<string, Promise<QuotaSnapshot>>>();
+
+/** Identical concurrent refreshes share work; completed snapshots are never cached. */
 export async function collectQuotaSnapshot(
   config: ProxyConfig,
   fetchImpl: typeof fetch = fetch,
   loadCredentialImpl: typeof loadCredential = loadCredential,
 ): Promise<QuotaSnapshot> {
-  const cred = await loadCredentialImpl();
-  if (!cred) {
-    throw new Error("not logged in (run: zcode-proxy auth login)");
-  }
+  config = structuredClone(config);
+  const cred = await resolveConfiguredCredential(config, loadCredentialImpl);
+  if (!cred) throw new Error("not logged in or no usable credential for the configured provider");
+  const key = createHash("sha256").update(JSON.stringify([
+    cred, config.provider, config.plan, config.providers, config.claim.origin,
+    config.identity, config.mcp.usageEnabled, config.subscription?.checkOnSwitch,
+  ])).digest("hex");
+  let requests = quotaInFlight.get(fetchImpl);
+  if (!requests) { requests = new Map(); quotaInFlight.set(fetchImpl, requests); }
+  const existing = requests.get(key);
+  if (existing) return existing;
+  const transport = cred.proxy
+    ? ((input, init) => proxiedFetch(input, { ...init, proxy: cred.proxy }, fetchImpl)) as typeof fetch
+    : fetchImpl;
+  const pending = buildQuotaSnapshot(config, cred, transport);
+  requests.set(key, pending);
+  try { return await pending; }
+  finally { if (requests.get(key) === pending) requests.delete(key); }
+}
+
+async function buildQuotaSnapshot(config: ProxyConfig, cred: Credential, fetchImpl: typeof fetch): Promise<QuotaSnapshot> {
   const jwtInfo = cred.jwt ? inspectJwt(cred.jwt) : null;
   const jwt = jwtInfo
     ? { ageHours: Number(jwtInfo.ageHours.toFixed(2)), issuedAt: jwtInfo.iat }
@@ -210,39 +226,27 @@ export async function collectQuotaSnapshot(
   const errors: string[] = [];
   // Credits plane needs the plan JWT; a coding-plan account without one still
   // gets its monitor-plane limits below instead of a dead snapshot.
-  let balance: Awaited<ReturnType<typeof fetchBilling>> = null;
-  let preview: Awaited<ReturnType<typeof fetchBilling>> = null;
+  const cOrigin = codingOrigin(config, cred.provider);
+  const [balance, preview, cEnvelope, mcpUsage, subscriptionAvailability] = await Promise.all([
+    cred.jwt ? fetchBilling(origin, `/api/v1/zcode-plan/billing/balance?app_version=${encodeURIComponent(appVersion)}&platform=${encodeURIComponent(platform)}`, headers, fetchImpl) : null,
+    cred.jwt ? fetchBilling(origin, `/api/v1/zcode-plan/billing/preview?app_version=${encodeURIComponent(appVersion)}&platform=${encodeURIComponent(platform)}`, headers, fetchImpl) : null,
+    cOrigin ? fetchBilling(cOrigin, "/api/monitor/usage/quota/limit", { authorization: credentialString(cred), accept: "application/json" }, fetchImpl) : null,
+    config.mcp.usageEnabled === false ? null : fetchMcpUsage(cred, { origin, fetchImpl, identity }).catch(() => null),
+    config.subscription?.checkOnSwitch === false ? null : fetchSubscriptionAvailability(cred, { fetchImpl, identity, origin: config.subscription?.origin, timeoutMs: config.subscription?.timeoutMs }).catch(() => null),
+  ]);
   if (cred.jwt) {
-    [balance, preview] = await Promise.all([
-      fetchBilling(origin, `/api/v1/zcode-plan/billing/balance?app_version=${encodeURIComponent(appVersion)}&platform=${encodeURIComponent(platform)}`, headers, fetchImpl),
-      fetchBilling(origin, `/api/v1/zcode-plan/billing/preview?app_version=${encodeURIComponent(appVersion)}&platform=${encodeURIComponent(platform)}`, headers, fetchImpl),
-    ]);
     if (balance && !isSuccessfulEnvelope(balance)) errors.push(`balance: ${balance.code} ${balance.msg ?? ""}`.trim());
     if (preview && !isSuccessfulEnvelope(preview)) errors.push(`preview: ${preview.code} ${preview.msg ?? ""}`.trim());
-  } else {
-    errors.push("balance: no plan JWT — credits plane unavailable (re-login to capture it)");
-  }
-
-  // Coding plane: same contract the official usage panel uses for individual
-  // coding plans (`authorization` = the raw API key, personal scope — no team
-  // headers, no `?type=2`). Failures degrade to null like the official
-  // `fetchQuota().catch(() => null)`, never killing the credits data.
+  } else errors.push("balance: no plan JWT — credits plane unavailable (re-login to capture it)");
   let codingPlan: QuotaCodingPlan | null = null;
-  const cOrigin = codingOrigin(config, cred.provider);
   if (cOrigin) {
-    const cEnvelope = await fetchBilling(cOrigin, "/api/monitor/usage/quota/limit", {
-      authorization: credentialString(cred),
-      accept: "application/json",
-    }, fetchImpl);
     if (cEnvelope && isSuccessfulEnvelope(cEnvelope)) {
       const d = (cEnvelope.data ?? {}) as { level?: unknown; limits?: unknown };
       codingPlan = {
         level: typeof d.level === "string" && d.level.trim() !== "" ? d.level.trim() : null,
         limits: (Array.isArray(d.limits) ? d.limits : []).map(parseCodingLimit).filter((l): l is QuotaCodingLimit => l !== null),
       };
-    } else {
-      errors.push(`coding: ${cEnvelope ? `${cEnvelope.code} ${cEnvelope.msg ?? ""}`.trim() : "request failed"}`);
-    }
+    } else errors.push(`coding: ${cEnvelope ? `${cEnvelope.code} ${cEnvelope.msg ?? ""}`.trim() : "request failed"}`);
   }
 
   const balances: QuotaBalanceEntry[] = [];
@@ -290,23 +294,8 @@ export async function collectQuotaSnapshot(
     balances,
     claimablePlans,
     codingPlan,
-    // 3.14.4 supplemental planes — both fail-open (null) on any error to
-    // match the desktop's tolerance of usage:null / availability:unknown.
-    // Gated by config.mcp.usageEnabled (default true) / config.subscription?.checkOnSwitch
-    // (default true when section absent, false when explicitly disabled).
-    mcpUsage: config.mcp.usageEnabled === false
-      ? null
-      : await fetchMcpUsage(cred, {
-          origin,
-          fetchImpl,
-          identity: config.identity,
-        }).catch(() => null),
-    subscriptionAvailability: config.subscription?.checkOnSwitch === false
-      ? null
-      : await fetchSubscriptionAvailability(cred, {
-          fetchImpl,
-          identity: config.identity,
-        }).catch(() => null),
+    mcpUsage,
+    subscriptionAvailability,
     errors,
   };
 }
@@ -356,7 +345,7 @@ export async function collectResetSnapshot(
   fetchImpl: typeof fetch = fetch,
   loadCredentialImpl: typeof loadCredential = loadCredential,
 ): Promise<QuotaResetSnapshot> {
-  const cred = await loadCredentialImpl();
+  const cred = await resolveConfiguredCredential(config, loadCredentialImpl);
   if (!cred) {
     throw new Error("not logged in (run: zcode-proxy auth login)");
   }
@@ -461,7 +450,7 @@ export async function handleQuotaResetAction(
   } catch {
     return errorResponse(400, "reset_invalid_body", "request body must be JSON");
   }
-  const cred = await loadCredentialImpl();
+  const cred = await resolveConfiguredCredential(config, loadCredentialImpl);
   if (!cred) {
     return errorResponse(401, "not_logged_in", "not logged in (run: zcode-proxy auth login)");
   }
@@ -555,7 +544,7 @@ export async function collectClaimSnapshot(
   fetchImpl: typeof fetch = fetch,
   loadCredentialImpl: typeof loadCredential = loadCredential,
 ): Promise<QuotaClaimSnapshot> {
-  const cred = await loadCredentialImpl();
+  const cred = await resolveConfiguredCredential(config, loadCredentialImpl);
   if (!cred) {
     throw new Error("not logged in (run: zcode-proxy auth login)");
   }
@@ -623,7 +612,7 @@ export async function handleQuotaClaimSubmit(
   } catch {
     return errorResponse(400, "claim_invalid_body", "request body must be JSON");
   }
-  const cred = await loadCredentialImpl();
+  const cred = await resolveConfiguredCredential(config, loadCredentialImpl);
   if (!cred) {
     return errorResponse(401, "not_logged_in", "not logged in (run: zcode-proxy auth login)");
   }

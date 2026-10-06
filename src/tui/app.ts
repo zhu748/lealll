@@ -14,10 +14,11 @@
  */
 import { loadConfig } from "../config/loader.js";
 import { updateConfigYaml, ensureConfigFile } from "../config/edit.js";
-import { AuthManager } from "../auth/manager.js";
+import { configuredAuthOptions, createConfiguredAuthManager, resolveConfiguredCredential } from "../auth/selection.js";
+import { createSerialQueue } from "../utils/serial.js";
 import { startServer, type ProxyServer } from "../server/server.js";
 import { buildServerOptions } from "../server/server-options.js";
-import { loadCredential, saveCredential, clearCredentialAsync } from "../auth/store.js";
+import { saveCredential, clearCredentialAsync } from "../auth/store.js";
 import { ZaiOAuthClient, BigmodelOAuthClient, BigmodelPollOAuthClient, LOGIN_TIMEOUT_MS, parsePastedCallbackUrl, type OAuthFlowClient, type OAuthFlowStart, type OAuthFlowTokens } from "../auth/oauth.js";
 import { KeyResolver } from "../auth/resolver.js";
 import { openBrowser } from "../runtime/open-browser.js";
@@ -62,7 +63,7 @@ export async function runTui(args: ServeArgs): Promise<void> {
     process.exit(1);
   }
 
-  const auth = new AuthManager();
+  const auth = createConfiguredAuthManager(config);
   const pane = new LogPane(2000);
   const serverRef: { current: ProxyServer | null } = { current: null };
 
@@ -257,9 +258,19 @@ export async function runTui(args: ServeArgs): Promise<void> {
     else setToast("update check unavailable (offline, or GitHub blocked)", "err");
   });
 
+  const runLifecycle = createSerialQueue();
+  const runAuthMutation = createSerialQueue();
+  let loginEpoch = 0;
+  let closing = false;
+
   // --- auth ----------------------------------------------------------------
   async function refreshAuth(): Promise<void> {
-    const cred = await loadCredential().catch(() => null);
+    const epoch = loginEpoch;
+    const cred = await resolveConfiguredCredential(config).catch(() => null);
+    if (closing || epoch !== loginEpoch) return;
+    auth.updateConfig(configuredAuthOptions(config));
+    if (cred) auth.setOAuthCredential(cred);
+    else auth.clearOAuthCredential();
     state.loggedIn = cred != null;
     state.apiKeyPreview = cred ? `${cred.apiKey.slice(0, 8)}…` : "";
     // Logout hides the quota card (the billing calls need the JWT).
@@ -274,11 +285,13 @@ export async function runTui(args: ServeArgs): Promise<void> {
   async function refreshQuota(): Promise<void> {
     if (quotaFetchInFlight) return;
     quotaFetchInFlight = true;
+    const epoch = loginEpoch;
     const firstFetch = state.quota == null;
     state.quota = { status: "loading", balances: [], coding: null, errors: [], error: "", fetchedAt: Date.now() };
     scheduleRender();
     try {
       const snap: QuotaSnapshot = await collectQuotaSnapshot(config);
+      if (epoch !== loginEpoch || closing) return;
       state.quota = {
         status: "ok",
         balances: snap.balances.map((b) => ({
@@ -305,6 +318,7 @@ export async function runTui(args: ServeArgs): Promise<void> {
         fetchedAt: Date.now(),
       };
     } catch (err) {
+      if (epoch !== loginEpoch || closing) return;
       // Replace the card content with the error — stale balances shown next to
       // a failure would read as current numbers.
       state.quota = {
@@ -318,17 +332,23 @@ export async function runTui(args: ServeArgs): Promise<void> {
       if (!firstFetch) setToast(`quota refresh failed: ${(err as Error).message}`, "err");
     } finally {
       quotaFetchInFlight = false;
+      if (!closing && state.loggedIn && state.quota === null) void refreshQuota();
       scheduleRender();
     }
   }
 
   // --- proxy lifecycle (mirrors the Android startProxy/stopProxy hooks) ----
-  async function startProxy(): Promise<void> {
+  function startProxy(): Promise<void> {
+    return runLifecycle(startProxyNow);
+  }
+  async function startProxyNow(): Promise<void> {
+    if (closing) return;
     if (state.serverStatus === "running" || state.serverStatus === "starting") return;
     state.serverStatus = "starting";
     state.serverError = "";
     scheduleRender();
-    const cred = await loadCredential().catch(() => null);
+    const cred = await resolveConfiguredCredential(config).catch(() => null);
+    if (closing) return;
     if (!cred) {
       state.serverStatus = "stopped";
       setToast("not logged in — press l to login", "err");
@@ -337,6 +357,7 @@ export async function runTui(args: ServeArgs): Promise<void> {
     auth.setOAuthCredential(cred);
     try {
       const s = await startServer(buildServerOptions(config, auth, args.debug, { configPath: path }));
+      if (closing) { s.stop(false); return; }
       serverRef.current = s;
       state.serverStatus = "running";
       state.serverUrl = `http://${s.hostname}:${s.port}`;
@@ -349,7 +370,10 @@ export async function runTui(args: ServeArgs): Promise<void> {
     }
   }
 
-  function stopProxy(): void {
+  function stopProxy(): Promise<void> {
+    return runLifecycle(stopProxyNow);
+  }
+  function stopProxyNow(): void {
     const s = serverRef.current;
     if (!s) return;
     try {
@@ -409,6 +433,10 @@ export async function runTui(args: ServeArgs): Promise<void> {
   }
 
   function applyConfigChange(provider: ProviderId, plan: PlanTier, message: string): void {
+    void runLifecycle(() => applyConfigChangeNow(provider, plan, message));
+  }
+  function applyConfigChangeNow(provider: ProviderId, plan: PlanTier, message: string): void {
+    if (closing) return;
     if (state.serverStatus === "running" || state.serverStatus === "starting") {
       setToast("stop the proxy before switching (press s)", "err");
       return;
@@ -420,10 +448,18 @@ export async function runTui(args: ServeArgs): Promise<void> {
     // while the panel showed the old one.
     try {
       updateConfigYaml(path, { provider, plan });
+      loginEpoch++;
+      void activeOauth?.client.close().catch(() => {});
+      activeOauth = null;
+      state.loginInFlight = false;
+      state.loginHint = "";
       config.provider = provider;
       config.plan = plan;
+      auth.updateConfig(configuredAuthOptions(config));
       state.provider = provider;
       state.plan = plan;
+      state.quota = null;
+      void refreshAuth();
       setToast(message, "ok");
       console.log(`config updated: provider=${provider} plan=${plan}`);
     } catch (err) {
@@ -441,6 +477,7 @@ export async function runTui(args: ServeArgs): Promise<void> {
       return;
     }
     const provider = state.provider;
+    const epoch = ++loginEpoch;
     if (opts.paste && provider !== "bigmodel") {
       setToast("paste login is bigmodel-only — poll login already works headless (press l)", "info");
       return;
@@ -453,24 +490,27 @@ export async function runTui(args: ServeArgs): Promise<void> {
       // concurrent OAuth clients (two browser tabs, two competing
       // settleLogin writers, last-writer-wins on credentials.json).
       state.loginInFlight = true;
+      activeOauth = { client, provider };
       scheduleRender();
       let started: Awaited<ReturnType<BigmodelOAuthClient["start"]>>;
       try {
         started = await client.start();
       } catch (err) {
+        if (epoch !== loginEpoch || closing) { void client.close().catch(() => {}); return; }
+        activeOauth = null;
         state.loginInFlight = false;
         void client.close().catch(() => {});
         setToast(`login failed: ${(err as Error).message}`, "err");
         scheduleRender();
         return;
       }
-      activeOauth = { client, provider };
+      if (epoch !== loginEpoch || closing) { void client.close().catch(() => {}); return; }
       console.log(`OAuth: opening ${started.authorizeUrl}`);
       console.log("If the browser did not open, copy the URL above into a browser.");
       openBrowser(started.authorizeUrl);
       state.loginHint = "paste the callback URL in the terminal…";
       scheduleRender();
-      settleLogin(runPasteLoginInTui(client, started), client, provider);
+      settleLogin(runPasteLoginInTui(client, started), client, provider, epoch);
       return;
     }
 
@@ -479,18 +519,21 @@ export async function runTui(args: ServeArgs): Promise<void> {
     const client: OAuthFlowClient = provider === "bigmodel" ? new BigmodelPollOAuthClient() : new ZaiOAuthClient();
     // Guard before the first await (see the paste branch above).
     state.loginInFlight = true;
+    activeOauth = { client, provider };
     scheduleRender();
     let started: Awaited<ReturnType<OAuthFlowClient["start"]>>;
     try {
       started = await client.start();
     } catch (err) {
+      if (epoch !== loginEpoch || closing) { void client.close().catch(() => {}); return; }
+      activeOauth = null;
       state.loginInFlight = false;
       void client.close().catch(() => {});
       setToast(`login failed: ${(err as Error).message}`, "err");
       scheduleRender();
       return;
     }
-    activeOauth = { client, provider };
+    if (epoch !== loginEpoch || closing) { void client.close().catch(() => {}); return; }
     state.loginHint = "waiting for browser authorization…";
     console.log(`OAuth: opening ${started.authorizeUrl}`);
     console.log("If the browser did not open, copy the URL above into a browser (any device works).");
@@ -500,7 +543,7 @@ export async function runTui(args: ServeArgs): Promise<void> {
     openBrowser(started.authorizeUrl);
     scheduleRender();
 
-    settleLogin(client.complete(started), client, provider);
+    settleLogin(client.complete(started), client, provider, epoch);
   }
 
   /** `L` key: start a classic paste login (bigmodel fallback for the poll flow). */
@@ -517,23 +560,27 @@ export async function runTui(args: ServeArgs): Promise<void> {
   }
 
   /** Shared completion tail: resolve key, save, and ALWAYS close the client. */
-  function settleLogin(pending: Promise<OAuthFlowTokens>, client: OAuthFlowClient, provider: ProviderId): void {
+  function settleLogin(pending: Promise<OAuthFlowTokens>, client: OAuthFlowClient, provider: ProviderId, epoch: number): void {
     pending.then(async (tokens) => {
       // Logout-during-login guard: if this client was closed (activeOauth
       // cleared/replaced), the user abandoned the flow — saving here would
       // resurrect the credential they just deleted.
-      if (activeOauth?.client !== client) {
+      if (activeOauth?.client !== client || epoch !== loginEpoch || closing) {
         console.log(`OAuth flow for ${provider} was cancelled — ignoring late result`);
         return;
       }
       const resolver = new KeyResolver();
       const cred = await resolver.resolveCodingPlanCredential(tokens.accessToken, provider, tokens.userId);
       if (tokens.jwt) cred.jwt = tokens.jwt;
-      await saveCredential(cred);
+      await runAuthMutation(async () => {
+        if (epoch === loginEpoch && activeOauth?.client === client && !closing) await saveCredential(cred);
+      });
+      if (epoch !== loginEpoch || closing) return;
       if (serverRef.current) auth.setOAuthCredential(cred);
       console.log(`OAuth completed for ${provider}`);
       setToast("logged in", "ok");
     }).catch((err: unknown) => {
+      if (epoch !== loginEpoch || closing) return;
       const msg = (err as Error)?.message ?? String(err);
       console.error(`OAuth flow ended without success: ${msg}`);
       setToast(`login failed: ${msg}`, "err");
@@ -541,7 +588,8 @@ export async function runTui(args: ServeArgs): Promise<void> {
       // MUST run on rejection too — otherwise the callback port leaks
       // (fixed Android bug 5746857, same discipline applies here).
       void client.close().catch(() => {});
-      if (activeOauth?.client === client) activeOauth = null;
+      if (activeOauth?.client !== client || epoch !== loginEpoch || closing) return;
+      activeOauth = null;
       state.loginInFlight = false;
       state.loginHint = "";
       void refreshAuth();
@@ -587,6 +635,7 @@ export async function runTui(args: ServeArgs): Promise<void> {
       setToast("stop the proxy before logging out (press s)", "err");
       return;
     }
+    loginEpoch++;
     if (activeOauth) {
       void activeOauth.client.close().catch(() => {});
       activeOauth = null;
@@ -597,7 +646,8 @@ export async function runTui(args: ServeArgs): Promise<void> {
       // Mutex-safe logout: the TUI can run an in-process proxy whose requests
       // hold the store write lock — the sync variant could race a withStoreLock
       // save and resurrect the credentials file after the unlink.
-      await clearCredentialAsync();
+      await runAuthMutation(clearCredentialAsync);
+      auth.clearOAuthCredential();
     } catch { /* best-effort logout */ }
     await refreshAuth();
     if (serverRef.current) setToast("logged out — restart the proxy to apply", "info");
@@ -693,6 +743,9 @@ export async function runTui(args: ServeArgs): Promise<void> {
     process.exit(0);
   }
   function cleanup(): void {
+    closing = true;
+    loginEpoch++;
+    void activeOauth?.client.close().catch(() => {});
     restore();
     restoreConsole();
     restoreStdio();

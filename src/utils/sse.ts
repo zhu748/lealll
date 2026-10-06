@@ -10,6 +10,7 @@
 // v0.3.7.1: host-captured timer — see utils/host-timers.ts (the bare global
 // is shadowed by the captcha solver's window alias during solve epochs).
 import { hostSetTimeout } from "./host-timers.js";
+import { waitForStreamCapacity } from "./stream.js";
 
 export interface ParsedSSE {
   /** Event type from the `event:` line, or "" if absent. */
@@ -138,6 +139,7 @@ export async function waitForBackpressure(
   maxYieldMs: number = 1,
   maxWaitMs: number = 25,
 ): Promise<void> {
+  if (await waitForStreamCapacity(controller)) return;
   // desiredSize === null means the controller is errored or closed — caller
   // will get an exception on enqueue, which they should handle.
   // desiredSize <= 0 means the consumer is behind — yield to the event loop

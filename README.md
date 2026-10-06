@@ -18,6 +18,12 @@
 
 ---
 
+## v4.7.8-fork.1 恢复说明
+
+补回前两轮上游功能对齐与可靠性优化，并保留第三轮代码分类成果。恢复基准为上游 `17933d2`，涵盖视频/文档输入、Responses 流式失败、独立面板、更新检查与跨端额度展示；同时修复凭据模式串用、登录与启停竞争、重复额度请求、流式清理、缓存字节预算和面板草稿覆盖。
+
+原有 `/admin`、多账号、代理池、统计、MCP、验证码、闲时通道、领取和重置继续保留。详见 [功能恢复记录](docs/upstream-parity.md)、[优化与验证记录](docs/optimization-review.md) 和 [版本使用说明](release/README.md)。
+
 ## 🍴 Fork 合并版说明（v4.7.1-fork.1）
 
 本仓库是 [TriDefender/zcode-api](https://github.com/TriDefender/zcode-api) v4.7.1 与 [zhu748/lealll](https://github.com/zhu748/lealll)（fork，v0.3.10.11）的**合并版**：以上游最新架构为基座（领取优惠 / MCP 反代 / TUI / 验证码 worker / V4 签名），并完整移植了 fork 的自研能力：

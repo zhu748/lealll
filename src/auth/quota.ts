@@ -167,7 +167,7 @@ async function readChunkWithTimeout(
 }
 
 /** Shared byte/time-capped JSON body reader (also used by client-config's CDN fetch). */
-export async function readJsonLimited(resp: Response, maxBytes = MAX_QUOTA_JSON_BYTES, timeoutMs = REQUEST_TIMEOUT_MS): Promise<any> {
+export async function readJsonLimited(resp: Response, maxBytes = MAX_QUOTA_JSON_BYTES, timeoutMs = REQUEST_TIMEOUT_MS, signal?: AbortSignal): Promise<any> {
   const limit = Math.max(1, Math.floor(maxBytes));
   const readTimeoutMs = normalizeTimerMs(timeoutMs);
   const declaredLength = parseContentLength(resp.headers);
@@ -178,11 +178,21 @@ export async function readJsonLimited(resp: Response, maxBytes = MAX_QUOTA_JSON_
   if (!resp.body) return {};
 
   const reader = resp.body.getReader();
+  const abort = () => { void reader.cancel(signal?.reason).catch(() => {}); };
+  if (signal?.aborted) abort();
+  else signal?.addEventListener("abort", abort, { once: true });
+  const deadlineAt = Date.now() + readTimeoutMs;
   const chunks: Uint8Array[] = [];
   let total = 0;
   try {
     for (;;) {
-      const { done, value } = await readChunkWithTimeout(reader, readTimeoutMs);
+      if (signal?.aborted) throw signal.reason ?? new Error("request cancelled");
+      if (Date.now() >= deadlineAt) {
+        const error = new Error(`quota JSON response read timeout after ${readTimeoutMs}ms`);
+        void reader.cancel(error).catch(() => {});
+        throw error;
+      }
+      const { done, value } = await readChunkWithTimeout(reader, Math.max(1, deadlineAt - Date.now()));
       if (done) break;
       if (!value) continue;
       total += value.byteLength;
@@ -193,6 +203,7 @@ export async function readJsonLimited(resp: Response, maxBytes = MAX_QUOTA_JSON_
       chunks.push(value);
     }
   } finally {
+    signal?.removeEventListener("abort", abort);
     try { reader.releaseLock(); } catch {}
   }
 

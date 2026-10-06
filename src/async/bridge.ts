@@ -1,3 +1,5 @@
+import { withAbort } from "../utils/abort.js";
+import { createBackpressuredStream, waitForStreamCapacity } from "../utils/stream.js";
 /**
  * Async bridge: core state machine turning sync client stream expectation
  * into off-peak async reality. See `.omo/plans/async-off-peak-bridge.md` §3.
@@ -73,7 +75,18 @@ export function runAsyncBridge(opts: BridgeOptions): { stream: ReadableStream<Ui
     outcomeResolve(o);
   }
 
+  let currentTicket = opts.initialTicket;
+  let attempt = 0;
   let aborted = false;
+  const cancellation = new AbortController();
+  let activeReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  const abort = () => {
+    aborted = true;
+    cancellation.abort(opts.clientSignal?.reason ?? new Error("client cancelled"));
+    void activeReader?.cancel(cancellation.signal.reason).catch(() => {});
+    settleOnce(currentTicket.ticketId);
+    resolveOutcome({ attempts: attempt + 1, finalTicketId: currentTicket.ticketId, terminalPhase: "abort" });
+  };
   const settledTickets = new Set<string>();
   function settleOnce(ticketId: string): void {
     if (settledTickets.has(ticketId)) return;
@@ -83,6 +96,8 @@ export function runAsyncBridge(opts: BridgeOptions): { stream: ReadableStream<Ui
     });
   }
 
+  if (opts.clientSignal?.aborted) abort();
+  else opts.clientSignal?.addEventListener("abort", abort, { once: true });
   function log(info: BridgeTransition): void {
     try {
       opts.onTransition?.(info);
@@ -92,7 +107,7 @@ export function runAsyncBridge(opts: BridgeOptions): { stream: ReadableStream<Ui
   }
 
   function emitKeepalive(controller: ReadableStreamDefaultController<Uint8Array>): void {
-    if (aborted) return;
+    if (aborted || (controller.desiredSize ?? 0) <= 0) return;
     try {
       controller.enqueue(keepaliveFrame());
     } catch {
@@ -136,10 +151,10 @@ export function runAsyncBridge(opts: BridgeOptions): { stream: ReadableStream<Ui
         // remainder and report a deadline overrun (NOT "expired" — an early
         // `expired` here used to send the caller into the retake loop against
         // the same deadline until maxRetries burned out).
-        await sleep(Math.max(0, deadlineAt - Date.now()), opts.clientSignal);
+        await sleep(Math.max(0, deadlineAt - Date.now()), cancellation.signal);
         return { state: "expired" as TicketState, maxWaitExceeded: true };
       }
-      await sleep(delay, opts.clientSignal);
+      await sleep(delay, cancellation.signal);
     }
   }
 
@@ -156,14 +171,14 @@ export function runAsyncBridge(opts: BridgeOptions): { stream: ReadableStream<Ui
     const retryDelayMs = Math.min(opts.pollIntervalMs, 2000);
     let lastErr: unknown;
     for (let attempt = 1; attempt <= POLL_RETRY_LIMIT; attempt++) {
-      if (aborted || opts.clientSignal?.aborted) throw lastErr ?? new Error("client aborted during poll");
+      if (aborted || cancellation.signal?.aborted) throw lastErr ?? new Error("client aborted during poll");
       try {
-        return await opts.client.batchStatus([ticketId], opts.clientSignal);
+        return await withAbort(opts.client.batchStatus([ticketId], cancellation.signal), cancellation.signal);
       } catch (err) {
         lastErr = err;
         // Client disconnected mid-poll — retrying would delay the abort path.
-        if (aborted || opts.clientSignal?.aborted) throw err;
-        if (attempt < POLL_RETRY_LIMIT) await sleep(retryDelayMs, opts.clientSignal);
+        if (aborted || cancellation.signal?.aborted) throw err;
+        if (attempt < POLL_RETRY_LIMIT) await sleep(retryDelayMs, cancellation.signal);
       }
     }
     throw lastErr;
@@ -181,15 +196,19 @@ export function runAsyncBridge(opts: BridgeOptions): { stream: ReadableStream<Ui
     if (opts.credentials.bigmodelOrganization) headers["bigmodel-organization"] = opts.credentials.bigmodelOrganization;
     if (opts.credentials.bigmodelProject) headers["bigmodel-project"] = opts.credentials.bigmodelProject;
 
-    const resp = await fetchImpl(url, {
+    const pending = fetchImpl(url, {
       method: "POST",
       headers,
       body: opts.llmRequestBody,
-      signal: opts.clientSignal,
+      signal: cancellation.signal,
+    }).then(response => {
+      if (aborted) { void response.body?.cancel().catch(() => {}); throw cancellation.signal.reason; }
+      return response;
     });
+    const resp = await withAbort(pending, cancellation.signal);
 
     if (!resp.ok) {
-      const bodyText = await resp.text().catch(() => "");
+      const bodyText = await withAbort(resp.text(), cancellation.signal).catch(() => "");
       if (bodyText.includes(EXPIRED_MARKER)) {
         return { response: new Response(bodyText, { status: resp.status, headers: resp.headers }), expiredInBody: true };
       }
@@ -198,14 +217,8 @@ export function runAsyncBridge(opts: BridgeOptions): { stream: ReadableStream<Ui
     return { response: resp, expiredInBody: false };
   }
 
-  const stream = new ReadableStream<Uint8Array>({
+  const stream = createBackpressuredStream({
     async start(controller) {
-      // External signal → local aborted flag. Both paths (consumer cancel + signal abort) converge here.
-      if (opts.clientSignal) {
-        if (opts.clientSignal.aborted) aborted = true;
-        else opts.clientSignal.addEventListener("abort", () => { aborted = true; }, { once: true });
-      }
-
       // Keepalive runs ONLY during WAIT/retry phases; stopped before LLM streaming to
       // avoid inserting `: keepalive\n\n` inside a partial SSE frame split across chunks.
       let keepAliveTimer: ReturnType<typeof setInterval> | undefined;
@@ -228,8 +241,8 @@ export function runAsyncBridge(opts: BridgeOptions): { stream: ReadableStream<Ui
       const requestStartedAt = Date.now();
       const deadlineAt = opts.maxWaitMs > 0 ? requestStartedAt + opts.maxWaitMs : Number.MAX_SAFE_INTEGER;
 
-      let currentTicket = opts.initialTicket;
-      let attempt = 0;
+
+
 
       try {
         while (true) {
@@ -278,7 +291,7 @@ export function runAsyncBridge(opts: BridgeOptions): { stream: ReadableStream<Ui
                 return;
               }
               try {
-                currentTicket = await opts.client.takeTicket(opts.taskId, opts.clientSignal);
+                currentTicket = await withAbort(opts.client.takeTicket(opts.taskId, cancellation.signal), cancellation.signal);
               } catch (takeErr) {
                 emitTerminalError(controller, `async retake failed: ${(takeErr as Error).message}`, "api_error");
                 resolveOutcome({ attempts: attempt, finalTicketId: currentTicket.ticketId, terminalPhase: "error" });
@@ -320,7 +333,7 @@ export function runAsyncBridge(opts: BridgeOptions): { stream: ReadableStream<Ui
                 return;
               }
               try {
-                currentTicket = await opts.client.takeTicket(opts.taskId, opts.clientSignal);
+                currentTicket = await withAbort(opts.client.takeTicket(opts.taskId, cancellation.signal), cancellation.signal);
               } catch (takeErr) {
                 emitTerminalError(controller, `async retake failed: ${(takeErr as Error).message}`, "api_error");
                 resolveOutcome({ attempts: attempt, finalTicketId: currentTicket.ticketId, terminalPhase: "error" });
@@ -361,6 +374,7 @@ export function runAsyncBridge(opts: BridgeOptions): { stream: ReadableStream<Ui
           let committed = false;
           if (resp.body) {
             const reader = resp.body.getReader();
+            activeReader = reader;
             const streamDecoder = new TextDecoder();
             let pending = "";
             // A CRLF pair split across network chunks (this chunk ends with
@@ -388,7 +402,7 @@ export function runAsyncBridge(opts: BridgeOptions): { stream: ReadableStream<Ui
                       else midStreamExpiredPostCommit = true;
                     } else if (pending.endsWith("\n\n")) {
                       // Properly terminated final frame — safe to forward.
-                      try { controller.enqueue(encoder.encode(pending)); } catch {}
+                      try { await waitForStreamCapacity(controller, cancellation.signal); controller.enqueue(encoder.encode(pending)); } catch {}
                     }
                     // else: unterminated event at EOF — discard per SSE spec.
                     pending = "";
@@ -434,6 +448,7 @@ export function runAsyncBridge(opts: BridgeOptions): { stream: ReadableStream<Ui
                     break;
                   }
                   try {
+                    await waitForStreamCapacity(controller, cancellation.signal);
                     controller.enqueue(encoder.encode(frame));
                     committed = true;
                   } catch {
@@ -453,6 +468,7 @@ export function runAsyncBridge(opts: BridgeOptions): { stream: ReadableStream<Ui
                 crCarry = "";
               }
             } finally {
+              activeReader = undefined;
               reader.releaseLock?.();
             }
           }
@@ -467,7 +483,7 @@ export function runAsyncBridge(opts: BridgeOptions): { stream: ReadableStream<Ui
               return;
             }
             try {
-              currentTicket = await opts.client.takeTicket(opts.taskId, opts.clientSignal);
+              currentTicket = await withAbort(opts.client.takeTicket(opts.taskId, cancellation.signal), cancellation.signal);
             } catch (takeErr) {
               emitTerminalError(controller, `async retake failed: ${(takeErr as Error).message}`, "api_error");
               resolveOutcome({ attempts: attempt, finalTicketId: currentTicket.ticketId, terminalPhase: "error" });
@@ -506,6 +522,7 @@ export function runAsyncBridge(opts: BridgeOptions): { stream: ReadableStream<Ui
         resolveOutcome({ attempts: attempt + 1, finalTicketId: currentTicket.ticketId, terminalPhase: "error" });
       } finally {
         stopKeepalive();
+        opts.clientSignal?.removeEventListener("abort", abort);
         try {
           controller.close();
         } catch {
@@ -522,7 +539,8 @@ export function runAsyncBridge(opts: BridgeOptions): { stream: ReadableStream<Ui
     },
 
     cancel() {
-      aborted = true;
+      abort();
+      settleOnce(currentTicket.ticketId);
     },
   });
 

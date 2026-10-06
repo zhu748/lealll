@@ -7,6 +7,7 @@ import type { AnthropicStreamEvent, AnthropicUsage, OpenAIStreamChunk, OpenAIStr
 import { openaiUsageToAnthropic } from "./anthropic-to-openai.js";
 import { anthropicUsageToOpenAI } from "./openai-to-anthropic.js";
 import { parseSSEChunk } from "../utils/sse.js";
+import { createBackpressuredStream } from "../utils/stream.js";
 import { waitForBackpressure } from "../utils/sse.js";
 
 // Re-export the shared spec-correct parser (multi-line `data:` fields joined,
@@ -99,14 +100,19 @@ export function anthropicSseToOpenaiSse(
   const encoder = new TextEncoder();
   let buffer = "";
 
-  return new ReadableStream({
+  let upstreamReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  let cancelled = false;
+  return createBackpressuredStream({
     async start(controller) {
+      if (cancelled) return;
       const reader = upstream.getReader();
+      upstreamReader = reader;
       let errored = false;
 
       try {
         while (true) {
           const { done, value } = await reader.read();
+          if (cancelled) return;
           if (done) break;
 
           buffer += decoder.decode(value, { stream: true });
@@ -127,6 +133,7 @@ export function anthropicSseToOpenaiSse(
           }
         }
 
+        if (cancelled) return;
         // Flush remaining buffer
         if (buffer.trim()) {
           const parsed = parseSSEChunk(buffer);
@@ -151,9 +158,11 @@ export function anthropicSseToOpenaiSse(
         if (!errored) {
           try { controller.close(); } catch {}
         }
+        upstreamReader = undefined;
         reader.releaseLock();
       }
     },
+    cancel(reason) { cancelled = true; void (upstreamReader ? upstreamReader.cancel(reason) : upstream.cancel(reason)).catch(() => {}); },
   });
 }
 
@@ -307,9 +316,13 @@ export function openaiSseToAnthropicSse(
   let messageStopped = false;
   const messageId = `msg_${Date.now()}`;
 
-  return new ReadableStream({
+  let upstreamReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  let cancelled = false;
+  return createBackpressuredStream({
     async start(controller) {
+      if (cancelled) return;
       const reader = upstream.getReader();
+      upstreamReader = reader;
       let errored = false;
 
       // Every emit awaits backpressure first: a slow downstream client must
@@ -593,6 +606,7 @@ export function openaiSseToAnthropicSse(
       try {
         while (true) {
           const { done, value } = await reader.read();
+          if (cancelled) return;
           if (done) break;
 
           buffer += decoder.decode(value, { stream: true });
@@ -604,6 +618,7 @@ export function openaiSseToAnthropicSse(
           }
         }
 
+        if (cancelled) return;
         // Flush a trailing frame that lacked its final blank-line terminator
         // (the old line splitter consumed it; frame splitting needs this).
         if (buffer.trim()) {
@@ -616,15 +631,18 @@ export function openaiSseToAnthropicSse(
         await finalizeStream();
       } catch (err) {
         errored = true;
+        void reader.cancel(err).catch(() => {});
         // error()/close() 互斥:errored 流上再 close() 会抛 TypeError,进而触发 Bun 引擎空指针崩溃。
         try { controller.error(err); } catch {}
       } finally {
         if (!errored) {
           try { controller.close(); } catch {}
         }
+        upstreamReader = undefined;
         reader.releaseLock();
       }
     },
+    cancel(reason) { cancelled = true; void (upstreamReader ? upstreamReader.cancel(reason) : upstream.cancel(reason)).catch(() => {}); },
   });
 }
 

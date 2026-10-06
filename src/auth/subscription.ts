@@ -39,7 +39,7 @@ import type { Credential, PlanId } from "./types.js";
 import type { ProxyIdentity } from "../config/types.js";
 import { DEFAULT_APP_VERSION } from "../config/loader.js";
 import { buildIdentityHeaders } from "../proxy/identity.js";
-import { hostSetTimeout, hostClearTimeout } from "../utils/host-timers.js";
+import { fetchJsonWithDeadline } from "../utils/fetch-json.js";
 
 /** Default origin of the z.ai biz plane (subscription list lives here, not zcode.z.ai). */
 export const DEFAULT_SUBSCRIPTION_ORIGIN = "https://api.z.ai";
@@ -118,44 +118,18 @@ export async function fetchSubscriptionAvailability(
     accept: "application/json",
   };
 
-  const controller = new AbortController();
-  // Host-safe timer, armed until BODY consumption finishes (a stalled body
-  // previously had no timeout once headers arrived). See utils/host-timers.ts.
-  const timer = hostSetTimeout(() => controller.abort(), timeoutMs);
-  try {
-    let resp: Response;
-    try {
-      resp = await fetchImpl(`${origin}/api/biz/subscription/list`, {
-        method: "GET",
-        headers,
-        signal: controller.signal,
-      });
-    } catch {
-      return { kind: "unknown", count: 0 };
-    }
-    if (!resp.ok) {
-      void resp.body?.cancel().catch(() => {});
-      return { kind: "unknown", count: 0 };
-    }
-    let envelope: { code?: unknown; data?: unknown };
-    try {
-      envelope = await resp.json();
-    } catch {
-      return { kind: "unknown", count: 0 };
-    }
-    if (typeof envelope !== "object" || envelope === null) {
-      return { kind: "unknown", count: 0 };
-    }
-    // The z.ai biz plane uses BigModel envelope: {code, msg?, data?: [...]}.
-    // Any non-zero code → unknown (fail-open; do not penalize transient 3103).
-    const code = (envelope as { code?: unknown }).code;
-    if (typeof code !== "number" || code !== 0) {
-      return { kind: "unknown", count: 0 };
-    }
-    const data = (envelope as { data?: unknown }).data;
-    const count = Array.isArray(data) ? data.length : 0;
-    return { kind: count > 0 ? "available" : "unavailable", count };
-  } finally {
-    hostClearTimeout(timer);
+  const envelope = await fetchJsonWithDeadline(`${origin}/api/biz/subscription/list`, { method: "GET", headers }, fetchImpl, timeoutMs).catch(() => null);
+  if (envelope === null) return { kind: "unknown", count: 0 };
+  if (typeof envelope !== "object" || envelope === null) {
+    return { kind: "unknown", count: 0 };
   }
+  // The z.ai biz plane uses BigModel envelope: {code, msg?, data?: [...]}.
+  // Any non-zero code → unknown (fail-open; do not penalize transient 3103).
+  const code = (envelope as { code?: unknown }).code;
+  if (typeof code !== "number" || code !== 0) {
+    return { kind: "unknown", count: 0 };
+  }
+  const data = (envelope as { data?: unknown }).data;
+  const count = Array.isArray(data) ? data.length : 0;
+  return { kind: count > 0 ? "available" : "unavailable", count };
 }

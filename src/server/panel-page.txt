@@ -208,22 +208,52 @@
         $("conn").textContent = text;
       }
 
-      async function cmd(payload) {
-        const res = await fetch("/api/control", {
-          method: "POST",
-          headers: { "content-type": "application/json", authorization: "Bearer " + token },
-          body: JSON.stringify(payload),
-        });
-        let body;
-        try {
-          body = await res.json();
-        } catch (err) {
-          body = { ok: false, error: "invalid_response" };
-        }
-        lastCommand = { request: payload, status: res.status, response: body };
-        render(lastCommand);
-        if (res.status === 401) setConn("bad", "unauthorized");
-        return body;
+      const commandsInFlight = new Map();
+      const commandControllers = new Set();
+      let commandEpoch = 0;
+      let configDirty = false;
+      let configDraftVersion = 0;
+      let loginPollTimer;
+
+      function cmd(payload) {
+        const readonly = ["status", "getLogs", "quota"].includes(payload.cmd);
+        const requestToken = token;
+        if (!readonly) commandEpoch++;
+        const epoch = commandEpoch;
+        const key = JSON.stringify([requestToken, epoch, payload]);
+        if (commandsInFlight.has(key)) return commandsInFlight.get(key);
+        const pending = (async () => {
+          const controller = new AbortController();
+          commandControllers.add(controller);
+          let rejectAbort;
+          const aborted = new Promise((_, reject) => { rejectAbort = reject; });
+          const onAbort = () => rejectAbort(new Error("request cancelled or timed out"));
+          controller.signal.addEventListener("abort", onAbort, { once: true });
+          const timer = setTimeout(() => controller.abort(), 20000);
+          try {
+            const res = await Promise.race([fetch("/api/control", {
+              method: "POST",
+              headers: { "content-type": "application/json", authorization: "Bearer " + requestToken },
+              body: JSON.stringify(payload), signal: controller.signal,
+            }), aborted]);
+            const body = await Promise.race([res.json(), aborted]);
+            if (requestToken !== token || epoch !== commandEpoch) return { ok: false, stale: true };
+            lastCommand = { request: payload, status: res.status, response: body };
+            render(lastCommand);
+            if (res.status === 401) setConn("bad", "unauthorized");
+            return body;
+          } catch (err) {
+            if (requestToken !== token || epoch !== commandEpoch) return { ok: false, stale: true };
+            return { ok: false, error: err.message || "invalid_response" };
+          } finally {
+            clearTimeout(timer);
+            controller.signal.removeEventListener("abort", onAbort);
+            commandControllers.delete(controller);
+          }
+        })();
+        commandsInFlight.set(key, pending);
+        void pending.finally(() => { if (commandsInFlight.get(key) === pending) commandsInFlight.delete(key); });
+        return pending;
       }
 
       function esc(value) {
@@ -241,8 +271,9 @@
       }
 
       async function refreshStatus() {
-        if (!token) return;
+        if (!token || document.hidden) return;
         const r = await cmd({ cmd: "status" });
+        if (r.stale) return;
         if (!r.ok) {
           setConn("bad", r.error || "error");
           return;
@@ -254,8 +285,10 @@
         $("s-port").textContent = r.proxyPort ? "listening on " + r.proxyPort : "stopped";
         $("s-login").textContent = r.loggedIn ? "yes" : "no — use Login below";
         $("s-login").className = r.loggedIn ? "" : "danger";
-        $("cfg-provider").value = r.provider;
-        $("cfg-plan").value = r.plan;
+        if (!configDirty) {
+          $("cfg-provider").value = r.provider;
+          $("cfg-plan").value = r.plan;
+        }
         $("start").disabled = !!r.proxyPort;
         $("stop").disabled = !r.proxyPort;
       }
@@ -323,6 +356,7 @@
         lastQuotaAt = now;
         $("quota-age").textContent = "loading…";
         const r = await cmd({ cmd: "quota" });
+        if (r.stale) return;
         if (r.ok && r.quota) {
           renderQuota(r.quota);
           $("quota-age").textContent = "updated " + new Date().toLocaleTimeString();
@@ -333,7 +367,7 @@
       }
 
       async function pollLogs() {
-        if (!token || !document.getElementById("logs-auto").checked) return;
+        if (!token || document.hidden || !document.getElementById("logs-auto").checked) return;
         const r = await cmd({ cmd: "getLogs", since: logCursor });
         if (!r.ok) return;
         logCursor = r.nextSince;
@@ -348,8 +382,10 @@
 
       async function startLogin(provider) {
         if (!token) return;
+        clearInterval(loginPollTimer);
         $("login-body").innerHTML = '<span class="muted">requesting authorize URL…</span>';
         const r = await cmd({ cmd: "startOAuth", provider });
+        if (r.stale) return;
         if (!r.ok) {
           $("login-body").innerHTML = '<span class="danger">' + esc(r.error) + "</span>";
           return;
@@ -360,22 +396,35 @@
         // The server finishes the flow by itself (polling login, no local
         // callback needed), so poll briefly to flip the status card.
         let tries = 0;
-        const timer = setInterval(async () => {
+        loginPollTimer = setInterval(async () => {
           tries += 1;
           await refreshStatus();
-          if (loggedIn || tries >= 100) clearInterval(timer);
+          if (loggedIn || tries >= 100) clearInterval(loginPollTimer);
         }, 3000);
       }
 
       async function guard(label, payload) {
         if (!token) return;
+        const draftVersion = configDraftVersion;
+        if (payload.cmd === "logout") clearInterval(loginPollTimer);
         const r = await cmd(payload);
+        if (r.stale) return;
+        if (r.ok && payload.cmd === "setConfig" && draftVersion === configDraftVersion) configDirty = false;
         if (!r.ok) $("cfg-note").textContent = label + ": " + r.error;
         else $("cfg-note").textContent = label + ": ok";
         await refreshStatus();
       }
 
+      for (const id of ["cfg-provider", "cfg-plan"]) {
+        $(id).onchange = () => { configDirty = true; configDraftVersion++; };
+      }
+
       $("connect").onclick = async () => {
+        commandEpoch++;
+        for (const controller of commandControllers) controller.abort();
+        commandsInFlight.clear();
+        clearInterval(loginPollTimer);
+        configDirty = false;
         token = $("token").value.trim();
         localStorage.setItem(STORAGE_KEY, token);
         logCursor = 0;

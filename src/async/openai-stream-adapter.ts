@@ -20,6 +20,7 @@
  * duplicate finish reasons.
  */
 import { initState, parseSSEChunk, translateEvent, SSE_FRAME_SPLIT, type TranslationState, type ParsedSSE } from "../translator/sse-translator.js";
+import { createBackpressuredStream } from "../utils/stream.js";
 import { waitForBackpressure } from "../utils/sse.js";
 
 export function anthropicSseToOpenaiSseWithKeepalive(
@@ -35,11 +36,12 @@ export function anthropicSseToOpenaiSseWithKeepalive(
   async function emit(out: string): Promise<void> {
     if (errored) return;
     try {
+      await waitForBackpressure(controller0);
+      if (errored) return;
       controller0.enqueue(encoder.encode(out));
       // Mirror the shared translator's backpressure contract: a slow (but
       // connected) OpenAI client must slow the pump down instead of letting
       // the translated queue grow unbounded for the whole generation.
-      await waitForBackpressure(controller0);
     } catch {
       // controller closed by consumer
     }
@@ -51,19 +53,21 @@ export function anthropicSseToOpenaiSseWithKeepalive(
   // Hoisted upstream reader so cancel() can stop the pump immediately.
   let upstreamReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
 
-  return new ReadableStream<Uint8Array>({
-    start(controller) {
+  return createBackpressuredStream({
+    async start(controller) {
+      if (errored) return;
       controller0 = controller;
       const reader = upstream.getReader();
       upstreamReader = reader;
       let buffer = "";
 
-      reader.read().then(async function pump({ done, value }): Promise<unknown | undefined> {
+      await reader.read().then(async function pump({ done, value }): Promise<unknown | undefined> {
+        if (errored) return;
         if (done) {
           // Flush trailing buffer
           if (buffer.trim()) await processBlock(buffer, state);
           buffer = "";
-          emitDone();
+          await emitDone();
           try { controller.close(); } catch {}
           return;
         }
@@ -82,11 +86,11 @@ export function anthropicSseToOpenaiSseWithKeepalive(
           }
         }
         return reader.read().then(pump);
-      }).catch((err) => {
+      }).catch(async (err) => {
         if (!errored) {
           const errPayload = JSON.stringify({ error: { message: `async stream error: ${(err as Error).message}`, type: "server_error" } });
-          void emit(`data: ${errPayload}\n\n`);
-          emitDone();
+          await emit(`data: ${errPayload}\n\n`);
+          await emitDone();
         }
         try { controller.close(); } catch {}
       }).finally(() => {
@@ -95,11 +99,11 @@ export function anthropicSseToOpenaiSseWithKeepalive(
       });
     },
 
-    cancel() {
+    cancel(reason) {
       // Consumer disconnected mid-stream: flip errored so the pending pump
       // iteration stops, and cancel the upstream reader.
       errored = true;
-      upstreamReader?.cancel().catch(() => {});
+      void (upstreamReader ? upstreamReader.cancel(reason) : upstream.cancel(reason)).catch(() => {});
     },
   });
 
@@ -135,7 +139,7 @@ export function anthropicSseToOpenaiSseWithKeepalive(
       }
       const oaiPayload = JSON.stringify({ error: { message: anthropicMsg, type: anthropicType } });
       await emit(`data: ${oaiPayload}\n\n`);
-      emitDone();
+      await emitDone();
       errored = true;
       return;
     }
@@ -148,10 +152,10 @@ export function anthropicSseToOpenaiSseWithKeepalive(
     }
   }
 
-  function emitDone(): void {
+  async function emitDone(): Promise<void> {
     if (doneSent) return;
     doneSent = true;
-    emit("data: [DONE]\n\n");
+    await emit("data: [DONE]\n\n");
   }
 }
 
