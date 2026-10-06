@@ -2,9 +2,8 @@
  * End-to-end tests for the SOCKS bridge.
  *
  * These tests spin up a tiny SOCKS5 / SOCKS4 server in-process (with real
- * tunneling to the public internet) and verify Bun's native fetch can reach
- * a real HTTPS target through the bridge. They make real network calls —
- * if the test environment has no outbound internet, they'll fail.
+ * tunneling to a loopback TLS server) and verify Bun's native fetch can reach
+ * an HTTPS target through the bridge without requiring outbound internet.
  *
  * Tests:
  *   - SOCKS5 without auth → fetch reaches real HTTPS target
@@ -22,9 +21,12 @@ import {
   _shutdownAllBridgesForTesting,
 } from "./socks-bridge.js";
 import { proxiedFetch } from "./proxied-fetch.js";
+import { readFileSync } from "node:fs";
 
-// Real HTTPS target — picked because it's stable and CORS-friendly.
-const TARGET = "https://www.example.com/";
+// Public test-only certificate/key: never use these fixtures for a deployed server.
+const TEST_CERT = readFileSync(new URL("./fixtures/localhost-cert.pem", import.meta.url));
+let TARGET = "";
+let targetServer: ReturnType<typeof Bun.serve> | undefined;
 
 // ---------------------------------------------------------------------------
 // Tiny SOCKS5 server (with optional user/pass auth, real tunneling)
@@ -251,24 +253,24 @@ function makeSocks4aServer(): { port: number; stop: () => void } {
 // ---------------------------------------------------------------------------
 
 describe("SOCKS bridge end-to-end", () => {
-  // Skip the entire suite if there's no outbound internet (CI without network).
-  // The smoke-test script under scripts/socks-smoke.mjs covers the same path.
-  beforeAll(async () => {
-    try {
-      const ctrl = new AbortController();
-      const t = setTimeout(() => ctrl.abort(), 5000);
-      await fetch(TARGET, { method: "HEAD", signal: ctrl.signal });
-      clearTimeout(t);
-    } catch {
-      console.log("Skipping SOCKS bridge e2e tests — no outbound internet.");
-      // We can't dynamically skip in bun:test, but the tests below will fail
-      // gracefully and the rest of the suite (unit tests) still runs.
-    }
+  beforeAll(() => {
     _shutdownAllBridgesForTesting();
+    targetServer = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      tls: {
+        key: readFileSync(new URL("./fixtures/localhost-key.pem", import.meta.url)),
+        cert: TEST_CERT,
+      },
+      fetch: () => new Response("local SOCKS TLS fixture"),
+    });
+    // Keep the domain hostname so SOCKS4a exercises domain-based negotiation.
+    TARGET = `https://localhost:${targetServer.port}/`;
   });
 
   afterAll(() => {
     _shutdownAllBridgesForTesting();
+    targetServer?.stop(true);
   });
 
   test("SOCKS5 (no auth) → fetch reaches real HTTPS target", async () => {
@@ -279,9 +281,9 @@ describe("SOCKS bridge end-to-end", () => {
         method: "HEAD",
         proxy: socksUrl,
         signal: AbortSignal.timeout(10_000),
+        tls: { ca: TEST_CERT },
       } as RequestInit & { proxy?: string });
-      expect(resp.status).toBeGreaterThanOrEqual(200);
-      expect(resp.status).toBeLessThan(500);
+      expect(resp.status).toBe(200);
     } finally {
       server.stop();
     }
@@ -295,9 +297,9 @@ describe("SOCKS bridge end-to-end", () => {
         method: "HEAD",
         proxy: socksUrl,
         signal: AbortSignal.timeout(10_000),
+        tls: { ca: TEST_CERT },
       } as RequestInit & { proxy?: string });
-      expect(resp.status).toBeGreaterThanOrEqual(200);
-      expect(resp.status).toBeLessThan(500);
+      expect(resp.status).toBe(200);
     } finally {
       server.stop();
     }
@@ -314,6 +316,7 @@ describe("SOCKS bridge end-to-end", () => {
         method: "HEAD",
         proxy: socksUrl,
         signal: AbortSignal.timeout(10_000),
+        tls: { ca: TEST_CERT },
       } as RequestInit & { proxy?: string });
       // Either a 502 (bridge surfaced the auth failure) or a network-level
       // throw — both indicate the auth was rejected.
@@ -335,9 +338,9 @@ describe("SOCKS bridge end-to-end", () => {
         method: "HEAD",
         proxy: socksUrl,
         signal: AbortSignal.timeout(10_000),
+        tls: { ca: TEST_CERT },
       } as RequestInit & { proxy?: string });
-      expect(resp.status).toBeGreaterThanOrEqual(200);
-      expect(resp.status).toBeLessThan(500);
+      expect(resp.status).toBe(200);
     } finally {
       server.stop();
     }
@@ -500,10 +503,12 @@ describe("SOCKS bridge end-to-end", () => {
         method: "GET",
         proxy: socksUrl,
         signal: AbortSignal.timeout(10_000),
+        tls: { ca: TEST_CERT },
       } as RequestInit & { proxy?: string });
       // A clean HTTP response — body should NOT contain "Bad Gateway" text.
       const body = await resp.text();
       expect(body).not.toContain("Bad Gateway");
+      expect(body).toBe("local SOCKS TLS fixture");
       expect(body).not.toContain("502");
     } finally {
       server.stop();

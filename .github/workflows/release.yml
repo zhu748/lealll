@@ -204,7 +204,9 @@ jobs:
           body: |
             ## zcode-proxy v${{ steps.ver.outputs.version }}
 
-            Fork 合并版（zhu748/lealll）：上游 TriDefender/zcode-api v4.7.1 全部能力 + fork 多账号 / Web 面板 / 代理池 / 韧性重试。
+            zhu748/lealll fork：保留多账号 / Web 面板 / 代理池 / 韧性重试与现有上游兼容功能。
+
+            本次更新与升级说明：[release/README.md](https://github.com/${{ github.repository }}/blob/v${{ steps.ver.outputs.version }}/release/README.md)。
 
             按平台下载对应 zip，解压后运行 `start.bat`（Windows）或 `start.sh`（Linux / macOS，自动识别二进制）。
 
