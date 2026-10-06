@@ -27,6 +27,7 @@ import {
 } from "../auth/oauth.js";
 import { KeyResolver } from "../auth/resolver.js";
 import { saveCredential, clearCredentialAsync, loadCredential } from "../auth/store.js";
+import type { QuotaSnapshot } from "../server/routes-quota.js";
 
 /** Supported plan tiers. Mirrors `ProxyConfig.plan`. */
 export type PlanTier = "coding-plan" | "start-plan";
@@ -41,6 +42,7 @@ export type ControlCommand =
   | { cmd: "startProxy" }
   | { cmd: "stopProxy" }
   | { cmd: "getLogs"; since?: number }
+  | { cmd: "quota" }
   | { cmd: "shutdown" };
 
 /** Successful response envelope. */
@@ -53,6 +55,7 @@ export type ControlOk =
   | { ok: true; event: "proxyStarted"; port: number }
   | { ok: true; event: "proxyStopped" }
   | { ok: true; event: "logs"; nextSince: number; lines: string[] }
+  | { ok: true; event: "quota"; quota: QuotaSnapshot }
   | { ok: true; event: "shuttingDown" };
 
 /** Failure response envelope. */
@@ -98,6 +101,8 @@ interface StartControlOpts {
   onSetConfig?: (changes: { provider?: ProviderId; plan?: PlanTier }) => Promise<ConfigUpdateResult>;
   /** Hook for graceful shutdown (called by the `shutdown` command). */
   onShutdown?: () => Promise<void> | void;
+  /** Live quota snapshot for the `quota` command (wired to collectQuotaSnapshot). */
+  onQuota?: () => Promise<QuotaSnapshot>;
   /** Log buffer polled by `getLogs`. If omitted, an internal one is used. */
   logBuffer?: LogBuffer;
 }
@@ -189,6 +194,7 @@ export function startControlListener(opts: StartControlOpts): Promise<{ close():
         onStopProxy: opts.onStopProxy,
         onSetConfig: opts.onSetConfig,
         onShutdown: opts.onShutdown,
+        onQuota: opts.onQuota,
         logBuffer,
         authToken,
       });
@@ -211,12 +217,30 @@ export interface ControlHandlerResult {
   body: ControlResponse;
 }
 
+/**
+ * Build an in-process dispatcher for the control protocol: identical command
+ * semantics to `POST /control`, but no listener and no loopback check — the
+ * caller owns its transport and must guard it (token, origin, size limits).
+ *
+ * The Android shell keeps using {@link startControlListener}. Embedders that
+ * already expose their own authenticated HTTP surface (the `serve` web panel)
+ * use this instead, so a reachable panel does not also open a second,
+ * unauthenticated port that can run stopProxy / logout / shutdown.
+ */
+export function createControlDispatcher(
+  state: ControlState,
+  ctx: HandlerContext,
+): (cmd: ControlCommand) => Promise<ControlResponse> {
+  return (cmd) => dispatch(cmd, state, ctx);
+}
+
 /** Context passed to `handleControlRequest` for hook wiring + log access. */
 export interface HandlerContext {
   onStartProxy?: () => Promise<LifecycleResult>;
   onStopProxy?: () => Promise<{ ok: true } | { ok: false; error: string }>;
   onSetConfig?: (changes: { provider?: ProviderId; plan?: PlanTier }) => Promise<ConfigUpdateResult>;
   onShutdown?: () => Promise<void> | void;
+  onQuota?: () => Promise<QuotaSnapshot>;
   logBuffer: LogBuffer;
   /** Overrides login-client construction (tests inject offline clients). */
   createLoginClient?: (provider: ProviderId) => OAuthFlowClient;
@@ -426,6 +450,19 @@ async function dispatch(
       const since = typeof cmd.since === "number" ? cmd.since : 0;
       const { nextSince, lines } = ctx.logBuffer.since(since);
       return { ok: true, event: "logs", nextSince, lines: [...lines] };
+    }
+
+    case "quota": {
+      // Snapshot build hits both upstream quota planes (billing + monitor);
+      // a failure (e.g. not logged in) surfaces verbatim as the envelope error
+      // so the app can render 点按重试 instead of an empty card.
+      if (!ctx.onQuota) return { ok: false, error: "quota_unavailable" };
+      try {
+        const quota = await ctx.onQuota();
+        return { ok: true, event: "quota", quota };
+      } catch (err) {
+        return { ok: false, error: (err as Error).message };
+      }
     }
 
     case "shutdown": {

@@ -1664,47 +1664,34 @@ describe("POST /admin/api/accounts/active — does not freeze server via appendL
   });
 
   it("coalesces same-tick SSE log fanout into one enqueue per client", async () => {
-    await new Promise(resolve => setTimeout(resolve, 0));
-    const opts = makeAdminOpts();
-    const sseResp = await callAdmin(authedReq("/admin/api/logs/stream"), opts);
+    const sseResp = await callAdmin(authedReq("/admin/api/logs/stream"), makeAdminOpts());
     expect(sseResp).not.toBeNull();
     expect(sseResp!.status).toBe(200);
-
     const reader = (sseResp!.body as ReadableStream<Uint8Array>).getReader();
-    const originalEnqueue = ReadableStreamDefaultController.prototype.enqueue;
-    let enqueueCount = 0;
     const marker = `batched-fanout-marker-${Date.now()}-${Math.random()}`;
     try {
-      (ReadableStreamDefaultController.prototype as any).enqueue = function trackedEnqueue(
-        this: ReadableStreamDefaultController<Uint8Array>,
-        chunk: Uint8Array,
-      ) {
-        enqueueCount++;
-        return originalEnqueue.call(this, chunk);
-      };
-
-      for (let i = 0; i < 25; i++) {
-        appendLog("info", `${marker}-${i}`);
-      }
-      await new Promise(resolve => setTimeout(resolve, 0));
-
-      expect(enqueueCount).toBe(1);
-
+      for (let i = 0; i < 25; i++) appendLog("info", `${marker}-${i}`);
       const decoder = new TextDecoder();
       let seen = "";
+      let matchingChunks = 0;
       const deadline = Date.now() + 2_000;
       while (!seen.includes(`${marker}-24`) && Date.now() < deadline) {
-        const remaining = Math.max(1, deadline - Date.now());
         const result = await Promise.race([
           reader.read(),
-          new Promise<"timeout">(resolve => setTimeout(() => resolve("timeout"), remaining)),
+          new Promise<"timeout">(resolve => setTimeout(() => resolve("timeout"), Math.max(1, deadline - Date.now()))),
         ]);
         if (result === "timeout" || result.done) break;
-        seen += decoder.decode(result.value, { stream: true });
+        const text = decoder.decode(result.value, { stream: true });
+        if (text.includes(marker)) matchingChunks++;
+        seen += text;
       }
-      expect(seen).toContain(`${marker}-24`);
+      // Observe this client's batch, rather than every stream in the process.
+      expect(matchingChunks).toBe(1);
+      const messages = seen.split("\n\n").filter(line => line.startsWith("data: "))
+        .map(line => JSON.parse(line.slice(6)).message as string)
+        .filter(message => message.startsWith(marker));
+      expect(messages).toEqual(Array.from({ length: 25 }, (_, i) => `${marker}-${i}`));
     } finally {
-      (ReadableStreamDefaultController.prototype as any).enqueue = originalEnqueue;
       try { await reader.cancel(); } catch {}
     }
   });

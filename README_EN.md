@@ -39,7 +39,7 @@ After launching, you'll land in the terminal control panel (this is the main UI)
 
 <img src="docs/images/tui-annotated.png" alt="ZCode Proxy terminal control panel" width="980" />
 
-The panel has three areas: **Login & Settings** (provider / plan / login), **Proxy Service** (start/stop, current config) and **Logs** (one line per request, scrolling live). Press <kbd>s</kbd> to start the proxy — once you see `Status: running`, you're ready.
+The panel has four cards: **Login & Settings** (provider / plan / login), **Quota** (remaining-share bars + reset countdowns, press <kbd>r</kbd> or click Refresh), **Proxy Service** (start/stop, current config) and **Logs** (one line per request, scrolling live). Press <kbd>s</kbd> to start the proxy — once you see `Status: running`, you're ready.
 
 > Not fond of keyboard shortcuts? The panel buttons support **mouse clicks**. Want it to run silently in the background? Use `zcode-proxy.exe --cli serve`.
 
@@ -52,6 +52,7 @@ The panel has three areas: **Login & Settings** (provider / plan / login), **Pro
 | <kbd>L</kbd> | bigmodel paste login (fallback mode; the `l` login itself is callback-free and works headless) |
 | <kbd>o</kbd> | Log out |
 | <kbd>p</kbd> / <kbd>t</kbd> | Switch provider (Z.AI ↔ Zhipu) / plan (coding-plan ↔ start-plan) |
+| <kbd>r</kbd> | Refresh the quota card |
 | <kbd>↑</kbd><kbd>↓</kbd> / <kbd>PgUp</kbd> / <kbd>g</kbd> | Scroll logs / jump back to the bottom |
 | <kbd>c</kbd> | Clear the log screen |
 | <kbd>q</kbd> | Quit the panel |
@@ -181,8 +182,39 @@ The config file is `config.yaml` in the project root (auto-generated on first st
 | `ZCODE_PROXY_CONFIG` | `config.yaml` | Config file path |
 | `ZCODE_PROXY_CREDENTIAL_SECRET` | machine-specific | Encryption seed for login credentials (fix it when migrating across machines / using Docker) |
 | `ZCODE_LOG_FORMAT` | desktop table | Set to `compact` for single-line logs (good for narrow screens) |
+| `ZCODE_PANEL_ENABLED` | off | Set to `1`/`true` to start a local web panel in headless `serve` mode (including Docker) |
+| `ZCODE_PANEL_TOKEN` | none | Access token for the panel, **required when the panel is enabled** (without it the panel does not start, so the control endpoints are never left open) |
+| `ZCODE_PANEL_PORT` | `8090` | Panel port (bound to `127.0.0.1` only) |
+| `ZCODE_UPDATE_CHECK` | on | Set to `off`/`0` to disable the startup "new version" check (it only notifies, it never updates in place) |
+| `ZCODE_UPDATE_SKIP` | none | Comma-separated tags to mute, e.g. `v4.7.6,v4.7.7` |
 
 The plan type (`plan`: `coding-plan` personal / `start-plan` trial) can be toggled in the panel with <kbd>t</kbd>, which writes the change back to config.yaml.
+
+Without a TUI (cloud server) you can use a browser instead: set `ZCODE_PANEL_ENABLED=1` and `ZCODE_PANEL_TOKEN=<your own random string>`, start the proxy, then forward the port and open `http://127.0.0.1:8090` — it shows status and quota, switches provider/plan, logs in and out, and tails the live logs plus the MCP list. The panel binds loopback only and requires the token on every API call; without a token it does not start. Commands are dispatched in process, so no extra control port is opened. Stopping the proxy from the page does not keep the process alive: SIGTERM/SIGINT and the panel's own shutdown all clear the background timers (auto-claim, captcha pool) before exiting. Logging out from the page also clears the live credential and stops the proxy, so a logged-out account is not spent any further.
+
+**Update notice**: on startup `serve` and the TUI ask GitHub once for the latest release, printing at most one extra log line (press <kbd>u</kbd> in the TUI to re-check manually). It never blocks startup and never affects the proxy: offline, blocked, rate-limited or unexpected answers are ignored silently. A manual check always answers — "already on the latest version" or "check unavailable". Container images are immutable, so the hint names the pull command of the **detected runtime** (Docker: `docker compose pull && docker compose up -d`, Podman: `podman compose pull && podman compose up -d`; when the runtime cannot be told apart it just says "pull the new image and recreate the container") rather than replacing files in place (release artifacts carry no checksums yet, so automatic download-and-replace is not offered). Set `ZCODE_UPDATE_CHECK=off` to disable the check, or `ZCODE_UPDATE_SKIP=v4.7.6` to mute a single tag.
+
+**Reaching the panel from Docker**: the panel listens on the *container's own* `127.0.0.1`, so with the default bridge network `-p 8080:8080` does not expose it, and adding `-p 8090:8090` does not help either (that maps a non-loopback container address). On a Linux server, use host networking so the container shares the host's loopback:
+
+```yaml
+services:
+  zcode-proxy:
+    # keep the existing image / volumes / restart settings
+    network_mode: host        # and drop the original ports: block
+    environment:
+      ZCODE_PROXY_CREDENTIAL_SECRET: "a-passphrase-only-you-know"
+      ZCODE_PANEL_ENABLED: "1"
+      ZCODE_PANEL_TOKEN: "${ZCODE_PANEL_TOKEN:?set a panel token in .env first}"
+      ZCODE_PANEL_PORT: "8090"
+```
+
+Then forward-only tunnel from your machine (`-N` = no shell):
+
+```bash
+ssh -N -L 8090:127.0.0.1:8090 user@host
+```
+
+and open `http://127.0.0.1:8090`. With host networking the proxy port is the host port too, so keep the firewall rules for 8080 as they were and do **not** expose 8090 publicly.
 
 </details>
 
@@ -193,7 +225,7 @@ The plan type (`plan`: `coding-plan` personal / `start-plan` trial) can be toggl
 
 **Weekend/trial plan auto-claiming (claim)** — enabled by default. The proxy probes the official limited-plan campaign page every 5 minutes and grabs new drops for you the instant they appear (`claim.enabled: false` to disable). Manual run: `bun run src/index.ts claim`.
 
-**Quota display (quota)** — after login the panel fetches quota once automatically; refresh manually with <kbd>r</kbd>. Data comes from two upstream planes: trial/credits-plan buckets (`billing/balance`, remaining / total units, expiry) and individual coding-plan usage windows (`/api/monitor/usage/quota/limit`, same endpoint the official usage panel reads — 5-hour / weekly window remaining / total and reset time). CLI: `bun run src/index.ts quota` (HTTP: `GET /quota`). The upstream gateways rate-limit frequent queries, so the panel does not poll on a timer.
+**Quota display (quota)** — after login the panel fetches quota once automatically; refresh manually with <kbd>r</kbd>. Data comes from two upstream planes: trial/credits-plan buckets (`billing/balance`, remaining / total units, expiry) and individual coding-plan usage windows (`/api/monitor/usage/quota/limit`, same endpoint the official usage panel reads — 5-hour / weekly window **remaining** and reset time. Upstream `number` is not a total comparable with remaining, so like the CLI/TUI only remaining is shown, and a bar is drawn only when upstream reports a percentage). CLI: `bun run src/index.ts quota` (HTTP: `GET /quota`). The upstream gateways rate-limit frequent queries, so the panel does not poll on a timer.
 
 **Usage-window resets (reset, new in 4.7.2-fork.1)** — aligned with the coding-plan reset system added in ZCode desktop 3.14.4 (`/api/v1/coding-plan/reset/*`): accounts can hold reset entitlements (granted via rewards/events) that immediately clear the 5-hour or weekly usage window. CLI: `zcode-proxy reset` lists available resets and latest history, `zcode-proxy reset --use five_hour` / `--use week` spends one, `--opportunity` asks the server for an automatic grant; HTTP: `GET /quota/reset`. Accounts must re-login after upgrading (the credential now also stores the raw OAuth access token required by these endpoints).
 

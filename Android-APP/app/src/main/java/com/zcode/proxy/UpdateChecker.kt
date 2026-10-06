@@ -8,7 +8,7 @@ import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
 
-/** GitHub Release 元数据（https://github.com/TriDefender/zcode-api/releases）。 */
+/** GitHub Release 元数据（https://github.com/zhu748/lealll/releases）。 */
 data class UpdateInfo(
     val tag: String,
     val htmlUrl: String,
@@ -18,8 +18,8 @@ data class UpdateInfo(
 
 object UpdateChecker {
     private const val TAG = "UpdateChecker"
-    private const val LATEST_API = "https://api.github.com/repos/TriDefender/zcode-api/releases/latest"
-    const val RELEASES_PAGE = "https://github.com/TriDefender/zcode-api/releases"
+    private const val LATEST_API = "https://api.github.com/repos/zhu748/lealll/releases/latest"
+    const val RELEASES_PAGE = "https://github.com/zhu748/lealll/releases"
     private const val CONNECT_TIMEOUT_MS = 10_000
     private const val READ_TIMEOUT_MS = 15_000
 

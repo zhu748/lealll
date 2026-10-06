@@ -55,7 +55,7 @@
 
 <img src="docs/images/tui-annotated.png" alt="ZCode Proxy 终端控制面板" width="980" />
 
-面板分三块：**登录与设置**（服务商 / 套餐 / 登录）、**代理服务**（启动停止 / 当前配置）、**日志**（每个请求一行，实时滚动）。按 <kbd>s</kbd> 启动代理，看到 `Status: running` 就绪了。
+面板四块卡：**登录与设置**（服务商 / 套餐 / 登录）、**套餐用量**（余量占比条 + 重置倒计时，按 <kbd>r</kbd> 或点 Refresh 刷新）、**代理服务**（启动停止 / 当前配置）、**日志**（每个请求一行，实时滚动）。按 <kbd>s</kbd> 启动代理，看到 `Status: running` 就绪了。
 
 > 用不惯键盘快捷键？面板上的按钮支持**鼠标点击**。想让它在后台静默运行？`zcode-proxy.exe --cli serve`。
 
@@ -68,6 +68,7 @@
 | <kbd>L</kbd> | bigmodel 粘贴登录（回退模式；`l` 登录本身就免回调，无头可用） |
 | <kbd>o</kbd> | 退出登录 |
 | <kbd>p</kbd> / <kbd>t</kbd> | 切换服务商（Z.AI ↔ 智谱）/ 套餐（coding-plan ↔ start-plan） |
+| <kbd>r</kbd> | 刷新套餐用量 |
 | <kbd>↑</kbd><kbd>↓</kbd> / <kbd>PgUp</kbd> / <kbd>g</kbd> | 滚动日志 / 回到底部 |
 | <kbd>c</kbd> | 清屏日志 |
 | <kbd>q</kbd> | 退出面板 |
@@ -197,8 +198,39 @@ services:
 | `ZCODE_PROXY_CONFIG` | `config.yaml` | 配置文件路径 |
 | `ZCODE_PROXY_CREDENTIAL_SECRET` | 机器相关 | 登录凭据的加密种子（跨机器迁移/Docker 时需要固定它） |
 | `ZCODE_LOG_FORMAT` | 桌面表格 | 设为 `compact` 可得到单行日志（适合窄屏） |
+| `ZCODE_PANEL_ENABLED` | 关 | 设为 `1`/`true` 后，无界面的 `serve` 模式（含 Docker）额外启动一个本机 Web 面板 |
+| `ZCODE_PANEL_TOKEN` | 无 | 面板的访问令牌，**开启面板时必填**（不填则面板不启动，避免裸奔的控制接口） |
+| `ZCODE_PANEL_PORT` | `8090` | 面板端口（只监听 `127.0.0.1`） |
+| `ZCODE_UPDATE_CHECK` | 开 | 设为 `off`/`0` 关闭启动时的「有新版」检查（只提示，不自动更新） |
+| `ZCODE_UPDATE_SKIP` | 无 | 逗号分隔要忽略的版本，如 `v4.7.6,v4.7.7` |
 
 套餐类型（`plan`: `coding-plan` 个人套餐 / `start-plan` 体验套餐）在面板里按 <kbd>t</kbd> 切换，会写回 config.yaml。
+
+服务器这类没有 TUI 的场景，可以让浏览器来看：设 `ZCODE_PANEL_ENABLED=1`、`ZCODE_PANEL_TOKEN=<一段你自己的随机串>` 后启动，再用 SSH 端口转发打开 `http://127.0.0.1:8090` —— 能看状态和额度、切服务商/套餐、登录登出、看实时日志和 MCP 列表。面板只绑回环、每次调 API 都要带 token，没有 token 不启动；命令走进程内分发，不会再额外开一个控制端口。面板上的「Stop proxy」只停代理，进程本身仍能正常退出（SIGTERM/SIGINT 和面板的 shutdown 都会先清掉后台定时器——自动领取、验证码池——再退出）；在面板里登出会同时清掉运行中的凭据并停掉代理，避免登出后新请求还继续花旧账号的额度。
+
+**有新版提示**：`serve` 和 TUI 启动时会异步向 GitHub 查一次 latest release，最多多打一行日志（TUI 里按 <kbd>u</kbd> 可手动重查），不阻塞启动、不影响代理；离线、被挡、限流或返回格式变了都一律静默忽略。手动检查总会给你明确答复（「已是最新」或「检查不可用」）。容器里镜像是不可变的，所以提示给的是**当前运行时的拉取命令**（Docker 为 `docker compose pull && docker compose up -d`，Podman 为 `podman compose pull && podman compose up -d`；认不出运行时则只说「拉取新镜像后重建容器」），而不是自己去替换文件（release 目前也没有校验和，所以不做自动下载替换）。不想让它查就设 `ZCODE_UPDATE_CHECK=off`，某个版本太吵可以 `ZCODE_UPDATE_SKIP=v4.7.6` 忽略。
+
+**Docker 里怎么连面板**：面板只监听**容器自己的** `127.0.0.1`，所以默认 bridge 网络下 `-p 8080:8080` 映射不出来，只补一个 `-p 8090:8090` 也连不上（端口映射到的是容器的非回环地址）。Linux 服务器上用 host 网络，让容器直接用宿主机回环：
+
+```yaml
+services:
+  zcode-proxy:
+    # 保留现有 image / volumes / restart 等配置
+    network_mode: host        # host 模式下删掉原来的 ports:
+    environment:
+      ZCODE_PROXY_CREDENTIAL_SECRET: "一串只有你知道的口令"
+      ZCODE_PANEL_ENABLED: "1"
+      ZCODE_PANEL_TOKEN: "${ZCODE_PANEL_TOKEN:?请先在 .env 里设置面板 token}"
+      ZCODE_PANEL_PORT: "8090"
+```
+
+然后在本机建一条只转发的隧道（`-N` 不开 shell）：
+
+```bash
+ssh -N -L 8090:127.0.0.1:8090 user@host
+```
+
+再打开 `http://127.0.0.1:8090`。host 网络下代理主端口也直接占用宿主机端口，安全组/防火墙照旧按原来放行 8080，**不要**对外放行 8090。
 
 </details>
 
@@ -209,7 +241,7 @@ services:
 
 **周末/体验套餐自动领取 (claim)** —— 默认开启。代理每 5 分钟探测一次官方的限量套餐活动页，上新瞬间自动帮你抢（`claim.enabled: false` 可关闭）。手动抢：`bun run src/index.ts claim`。
 
-**额度显示 (quota)** —— 登录后面板会自动查一次额度，之后按 <kbd>r</kbd> 手动刷新。数据来自上游两个额度平面：体验/积分制套餐的积分桶（`billing/balance`，剩余 / 总额、到期时间），以及个人编码套餐的用量窗口（`/api/monitor/usage/quota/limit`，与官方用量面板同源，5 小时 / 周窗口的剩余 / 总量与重置时间）。命令行直接查：`bun run src/index.ts quota`（对应 HTTP 接口 `GET /quota`）。注意上游网关对频繁查询有限速，所以面板不做定时轮询。
+**额度显示 (quota)** —— 登录后面板会自动查一次额度，之后按 <kbd>r</kbd> 手动刷新。数据来自上游两个额度平面：体验/积分制套餐的积分桶（`billing/balance`，剩余 / 总额、到期时间），以及个人编码套餐的用量窗口（`/api/monitor/usage/quota/limit`，与官方用量面板同源，5 小时 / 周窗口的**剩余额度**与重置时间——上游 `number` 不是可与剩余比较的总量，所以与 CLI/TUI 一致只显示剩余，只有上游给出百分比时才画比例条）。命令行直接查：`bun run src/index.ts quota`（对应 HTTP 接口 `GET /quota`）。注意上游网关对频繁查询有限速，所以面板不做定时轮询。
 
 **用量窗口重置 (reset，4.7.2-fork.1 新增)** —— 对齐 ZCode 桌面端 3.14.4 新增的编码套餐额度重置系统（`/api/v1/coding-plan/reset/*`）：账号可持有"重置券"（活动/奖励发放），花费一张立即清零 5 小时或每周用量窗口，无需等自然滚动。命令行：`zcode-proxy reset` 查看可用张数与最近使用记录，`zcode-proxy reset --use five_hour` / `--use week` 花费一张，`--opportunity` 向服务端申请自动重置机会；HTTP 接口 `GET /quota/reset` 返回同样信息。需要 4.7.2-fork.1 之后重新登录的账号（新版凭证额外保存 OAuth 原始 access token，老账号请重新 `auth login` 一次）。
 

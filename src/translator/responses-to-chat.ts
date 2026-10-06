@@ -173,7 +173,8 @@ function buildMessagesFromItems(items: ResponsesInputItem[]): OpenAIMessage[] {
   let pendingReasoning = "";
 
   for (const item of items) {
-    const type = (item as { type?: string }).type ?? "";
+    const role = (item as { role?: string }).role;
+    const type = item.type ?? (["user", "assistant", "developer", "system"].includes(role ?? "") ? "message" : "");
 
     switch (type) {
       case "message": {
@@ -192,12 +193,12 @@ function buildMessagesFromItems(items: ResponsesInputItem[]): OpenAIMessage[] {
         continue;
       }
       case "function_call": {
-        const fc = item as { call_id: string; name: string; arguments?: string };
+        const fc = item as { call_id: string; name: string; namespace?: string; arguments?: string };
         const args = (fc.arguments ?? "").trim().length === 0 ? "{}" : fc.arguments!;
         const toolCall = {
           id: fc.call_id,
           type: "function" as const,
-          function: { name: fc.name, arguments: args },
+          function: { name: fc.namespace ? `${fc.namespace}__${fc.name}` : fc.name, arguments: args },
         };
         mergeToolCallIntoAssistant(out, toolCall, pendingReasoning);
         pendingReasoning = "";
@@ -207,12 +208,12 @@ function buildMessagesFromItems(items: ResponsesInputItem[]): OpenAIMessage[] {
         // Custom tool calls arrive as {call_id, name, input}; rewrite to a
         // function_call-shaped assistant message so the upstream sees the same
         // tool-call invariant. Input is wrapped in {input: "..."}.
-        const ct = item as { call_id: string; name: string; input?: string };
+        const ct = item as { call_id: string; name: string; namespace?: string; input?: string };
         const argObj = JSON.stringify({ input: ct.input ?? "" });
         const toolCall = {
           id: ct.call_id,
           type: "function" as const,
-          function: { name: ct.name, arguments: argObj },
+          function: { name: ct.namespace ? `${ct.namespace}__${ct.name}` : ct.name, arguments: argObj },
         };
         mergeToolCallIntoAssistant(out, toolCall, pendingReasoning);
         pendingReasoning = "";
@@ -310,7 +311,7 @@ function contentPartsToChat(
   if (!Array.isArray(content)) return "";
   const textParts: string[] = [];
   const chatParts: OpenAIContentPart[] = [];
-  let hasImage = false;
+  let hasMedia = false;
   for (const part of content) {
     if ((part.type === "input_text" || part.type === "output_text" || part.type === "text") && typeof part.text === "string") {
       if (part.text.length === 0) continue;
@@ -319,12 +320,33 @@ function contentPartsToChat(
     } else if (part.type === "input_image" || part.type === "image_url") {
       const url = typeof part.image_url === "string" ? part.image_url : part.image_url?.url;
       if (!url) continue;
-      hasImage = true;
+      hasMedia = true;
       chatParts.push({ type: "image_url", image_url: { url } });
+    } else if (part.type === "input_video" || part.type === "video_url") {
+      // GLM chat dialect carries video as `video_url`; the Anthropic upstream
+      // (always the target here) accepts the base64 data-URL form. The URL
+      // rides `video_url` (symmetric with `input_image`) or a bare `data`
+      // field that some Responses clients use instead.
+      const url = typeof part.video_url === "string"
+        ? part.video_url
+        : part.video_url?.url ?? (typeof part.data === "string" ? part.data : undefined);
+      if (!url) continue;
+      hasMedia = true;
+      chatParts.push({ type: "video_url", video_url: { url } });
+    } else if (part.type === "input_file" || part.type === "file") {
+      // OpenAI Responses `input_file`: {filename?, file_data} (data URL) or a
+      // hosted `file_id` with no fetchable payload — the latter is skipped.
+      const fileData = part.file_data ?? part.file?.file_data;
+      if (!fileData) continue;
+      hasMedia = true;
+      chatParts.push({
+        type: "file",
+        file: { filename: part.filename ?? part.file?.filename, file_data: fileData },
+      });
     }
   }
-  // No image → collapse to plain string (cleaner for the upstream).
-  if (!hasImage) return textParts.join("\n");
+  // No media → collapse to plain string (cleaner for the upstream).
+  if (!hasMedia) return textParts.join("\n");
   // Non-user roles can't carry image_url in many upstreams — degrade to text.
   if (role !== "user") return textParts.join("\n");
   return chatParts;

@@ -43,7 +43,7 @@ import { buildAnthropicMetadataUserId } from "./trace-headers.js";
 import { recordHeaders } from "../utils/header-debug.js";
 import { credentialString } from "../auth/types.js";
 import { translateRequestOpenAIToAnthropic, translateResponseAnthropicToOpenAI } from "../translator/openai-to-anthropic.js";
-import { anthropicSseToOpenaiSse } from "../translator/sse-translator.js";
+import { anthropicSseToOpenaiSse, AnthropicStreamError } from "../translator/sse-translator.js";
 import type { AnthropicMessagesRequest, AnthropicMessagesResponse } from "../translator/types.js";
 import type { ProviderDef } from "../provider/types.js";
 import {
@@ -54,6 +54,7 @@ import {
   chatCompletionsToResponses,
   chatChunkToResponsesEvents,
   finalizeResponsesStream,
+  failResponsesStream,
   newResponsesStreamState,
   responsesEventToSse,
 } from "../translator/chat-to-responses.js";
@@ -432,7 +433,13 @@ function streamResponse(upstreamResp: Response, context: StreamResponseContext):
         }
         try { controller.close(); } catch {}
       } catch (err) {
-        try { controller.error(err); } catch {}
+        try {
+          for (const evt of failResponsesStream(state, {
+            code: err instanceof AnthropicStreamError ? err.code : "upstream_error",
+            message: err instanceof Error ? err.message : String(err),
+          })) send(evt);
+          controller.close();
+        } catch { try { controller.error(err); } catch {} }
       }
     },
     cancel(reason) {
