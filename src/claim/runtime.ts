@@ -10,16 +10,19 @@ import { formatUnixSeconds } from "./types.js";
 import { createClaimClient, ClaimPreviewError } from "./client.js";
 import { ClaimScheduler } from "./scheduler.js";
 import { getCaptchaToken } from "../proxy/captcha.js";
+import { resolveBillingDeviceMid } from "../proxy/identity.js";
 import { loadCredential } from "../auth/store.js";
 
 /**
- * Same deviceMid resolution as identity.ts: the `ZCODE_IDENTITY_DEVICE_MID`
- * env (Android NodeRunner injection) wins over the YAML value. The billing
- * gateway requires a UUID X-Device-Mid on the claim plane — omitting it fails
- * preview with biz 3001 "parameter error" on every poll.
+ * Billing-gateway deviceMid resolution: `ZCODE_IDENTITY_DEVICE_MID` env
+ * (Android NodeRunner injection) wins over the YAML value; when neither
+ * exists, resolveBillingDeviceMid falls back to an ephemeral per-process
+ * UUID instead of returning undefined — the billing gateway requires a UUID
+ * X-Device-Mid on the claim plane, and omitting it failed preview with biz
+ * 3001 "parameter error" on every poll.
  */
-function resolveDeviceMid(config: ProxyConfig): string | undefined {
-  return process.env.ZCODE_IDENTITY_DEVICE_MID?.trim() || config.identity.deviceMid?.trim() || undefined;
+function resolveDeviceMid(config: ProxyConfig): string {
+  return resolveBillingDeviceMid(config.identity.deviceMid);
 }
 
 /** `${process.platform}-${process.arch}` — mirrors the client's `TH()`. */
@@ -29,9 +32,6 @@ export function claimPlatform(): string {
 
 export function startAutoClaim(config: ProxyConfig, auth: AuthManager): ClaimScheduler {
   const deviceMid = resolveDeviceMid(config);
-  if (!deviceMid) {
-    console.log("[claim] warning: no identity.deviceMid (config or ZCODE_IDENTITY_DEVICE_MID env) — billing/preview will fail with 3001 parameter error until one exists");
-  }
   const scheduler = new ClaimScheduler({
     // AuthManager first (fresh), then the encrypted store — on Android the
     // login can land in the store after boot while auth hasn't been reloaded.

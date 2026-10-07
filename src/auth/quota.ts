@@ -19,13 +19,13 @@
  *
  * @see memory: zcode-quota-endpoints
  */
-import type { Credential } from "./types.js";
+import type { Credential, PlanId } from "./types.js";
 import type { ProviderId } from "../provider/types.js";
 import type { FetchFn } from "./oauth.js";
 import { credentialString } from "./types.js";
 import { getProvider } from "../provider/providers.js";
 import type { ProxyIdentity } from "../config/types.js";
-import { buildIdentityHeaders } from "../proxy/identity.js";
+import { buildIdentityHeaders, resolveBillingDeviceMid } from "../proxy/identity.js";
 // v0.3.7.1: host-captured timers — auth flows (credential rotation
 // during retries, OAuth, quota probes) run concurrent with captcha solve
 // epochs; bare globals resolve through the solver window alias there and are
@@ -247,7 +247,16 @@ export async function queryQuota(
   identity?: ProxyIdentity,
 ): Promise<QuotaResult> {
   const fetchWithTimeout = withTimeout(fetchImpl);
-  const plan = cred.plan ?? "coding-plan";
+  // Plan resolution priority (mirrors the serve path in index.ts):
+  //   1. cred.plan — explicit
+  //   2. cred.jwt present → start-plan (JWTs are start-plan exclusive)
+  //   3. coding-plan
+  // The dashboard quota probe feeds STORED credentials here, and imported /
+  // pasted accounts routinely carry a jwt WITHOUT a plan field — defaulting
+  // those to coding-plan sent the probe to api.z.ai's monitor endpoint, which
+  // answers "当前用户不存在coding plan" (no_plan) and blanked the panel's
+  // 免费套餐 display even though billing/balance had an active Start Plan.
+  const plan: PlanId = cred.plan ?? (cred.jwt?.trim() ? "start-plan" : "coding-plan");
   // Real-client header set: explicit identity wins; otherwise synthesize one
   // from the appVersion param (with the same defaults config.loader applies)
   // so even legacy callers send a plausible UA.
@@ -256,7 +265,14 @@ export async function queryQuota(
     sourceTitle: "cli",
     refererOrigin: "https://zcode.z.ai",
   };
-  const identityHeaders = buildIdentityHeaders(effectiveIdentity);
+  // The billing gateway requires a UUID X-Device-Mid on balance/current
+  // (device-mid-less balance answers biz 3001 / HTTP 400 — "免费套餐刷不出来").
+  // resolveBillingDeviceMid falls back to an ephemeral per-process mid when
+  // neither env nor config provides one (read-only / env-only deployments).
+  const identityHeaders = buildIdentityHeaders({
+    ...effectiveIdentity,
+    deviceMid: resolveBillingDeviceMid(effectiveIdentity.deviceMid),
+  });
 
   if (plan === "start-plan" && cred.jwt?.trim()) {
     return queryStartPlan(cred, fetchWithTimeout, appVersion, identityHeaders);

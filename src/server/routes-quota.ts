@@ -10,8 +10,10 @@
  *    the windowed usage limits of individual coding plans (`data.limits[]`,
  *    `TIME_LIMIT` rows preferred by the official `Xj` picker).
  *
- * The billing gateway requires a stable `X-Device-Mid`, so the config identity
- * is forwarded unchanged.
+ * The billing gateway requires a UUID `X-Device-Mid`: the config identity is
+ * forwarded with resolveBillingDeviceMid applied (env > config > ephemeral
+ * per-process fallback) so read-only / env-only deployments still pass the
+ * gateway's device check.
  *
  * @see _reverse/NOTEPAD.md "coding-plan 用量平面" (chain extracted from
  *      zcode.z.ai desktop bundle `getSnapshotForQuery`/`BigModelUsageQuotaProvider`)
@@ -24,7 +26,7 @@ import { readJsonLimited } from "../auth/quota.js";
 import { hostSetTimeout, hostClearTimeout } from "../utils/host-timers.js";
 import { proxiedFetch } from "../proxy/proxied-fetch.js";
 import { loadCredential } from "../auth/store.js";
-import { buildIdentityHeaders, normalizePrintableHeaderValue } from "../proxy/identity.js";
+import { buildIdentityHeaders, normalizePrintableHeaderValue, resolveBillingDeviceMid } from "../proxy/identity.js";
 import { inspectJwt } from "../auth/jwt-age.js";
 import { credentialString, type Credential } from "../auth/types.js";
 import { createResetClient, DEFAULT_RESET_ORIGIN, normalizeResetType, type ResetStatus, type ResetType } from "../auth/reset.js";
@@ -228,7 +230,12 @@ async function buildQuotaSnapshot(config: ProxyConfig, cred: Credential, fetchIm
   const jwt = jwtInfo
     ? { ageHours: Number(jwtInfo.ageHours.toFixed(2)), issuedAt: jwtInfo.iat }
     : null;
-  const identity = config.identity;
+  const identity = {
+    ...config.identity,
+    // Billing gateway rejects device-mid-less balance calls (3001); fall back
+    // to an ephemeral per-process mid when config/env have none.
+    deviceMid: resolveBillingDeviceMid(config.identity.deviceMid),
+  };
   const idHeaders = buildIdentityHeaders(identity);
   // The claim client drops X-ZCode-Agent for zcode.z.ai control-plane calls;
   // the billing gateway follows the same precedent.
@@ -578,7 +585,7 @@ export async function collectClaimSnapshot(
     jwt: cred.jwt,
     appVersion: config.identity.appVersion,
     platform: `${process.platform}-${os.arch()}`,
-    deviceMid: config.identity.deviceMid,
+    deviceMid: resolveBillingDeviceMid(config.identity.deviceMid),
     fetchImpl: fetchImpl as unknown as (url: string | URL | Request, init?: RequestInit) => Promise<Response>,
   });
   try {
@@ -649,7 +656,7 @@ export async function handleQuotaClaimSubmit(
     jwt: cred.jwt,
     appVersion: config.identity.appVersion,
     platform: `${process.platform}-${os.arch()}`,
-    deviceMid: config.identity.deviceMid,
+    deviceMid: resolveBillingDeviceMid(config.identity.deviceMid),
     fetchImpl: fetchImpl as unknown as (url: string | URL | Request, init?: RequestInit) => Promise<Response>,
   });
   try {

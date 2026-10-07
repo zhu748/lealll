@@ -193,7 +193,13 @@ export function probeStartPlanActivation(
   appVersion: string | undefined,
   identity?: ProxyIdentity,
 ): void {
-  if (cred.plan !== "start-plan" || !cred.jwt) return;
+  // Stored credentials imported with a jwt but NO plan field are start-plan
+  // (JWTs are start-plan exclusive — same inference as queryQuota / the serve
+  // path in index.ts). Gating on `cred.plan !== "start-plan"` alone skipped
+  // the activation probe for those, so a fresh account's free trial was never
+  // activated by the proxy ("免费套餐刷不出来" until something else queried
+  // billing/balance with a real client version).
+  if ((cred.plan && cred.plan !== "start-plan") || !cred.jwt?.trim()) return;
   const key = `${cred.provider}:${cred.apiKey}:${cred.jwt.slice(0, 16)}:${cred.proxy ?? ""}:${appVersion ?? ""}`;
   if (activationProbeInFlight.has(key)) return;
   pruneActivationProbes();
