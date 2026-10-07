@@ -11,7 +11,6 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -39,7 +38,6 @@ import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -47,8 +45,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -63,13 +59,18 @@ import com.zcode.proxy.ui.MessageCard
 import com.zcode.proxy.ui.NavItem
 import com.zcode.proxy.ui.ProxyViewModel
 import com.zcode.proxy.ui.RuntimeBanner
+import com.zcode.proxy.ui.ServiceAction
+import com.zcode.proxy.ui.ServiceActionDialog
 import com.zcode.proxy.ui.SettingsScreen
 import com.zcode.proxy.ui.TopBar
-import com.zcode.proxy.ui.theme.Mono
+import com.zcode.proxy.ui.UpdateDialog
+import com.zcode.proxy.ui.UpdateViewModel
+import com.zcode.proxy.update.UpdatePrefs
 import com.zcode.proxy.ui.theme.ThemeMode
 import com.zcode.proxy.ui.theme.ThemePrefs
 import com.zcode.proxy.ui.theme.ZcodeTheme
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
@@ -82,7 +83,8 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        ServerService.requestStart(this)
+        val session = RuntimeStatus.state.value
+        if (savedInstanceState == null || !session.userStopped) ServerService.requestStart(this)
         if (android.os.Build.VERSION.SDK_INT >= 33 &&
             androidx.core.content.ContextCompat.checkSelfPermission(this, android.Manifest.permission.POST_NOTIFICATIONS) !=
             android.content.pm.PackageManager.PERMISSION_GRANTED) {
@@ -106,11 +108,12 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 private fun AppScreen(themeMode: ThemeMode, notificationRevision: Int, onThemeModeChange: (ThemeMode) -> Unit) {
-    val scope = rememberCoroutineScope()
     val clipboard = LocalClipboardManager.current
     val context = LocalContext.current
     val model: ProxyViewModel = androidx.lifecycle.viewmodel.compose.viewModel()
     val state by model.state.collectAsStateWithLifecycle()
+    val updates: UpdateViewModel = androidx.lifecycle.viewmodel.compose.viewModel()
+    val update by updates.state.collectAsStateWithLifecycle()
     val runtime by RuntimeStatus.state.collectAsStateWithLifecycle()
     val lifecycle = androidx.lifecycle.compose.LocalLifecycleOwner.current.lifecycle
     val reachable = state.reachable
@@ -124,23 +127,27 @@ private fun AppScreen(themeMode: ThemeMode, notificationRevision: Int, onThemeMo
     var tab by rememberSaveable { mutableIntStateOf(0) }
     var confirmLogout by remember { mutableStateOf(false) }
     var showDiagnostics by remember { mutableStateOf(false) }
+    var serviceAction by rememberSaveable { mutableStateOf<ServiceAction?>(null) }
     var notificationsEnabled by remember { mutableStateOf(androidx.core.app.NotificationManagerCompat.from(context).areNotificationsEnabled()) }
 
     LaunchedEffect(notificationRevision) {
         notificationsEnabled = androidx.core.app.NotificationManagerCompat.from(context).areNotificationsEnabled()
     }
 
-    LaunchedEffect(model, lifecycle) {
+    LaunchedEffect(model, updates, lifecycle) {
         lifecycle.repeatOnLifecycle(androidx.lifecycle.Lifecycle.State.STARTED) {
             notificationsEnabled = androidx.core.app.NotificationManagerCompat.from(context).areNotificationsEnabled()
             model.setVisible(true)
             try {
-                model.events.collect { event ->
-                    when (event) {
-                        is AppEvent.Message -> toast = event.text
-                        is AppEvent.OpenBrowser -> if (!openInBrowser(context, event.url)) {
-                            clipboard.setText(AnnotatedString(event.url))
-                            toast = "未找到浏览器，已复制授权链接，请安装浏览器后打开"
+                coroutineScope {
+                    launch { updates.messages.collect { toast = it } }
+                    model.events.collect { event ->
+                        when (event) {
+                            is AppEvent.Message -> toast = event.text
+                            is AppEvent.OpenBrowser -> if (!openInBrowser(context, event.url)) {
+                                clipboard.setText(AnnotatedString(event.url))
+                                toast = "未找到浏览器，已复制授权链接，请安装浏览器后打开"
+                            }
                         }
                     }
                 }
@@ -150,37 +157,12 @@ private fun AppScreen(themeMode: ThemeMode, notificationRevision: Int, onThemeMo
         }
     }
 
-    // 更新检查（GitHub Releases）：每次启动自动查一次，设置页可手动触发
     val currentVersion = remember {
         runCatching { context.packageManager.getPackageInfo(context.packageName, 0).versionName }.getOrNull()
     }
-    var updateInfo by remember { mutableStateOf<UpdateInfo?>(null) }
-    var updateChecking by remember { mutableStateOf(false) }
-    var updateCheckFailed by remember { mutableStateOf(false) }
-    var showUpdateDialog by remember { mutableStateOf(false) }
-    var skippedTag by remember { mutableStateOf(UpdatePrefs.loadSkipped(context)) }
-    var autoCheckUpdate by remember { mutableStateOf(UpdatePrefs.loadAutoCheck(context)) }
-
-    fun checkForUpdate(manual: Boolean) {
-        if (updateChecking) return
-        updateChecking = true
-        scope.launch {
-            val info = try { UpdateChecker.fetchLatest() } finally { updateChecking = false }
-            if (info == null) {
-                updateCheckFailed = true
-                if (manual) toast = "检查更新失败，GitHub 暂不可达"
-                return@launch
-            }
-            updateCheckFailed = false
-            updateInfo = info
-            val hasUpdate = UpdateChecker.isNewer(currentVersion, info.tag)
-            if (manual) toast = if (hasUpdate) "发现新版本 ${info.tag}" else "已是最新版本"
-            if (hasUpdate && (manual || info.tag != skippedTag)) showUpdateDialog = true
-        }
+    LaunchedEffect(updates) {
+        updates.initialize(currentVersion, UpdatePrefs.loadAutoCheck(context), UpdatePrefs.loadSkipped(context))
     }
-
-    // 每次启动自动检查一次（可在设置页关闭；手动检查不受开关影响）
-    LaunchedEffect(Unit) { if (autoCheckUpdate) checkForUpdate(manual = false) }
 
     var nowMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
     LaunchedEffect(state.startedAt, lifecycle) {
@@ -218,6 +200,9 @@ private fun AppScreen(themeMode: ThemeMode, notificationRevision: Int, onThemeMo
                         item {
                             TopBar(
                                 subtitle = when {
+                                    runtime.phase == RuntimePhase.STOPPED -> "本地反向代理 · 已停止"
+                                    runtime.phase == RuntimePhase.STOPPING -> "本地反向代理 · 停止中"
+                                    runtime.phase == RuntimePhase.FAILED -> "本地反向代理 · 启动失败"
                                     !reachable -> "本地反向代理 · 连接中"
                                     else -> "本地反向代理 · 已连接"
                                 },
@@ -312,18 +297,23 @@ private fun AppScreen(themeMode: ThemeMode, notificationRevision: Int, onThemeMo
                     reachable = reachable,
                     loggedIn = loggedIn,
                     currentVersion = currentVersion,
-                    updateInfo = updateInfo,
-                    updateChecking = updateChecking,
-                    updateCheckFailed = updateCheckFailed,
-                    onCheckUpdate = { checkForUpdate(manual = true) },
-                    autoCheckUpdate = autoCheckUpdate,
+                    updateInfo = update.info,
+                    updateChecking = update.checking,
+                    updateCheckFailed = update.failed,
+                    onCheckUpdate = { updates.check() },
+                    autoCheckUpdate = update.autoCheck,
+                    runtime = runtime,
+                    busy = state.busy != null,
+                    onStartService = { ServerService.requestStart(context) },
+                    onRestartService = { serviceAction = ServiceAction.RESTART },
+                    onStopService = { serviceAction = ServiceAction.STOP },
                     notificationsEnabled = notificationsEnabled,
                     onNotificationSettings = { openNotificationSettings(context) },
                     onOpenDashboard = {
                         if (!openInBrowser(context, "http://127.0.0.1:$proxyPort/admin")) toast = "未找到浏览器，请先安装浏览器"
                     },
                     onAutoCheckUpdateChange = { enabled ->
-                        autoCheckUpdate = enabled
+                        updates.setAutoCheck(enabled)
                         UpdatePrefs.saveAutoCheck(context, enabled)
                     },
                 )
@@ -382,52 +372,30 @@ private fun AppScreen(themeMode: ThemeMode, notificationRevision: Int, onThemeMo
         )
     }
 
-    // 新版本弹窗（启动自动检查 / 设置页手动检查共用）
-    if (showUpdateDialog) {
-        updateInfo?.let { info ->
-            AlertDialog(
-                onDismissRequest = { showUpdateDialog = false },
-                title = { Text("发现新版本", fontWeight = FontWeight.SemiBold) },
-                text = {
-                    Column {
-                        Text(
-                            "最新 ${info.tag} · 当前 ${currentVersion ?: "未知"}",
-                            fontFamily = Mono,
-                            fontSize = 13.sp,
-                            color = cs.onSurfaceVariant,
-                        )
-                        info.notes?.let { notes ->
-                            Spacer(Modifier.height(10.dp))
-                            Text(
-                                notes.trim(),
-                                fontSize = 12.sp,
-                                lineHeight = 18.sp,
-                                color = cs.onSurfaceVariant,
-                                maxLines = 10,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                        }
+    serviceAction?.let { action ->
+        ServiceActionDialog(
+            action = action,
+            enabled = runtime.phase == RuntimePhase.READY && state.busy == null,
+            onConfirm = {
+                serviceAction = null
+                if (action == ServiceAction.RESTART) ServerService.requestRestart(context) else ServerService.requestStop(context)
+            },
+            onDismiss = { serviceAction = null },
+        )
+    }
+
+    if (update.showDialog) {
+        update.info?.let { info ->
+            UpdateDialog(info, currentVersion,
+                onDownload = {
+                    updates.dismissDialog()
+                    if (!openInBrowser(context, info.apkUrl ?: info.htmlUrl)) {
+                        clipboard.setText(AnnotatedString(info.apkUrl ?: info.htmlUrl))
+                        toast = "未找到浏览器，已复制下载链接"
                     }
                 },
-                confirmButton = {
-                    TextButton(onClick = {
-                        showUpdateDialog = false
-                        if (!openInBrowser(context, info.apkUrl ?: info.htmlUrl)) {
-                            clipboard.setText(AnnotatedString(info.apkUrl ?: info.htmlUrl))
-                            toast = "未找到浏览器，已复制下载链接"
-                        }
-                    }) { Text("前往下载", fontWeight = FontWeight.Medium) }
-                },
-                dismissButton = {
-                    Row {
-                        TextButton(onClick = {
-                            skippedTag = info.tag
-                            UpdatePrefs.saveSkipped(context, info.tag)
-                            showUpdateDialog = false
-                        }) { Text("忽略此版本") }
-                        TextButton(onClick = { showUpdateDialog = false }) { Text("以后再说") }
-                    }
-                },
+                onSkip = { updates.skipVersion()?.let { UpdatePrefs.saveSkipped(context, it) } },
+                onDismiss = updates::dismissDialog,
             )
         }
     }

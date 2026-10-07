@@ -17,6 +17,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
@@ -26,6 +27,7 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withContext
 import java.io.IOException
 
 class ServerService : Service() {
@@ -53,15 +55,17 @@ class ServerService : Service() {
         if (stopping) return START_NOT_STICKY
         if (intent?.action == ACTION_STOP) {
             stopping = true
-            RuntimeStatus.publish(RuntimeSession(message = "后台服务已停止，可在应用内重新启动"))
+            RuntimeStatus.publish(RuntimeSession(RuntimePhase.STOPPING, "正在停止后台服务…", userStopped = true))
             stopSelf()
             return START_NOT_STICKY
         }
         if (intent?.action == ACTION_RESTART) {
-            if (restartJob?.isActive != true) restartJob = scope.launch {
+            if (restartJob?.isActive != true) {
                 RuntimeStatus.publish(RuntimeSession(RuntimePhase.STARTING, "正在重启本地服务…"))
-                nodeJob?.cancelAndJoin()
-                nodeJob = scope.launch { runNode() }
+                restartJob = scope.launch {
+                    nodeJob?.cancelAndJoin()
+                    if (!stopping) nodeJob = scope.launch { runNode() }
+                }
             }
             return START_STICKY
         }
@@ -73,13 +77,16 @@ class ServerService : Service() {
     }
 
     private suspend fun runNode() {
+        if (stopping) return
         RuntimeStatus.publish(RuntimeSession(RuntimePhase.STARTING, "正在准备本地服务…"))
+        var runner: NodeRunner? = null
+        var client: ControlClient? = null
         try {
-            val runner = NodeRunner(applicationContext)
+            runner = NodeRunner(applicationContext)
             nodeRunner = runner
             runner.ensureAssetsExtracted()
             runner.start()
-            val client = ControlClient(runner.controlPort, runner.controlToken)
+            client = ControlClient(runner.controlPort, runner.controlToken)
             controlClient = client
             // A spawned process is not ready until its authenticated listener responds.
             withTimeout(20_000) {
@@ -101,8 +108,17 @@ class ServerService : Service() {
         } catch (exception: Exception) {
             if (!stopping) fail(exception.message ?: "本地服务启动失败", exception)
         } finally {
-            controlClient?.close()
-            nodeRunner?.stop()
+            client?.close()
+            runner?.stop()
+            // cancelAndJoin must release the proxy port before a replacement starts.
+            withContext(NonCancellable) {
+                try { runner?.awaitStopped() }
+                catch (exception: IOException) {
+                    if (!stopping) fail(exception.message ?: "本地服务未退出", exception)
+                }
+            }
+            if (controlClient === client) controlClient = null
+            if (nodeRunner === runner) nodeRunner = null
         }
     }
 
@@ -130,13 +146,26 @@ class ServerService : Service() {
 
     override fun onDestroy() {
         stopping = true
+        val runner = nodeRunner
+        val job = nodeJob
+        val userStopped = RuntimeStatus.state.value.userStopped
         nodeJob?.cancel()
         controlClient?.close()
         nodeRunner?.stop()
         scope.cancel()
         if (RuntimeStatus.state.value.phase != RuntimePhase.FAILED) {
-            RuntimeStatus.publish(RuntimeSession(message = "后台服务已停止，可在应用内重新启动"))
+            RuntimeStatus.publish(RuntimeSession(RuntimePhase.STOPPING, "正在停止后台服务…", userStopped = userStopped))
             stopForeground(STOP_FOREGROUND_REMOVE)
+            // This bounded cleanup outlives the cancelled service scope.
+            CoroutineScope(Dispatchers.IO).launch {
+                val error = try { job?.join(); runner?.awaitStopped(); null }
+                catch (exception: IOException) { exception.message }
+                if (RuntimeStatus.state.value.phase == RuntimePhase.STOPPING) {
+                    RuntimeStatus.publish(if (error == null) {
+                        RuntimeSession(message = "后台服务已停止，可在应用内重新启动", userStopped = userStopped)
+                    } else RuntimeSession(RuntimePhase.FAILED, error, userStopped = userStopped))
+                }
+            }
         }
         super.onDestroy()
     }
@@ -187,7 +216,15 @@ class ServerService : Service() {
         private const val ACTION_STOP = "com.zcode.proxy.STOP_SERVICE"
         private const val ACTION_RESTART = "com.zcode.proxy.RESTART_SERVICE"
 
+        fun requestStop(context: Context) {
+            RuntimeStatus.publish(RuntimeSession(RuntimePhase.STOPPING, "正在停止后台服务…", userStopped = true))
+            if (!context.stopService(Intent(context, ServerService::class.java))) {
+                RuntimeStatus.publish(RuntimeSession(message = "后台服务已停止，可在应用内重新启动", userStopped = true))
+            }
+        }
+
         fun requestRestart(context: Context) {
+            if (RuntimeStatus.state.value.phase == RuntimePhase.STOPPING) return
             try {
                 ContextCompat.startForegroundService(context, Intent(context, ServerService::class.java).setAction(ACTION_RESTART))
             } catch (exception: Exception) {
@@ -196,6 +233,7 @@ class ServerService : Service() {
         }
 
         fun requestStart(context: Context) {
+            if (RuntimeStatus.state.value.phase == RuntimePhase.STOPPING) return
             try {
                 ContextCompat.startForegroundService(context, Intent(context, ServerService::class.java))
             } catch (exception: Exception) {

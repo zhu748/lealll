@@ -18,11 +18,11 @@ import com.zcode.proxy.RuntimeSession
 
 @Composable
 internal fun RuntimeBanner(session: RuntimeSession, reachable: Boolean, onRetry: () -> Unit, onDiagnostics: () -> Unit) {
-    val starting = session.phase == RuntimePhase.STARTING
+    val transitioning = session.phase == RuntimePhase.STARTING || session.phase == RuntimePhase.STOPPING
     val message = if (session.phase == RuntimePhase.READY && !reachable) "暂时无法连接本地服务，可重启后重试" else session.message
-    CardBlock(if (starting) "正在启动" else "本地服务") {
+    CardBlock(if (session.phase == RuntimePhase.STARTING) "正在启动" else "本地服务") {
         Text(message, fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        if (!starting) {
+        if (!transitioning) {
             Row {
                 TextButton(onClick = onRetry) { Text(if (session.phase == RuntimePhase.READY) "重启服务" else "启动服务") }
                 Spacer(Modifier.width(8.dp))

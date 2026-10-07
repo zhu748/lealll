@@ -164,11 +164,11 @@ val lightWarning = Color(0xFFA9760B)
 val darkWarning = Color(0xFFE0BC5E)
 
 @Composable
-fun successColor(): Color = if (isSystemInDarkTheme()) darkSuccess else lightSuccess
+fun successColor(): Color = if (isDarkTheme()) darkSuccess else lightSuccess
 
 @Composable
-fun warningColor(): Color = if (isSystemInDarkTheme()) darkWarning else lightWarning
+fun warningColor(): Color = if (isDarkTheme()) darkWarning else lightWarning
 
 /** 卡片内的弱化文字（日志 dim / 提示）。 */
 @Composable
-fun dimColor(): Color = if (isSystemInDarkTheme()) DarkDim else LightDim
+fun dimColor(): Color = if (isDarkTheme()) DarkDim else LightDim

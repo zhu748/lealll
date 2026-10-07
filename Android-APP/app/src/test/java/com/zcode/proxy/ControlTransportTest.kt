@@ -68,4 +68,25 @@ class ControlTransportTest {
         transport.close()
         assertTrue(runCatching { transport.request("{}", 1000) }.isFailure)
     }
+
+    @Test fun disconnectedMutationIsNotAutomaticallyReplayed() = runBlocking {
+        server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AFTER_REQUEST))
+        server.enqueue(MockResponse().setBody("{\"ok\":true}"))
+        assertTrue(runCatching { transport.request("{\"cmd\":\"startOAuth\"}", 1000) }.isFailure)
+        assertEquals(1, server.requestCount)
+    }
+
+    @Test fun closeCancelsActiveRequestBeforeItsDeadline() = runBlocking {
+        server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE))
+        val job = async { runCatching { transport.request("{}", 10_000) } }
+        withContext(Dispatchers.IO) { assertNotNull(server.takeRequest(1, TimeUnit.SECONDS)) }
+        val result = withTimeout(1000) { transport.close(); job.await() }
+        assertTrue(result.isFailure)
+    }
+
+    @Test(timeout = 15_000) fun longRequestUsesItsOwnDeadlineInsteadOfTenSecondDefault() = runBlocking {
+        val text = "{\"ok\":true}"
+        server.enqueue(MockResponse().setBody(text).setBodyDelay(10_500, TimeUnit.MILLISECONDS))
+        assertEquals(text, transport.request("{\"cmd\":\"quota\"}", 12_000))
+    }
 }

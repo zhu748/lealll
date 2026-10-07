@@ -7,6 +7,9 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -320,6 +323,7 @@ internal fun AccountCard(
 }
 
 @Composable
+@OptIn(ExperimentalLayoutApi::class)
 internal fun AccessConfigCard(
     reachable: Boolean,
     proxyRunning: Boolean,
@@ -352,18 +356,16 @@ internal fun AccessConfigCard(
             )
         }
         HorizontalDivider(color = cs.outlineVariant, thickness = 1.dp, modifier = Modifier.padding(vertical = 12.dp))
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("服务商", fontSize = 13.sp, color = cs.onSurfaceVariant, modifier = Modifier.width(52.dp))
-            SegChip("Z.AI", provider == "zai", enabled, modifier = Modifier.weight(1f), fill = true) { onProviderChange("zai") }
-            Spacer(Modifier.width(8.dp))
-            SegChip("智谱", provider == "bigmodel", enabled, modifier = Modifier.weight(1f), fill = true) { onProviderChange("bigmodel") }
+        Text("服务商", fontSize = 13.sp, color = cs.onSurfaceVariant)
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            SegChip("Z.AI", provider == "zai", enabled) { onProviderChange("zai") }
+            SegChip("智谱", provider == "bigmodel", enabled) { onProviderChange("bigmodel") }
         }
         Spacer(Modifier.height(14.dp))
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("套餐", fontSize = 13.sp, color = cs.onSurfaceVariant, modifier = Modifier.width(52.dp))
-            SegChip("coding-plan", plan == "coding-plan", enabled, modifier = Modifier.weight(1f), fill = true, mono = true) { onPlanChange("coding-plan") }
-            Spacer(Modifier.width(8.dp))
-            SegChip("start-plan", plan == "start-plan", enabled, modifier = Modifier.weight(1f), fill = true, mono = true) { onPlanChange("start-plan") }
+        Text("套餐", fontSize = 13.sp, color = cs.onSurfaceVariant)
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            SegChip("coding-plan", plan == "coding-plan", enabled, mono = true) { onPlanChange("coding-plan") }
+            SegChip("start-plan", plan == "start-plan", enabled, mono = true) { onPlanChange("start-plan") }
         }
     }
 }

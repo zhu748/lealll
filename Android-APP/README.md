@@ -19,9 +19,10 @@ a Kotlin shell; OAuth login happens in the system browser via Custom Tabs.
 1. 安装 APK 后打开应用，首次启动会申请通知权限。通知可以返回应用或停止整个后台服务；拒绝通知权限时仍可在应用内操作。
 2. 在主页选择服务商和套餐，点击登录，在系统浏览器完成授权后返回应用。等待授权期间会显示提示；授权未完成时可重新登录。
 3. 点击「启动代理」。OpenAI 客户端复制 `http://127.0.0.1:8080/v1`，Anthropic 客户端使用 `http://127.0.0.1:8080`，实际端口以主页为准。
-4. 「停止代理」保留本地控制服务和登录状态；通知中的「停止服务」会关闭整个后台服务。再次打开应用或点击恢复按钮可启动服务。
+4. 「停止代理」保留本地控制服务和登录状态；通知或设置页的「停止服务」会关闭整个后台服务。旋转屏幕不会撤销停止操作，再次打开应用或点击「启动服务」可恢复。
 5. 启动失败时点击「查看诊断」复制最近的启动日志，再点击「启动服务」重试；服务已连接但没有响应时可点击「重启服务」。
-6. 设置页可打开通知设置和高级管理面板。高级管理面板需先启动代理，提供账户、统计和详细配置。
+6. 设置页可停止、重启后台服务，打开通知设置和高级管理面板。重启会重新读取配置并中断当前连接，完成后需手动启动代理。高级管理面板需先启动代理，提供账户、统计和详细配置。
+7. 自动更新检查每个界面会话只发起一次，旋转屏幕会保留检查进度、结果和弹窗状态；手动检查不受自动检查开关和已忽略版本影响。检查失败时可稍后重试，不影响本地代理。
 
 ## Build steps
 
@@ -105,6 +106,9 @@ cd Android-APP
 
 ## Validation and limitations
 
+The latest APK changes and validation are recorded in
+[Android usability round 2](../docs/android-usability-round2.md).
+
 - **Start-plan tier untested on Android** — the in-process happy-dom captcha
   solver is bundled into `server.cjs` (jsdom was removed from the project
   entirely), but the tier has not been validated on-device. Coding-plan
@@ -122,17 +126,31 @@ cd Android-APP
 | --- | --- |
 | `MainActivity.kt` | Activity permissions, lifecycle and screen composition |
 | `ui/ProxyViewModel.kt` | Retained state, polling, serialized UI commands and quota cancellation |
+| `ui/UpdateViewModel.kt`, `UpdateDialog.kt` | Retained single update request, feedback and release dialog |
+| `update/` | Release metadata, version comparison and stable preference keys |
 | `ui/HomeCards.kt`, `LogsScreen.kt`, `SettingsScreen.kt` | Page components |
 | `ui/QuotaUi.kt`, `QuotaBlock.kt` | Quota normalization and rendering |
-| `ui/Components.kt`, `RuntimeBanner.kt` | Reusable controls and recovery feedback |
+| `ui/Components.kt`, `RuntimeBanner.kt`, `ServiceActionDialog.kt` | Reusable controls, recovery and service action confirmation |
 | `ServerService.kt`, `RuntimeStatus.kt` | Foreground notification, process readiness and runtime state |
-| `NodeRunner.kt`, `BundleExtractor.kt` | Native process and cached atomic asset extraction |
-| `ControlClient.kt`, `ControlTransport.kt` | JSON commands and cancellable bounded HTTP transport |
+| `NodeRunner.kt`, `ProcessShutdown.kt`, `BundleExtractor.kt` | Native process, bounded shutdown and cached atomic asset extraction |
+| `ControlClient.kt`, `ControlTransport.kt` | JSON commands and authenticated local endpoint |
+| `http/` | Shared OkHttp transport, call deadlines, cancellation and bounded UTF-8 bodies |
 
 Status/log polling stops when the Activity is hidden. ViewModel state survives
 rotation. Quota requests are invalidated on login/provider/plan/session changes,
 and late responses cannot restore obsolete data. Proxy uptime comes from the
 server instead of restarting when the screen is reopened.
+
+Background service restart waits for the old child to exit before spawning a
+replacement. Stop callbacks do not wait on the main thread; the UI remains in
+`STOPPING` until cleanup completes and disables startup during that interval.
+Explicitly stopping the service is retained during Activity recreation.
+
+Local control and release requests share OkHttp 4.12.0 with a 1 MiB decoded
+body cap. Each call has an overall deadline, including reading a trickling
+response; cancellation closes the active call. Redirects and automatic network
+retries are disabled so control mutations cannot be replayed. HTTP resources
+are owned by the transport; page components contain no network requests.
 
 Runtime assets are extracted only after APK installation/update or a missing
 asset, with atomic file replacement and a version marker committed last.

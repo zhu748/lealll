@@ -13,7 +13,6 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.util.UUID
 import java.util.ArrayDeque
-import java.util.concurrent.TimeUnit
 
 class NodeRunner(private val context: Context) {
 
@@ -32,6 +31,7 @@ class NodeRunner(private val context: Context) {
      */
     val controlToken: String = UUID.randomUUID().toString().replace("-", "")
     @Volatile private var process: Process? = null
+    @Volatile private var shutdown: ProcessShutdown? = null
 
     /** Set by stop(); a process that spawns after this self-destructs. */
     @Volatile private var stopRequested = false
@@ -98,6 +98,10 @@ class NodeRunner(private val context: Context) {
 
         val p = pb.start()
         process = p
+        shutdown = ProcessShutdown(p) { child ->
+            if (android.os.Build.VERSION.SDK_INT >= 26) child.destroyForcibly()
+            else child.destroy()
+        }
         // stop() may have run while the process was spawning (it saw
         // process == null); destroy the newborn so it cannot become an orphan
         // holding the control/callback ports past service destruction.
@@ -135,15 +139,10 @@ class NodeRunner(private val context: Context) {
 
     fun stop() {
         stopRequested = true
-        val stopped = process ?: return
-        stopped.destroy()
-        // Do not block the main-thread service callbacks while Node flushes logs.
-        Thread({
-            if (android.os.Build.VERSION.SDK_INT >= 26) {
-                if (!stopped.waitFor(2, TimeUnit.SECONDS)) stopped.destroyForcibly()
-            }
-        }, "node-stop").apply { isDaemon = true }.start()
+        shutdown?.request()
     }
+
+    suspend fun awaitStopped() { shutdown?.awaitStopped() }
 
     private fun appendLog(line: String) {
         Log.i("Node", line)

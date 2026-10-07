@@ -138,6 +138,26 @@ class ProxyViewModelTest {
         assertNotEquals(previous, model.state.value.logs)
     }
 
+    @Test fun stoppingServiceClearsEndpointAndRejectsOldQuota() = runModelTest {
+        client.loggedIn = true
+        client.port = 8080
+        val old = CompletableDeferred<JSONObject>()
+        client.quotaResults.add(old)
+        model.setVisible(true)
+        runCurrent()
+        assertTrue(model.state.value.proxyRunning)
+        runtime.value = RuntimeSession(RuntimePhase.STOPPING, userStopped = true)
+        runCurrent()
+        val calls = client.statusCalls
+        old.complete(quota("已关闭服务的数据"))
+        advanceTimeBy(5000)
+        runCurrent()
+        assertEquals(calls, client.statusCalls)
+        assertFalse(model.state.value.reachable)
+        assertFalse(model.state.value.proxyRunning)
+        assertNull(model.state.value.quota)
+    }
+
     private fun runModelTest(body: suspend TestScope.() -> Unit) = runTest {
         try { body() } finally { store.clear(); runCurrent() }
     }

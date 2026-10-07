@@ -3,3 +3,6 @@
 -keep,allowoptimization,allowobfuscation class com.zcode.proxy.ui.ProxyViewModel {
     public <init>();
 }
+-keep,allowoptimization,allowobfuscation class com.zcode.proxy.ui.UpdateViewModel {
+    public <init>();
+}
