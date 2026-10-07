@@ -44,8 +44,8 @@ Docker 镜像（Release 成功后自动构建推送，多架构 linux/amd64 + li
   build:android-bundle`，产物 4.7MB，无运行时外部依赖）注入 APK assets。
 - **控制协议**：`src/android/control.ts` 提供仅绑定 127.0.0.1 的 HTTP 控制监听器
   （`POST /control`），Kotlin UI 通过它驱动 status/startOAuth/deliverOAuthCode/logout/
-  setConfig/startProxy/stopProxy/getLogs/shutdown。OAuth 经内嵌 WebView 完成，回调端口
-  固定（`ZCODE_OAUTH_CALLBACK_PORT`，`oauth.ts` 支持）。
+  setConfig/startProxy/stopProxy/getLogs/shutdown。OAuth 经系统浏览器 / Custom Tabs 完成，Node 通过服务端轮询接收授权结果。
+  兼容旧回调流程时仍保留独立的 `ZCODE_OAUTH_CALLBACK_PORT`。
 - **server 层**：`src/server/server.ts` 已从 `Bun.serve` 迁移到 `node:http`（v0.3.3.0），
   Bun 与 Node 双运行时兼容；Node 侧由 `src/runtime/node-fetch-compat.ts` 关闭 undici
   默认 300s 头/体超时（长 reasoning 必需）。
@@ -55,7 +55,7 @@ Docker 镜像（Release 成功后自动构建推送，多架构 linux/amd64 + li
   (Node) 构建下配置 socks:// 代理会返回明确错误（故意不静默直连，避免 IP 泄漏）；
   http/https 代理不受影响。
 - **本地验证**：`bun run build:android-bundle && node dist/android/server.cjs version`；
-  完整生命周期冒烟见 `scripts/android_smoke.py`（模拟 Kotlin 控制协议全流程）。
+  完整生命周期冒烟见 `scripts/android-smoke.py`（模拟 Kotlin 控制协议全流程）。
 
 ---
 

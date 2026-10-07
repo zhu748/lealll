@@ -4,13 +4,16 @@ import android.content.Context
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.runInterruptible
 import java.io.BufferedReader
 import java.io.File
-import java.io.FileOutputStream
 import java.io.InputStreamReader
 import java.net.ServerSocket
+import java.net.InetAddress
+import java.net.InetSocketAddress
 import java.util.UUID
-import java.util.concurrent.ConcurrentLinkedDeque
+import java.util.ArrayDeque
+import java.util.concurrent.TimeUnit
 
 class NodeRunner(private val context: Context) {
 
@@ -28,7 +31,7 @@ class NodeRunner(private val context: Context) {
      * header cannot be forged by a no-cors browser fetch either.
      */
     val controlToken: String = UUID.randomUUID().toString().replace("-", "")
-    private var process: Process? = null
+    @Volatile private var process: Process? = null
 
     /** Set by stop(); a process that spawns after this self-destructs. */
     @Volatile private var stopRequested = false
@@ -39,26 +42,16 @@ class NodeRunner(private val context: Context) {
         callbackPort = ports.second
     }
 
-    private val logLines: ConcurrentLinkedDeque<String> = ConcurrentLinkedDeque()
+    private val logLines = ArrayDeque<String>()
 
     suspend fun ensureAssetsExtracted() = withContext(Dispatchers.IO) {
         val targetDir = File(context.filesDir, "server_bundle")
-        val assetManager = context.assets
-        val filesToExtract = listOf(
-            "server_bundle/server.cjs",
-            "server_bundle/config.example.yaml",
-            "server_bundle/webui.txt",
-            "server_bundle/zcode_system.json",
-        )
-        targetDir.mkdirs()
-        for (assetPath in filesToExtract) {
-            val outFile = File(context.filesDir, assetPath)
-            outFile.parentFile?.mkdirs()
-            assetManager.open(assetPath).use { input ->
-                FileOutputStream(outFile).use { output -> input.copyTo(output) }
-            }
-            Log.i(TAG, "extracted $assetPath (${outFile.length()} bytes)")
+        val installedAt = context.packageManager.getPackageInfo(context.packageName, 0).lastUpdateTime
+        val names = listOf("server.cjs", "config.example.yaml", "webui.txt", "zcode_system.json")
+        val extracted = BundleExtractor(targetDir).extract(installedAt.toString(), names) { name ->
+            context.assets.open("server_bundle/$name")
         }
+        Log.i(TAG, if (extracted) "Runtime bundle extracted" else "Runtime bundle reused")
     }
 
     suspend fun start() = withContext(Dispatchers.IO) {
@@ -79,7 +72,6 @@ class NodeRunner(private val context: Context) {
             config.writeText(DEFAULT_CONFIG)
         }
 
-        val credentialSeed = CredentialStore.getOrCreateSeed(context)
         val deviceMid = ensureDeviceMid()
 
         val pb = ProcessBuilder(
@@ -96,7 +88,6 @@ class NodeRunner(private val context: Context) {
             environment()["ZCODE_CONTROL_PORT"] = controlPort.toString()
             environment()["ZCODE_CONTROL_TOKEN"] = controlToken
             environment()["ZCODE_OAUTH_CALLBACK_PORT"] = callbackPort.toString()
-            environment()["ZCODE_PROXY_CREDENTIAL_SECRET"] = credentialSeed
             environment()["ZCODE_IDENTITY_PLATFORM"] = "linux"
             environment()["ZCODE_IDENTITY_ARCH"] = "x64"
             environment()["ZCODE_IDENTITY_RELEASE"] = "6.8.0-49-generic"
@@ -111,38 +102,54 @@ class NodeRunner(private val context: Context) {
         // process == null); destroy the newborn so it cannot become an orphan
         // holding the control/callback ports past service destruction.
         if (stopRequested) {
-            p.destroy()
+            stop()
             throw IllegalStateException("NodeRunner.stop() called before start completed")
         }
         Log.i(TAG, "Node.js started (controlPort=$controlPort)")
 
         Thread({
-            BufferedReader(InputStreamReader(p.inputStream, Charsets.UTF_8)).use { reader ->
-                while (true) {
-                    val line = reader.readLine() ?: break
-                    appendLog(line)
+            try {
+                BufferedReader(InputStreamReader(p.inputStream, Charsets.UTF_8)).use { reader ->
+                    while (true) {
+                        val line = reader.readLine() ?: break
+                        appendLog(line)
+                    }
                 }
+            } catch (exception: Exception) {
+                if (!stopRequested) Log.w(TAG, "Node log stream closed", exception)
             }
             val exit = try { p.exitValue() } catch (_: IllegalThreadStateException) { -1 }
             Log.i(TAG, "Node stdout stream closed (exit=$exit)")
-        }, "node-stdout").start()
+        }, "node-stdout").apply { isDaemon = true }.start()
     }
 
-    fun snapshotLogs(): List<String> = logLines.toList()
+    fun snapshotLogs(): List<String> = synchronized(logLines) { logLines.toList() }
 
-    fun isAlive(): Boolean = process?.isAlive == true
+    fun isAlive(): Boolean = process?.let { running ->
+        try { running.exitValue(); false } catch (_: IllegalThreadStateException) { true }
+    } ?: false
+
+    fun exitCode(): Int? = try { process?.exitValue() } catch (_: IllegalThreadStateException) { null }
+
+    suspend fun awaitExit(): Int = runInterruptible(Dispatchers.IO) { process?.waitFor() ?: -1 }
 
     fun stop() {
         stopRequested = true
-        process?.destroy()
-        process = null
+        val stopped = process ?: return
+        stopped.destroy()
+        // Do not block the main-thread service callbacks while Node flushes logs.
+        Thread({
+            if (android.os.Build.VERSION.SDK_INT >= 26) {
+                if (!stopped.waitFor(2, TimeUnit.SECONDS)) stopped.destroyForcibly()
+            }
+        }, "node-stop").apply { isDaemon = true }.start()
     }
 
     private fun appendLog(line: String) {
         Log.i("Node", line)
-        logLines.addLast(line)
-        while (logLines.size > LOG_CAPACITY) {
-            logLines.pollFirst()
+        synchronized(logLines) {
+            logLines.addLast(line)
+            if (logLines.size > LOG_CAPACITY) logLines.removeFirst()
         }
     }
 
@@ -160,7 +167,9 @@ class NodeRunner(private val context: Context) {
                 parts.size == 1 -> parts[0].toIntOrNull()?.let { it to it + 1 }
                 else -> null
             }
-            if (cached != null && isPortFree(cached.first) && isPortFree(cached.second)) {
+            if (cached != null && cached.first != cached.second &&
+                cached.first in 1..65535 && cached.second in 1..65535 &&
+                isPortFree(cached.first) && isPortFree(cached.second)) {
                 if (parts.size < 2) portFile.writeText("${cached.first}\n${cached.second}\n")
                 return cached
             }
@@ -173,11 +182,14 @@ class NodeRunner(private val context: Context) {
     }
 
     private fun reservePort(): Int {
-        ServerSocket(0).use { s -> return s.localPort }
+        ServerSocket().use { s ->
+            s.bind(InetSocketAddress(InetAddress.getByName("127.0.0.1"), 0))
+            return s.localPort
+        }
     }
 
     private fun isPortFree(port: Int): Boolean = try {
-        ServerSocket(port).use { it }
+        ServerSocket().use { it.bind(InetSocketAddress(InetAddress.getByName("127.0.0.1"), port)) }
         true
     } catch (e: Exception) {
         false

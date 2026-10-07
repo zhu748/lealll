@@ -14,26 +14,48 @@ a Kotlin shell; OAuth login happens in the system browser via Custom Tabs.
   the Termux Node.js `.deb` packages via `scripts/extract-termux-deps.sh` (the
   extracted `.so` files are committed in `app/src/main/jniLibs/arm64-v8a/`)
 
+## 使用步骤
+
+1. 安装 APK 后打开应用，首次启动会申请通知权限。通知可以返回应用或停止整个后台服务；拒绝通知权限时仍可在应用内操作。
+2. 在主页选择服务商和套餐，点击登录，在系统浏览器完成授权后返回应用。等待授权期间会显示提示；授权未完成时可重新登录。
+3. 点击「启动代理」。OpenAI 客户端复制 `http://127.0.0.1:8080/v1`，Anthropic 客户端使用 `http://127.0.0.1:8080`，实际端口以主页为准。
+4. 「停止代理」保留本地控制服务和登录状态；通知中的「停止服务」会关闭整个后台服务。再次打开应用或点击恢复按钮可启动服务。
+5. 启动失败时点击「查看诊断」复制最近的启动日志，再点击「启动服务」重试；服务已连接但没有响应时可点击「重启服务」。
+6. 设置页可打开通知设置和高级管理面板。高级管理面板需先启动代理，提供账户、统计和详细配置。
+
 ## Build steps
 
 ```bash
-# 1. Install JS deps
-bun install
-
-# 2. Build the esbuild CJS bundle (outputs dist/android/server.cjs)
-bun run build:android-bundle
-cp dist/android/server.cjs Android-APP/app/src/main/assets/server_bundle/server.cjs
-
-# 3. Build the debug APK (Node binary + dependency .so files are committed
-#    in jniLibs — nothing is downloaded at build time)
-cd Android-APP
-./gradlew assembleDebug
-
-# 4. Sideload onto a device (USB debugging enabled)
-adb install -r app/build/outputs/apk/debug/app-debug.apk
+bun install --frozen-lockfile
+export ANDROID_HOME=/path/to/android-sdk
+# Automatically rebuilds/copies server.cjs and invokes the Gradle wrapper.
+bun run build:android-apk
+# Run Android JVM tests, lint and packaging together:
+bun run build:android-apk :app:testDebugUnitTest :app:lintDebug :app:assembleDebug
+# Exercise the actual Android Node entry with a local mock upstream:
+python3 scripts/android-smoke.py
+adb install -r Android-APP/app/build/outputs/apk/debug/app-debug.apk
 ```
 
+The wrapper pins Gradle 8.9 with SHA256 verification, paired with AGP 8.7.3,
+SDK 35 and build-tools 35.0.0. The helper prefers a local JDK/SDK;
+`ANDROID_BUILD_MODE=local|docker` overrides selection. Docker mode uses
+`llama-android-builder:latest` (build it with `scripts/android-builder.Dockerfile`)
+and the same Gradle wrapper. Extra Gradle tasks and `-P` options are forwarded.
+Node binaries are committed in `jniLibs`; Gradle and Maven dependencies may
+be downloaded on the first build.
+
+A debug APK is test-signed. Updating an existing installation requires a
+matching signing certificate and an equal or greater `versionCode`; local
+builds now derive the default code from the repository version just like CI,
+with `-PandroidApp.versionCode=...` available for overrides. Use the
+original release keystore for distributable updates. An unsigned release APK
+cannot be installed directly.
+
 ## Release build (signed)
+
+Release builds enable R8 code optimization and resource shrinking; debug
+builds keep readable classes for debugging.
 
 Requires GitHub Actions secrets `ANDROID_KEYSTORE_BASE64`,
 `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD`. The
@@ -55,8 +77,7 @@ cd Android-APP
 - `Android-APP/app/src/main/java/com/zcode/proxy/` — Kotlin shell.
 - `Android-APP/app/src/main/assets/server_bundle/` — tracked sidecar assets
   (`config.example.yaml`, `webui.txt`, `zcode_system.json`); `server.cjs` is
-  gitignored build output — regenerate via `bun run build:android-bundle` +
-  copy `dist/android/server.cjs` into it before building (Gradle's
+  gitignored build output — the APK helper regenerates it automatically (Gradle's
   `checkServerBundle` preBuild task fails with a hint if it is missing).
 - `Android-APP/app/src/main/jniLibs/arm64-v8a/` — committed Node.js binary
   (`libnode.so`) + Termux dependency `.so` files, extracted once via
@@ -82,24 +103,56 @@ cd Android-APP
    and persists the encrypted credential; the app's 1.5s status polling
    reflects the logged-in state automatically.
 
-## Known limitations (v1)
+## Validation and limitations
 
 - **Start-plan tier untested on Android** — the in-process happy-dom captcha
   solver is bundled into `server.cjs` (jsdom was removed from the project
   entirely), but the tier has not been validated on-device. Coding-plan
-  (direct upstream) is the supported tier on Android v1.
-- **Not Play Store-distributed** — APK is sideload-only. Play Store rejects apps
-  that launch external binaries from `jniLibs/`.
-- **arm64-v8a only** — no x86 / armeabi-v7a support. Covers 99%+ of modern
-  Android devices.
-- **No iOS build** — Android only for v1.
+  (direct upstream) remains the recommended tier; this refactor does not
+  substitute for device testing of either OAuth provider.
+- **Sideload distribution** — no Play Store submission is performed by this project.
+  The `specialUse` foreground-service declaration describes a user-started local
+  API proxy; a Play Store submission would require review of this use case.
+- **arm64-v8a only** — no x86 / armeabi-v7a support. Requires a 64-bit ARM Android device (minimum API 24).
+- **No iOS build** — Android only.
+
+### Android module boundaries
+
+| File/module | Responsibility |
+| --- | --- |
+| `MainActivity.kt` | Activity permissions, lifecycle and screen composition |
+| `ui/ProxyViewModel.kt` | Retained state, polling, serialized UI commands and quota cancellation |
+| `ui/HomeCards.kt`, `LogsScreen.kt`, `SettingsScreen.kt` | Page components |
+| `ui/QuotaUi.kt`, `QuotaBlock.kt` | Quota normalization and rendering |
+| `ui/Components.kt`, `RuntimeBanner.kt` | Reusable controls and recovery feedback |
+| `ServerService.kt`, `RuntimeStatus.kt` | Foreground notification, process readiness and runtime state |
+| `NodeRunner.kt`, `BundleExtractor.kt` | Native process and cached atomic asset extraction |
+| `ControlClient.kt`, `ControlTransport.kt` | JSON commands and cancellable bounded HTTP transport |
+
+Status/log polling stops when the Activity is hidden. ViewModel state survives
+rotation. Quota requests are invalidated on login/provider/plan/session changes,
+and late responses cannot restore obsolete data. Proxy uptime comes from the
+server instead of restarting when the screen is reopened.
+
+Runtime assets are extracted only after APK installation/update or a missing
+asset, with atomic file replacement and a version marker committed last.
+Configuration and credentials are kept separately from the extracted bundle.
+The obsolete Android Keystore seed has been removed: the server already owns
+credential persistence and did not use that seed. App backup is disabled so
+runtime files and credentials are not copied into an unrelated installation.
 
 ## Permissions
 
 - `INTERNET` — proxy server + upstream HTTPS
 - `ACCESS_NETWORK_STATE` — detect connectivity changes
-- `FOREGROUND_SERVICE` + `FOREGROUND_SERVICE_DATA_SYNC` — keep Node.js alive
+- `FOREGROUND_SERVICE` + `FOREGROUND_SERVICE_SPECIAL_USE` — keep Node.js alive
   when the app is backgrounded
-- `POST_NOTIFICATIONS` — required on Android 13+ for the foreground service
-  notification
-- `WAKE_LOCK` — prevent CPU sleep during long LLM calls
+- `POST_NOTIFICATIONS` — display the service notification on Android 13+
+  (requested once; settings offers a recovery entry; denial does not block the service)
+
+No permanent wake lock is acquired. OEM battery restrictions may still stop
+background execution; allow background activity in system settings if needed.
+
+Platform references: [foreground service types](https://developer.android.com/develop/background-work/services/fgs/service-types),
+[notification permission](https://developer.android.com/develop/ui/views/notifications/notification-permission),
+[AGP 8.7 compatibility](https://developer.android.com/build/releases/agp-8-7-0-release-notes).

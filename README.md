@@ -150,14 +150,16 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 
 ## 📱 手机版 (Android)
 
-从 [GitHub Releases](https://github.com/TriDefender/zcode-api/releases) 下载最新的 `apk` 安装即可。
+从 [GitHub Releases](https://github.com/zhu748/lealll/releases) 下载最新的 `apk` 安装即可。
 App 与电脑版功能对应：一键启动代理、扫码级简单配置、实时日志、切换服务商与套餐、亮暗双主题。
 
 | 主页 | 日志 | 设置 | 暗色主题 |
 |:-:|:-:|:-:|:-:|
 | <img src="docs/images/android/home-light.png" width="210" alt="主页" /> | <img src="docs/images/android/logs.png" width="210" alt="日志" /> | <img src="docs/images/android/settings.png" width="210" alt="设置" /> | <img src="docs/images/android/home-dark.png" width="210" alt="暗色主题" /> |
 
-手机和电脑跑的是同一套核心：App 内置了完整的代理引擎，**手机本身就是一个独立的代理服务器**，局域网内的电脑也可以连手机上的代理地址一起用。
+手机和电脑跑的是同一套核心：App 内置代理引擎，**手机本身就是一个独立的代理服务器**。默认仅监听本机；OpenAI 客户端使用 `http://127.0.0.1:8080/v1`，实际端口以应用显示为准。
+
+使用与构建步骤见 [Android 说明](Android-APP/README.md)，本轮优化与验证结果见 [APK 可用性检查](docs/android-usability-review.md)。
 
 <details>
 <summary><b>Docker 部署</b></summary>

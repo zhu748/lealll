@@ -214,6 +214,12 @@ describe("android control listener — lifecycle commands", () => {
       expect(result.body.port).toBe(9999);
     }
     expect(state.proxyPort).toBe(9999);
+    expect(state.proxyStartedAt).toBeGreaterThan(0);
+    const status = await post({ cmd: "status" }, state, ctx);
+    if (status.body.ok && "state" in status.body) {
+      expect(status.body.proxyStartedAt).toBe(state.proxyStartedAt);
+      expect(status.body.oauthPending).toBe(false);
+    } else throw new Error("expected status response");
   });
 
   it("startProxy surfaces hook errors", async () => {
@@ -245,6 +251,7 @@ describe("android control listener — lifecycle commands", () => {
     const result = await post({ cmd: "stopProxy" }, state, ctx);
     expect(result.body.ok).toBe(true);
     expect(state.proxyPort).toBe(0);
+    expect(state.proxyStartedAt).toBeUndefined();
   });
 });
 

@@ -12,7 +12,7 @@
  *    bind regression where the listener accidentally widens.
  *
  * The listener exposes a JSON command protocol so Kotlin can drive OAuth
- * (via embedded WebView), start/stop the proxy server, update runtime config
+ * (via system browser), start/stop the proxy server, update runtime config
  * (provider/plan), poll logs, and shut down the Node process.
  */
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
@@ -49,12 +49,12 @@ export type ControlCommand =
 
 /** Successful response envelope. */
 export type ControlOk =
-  | { ok: true; state: "running"; provider: ProviderId; plan: PlanTier; proxyPort: number; loggedIn: boolean }
+  | { ok: true; state: "running"; provider: ProviderId; plan: PlanTier; proxyPort: number; loggedIn: boolean; proxyStartedAt?: number; oauthPending?: boolean }
   | { ok: true; event: "oauthUrl"; authorizeUrl: string; callbackPort: number }
   | { ok: true; event: "loginOk"; provider: ProviderId }
   | { ok: true; event: "loggedOut" }
   | { ok: true; event: "configUpdated"; provider: ProviderId; plan: PlanTier }
-  | { ok: true; event: "proxyStarted"; port: number }
+  | { ok: true; event: "proxyStarted"; port: number; startedAt?: number }
   | { ok: true; event: "proxyStopped" }
   | { ok: true; event: "logs"; nextSince: number; lines: string[] }
   | { ok: true; event: "quota"; quota: QuotaSnapshot }
@@ -84,6 +84,8 @@ export interface ControlState {
   plan: PlanTier;
   /** Currently-bound proxy server port. 0 when proxy is stopped. */
   proxyPort: number;
+  /** Wall-clock start time, retained across Activity recreation. */
+  proxyStartedAt?: number;
   /** Active OAuth client while a flow is in flight; nulled on completion. */
   activeOauth?: {
     client: OAuthFlowClient;
@@ -374,6 +376,8 @@ async function dispatchCommand(cmd: ControlCommand, state: ControlState, ctx: Ha
         plan: state.plan,
         proxyPort: state.proxyPort,
         loggedIn: cred != null,
+        proxyStartedAt: state.proxyStartedAt ?? 0,
+        oauthPending: state.activeOauth != null,
       };
     }
 
@@ -462,7 +466,8 @@ async function dispatchCommand(cmd: ControlCommand, state: ControlState, ctx: Ha
       const result = await ctx.onStartProxy();
       if (!result.ok) return result;
       state.proxyPort = result.port;
-      return { ok: true, event: "proxyStarted", port: result.port };
+      state.proxyStartedAt = Date.now();
+      return { ok: true, event: "proxyStarted", port: result.port, startedAt: state.proxyStartedAt };
     }
 
     case "stopProxy": {
@@ -470,6 +475,7 @@ async function dispatchCommand(cmd: ControlCommand, state: ControlState, ctx: Ha
       const result = await ctx.onStopProxy();
       if (!result.ok) return result;
       state.proxyPort = 0;
+      state.proxyStartedAt = undefined;
       return { ok: true, event: "proxyStopped" };
     }
 

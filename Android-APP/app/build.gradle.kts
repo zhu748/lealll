@@ -32,12 +32,12 @@ if (System.getenv("CI") == "true") {
 android {
     namespace = "com.zcode.proxy"
     compileSdk = 35
+    buildToolsVersion = "35.0.0"
 
     defaultConfig {
         applicationId = "com.zcode.proxy"
         minSdk = 24
         targetSdk = 35
-        versionCode = prop("androidApp.versionCode").orNull?.toIntOrNull() ?: 1
         // CI injects the release tag via androidApp.versionName; local/dev
         // builds derive "<repo package.json version>-android" so they only
         // prompt for an update when a genuinely newer release exists.
@@ -46,6 +46,15 @@ android {
                 .find(rootProject.file("../package.json").readText())?.groupValues?.get(1)
         }.getOrNull()
         versionName = prop("androidApp.versionName").orNull ?: "${repoVersion ?: "0.0.0"}-android"
+        // Match release CI's major/minor/patch code; local signed updates must
+        // not silently downgrade an installed release to versionCode=1.
+        val parts = Regex("^(\\d+)\\.(\\d+)\\.(\\d+)")
+            .find(repoVersion.orEmpty())?.groupValues?.drop(1)?.map { it.toLong() }
+        val inferredCode = parts?.let { it[0] * 10000 + it[1] * 100 + it[2] } ?: 1L
+        val requestedCode = prop("androidApp.versionCode").orNull
+        val code = requestedCode?.toLongOrNull() ?: if (requestedCode == null) inferredCode else 0L
+        require(code in 1..Int.MAX_VALUE.toLong()) { "androidApp.versionCode must be a positive Android integer" }
+        versionCode = code.toInt()
         ndk {
             abiFilters += listOf("arm64-v8a")
         }
@@ -65,7 +74,8 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -90,6 +100,10 @@ android {
         compose = true
     }
 
+    testOptions {
+        unitTests.isReturnDefaultValues = true // Android Log calls in JVM tests.
+    }
+
     packaging {
         jniLibs {
             useLegacyPackaging = true
@@ -101,13 +115,18 @@ dependencies {
     implementation(platform("androidx.compose:compose-bom:2024.12.01"))
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
+    implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
+    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
     implementation("androidx.activity:activity-compose:1.9.3")
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-graphics")
     implementation("androidx.compose.material3:material3")
-    implementation("androidx.security:security-crypto:1.1.0-alpha06")
     implementation("androidx.browser:browser:1.8.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
+    testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")
 }
 
 // server.cjs is build output (gitignored), generated from ../../src by

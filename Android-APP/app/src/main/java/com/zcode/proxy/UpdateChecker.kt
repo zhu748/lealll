@@ -3,6 +3,7 @@ package com.zcode.proxy
 import android.content.Context
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.net.HttpURLConnection
@@ -42,7 +43,9 @@ object UpdateChecker {
             } finally {
                 conn.disconnect()
             }
-        } catch (t: Throwable) {
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (t: Exception) {
             Log.i(TAG, "update check failed: ${t.message}")
             null
         }
@@ -83,7 +86,8 @@ object UpdateChecker {
     }
 
     /**
-     * 提取前三个数字段逐位比较。current 取自 APK versionName：release CI 直接写入
+     * 比较主版本、次版本、补丁和 fork/第四段序号，确保 fork.2 能更新 fork.1。
+     * current 取自 APK versionName：release CI 直接写入
      * 完整 tag（如 "v5.0.0"），本地/开发构建是 "<package.json 版本>-android"
      * （build.gradle.kts 从仓库 package.json 派生，release CI 会自动 bump 并提交），
      * 因此只有当正式 release 比仓库版本更新时才提示。/releases/latest 不返回
@@ -104,7 +108,12 @@ object UpdateChecker {
     }
 
     private fun numericParts(v: String): List<Int> =
-        Regex("\\d+").findAll(v).take(3).mapNotNull { it.value.toIntOrNull() }.toList()
+        Regex("^v?(\\d+)\\.(\\d+)\\.(\\d+)(?:\\.(\\d+)|-fork\\.(\\d+))?")
+            .find(v.trim())?.let { match ->
+                listOf(match.groupValues[1], match.groupValues[2], match.groupValues[3],
+                    match.groupValues[4].ifBlank { match.groupValues[5] })
+                    .map { it.toIntOrNull() ?: 0 }
+            } ?: emptyList()
 }
 
 /** 更新偏好持久化：「忽略此版本」的 tag 不再自动弹窗；自动检查开关（默认开）控制启动时是否查询。手动检查均不受影响。 */
