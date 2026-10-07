@@ -487,5 +487,6 @@ describe("error handling", () => {
       expect(e).toBeInstanceOf(OffPeakServerError);
       expect((e as OffPeakServerError).message).toMatch(/abort/i);
     }
+    expect(called).toBe(false);
   });
 });

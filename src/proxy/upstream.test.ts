@@ -2,7 +2,7 @@
  * Tests for upstream request builder and proxy handler.
  * @see .omo/plans/zcode-proxy.md Task 6
  */
-import { describe, it, expect, mock, beforeEach } from "bun:test";
+import { describe, it, expect, mock } from "bun:test";
 import { gzipSync } from "node:zlib";
 import { createServer } from "node:net";
 import { buildUpstreamRequest, buildUpstreamHeaderPairs, buildUpstreamURL, buildAuthHeaders } from "./upstream.js";

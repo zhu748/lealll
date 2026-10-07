@@ -29,8 +29,6 @@ import {
 } from "./server/panel.js";
 import { checkForUpdate } from "./update/check.js";
 import { readFileSync, existsSync, writeFileSync, chmodSync } from "node:fs";
-import { join } from "node:path";
-import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { ensureNodeFetchNoTimeouts } from "./runtime/node-fetch-compat.js";
 import { initPool } from "./proxy/proxy-pool.js";

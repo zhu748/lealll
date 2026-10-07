@@ -17,6 +17,7 @@ import { dirname, join } from "node:path";
 // v0.3.7.1: host-captured timer — retry delays must not resolve through the
 // captcha window alias during solve epochs.
 import { hostSetTimeout } from "./host-timers.js";
+import { createSerialQueue } from "./serial.js";
 
 let atomicTmpCounter = 0;
 
@@ -111,15 +112,10 @@ export interface AsyncMutex {
 }
 
 export function createMutex(): AsyncMutex {
-  let chain: Promise<unknown> = Promise.resolve();
+  const run = createSerialQueue();
   return {
     run<T>(fn: () => Promise<T>): Promise<T> {
-      const next = chain.then(() => fn());
-      // Swallow rejections on the stored chain so a failed task doesn't
-      // poison every subsequent task. The returned `next` still surfaces
-      // the rejection to the caller.
-      chain = next.then(() => undefined, () => undefined);
-      return next as Promise<T>;
+      return run(() => fn());
     },
   };
 }

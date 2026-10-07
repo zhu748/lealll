@@ -296,12 +296,12 @@ ssh -N -L 8090:127.0.0.1:8090 user@host
 ## 🛠️ 参与开发
 
 ```bash
-bun test            # 跑测试
-bun x tsc --noEmit  # 类型检查
+bun run test:offline # 离线测试（mock / 回环地址）
+bun run typecheck    # 类型与未使用代码检查
 bun run dev         # 开发模式启动面板
 ```
 
-架构与实现细节见 [`src/`](src/) 下各源码文件内的注释。
+模块职责、修改入口和状态管理见 [代码分类与维护指南](docs/code-organization.md)，实现细节见 [`src/`](src/) 下各源码文件内的注释。
 
 ## Privacy
 

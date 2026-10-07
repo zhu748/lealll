@@ -1,6 +1,7 @@
 import { BigmodelPollOAuthClient, LOGIN_TIMEOUT_MS, ZaiOAuthClient } from "../auth/oauth.js";
 import { KeyResolver } from "../auth/resolver.js";
-import { loadCredential, maskApiKey, saveCredential } from "../auth/store.js";
+import { loadCredential, saveCredential } from "../auth/store.js";
+import { maskApiKey } from "../auth/account-view.js";
 import { errorResponse } from "../proxy/translated-response.js";
 import { hostSetInterval } from "../utils/host-timers.js";
 import { appendLog } from "./logs.js";

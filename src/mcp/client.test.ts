@@ -20,7 +20,7 @@ function mockFetch(responses: Response[]): typeof fetch {
 describe("McpClient", () => {
   it("captures Mcp-Session-Id from initialize and reuses it", async () => {
     const seenHeaders: Record<string, string>[] = [];
-    const fetchImpl = (async (url: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const fetchImpl = (async (_url: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
       const headers = new Headers(init?.headers);
       seenHeaders.push(Object.fromEntries(headers.entries()));
       return sse({ jsonrpc: "2.0", id: 1, result: { protocolVersion: "2024-11-05", capabilities: {}, serverInfo: { name: "x", version: "0" } } }, { "mcp-session-id": "sess-123" });

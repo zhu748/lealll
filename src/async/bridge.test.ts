@@ -472,6 +472,7 @@ describe("runAsyncBridge — abort handling", () => {
 
     expect(client.settleCalls).toContain("t-init");
     expect(o.terminalPhase).toBe("abort");
+    expect(upstreamReadCancelled).toBe(true);
   });
 });
 

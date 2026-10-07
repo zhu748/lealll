@@ -1,3 +1,4 @@
+import { maskApiKey } from "../../auth/account-view.js";
 import { KeyResolver } from "../../auth/resolver.js";
 import {
   clearCredentialAsync,
@@ -5,7 +6,6 @@ import {
   invalidateStoreCache,
   listAccounts,
   loadCredential,
-  maskApiKey,
   saveCredential,
 } from "../../auth/store.js";
 import type { Credential as AppCredential } from "../../auth/types.js";

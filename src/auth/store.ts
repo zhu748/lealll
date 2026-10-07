@@ -1,32 +1,33 @@
 /**
- * Encrypted file-based credential store with multi-account support.
+ * Encrypted credential-store persistence and account mutations.
  *
- * File format (v2):
- *   { version: 2, activeId: string | null, accounts: StoredAccount[] }
- *
- * Backward compat: if the on-disk file is the original v1 format ({ encrypted: ... }),
- * it is migrated on first load (decrypted, wrapped in a single account, marked active).
- *
- * Encryption: AES-256-GCM with a FIXED key derived from SHA-256("520").
- * The same key is used on every machine, every OS, every run — so credentials.json
- * is portable across devices and never breaks due to key drift. This is a conscious
- * trade-off: we give up encryption-at-rest strength (anyone with the source code
- * can decrypt the file) in exchange for never losing user data to key-derivation
- * bugs. For a local dev tool where the credentials file lives on the user's own
- * machine, this is the right trade-off.
- *
- * @see .omo/plans/zcode-proxy.md Task 14
+ * Owns the decrypted cache, file fingerprint, migration/write guards and
+ * process locks. Crypto, normalization and display helpers live in leaf
+ * modules so callers can reuse them without loading persistence state.
+ * Existing v1 files are migrated to the v2 multi-account envelope on read.
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, readdirSync, statSync, rmSync } from "node:fs";
 import { join, dirname, basename } from "node:path";
 import { homedir } from "node:os";
-import { randomBytes, createCipheriv, createDecipheriv, createHash } from "node:crypto";
 import { atomicWriteFile, createMutex } from "../utils/fs.js";
 import { runtimeLog, runtimeWarn } from "../utils/log.js";
 import type { Credential } from "./types.js";
-// v0.3.7.1: host-captured timer — store retry backoffs must survive captcha
-// solve epochs (bare global is aliased to the solving window there).
+import type { StoredAccount, StoreV2, AccountList } from "./store-types.js";
+import { encrypt, decrypt, resetEncryptionKeyCache } from "./store-crypto.js";
+import {
+  cloneStoredAccount, generateAccountId, defaultAccountLabel, normalizeCredential,
+  normalizeStoredAccount, normalizeStore, normalizeStoreInPlace, normalizeStoreActiveId,
+} from "./store-normalization.js";
+import { summarizeAccounts } from "./account-view.js";
+import { validateProxyUrl } from "../utils/proxy-url.js";
+// Store backoffs must survive destruction of the captcha solver's window.
 import { hostSetTimeout } from "../utils/host-timers.js";
+
+// Preserve the existing public entry points while internal users import leaves.
+export type { StoredAccount } from "./store-types.js";
+export { _resetKeyCacheForTesting } from "./store-crypto.js";
+export { maskApiKey, credentialStatsKey } from "./account-view.js";
+export { validateProxyUrl } from "../utils/proxy-url.js";
 
 /**
  * Store directory.
@@ -60,35 +61,11 @@ function refreshStorePathFromEnv(): void {
   undecryptableFilePresent = false;
   lastReadStoreNullReason = null;
 }
-/**
- * Optional env var: if set, its value is used as a legacy seed for decrypt
- * fallback (lets users recover credentials.json encrypted by an old version
- * whose homedir/platform/arch differed from the current one). ONLY used in
- * the decrypt fallback — new encryption always uses the fixed 520 key.
- *
- * NOTE: ZCODE_PROXY_CREDENTIAL_SECRET is intentionally NOT consulted.
- * The user's explicit requirement is "all keys encrypted/decrypted via the
- * 520 fixed key only — no separate secret file, no env-var override." The
- * old env-var-derived key was the #1 cause of "credentials lost on restart"
- * because if the env var was set during one run and unset the next, the key
- * silently rotated and the file became undecryptable. The fixed 520 key
- * eliminates that entire class of bugs.
- */
-const ENV_LEGACY_SEED = "ZCODE_PROXY_LEGACY_SEED";
 
 /**
- * In-memory cache of the decrypted store. Set to `undefined` to indicate
- * "not yet loaded" (distinct from `null` = "loaded but file doesn't exist").
- * Invalidated by every writeStore() and clearCredential() call so callers
- * always see fresh data after a mutation.
- *
- * v0.1.5+ STALENESS DETECTION: cross-process writes (e.g. `auth login` from
- * start.bat while the proxy is running) won't invalidate this cache — they
- * happen in a separate process. To catch that case, loadCredential() and
- * exportAccounts() now stat() the file's mtimeMs + ctimeMs + size and compare
- * against the cached fingerprint. If the file was modified externally, the
- * cache is dropped and the next read goes to disk. This is cheap (one stat per
- * read) and catches the common case of "user added a credential via CLI".
+ * undefined = not loaded, null = read returned no usable store, object =
+ * decrypted store. Successful writes update this cache; failed writes drop
+ * it. Reads compare mtime/ctime/size to detect changes from another process.
  */
 let cachedStore: StoreV2 | null | undefined = undefined;
 /** mtimeMs of the on-disk credentials.json at the time cachedStore was
@@ -132,474 +109,6 @@ function markStoreNull(reason: StoreNullReason): null {
 
 function clearStoreNullReason(): void {
   lastReadStoreNullReason = null;
-}
-
-/** One stored account record (without encryption — encryption wraps the whole file). */
-export interface StoredAccount {
-  /** Stable unique id (16 hex chars). */
-  id: string;
-  /** Human-readable label, e.g. "Z.AI · 2024-06-22 14:30". */
-  label: string;
-  /** Creation timestamp (ms). */
-  createdAt: number;
-  /** The credential payload. */
-  credential: Credential;
-}
-
-function cloneStoredAccount<T extends Omit<StoredAccount, "credential"> & { credential: Credential }>(account: T): T {
-  return {
-    ...account,
-    credential: { ...account.credential },
-  };
-}
-
-interface StoreV2 {
-  version: 2;
-  activeId: string | null;
-  accounts: StoredAccount[];
-}
-
-// ---------------------------------------------------------------------------
-// Encryption (AES-256-GCM via Node.js crypto — compatible with all platforms)
-// ---------------------------------------------------------------------------
-
-/**
- * The fixed encryption key seed. AES-256 requires a 32-byte key, so we derive
- * the actual key via SHA-256. The seed value "520" is intentionally trivial —
- * the goal is NOT cryptographic security (anyone with the source can decrypt
- * the file), but rather a stable, portable obfuscation that prevents casual
- * shoulder-surfing of plaintext credentials in `credentials.json`.
- *
- * Why a fixed key instead of per-machine key derivation:
- *   - The previous scheme derived the key from `${homedir}-${platform}-${arch}`,
- *     which broke whenever the user changed username, upgraded OS, switched
- *     32-bit↔64-bit binaries, or copied credentials.json to another machine.
- *     Each of those scenarios silently rotated the key and locked the user out
- *     of their own credentials — leading to data loss.
- *   - A fixed key eliminates that entire class of bugs. The same credentials.json
- *     file works on every machine, every OS, every Bun version, forever.
- *
- * If you ever need to change this value, ALL existing credentials.json files
- * will become unreadable (the decrypt fallback will try the old key via the
- * legacy-seed mechanism, but only if ZCODE_PROXY_LEGACY_SEED is set to "520").
- */
-const FIXED_KEY_SEED = "520";
-
-/**
- * In-memory cache of the fixed encryption key. Set once on first call to
- * avoid re-hashing on every encrypt/decrypt. Reset by `_resetKeyCacheForTesting`
- * between unit tests (harmless no-op for the fixed key — kept for backward
- * compat with test code that calls it).
- */
-let cachedKey: Buffer | null = null;
-
-/**
- * Reset the key cache. Internal — used by unit tests. With the fixed-key
- * scheme this is effectively a no-op (the cache will be repopulated with the
- * same SHA-256("520") on the next call), but it's kept so existing test code
- * that calls it between cases doesn't break.
- * @internal
- */
-export function _resetKeyCacheForTesting(): void {
-  cachedKey = null;
-}
-
-/**
- * SHA-256–derive a 256-bit key from a seed string. Used by the fixed-key
- * derivation and by the legacy multi-seed fallback in decrypt().
- */
-function deriveSha256Key(seed: string): Buffer {
-  return createHash("sha256").update(seed).digest();
-}
-
-/**
- * Derive the legacy XOR-fold key (zcode-api-ref / early zhipu format).
- * NOT cryptographic — kept only so users with credentials.json from the
- * open-source zcode-api-ref repo can be transparently migrated via the
- * decrypt fallback.
- */
-function deriveXorFoldKey(seed: string): Buffer {
-  const hash = Buffer.alloc(32);
-  const seedBytes = Buffer.from(seed, "utf8");
-  for (let i = 0; i < seedBytes.length; i++) {
-    hash[i % 32] ^= seedBytes[i];
-  }
-  return hash;
-}
-
-/**
- * Get the encryption key. Always returns SHA-256("520") — a fixed, portable
- * key that never changes across machines, OS versions, or Bun versions.
- *
- * This eliminates the entire class of "key drift" bugs that previously caused
- * credential corruption:
- *   - homedir() resolving differently across Bun versions
- *   - USERPROFILE vs HOMEDRIVE+HOMEPATH on Windows
- *   - 32-bit vs 64-bit binary switching arch
- *   - username changes / OS reinstalls
- *   - copying credentials.json between machines
- *   - ZCODE_PROXY_CREDENTIAL_SECRET env var being set during one run and not
- *     the next (the most recent incarnation of the bug — now permanently
- *     fixed by removing the env-var path entirely)
- *
- * The fixed key is cached after the first call. There is NO env var override,
- * NO key file in the credential directory, NO seed derivation — just one
- * constant key, everywhere, always. New encryption always uses this key.
- * Decrypt has a one-time fallback for files encrypted by older versions
- * (see buildCandidateKeysForDecrypt) but that fallback only READS — it never
- * affects what key new writes use.
- */
-function getEncryptionKeyBuffer(): Buffer {
-  if (cachedKey) return cachedKey;
-  cachedKey = deriveSha256Key(FIXED_KEY_SEED);
-  return cachedKey;
-}
-
-/**
- * Build a list of candidate encryption keys to try during decrypt fallback.
- *
- * This is ONLY used when the fixed key fails to decrypt the file — i.e. the
- * file was encrypted by an OLDER version of this code that used seed-based
- * or env-var-based key derivation. Once the fallback succeeds, the file is
- * re-encrypted with the fixed key on the next writeStore() call, so the
- * fallback is a one-time migration path.
- *
- * Candidate seeds cover common version-drift scenarios:
- *   - `${home}-${plat}-${arch}`     historical seed template
- *   - `${home}-${plat}`             arch differed (32-bit vs 64-bit binary)
- *   - `${home}-${arch}`             platform differed (unlikely but cheap)
- *   - `${home}`                     old version may have only used homedir
- *   - `ZCODE_PROXY_LEGACY_SEED`     user-supplied (manual recovery)
- *   - `ZCODE_PROXY_CREDENTIAL_SECRET`  old env-var-derived key (recovery)
- *
- * For each seed we generate both SHA-256 (zhipu) and XOR-fold (zcode-api-ref)
- * derived keys, matching the historical key derivation functions.
- */
-function buildCandidateKeysForDecrypt(): Array<{ label: string; key: Buffer }> {
-  const home = homedir();
-  const plat = process.platform;
-  const arch = process.arch;
-
-  // Collect all plausible "home path" strings that an older version might
-  // have used as the seed. The variations cover:
-  //   - os.homedir() result (current Bun version)
-  //   - Direct env vars (old Bun 1.1 used USERPROFILE on Windows verbatim,
-  //     and HOME on Unix — these may differ from homedir() in case / trailing
-  //     slash / canonicalization).
-  //   - Windows HOMEDRIVE+HOMEPATH fallback (some corporate Windows installs
-  //     have USERPROFILE pointing to a redirected folder while HOMEDRIVE+
-  //     HOMEPATH points to the canonical local path).
-  const homeVariants = new Set<string>();
-  homeVariants.add(home);
-  const userProfile = process.env.USERPROFILE;
-  if (userProfile) homeVariants.add(userProfile);
-  const homeDrive = process.env.HOMEDRIVE;
-  const homePath = process.env.HOMEPATH;
-  if (homeDrive && homePath) homeVariants.add(`${homeDrive}${homePath}`);
-  const homeEnv = process.env.HOME;
-  if (homeEnv) homeVariants.add(homeEnv);
-
-  // For each home variant, build the full seed combinations an older version
-  // might have used.
-  const seeds = new Set<string>();
-  for (const h of homeVariants) {
-    seeds.add(`${h}-${plat}-${arch}`);
-    seeds.add(`${h}-${plat}`);
-    seeds.add(`${h}-${arch}`);
-    seeds.add(`${h}`);
-  }
-  // User-supplied legacy seed (manual recovery). This is the ONLY env-var
-  // path consulted by the decrypt fallback. Users with credentials.json
-  // encrypted by an older version that derived the key from homedir/platform/
-  // arch (or via the removed ZCODE_PROXY_CREDENTIAL_SECRET env var) can set
-  // ZCODE_PROXY_LEGACY_SEED to that old seed string and the file will be
-  // recovered, then re-encrypted with the fixed 520 key on the next
-  // writeStore() — so this is a one-time migration, not a permanent
-  // dependency on the old key.
-  const legacyEnv = process.env[ENV_LEGACY_SEED];
-  if (legacyEnv) seeds.add(legacyEnv);
-  // NOTE: ZCODE_PROXY_CREDENTIAL_SECRET is intentionally NOT consulted here.
-  // It was the #1 cause of "credentials lost on restart" because setting it
-  // in one run and not the next rotated the key silently. The fixed 520 key
-  // + ZCODE_PROXY_LEGACY_SEED (manual, opt-in recovery) is the only path
-  // forward. Users with old env-var-encrypted files can set
-  // ZCODE_PROXY_LEGACY_SEED to the old secret value to recover.
-
-  const candidates: Array<{ label: string; key: Buffer }> = [];
-  for (const seed of seeds) {
-    const shortSeed = seed.length > 60 ? seed.slice(0, 57) + "..." : seed;
-    candidates.push({ label: `SHA-256("${shortSeed}")`, key: deriveSha256Key(seed) });
-    candidates.push({ label: `XOR-fold("${shortSeed}")`, key: deriveXorFoldKey(seed) });
-  }
-  return candidates;
-}
-
-/**
- * Encrypt plaintext using AES-256-GCM (Node.js crypto) with the fixed key.
- * Output format: base64( IV[16] + AUTH_TAG[16] + CIPHERTEXT )
- */
-async function encrypt(plaintext: string): Promise<string> {
-  const key = getEncryptionKeyBuffer();
-  const iv = randomBytes(16);
-  const cipher = createCipheriv("aes-256-gcm", key, iv);
-  const encrypted = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
-  const tag = cipher.getAuthTag();
-  return Buffer.concat([iv, tag, encrypted]).toString("base64");
-}
-
-/**
- * Decrypt ciphertext. Tries the fixed key first, then falls back to legacy
- * candidate keys for one-time recovery of files encrypted by older versions.
- *
- *   1. Fixed key (SHA-256("520")), Node.js crypto format (IV[16] + AUTH_TAG[16] + CIPHERTEXT).
- *      This handles ALL files encrypted by the current code — the normal path.
- *
- *   2. Fixed key in legacy WebCrypto format (IV[12] + encrypted+tag).
- *      Handles files encrypted by very old zhipu versions that used WebCrypto
- *      with the same key but a different cipher implementation.
- *
- *   3. Multi-seed fallback: iterate through ALL candidate seeds (homedir
- *      variants, ZCODE_PROXY_LEGACY_SEED, ZCODE_PROXY_CREDENTIAL_SECRET) in
- *      BOTH SHA-256 and XOR-fold derivations, in BOTH Node and WebCrypto
- *      formats. This recovers files encrypted by older versions of this code
- *      that used seed-based or env-var-based key derivation.
- *
- * On fallback success, the file is NOT re-encrypted with the fallback key.
- * Instead, the plaintext is returned to the caller (readStoreUncached), which
- * parses it into a StoreV2. The next writeStore() call will re-encrypt with
- * the fixed key — so the fallback is a one-time migration path, not a
- * permanent dependency on the old key.
- */
-async function decrypt(ciphertext: string): Promise<string> {
-  const data = Buffer.from(ciphertext, "base64");
-
-  // Helper: try decrypting with a key in Node.js crypto format (IV[16] + tag[16] + ct)
-  const tryNodeFormat = (key: Buffer): string | null => {
-    if (data.length < 32) return null;
-    try {
-      const iv = data.subarray(0, 16);
-      const tag = data.subarray(16, 32);
-      const encrypted = data.subarray(32);
-      const decipher = createDecipheriv("aes-256-gcm", key, iv);
-      decipher.setAuthTag(tag);
-      return decipher.update(encrypted, undefined, "utf8") + decipher.final("utf8");
-    } catch {
-      return null;
-    }
-  };
-
-  // Helper: try decrypting with a key in legacy WebCrypto format (IV[12] + ct+tag)
-  const tryWebCryptoFormat = async (key: Buffer): Promise<string | null> => {
-    try {
-      const keyCopy = new Uint8Array(32);
-      keyCopy.set(key);
-      const cryptoKey = await crypto.subtle.importKey(
-        "raw",
-        keyCopy,
-        { name: "AES-GCM" },
-        false,
-        ["decrypt"],
-      );
-      const iv = new Uint8Array(data.subarray(0, 12));
-      const encrypted = new Uint8Array(data.subarray(12));
-      const decrypted = await crypto.subtle.decrypt(
-        { name: "AES-GCM", iv },
-        cryptoKey,
-        encrypted,
-      );
-      return new TextDecoder().decode(decrypted);
-    } catch {
-      return null;
-    }
-  };
-
-  // --- Try 1: fixed key, Node.js crypto format (the normal path) ---
-  const fixedKey = getEncryptionKeyBuffer();
-  let plaintext = tryNodeFormat(fixedKey);
-  if (plaintext !== null) return plaintext;
-
-  // --- Try 2: fixed key in legacy WebCrypto format ---
-  plaintext = await tryWebCryptoFormat(fixedKey);
-  if (plaintext !== null) return plaintext;
-
-  // --- Try 3: multi-seed fallback (legacy file recovery) ---
-  // Only reached if the file was encrypted by an older version with a different
-  // key. We try every plausible candidate; on success, the caller will
-  // re-encrypt with the fixed key on the next writeStore().
-  const seen = new Set<string>([fixedKey.toString("hex")]);
-  for (const { label, key } of buildCandidateKeysForDecrypt()) {
-    // Skip duplicate keys (different seeds can derive the same key).
-    const hex = key.toString("hex");
-    if (seen.has(hex)) continue;
-    seen.add(hex);
-
-    plaintext = tryNodeFormat(key);
-    if (plaintext !== null) {
-      runtimeLog(`[store] Decryption succeeded with legacy fallback key: ${label}. File will be re-encrypted with the fixed key on next save.`);
-      return plaintext;
-    }
-
-    plaintext = await tryWebCryptoFormat(key);
-    if (plaintext !== null) {
-      runtimeLog(`[store] Decryption succeeded with legacy fallback key (WebCrypto format): ${label}. File will be re-encrypted with the fixed key on next save.`);
-      return plaintext;
-    }
-    void label; // label retained for future debug logging
-  }
-
-  throw new Error(
-    "Failed to decrypt credential store. Tried: fixed key SHA-256(\"520\") " +
-    "(Node + WebCrypto formats), multi-seed fallback covering homedir/platform/" +
-    "arch variations across Bun versions (Bun 1.1/1.2/1.3 homedir() differences, " +
-    "USERPROFILE vs HOMEDRIVE+HOMEPATH, etc.). If your credentials.json was " +
-    "encrypted on a different machine / OS / username, or by an older version " +
-    "that consulted ZCODE_PROXY_CREDENTIAL_SECRET, set ZCODE_PROXY_LEGACY_SEED " +
-    "to the old seed string (e.g. \"C:\\\\Users\\\\OldName-win32-x64\" or the old " +
-    "secret value) and retry. As a last resort, run `zcode-proxy auth logout` " +
-    "to discard and re-login."
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Store I/O
-// ---------------------------------------------------------------------------
-
-function genId(): string {
-  // 16 random bytes = 128 bits = 32 hex chars. Matches UUID-style entropy.
-  // 8 bytes was previously used; 16 is the modern default and removes any
-  // collision concern when accounts are imported from another machine.
-  return randomBytes(16).toString("hex");
-}
-
-function defaultLabel(cred: Credential, createdAt: number): string {
-  const ts = new Date(createdAt).toISOString().slice(0, 16).replace("T", " ");
-  return `${cred.provider} · ${ts}`;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function normalizeNonEmptyString(value: unknown): string | null {
-  if (typeof value !== "string") return null;
-  const trimmed = value.trim();
-  return trimmed ? trimmed : null;
-}
-
-function normalizeOptionalNonNegativeInteger(value: unknown): number | undefined {
-  if (typeof value === "number") {
-    if (!Number.isFinite(value) || value < 0) return undefined;
-    return Math.trunc(value);
-  }
-  if (typeof value === "string") {
-    const trimmed = value.trim();
-    if (!/^\d+$/.test(trimmed)) return undefined;
-    const parsed = Number(trimmed);
-    if (!Number.isSafeInteger(parsed)) return undefined;
-    return parsed;
-  }
-  return undefined;
-}
-
-function normalizeProvider(value: unknown): Credential["provider"] | null {
-  return value === "zai" || value === "bigmodel" ? value : null;
-}
-
-function normalizePlan(value: unknown): Credential["plan"] | undefined {
-  const plan = normalizeNonEmptyString(value);
-  return plan === "coding-plan" || plan === "start-plan" ? plan : undefined;
-}
-
-function normalizeCredential(raw: unknown): Credential | null {
-  if (!isRecord(raw)) return null;
-  const apiKey = normalizeNonEmptyString(raw.apiKey);
-  const provider = normalizeProvider(raw.provider);
-  if (!apiKey || !provider) return null;
-
-  const cred: Credential = { apiKey, provider };
-  const secret = normalizeNonEmptyString(raw.secret);
-  if (secret) cred.secret = secret;
-  const plan = normalizePlan(raw.plan);
-  if (plan) cred.plan = plan;
-  const expiresAt = normalizeOptionalNonNegativeInteger(raw.expiresAt);
-  if (expiresAt !== undefined) cred.expiresAt = expiresAt;
-  const userId = normalizeNonEmptyString(raw.userId);
-  if (userId) cred.userId = userId;
-  const jwt = normalizeNonEmptyString(raw.jwt);
-  if (jwt) cred.jwt = jwt;
-  // 4.7.2-fork.1: raw OAuth provider access token (desktop 3.14.4 reset
-  // endpoints use it as X-Bigmodel-Authorization).
-  const maasToken = normalizeNonEmptyString(raw.maasToken);
-  if (maasToken) cred.maasToken = maasToken;
-  const proxy = normalizeNonEmptyString(raw.proxy);
-  if (proxy && validateProxyUrl(proxy).ok) cred.proxy = proxy;
-  const name = normalizeNonEmptyString(raw.name);
-  if (name) cred.name = name;
-  const email = normalizeNonEmptyString(raw.email);
-  if (email) cred.email = email;
-  if (raw.disabled === true) cred.disabled = true;
-  return cred;
-}
-
-function normalizeStoredAccount(
-  raw: unknown,
-  opts: { usedIds?: Set<string>; now?: number } = {},
-): StoredAccount | null {
-  if (!isRecord(raw)) return null;
-  const credential = normalizeCredential(raw.credential);
-  if (!credential) return null;
-
-  const usedIds = opts.usedIds;
-  let id = normalizeNonEmptyString(raw.id);
-  if (!id || usedIds?.has(id)) {
-    do {
-      id = genId();
-    } while (usedIds?.has(id));
-  }
-  usedIds?.add(id);
-
-  const createdAt = normalizeOptionalNonNegativeInteger(raw.createdAt) ?? opts.now ?? Date.now();
-  const label = normalizeNonEmptyString(raw.label) ?? defaultLabel(credential, createdAt);
-  return { id, label, createdAt, credential };
-}
-
-function normalizeStore(raw: unknown): StoreV2 | null {
-  if (!isRecord(raw) || raw.version !== 2 || !Array.isArray(raw.accounts)) {
-    return null;
-  }
-  const usedIds = new Set<string>();
-  const now = Date.now();
-  const accounts: StoredAccount[] = [];
-  for (const rawAccount of raw.accounts) {
-    const account = normalizeStoredAccount(rawAccount, { usedIds, now });
-    if (account) accounts.push(account);
-  }
-  const store: StoreV2 = {
-    version: 2,
-    activeId: normalizeNonEmptyString(raw.activeId),
-    accounts,
-  };
-  normalizeStoreActiveId(store);
-  return store;
-}
-
-function normalizeStoreInPlace(store: StoreV2): void {
-  const normalized = normalizeStore(store);
-  if (!normalized) {
-    store.version = 2;
-    store.activeId = null;
-    store.accounts = [];
-    return;
-  }
-  store.version = 2;
-  store.activeId = normalized.activeId;
-  store.accounts = normalized.accounts;
-}
-
-function normalizeStoreActiveId(store: StoreV2): void {
-  const active = store.activeId ? store.accounts.find(a => a.id === store.activeId) : undefined;
-  if (active && !active.credential.disabled) return;
-  store.activeId = store.accounts.find(a => !a.credential.disabled)?.id ?? null;
 }
 
 /**
@@ -867,8 +376,8 @@ async function readStoreUncached(): Promise<StoreV2 | null> {
       return markStoreNull("unsupported_format");
     }
     const account: StoredAccount = {
-      id: genId(),
-      label: defaultLabel(cred, Date.now()),
+      id: generateAccountId(),
+      label: defaultAccountLabel(cred, Date.now()),
       createdAt: Date.now(),
       credential: cred,
     };
@@ -1420,12 +929,12 @@ export async function saveCredential(cred: Credential, opts?: { keepActive?: boo
       store.accounts[existingIdx] = {
         ...old,
         credential: normalizedCred,
-        label: old.label.startsWith(`${normalizedCred.provider} · `) ? defaultLabel(normalizedCred, old.createdAt) : old.label,
+        label: old.label.startsWith(`${normalizedCred.provider} · `) ? defaultAccountLabel(normalizedCred, old.createdAt) : old.label,
       };
     } else {
       const account: StoredAccount = {
-        id: genId(),
-        label: defaultLabel(normalizedCred, Date.now()),
+        id: generateAccountId(),
+        label: defaultAccountLabel(normalizedCred, Date.now()),
         createdAt: Date.now(),
         credential: normalizedCred,
       };
@@ -1450,6 +959,17 @@ export async function loadCredential(): Promise<Credential | null> {
   const account = store.accounts.find(a => a.id === store.activeId);
   if (!account || account.credential.disabled) return null;
   return { ...account.credential };
+}
+
+/** Reset cache and write guards only after confirming the file is gone. */
+function resetClearedStoreState(): void {
+  cachedStore = null;
+  cachedStoreMtimeMs = 0;
+  cachedStoreCtimeMs = 0;
+  cachedStoreSize = 0;
+  resetEncryptionKeyCache();
+  undecryptableFilePresent = false;
+  lastReadStoreNullReason = "missing";
 }
 
 /**
@@ -1477,52 +997,40 @@ export async function clearCredentialAsync(): Promise<void> {
     storeWriteLockedDepth++;
     try {
       await withCrossProcessStoreLock(async () => {
-    if (!existsSync(STORE_FILE)) {
-      // File already gone — just reset state.
-      cachedStore = null;
-      cachedStoreMtimeMs = 0;
-      cachedStoreCtimeMs = 0;
-      cachedStoreSize = 0;
-      cachedKey = null;
-      undecryptableFilePresent = false;
-      lastReadStoreNullReason = "missing";
-      return;
-    }
-    // Windows: unlink can fail with EPERM/EBUSY/EACCES if AV / indexer /
-    // backup tool briefly has the file open. Retry with backoff.
-    const MAX_RETRIES = 5;
-    const RETRY_DELAY_MS = 50;
-    let lastErr: unknown;
-    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-      try {
-        unlinkSync(STORE_FILE);
-        lastErr = null;
-        break;
-      } catch (err) {
-        lastErr = err;
-        const code = (err as NodeJS.ErrnoException)?.code;
-        if (code === "EPERM" || code === "EBUSY" || code === "EACCES") {
-          // ASYNC sleep — no event-loop blocking (unlike sync clearCredential).
-          await new Promise(r => hostSetTimeout(r, RETRY_DELAY_MS * (attempt + 1)));
-          continue;
+        if (!existsSync(STORE_FILE)) {
+          // File already gone — just reset state.
+          resetClearedStoreState();
+          return;
         }
-        // ENOENT (already gone) is fine — treat as success.
-        if (code === "ENOENT") {
-          lastErr = null;
-          break;
+        // Windows: unlink can fail with EPERM/EBUSY/EACCES if AV / indexer /
+        // backup tool briefly has the file open. Retry with backoff.
+        const MAX_RETRIES = 5;
+        const RETRY_DELAY_MS = 50;
+        let lastErr: unknown;
+        for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+          try {
+            unlinkSync(STORE_FILE);
+            lastErr = null;
+            break;
+          } catch (err) {
+            lastErr = err;
+            const code = (err as NodeJS.ErrnoException)?.code;
+            if (code === "EPERM" || code === "EBUSY" || code === "EACCES") {
+              // ASYNC sleep — no event-loop blocking (unlike sync clearCredential).
+              await new Promise(r => hostSetTimeout(r, RETRY_DELAY_MS * (attempt + 1)));
+              continue;
+            }
+            // ENOENT (already gone) is fine — treat as success.
+            if (code === "ENOENT") {
+              lastErr = null;
+              break;
+            }
+            throw err; // other non-retryable
+          }
         }
-        throw err; // other non-retryable
-      }
-    }
-    if (lastErr) throw lastErr;
-    cachedStore = null;       // file gone, cache reflects that
-    cachedStoreMtimeMs = 0;   // confirmed missing marker
-    cachedStoreCtimeMs = 0;
-    cachedStoreSize = 0;
-    cachedKey = null;
-    undecryptableFilePresent = false;
-    lastReadStoreNullReason = "missing";
-    });
+        if (lastErr) throw lastErr;
+        resetClearedStoreState();
+      });
     } finally {
       storeWriteLockedDepth--;
     }
@@ -1587,15 +1095,7 @@ export function clearCredential(): void {
     }
     if (lastErr) throw lastErr;
   }
-  cachedStore = null; // invalidate store cache
-  cachedStoreMtimeMs = 0; // confirmed missing marker
-  cachedStoreCtimeMs = 0;
-  cachedStoreSize = 0;
-  cachedKey = null;   // invalidate key cache (will be repopulated with the same fixed key)
-  // Clear the guard flag — once the user has explicitly cleared credentials,
-  // they're free to save new ones without the "refusing to overwrite" error.
-  undecryptableFilePresent = false;
-  lastReadStoreNullReason = "missing";
+  resetClearedStoreState();
 }
 
 export function getStorePath(): string {
@@ -1607,110 +1107,16 @@ export function getStorePath(): string {
 // Public API — multi-account management
 // ---------------------------------------------------------------------------
 
-/** Mask a credential's API key for display: "abc12345...wxyz". */
-export function maskApiKey(apiKey: string): string {
-  if (!apiKey) return "";
-  if (apiKey.length <= 12) return apiKey;
-  return apiKey.slice(0, 8) + "..." + apiKey.slice(-4);
-}
-
-/**
- * Stable non-secret key used to join request stats back to stored accounts.
- *
- * `maskApiKey()` is only a display label and can collide when two API keys
- * share the same first 8 / last 4 characters. A short SHA-256 digest of
- * provider + apiKey avoids merging usage stats for distinct accounts while
- * still keeping the plaintext API key out of dashboard responses.
- */
-export function credentialStatsKey(cred: Pick<Credential, "provider" | "apiKey">): string {
-  if (!cred.apiKey) return "";
-  return `sha256:${createHash("sha256")
-    .update(cred.provider)
-    .update("\0")
-    .update(cred.apiKey)
-    .digest("hex")
-    .slice(0, 16)}`;
-}
-
 /** List all stored accounts (without exposing secret material — apiKey is masked).
  *
  * Accounts are returned sorted by `createdAt` ascending (oldest first),
  * matching the user's expectation that the account list reflects the order
  * in which credentials were added. vceshi0.0.4+.
  */
-export async function listAccounts(): Promise<{
-  accounts: Array<Omit<StoredAccount, "credential"> & {
-    provider: string;
-    apiKeyMask: string;
-    credentialKey: string;
-    hasSecret: boolean;
-    userId?: string;
-    expiresAt?: number;
-    hasJwt: boolean;
-    plan: string;
-    /** Outbound HTTP proxy URL configured for this account (empty string if none). */
-    proxy: string;
-    /** Human-readable name (vceshi0.0.4+). Empty string when not set — the
-     *  dashboard should fall back to `label` for display in that case. */
-    name: string;
-    /** OAuth account email (vceshi0.0.4+). Empty string for ZCode imports
-     *  and manually-added API keys (no email available in those flows). */
-    email: string;
-    /** Disabled flag (vceshi0.0.6+). True = excluded from auto-switch +
-     *  manual activation. Default false. */
-    disabled: boolean;
-  }>;
-  activeId: string | null;
-}> {
+export async function listAccounts(): Promise<AccountList> {
   const store = await readStore();
   if (!store) return { accounts: [], activeId: null };
-  // Sort by createdAt ascending (oldest first). Array.prototype.sort is stable
-  // in modern V8/Bun, so accounts with identical createdAt keep insertion order.
-  const sortedAccounts = [...store.accounts].sort((a, b) => a.createdAt - b.createdAt);
-  return {
-    activeId: store.activeId,
-    accounts: sortedAccounts.map(a => ({
-      id: a.id,
-      label: a.label,
-      createdAt: a.createdAt,
-      provider: a.credential.provider,
-      apiKeyMask: maskApiKey(a.credential.apiKey),
-      credentialKey: credentialStatsKey(a.credential),
-      hasSecret: !!a.credential.secret,
-      userId: a.credential.userId,
-      expiresAt: a.credential.expiresAt,
-      hasJwt: !!a.credential.jwt,
-      // Display plan: explicit field wins; otherwise infer from JWT presence
-      // (v1 credentials from zcode-api-ref have no plan field but carry a
-      // start-plan JWT). Falls back to coding-plan only when neither signal
-      // is present. This keeps the dashboard dropdown in sync with what
-      // serve() will actually do at startup.
-      plan: inferPlan(a.credential),
-      // Per-account outbound proxy (v2.1.4.1test5+). Empty string means
-      // direct connection — surfaced as "" rather than undefined so the
-      // dashboard can always render the input with the current value.
-      proxy: a.credential.proxy ?? "",
-      // vceshi0.0.4+: expose name/email for display + editing. Empty string
-      // (not undefined) so the dashboard can always render the input with
-      // the current value, mirroring the `proxy` field convention.
-      name: a.credential.name ?? "",
-      email: a.credential.email ?? "",
-      // vceshi0.0.6+: expose disabled flag for the dashboard toggle.
-      disabled: !!a.credential.disabled,
-    })),
-  };
-}
-
-/**
- * Resolve a credential's plan for display/serving purposes.
- *   1. Explicit cred.plan wins (v0.1.4+ imports, dashboard edits)
- *   2. JWT presence → start-plan (v1 zcode-api-ref credentials)
- *   3. Default coding-plan
- */
-function inferPlan(cred: Credential): "coding-plan" | "start-plan" {
-  if (cred.plan === "start-plan" || cred.plan === "coding-plan") return cred.plan;
-  if (cred.jwt) return "start-plan";
-  return "coding-plan";
+  return { activeId: store.activeId, accounts: summarizeAccounts(store.accounts) };
 }
 
 /**
@@ -1761,160 +1167,59 @@ export async function removeAccount(id: string): Promise<boolean | null> {
   }, { allowEmptyWrite: true });
 }
 
+/** Apply a single-account mutation under the existing read/write guard. */
+function updateAccount(id: string, mutate: (account: StoredAccount) => void): Promise<boolean | null> {
+  return withExistingStoreLock((store) => {
+    const account = store.accounts.find(a => a.id === id);
+    if (!account) return false;
+    mutate(account);
+    return true;
+  });
+}
+
+/** Empty optional text is represented by an absent field on disk. */
+function setAccountOptionalText(
+  id: string,
+  field: "proxy" | "name" | "email",
+  value: string,
+): Promise<boolean | null> {
+  return updateAccount(id, account => {
+    const trimmed = (value ?? "").trim();
+    if (trimmed) account.credential[field] = trimmed;
+    else delete account.credential[field];
+  });
+}
+
 /**
  * Update an account's human-readable label.
  * Returns true/false as expected, OR null if store could not be read.
  */
 export async function setAccountLabel(id: string, label: string): Promise<boolean | null> {
-  return withExistingStoreLock((store) => {
-    const account = store.accounts.find(a => a.id === id);
-    if (!account) return false;
+  return updateAccount(id, account => {
     account.label = label.trim() || account.label;
-    return true;
   });
 }
 
 /** Update an account's plan. Returns null if store could not be read. */
 export async function setAccountPlan(id: string, plan: "coding-plan" | "start-plan"): Promise<boolean | null> {
-  return withExistingStoreLock((store) => {
-    const account = store.accounts.find(a => a.id === id);
-    if (!account) return false;
+  return updateAccount(id, account => {
     account.credential.plan = plan;
-    return true;
   });
 }
 
 /**
- * Update an account's outbound HTTP proxy URL.
- *
- * Pass an empty string (or undefined) to clear the override — the account
- * will fall back to a direct connection.
- *
- * v0.2.0.8 SSRF guard: we now validate the scheme (`http://`, `https://`,
- * `socks4://`, `socks4a://`, `socks5://`, `socks5h://`) and reject hostnames that resolve to internal
- * addresses (127.0.0.0/8, ::1, 169.254.0.0/16 link-local, 10/8, 172.16/12,
- * 192.168/16, 0.0.0.0, and cloud metadata endpoints like 169.254.169.254).
- * This prevents a compromised admin credential from exfiltrating all upstream
- * traffic to an attacker-controlled internal proxy or a cloud metadata
- * service. Literal-IP hosts are checked directly; hostname hosts are also
- * checked because a DNS rebinding attack could resolve a benign-looking name
- * to an internal address at request time.
- *
- * For hostname (non-IP) proxies we still accept them — operators may run a
- * local squid/tinyproxy under a name — but we block the obvious internal
- * ranges when the hostname is a literal IP. A full DNS-resolution check is
- * intentionally NOT performed here to avoid blocking legitimate proxies whose
- * names happen to resolve internally on some networks; the operator is
- * expected to vet hostname-based proxy URLs themselves.
+ * Set or clear the outbound proxy. Loopback/private proxies are supported;
+ * literal metadata, link-local and unspecified addresses are rejected by
+ * validateProxyUrl. Hostname URLs are accepted without DNS resolution.
+ * Invalid URLs throw before acquiring the store lock so admin returns 400.
  */
 export async function setAccountProxy(id: string, proxy: string): Promise<boolean | null> {
   const trimmed = (proxy ?? "").trim();
   if (trimmed) {
-    // Validate scheme + reject internal IPs.
     const validation = validateProxyUrl(trimmed);
-    if (!validation.ok) {
-      // Surface as a thrown error so the admin route returns 400 with the
-      // message; withExistingStoreLock's callback contract returns boolean,
-      // so we throw to abort the mutation.
-      throw new Error(validation.message);
-    }
+    if (!validation.ok) throw new Error(validation.message);
   }
-  return withExistingStoreLock((store) => {
-    const account = store.accounts.find(a => a.id === id);
-    if (!account) return false;
-    if (trimmed) {
-      account.credential.proxy = trimmed;
-    } else {
-      // Clear the field entirely so the serialized credential stays clean
-      // rather than accumulating empty strings across versions.
-      delete account.credential.proxy;
-    }
-    return true;
-  });
-}
-
-/**
- * Validate a proxy URL's scheme and reject literal-IP hosts that point at
- * cloud-metadata or unspecified addresses. Exported for unit testing.
- *
- * v0.2.0.8 SSRF scope: we ONLY block the highest-risk targets:
- *   - 169.254.169.254 and the 169.254/16 link-local range (AWS/GCP/Azure
- *     metadata services, which can leak instance credentials)
- *   - 0.0.0.0/8 (unspecified — never a valid proxy target)
- *   - :: (IPv6 unspecified)
- *
- * We intentionally ALLOW loopback (127.0.0.1, ::1) and private ranges
- * (10/8, 172.16/12, 192.168/16) because local proxies (clash, v2ray,
- * squid) and internal corporate proxies are legitimate, common use cases
- * for this tool. Blocking them would break the primary deployment pattern
- * (local proxy on the user's laptop).
- *
- * Returns `{ok: true}` or `{ok: false, message}`. Does NOT perform DNS
- * resolution — a hostname-based proxy is the operator's responsibility.
- */
-export function validateProxyUrl(url: string): { ok: true } | { ok: false; message: string } {
-  let parsed: URL;
-  try {
-    parsed = new URL(url);
-  } catch {
-    return { ok: false, message: `Invalid proxy URL: "${url}" is not a valid URL` };
-  }
-  const scheme = parsed.protocol.toLowerCase();
-  if (scheme !== "http:" && scheme !== "https:" && scheme !== "socks4:" && scheme !== "socks4a:" && scheme !== "socks5:" && scheme !== "socks5h:") {
-    return {
-      ok: false,
-      message: `Proxy URL scheme "${parsed.protocol}" is not allowed. Use http://, https://, socks4://, socks4a://, socks5://, or socks5h://`,
-    };
-  }
-  const host = parsed.hostname;
-  if (!host) {
-    return { ok: false, message: "Proxy URL is missing a hostname" };
-  }
-  if (parsed.port === "0") {
-    return { ok: false, message: "Proxy URL port must be between 1 and 65535" };
-  }
-  // Block only cloud-metadata / unspecified addresses (see SSRF scope above).
-  const ipCheck = isMetadataOrUnspecifiedIp(host);
-  if (ipCheck) {
-    return {
-      ok: false,
-      message: `Proxy URL host "${host}" is a ${ipCheck} — routing upstream traffic to cloud metadata or unspecified addresses is blocked to prevent credential theft.`,
-    };
-  }
-  return { ok: true };
-}
-
-/**
- * If `host` is a literal IP in a cloud-metadata or unspecified range,
- * return a short reason. Otherwise return null (allowed).
- *
- * Blocked ranges (see validateProxyUrl SSRF scope):
- *   - IPv4: 0.0.0.0/8, 169.254/16 (link-local + cloud metadata)
- *   - IPv6: :: (unspecified)
- *
- * Loopback, private, and ULA ranges are NOT blocked (legitimate local proxy use).
- */
-function isMetadataOrUnspecifiedIp(host: string): string | null {
-  const ipHost = host.startsWith("[") && host.endsWith("]")
-    ? host.slice(1, -1)
-    : host;
-  // IPv4 dotted-quad check.
-  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(ipHost)) {
-    const parts = ipHost.split(".").map(Number);
-    if (parts.some(p => p > 255)) return null; // not actually a valid IP
-    const [a, b] = parts;
-    if (a === 0) return "0.0.0.0/8 unspecified address";
-    if (a === 169 && b === 254) return "169.254/16 link-local / cloud metadata endpoint";
-    return null;
-  }
-  // IPv6 literals.
-  const lower = ipHost.toLowerCase();
-  if (lower === "::") return ":: unspecified";
-  // fe80::/10 link-local (IPv6 equivalent of 169.254/16) — also block.
-  if (lower.startsWith("fe8") || lower.startsWith("fe9") || lower.startsWith("fea") || lower.startsWith("feb")) {
-    return "fe80::/10 IPv6 link-local";
-  }
-  return null;
+  return setAccountOptionalText(id, "proxy", trimmed);
 }
 
 /**
@@ -1925,18 +1230,7 @@ function isMetadataOrUnspecifiedIp(host: string): string | null {
  * list "名称" column when set, otherwise the auto-generated label is shown.
  */
 export async function setAccountName(id: string, name: string): Promise<boolean | null> {
-  return withExistingStoreLock((store) => {
-    const account = store.accounts.find(a => a.id === id);
-    if (!account) return false;
-    const trimmed = (name ?? "").trim();
-    if (trimmed) {
-      account.credential.name = trimmed;
-    } else {
-      // Clear the field entirely so the serialized credential stays clean.
-      delete account.credential.name;
-    }
-    return true;
-  });
+  return setAccountOptionalText(id, "name", name);
 }
 
 /**
@@ -1947,17 +1241,7 @@ export async function setAccountName(id: string, name: string): Promise<boolean 
  * accommodate edge cases (e.g. upstream returning a non-standard email format).
  */
 export async function setAccountEmail(id: string, email: string): Promise<boolean | null> {
-  return withExistingStoreLock((store) => {
-    const account = store.accounts.find(a => a.id === id);
-    if (!account) return false;
-    const trimmed = (email ?? "").trim();
-    if (trimmed) {
-      account.credential.email = trimmed;
-    } else {
-      delete account.credential.email;
-    }
-    return true;
-  });
+  return setAccountOptionalText(id, "email", email);
 }
 
 /**
@@ -2044,7 +1328,7 @@ export async function exportStore(): Promise<StoreV2 | null> {
   return {
     version: 2,
     activeId: store.activeId,
-    accounts: store.accounts.map(a => ({ ...a, credential: { ...a.credential } })),
+    accounts: store.accounts.map(cloneStoredAccount),
   };
 }
 

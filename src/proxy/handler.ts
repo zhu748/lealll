@@ -13,27 +13,45 @@
  *
  * @see .omo/plans/zcode-proxy.md Task 6
  */
-import type { Format } from "../translator/types.js";
+import type { OpenAIChatRequest, Format } from "../translator/types.js";
 import type { ProxyConfig } from "../config/types.js";
 import type { AuthManager } from "../auth/manager.js";
 import { getProvider } from "../provider/providers.js";
-import { buildUpstreamHeaderPairs, buildUpstreamRequest, type UpstreamHeaderPair } from "./upstream.js";
+import { buildUpstreamHeaderPairs, buildUpstreamRequest } from "./upstream.js";
 import { getDefaultEndpointRouting, type EndpointRoutingService } from "./endpoint-routing.js";
 import { getDefaultClientSigning, sendWithClientSigning, type ClientSigningManager } from "./client-signing.js";
 import { credentialString } from "../auth/types.js";
-import { sendOrderedUpstreamRequest, orderedAdvertisedCodings } from "./ordered-transport.js";
 import { pickProxy, markProxyFailed, getMaxRotations } from "./proxy-pool.js";
-import { makeProxiedFetcher } from "./proxied-fetch.js";
 import { transformRequestBody, transformParsedBody } from "./body-transformer.js";
 import { isCaptchaChallenged, retryOnCaptchaChallenge } from "./captcha-retry.js";
-import { type ClientSessionResult } from "./client-session.js";
 import { resolveSessionContext } from "./session-context.js";
-import { gzipSync } from "node:zlib";
 // --- fork multi-account resilience layer ---
-import { maskApiKey, switchAccount, exportAccounts, credentialStatsKey } from "../auth/store.js";
+import { switchAccount, exportAccounts } from "../auth/store.js";
+import { maskApiKey, credentialStatsKey } from "../auth/account-view.js";
 import { sleep } from "../utils/sleep.js";
-import { recordStat } from "../admin/stats.js";
 import type { Credential } from "../auth/types.js";
+
+import { translateRequestOpenAIToAnthropic } from "../translator/openai-to-anthropic.js";
+import { anthropicSseToOpenaiSse } from "../translator/sse-translator.js";
+import { dumpPhase, dumpHeaders, dumpBody, dumpEnabled } from "./dump.js";
+import { createStatsTransform, observeStatsStream } from "./stats.js";
+import { recordHeaders } from "../utils/header-debug.js";
+import { readBody, RequestBodyTooLargeError, InflatedBodyTooLargeError } from "./request-body.js";
+import { buildAnthropicMetadataUserId } from "./trace-headers.js";
+import {
+  shouldUseOrderedTransport, capOrderedAcceptEncoding, dispatchWithConnectRetry,
+  sendUpstreamRequest, MAX_CONNECT_ATTEMPTS,
+} from "./upstream-dispatch.js";
+import { clientAcceptsGzip, passthroughResponse, translatedBatchResponse, translatedSseResponse } from "./response-builder.js";
+import {
+  createRequestLogger, nextReqId, debugLine, debugError,
+  formatHeaderPairs, formatResponseHeaders, previewBody, type RequestMeta,
+} from "./request-log.js";
+import { errorResponse } from "./translated-response.js";
+
+export { shouldUseOrderedTransport, capOrderedAcceptEncoding, MAX_CONNECT_ATTEMPTS, dispatchWithConnectRetry, stripAutoDecodedEncoding } from "./upstream-dispatch.js";
+export { errorResponse } from "./translated-response.js";
+export { readBody, RequestBodyTooLargeError, InflatedBodyTooLargeError } from "./request-body.js";
 
 // captcha.ts is loaded lazily inside the `startPlan` branch (only path that
 // touches it). The solver itself (captcha-happy.ts) is dynamically imported
@@ -46,16 +64,6 @@ async function loadCaptcha(): Promise<CaptchaModule> {
   if (!captchaModule) captchaModule = await import("./captcha.js");
   return captchaModule;
 }
-import { translateRequestOpenAIToAnthropic, translateResponseAnthropicToOpenAI } from "../translator/openai-to-anthropic.js";
-import { translateRequestAnthropicToOpenAI, translateResponseOpenAIToAnthropic } from "../translator/anthropic-to-openai.js";
-import { anthropicSseToOpenaiSse, openaiSseToAnthropicSse } from "../translator/sse-translator.js";
-import type { OpenAIChatRequest, OpenAIChatResponse, AnthropicMessagesRequest, AnthropicMessagesResponse } from "../translator/types.js";
-import { dumpPhase, dumpHeaders, dumpBody, dumpEnabled, SENSITIVE_HEADERS as SENSITIVE_HEADER_NAMES } from "./dump.js";
-import { createStatsTransform, observeStatsStream } from "./stats.js";
-import { recordHeaders } from "../utils/header-debug.js";
-import { readBody, RequestBodyTooLargeError, InflatedBodyTooLargeError } from "./request-body.js";
-export { readBody, RequestBodyTooLargeError, InflatedBodyTooLargeError } from "./request-body.js";
-import { buildAnthropicMetadataUserId } from "./trace-headers.js";
 
 /** Options for the proxy handler. */
 export interface ProxyHandlerOptions {
@@ -79,12 +87,11 @@ export interface ProxyHandlerOptions {
  * Forward a client request to the upstream provider with injected auth.
  *
  * Upstream fetch options differ by mode:
- * - **Passthrough** (OpenAI client): `{ decompress: false }` — compressed
- *   response bodies (gzip/deflate/br) pass through untouched; raw bytes and the
- *   Content-Encoding header are forwarded as-is, letting the client decompress.
- * - **Translation** (Anthropic client): no options — Bun decompresses so the proxy
- *   can read the body and translate OpenAI→Anthropic (then re-gzip if the client
- *   accepts).
+ * - **Passthrough** (Anthropic client): `{ decompress: false }` — preserve raw
+ *   upstream bytes and content encoding, decompressing gzip only when needed
+ *   for a client that did not accept it.
+ * - **Translation** (OpenAI client): read the decoded Anthropic response and
+ *   translate it to OpenAI; gzip batch output when accepted by the client.
  *
  * No upstream timeout is applied — matches ZCode desktop client behaviour
  * (the bundle has no automatic timer on LLM calls, only user-initiated abort).
@@ -130,6 +137,7 @@ export async function proxyRequest(
   }
 
   const meta = peekBody(parsedBody);
+  const logResult = createRequestLogger({ reqId, format, meta, started });
 
   if (dumpEnabled()) {
     dumpPhase(reqId, "client_in", {
@@ -152,7 +160,7 @@ export async function proxyRequest(
     cred = await auth.getCredential();
   } catch (err) {
     if (debug) debugError(reqId, "credential_unavailable", (err as Error).message);
-    printRow(reqId, format, meta, 503, started, Date.now(), 0, 0, 0);
+    logResult({ status: 503, headersAt: Date.now() });
     return errorResponse(503, "credential_unavailable", (err as Error).message);
   }
 
@@ -192,8 +200,7 @@ export async function proxyRequest(
   // posts Anthropic messages to /api/v1/zcode-plan/anthropic/v1/messages with
   // the start-plan JWT, so we do the same (no OpenAI translation either way).
   let startPlan = currentPlan === "start-plan";
-  const translateAnthropicToOpenAI = false;
-  const translateOpenAIToAnthropic = format === "openai";
+  const translateMode = format === "openai";
   const upstreamFormat: Format = "anthropic";
   const clientSession = resolveSessionContext({ clientReq, body, parsedBody, upstreamFormat, model: meta.model, config });
   if (debug && clientSession) {
@@ -206,7 +213,7 @@ export async function proxyRequest(
   // JSON object or is empty) — lets the transformer mutate in place instead
   // of a stringify→parse→stringify round trip.
   let upstreamParsed = parsedBody;
-  if (translateOpenAIToAnthropic) {
+  if (translateMode) {
     const translated = translateOpenAIBody(parsedBody, body);
     if (translated instanceof Response) return translated;
     upstreamParsed = translated;
@@ -263,7 +270,6 @@ export async function proxyRequest(
   let hadRetryAttempt = false;
 
   const useOrderedTransport = shouldUseOrderedTransport(config, clientSession, hasCustomFetchImpl);
-  const translateMode = translateOpenAIToAnthropic || translateAnthropicToOpenAI;
 
   const routing = opts.endpointRouting !== undefined ? opts.endpointRouting : getDefaultEndpointRouting(config);
   const signer = opts.clientSigning !== undefined ? opts.clientSigning : getDefaultClientSigning(config);
@@ -364,7 +370,17 @@ export async function proxyRequest(
           headerDebugRecorded = true;
           recordHeaders(clientReq, req, reqId, format, transformedBody, body);
         }
-        return sendUpstreamRequest(sendReq, finalPairs, transformedBody, translateMode, useOrderedTransport, fetchImpl, clientReq.signal, hasCustomFetchImpl, egressProxy);
+        return sendUpstreamRequest({
+          request: sendReq,
+          headerPairs: finalPairs,
+          body: transformedBody,
+          translateMode,
+          useOrderedTransport,
+          fetchImpl,
+          abortSignal: clientReq.signal,
+          hasCustomFetchImpl,
+          egressProxy,
+        });
       },
     });
   };
@@ -450,7 +466,7 @@ export async function proxyRequest(
     return delayMs;
   };
 
-  // Per-request stats context handed to printRow → recordStat (fork dashboard
+  // Per-request stats context handed to request logger → recordStat (fork dashboard
   // stats collector): retry flag + per-credential usage bucket.
   const rowStats = (): { retried: boolean; credentialKey?: string } => {
     let credentialKey: string | undefined;
@@ -609,7 +625,7 @@ export async function proxyRequest(
         continue;
       }
       if (debug) debugError(reqId, "upstream_unreachable", (err as Error).message);
-      printRow(reqId, format, meta, 502, started, Date.now(), 0, 0, 0, rowStats());
+      logResult({ status: 502, headersAt: Date.now(), stats: rowStats() });
       return errorResponse(502, "upstream_unreachable", (err as Error).message);
     }
     headersAt = Date.now();
@@ -633,7 +649,7 @@ export async function proxyRequest(
     if (upstreamResp.status === 401 && startPlan) {
       if (debug) debugError(reqId, "start_plan_jwt_invalid", "JWT rejected upstream");
       discardUpstreamBody();
-      printRow(reqId, format, meta, 401, started, headersAt, 0, 0, 0, rowStats());
+      logResult({ status: 401, headersAt, stats: rowStats() });
       return errorResponse(401, "start_plan_jwt_invalid", "Start-plan JWT was rejected. Re-run: zcode-proxy auth login");
     }
 
@@ -661,11 +677,11 @@ export async function proxyRequest(
         mapError: (err, phase) => {
           if (phase === "solver") {
             if (debug) debugError(reqId, "captcha_solver_failed", err.message);
-            printRow(reqId, format, meta, 503, started, Date.now(), 0, 0, 0, rowStats());
+            logResult({ status: 503, headersAt: Date.now(), stats: rowStats() });
             return errorResponse(503, "captcha_solver_failed", err.message);
           }
           if (debug) debugError(reqId, "upstream_unreachable", err.message);
-          printRow(reqId, format, meta, 502, started, Date.now(), 0, 0, 0, rowStats());
+          logResult({ status: 502, headersAt: Date.now(), stats: rowStats() });
           return errorResponse(502, "upstream_unreachable", err.message);
         },
       });
@@ -717,7 +733,7 @@ export async function proxyRequest(
       if (retryCfg.totalDeadlineMs > 0 && Date.now() - retryLoopStartedAt > retryCfg.totalDeadlineMs) {
         console.log(`${reqId} retry total deadline (${retryCfg.totalDeadlineMs}ms) exceeded after ${attempt} attempt(s) — returning 503`);
         discardUpstreamBody();
-        printRow(reqId, format, meta, 503, started, Date.now(), 0, 0, 0, rowStats());
+        logResult({ status: 503, headersAt: Date.now(), stats: rowStats() });
         return new Response(
           JSON.stringify({
             error: {
@@ -742,7 +758,7 @@ export async function proxyRequest(
       // Client disconnected during backoff — every further attempt is wasted.
       if (clientReq.signal.aborted) {
         console.log(`${reqId} client disconnected during retry backoff`);
-        printRow(reqId, format, meta, 499, started, Date.now(), 0, 0, 0, rowStats());
+        logResult({ status: 499, headersAt: Date.now(), stats: rowStats() });
         return errorResponse(499, "client_disconnected", "Client closed the connection before the response completed");
       }
 
@@ -762,7 +778,7 @@ export async function proxyRequest(
   if (allCredentialsExhausted && retryCfg.retryableStatuses.includes(upstreamResp.status)) {
     console.log(`${reqId} all credentials exhausted (${triedApiKeys.size}/${totalAvailableCredentials} tried) — returning 503 all_credentials_exhausted`);
     discardUpstreamBody();
-    printRow(reqId, format, meta, 503, started, headersAt, 0, 0, 0, rowStats());
+    logResult({ status: 503, headersAt, stats: rowStats() });
     return errorResponse(
       503,
       "all_credentials_exhausted",
@@ -773,138 +789,27 @@ export async function proxyRequest(
 
   const isSSE = upstreamResp.headers.get("content-type")?.includes("text/event-stream") ?? false;
 
-  if (translateOpenAIToAnthropic) {
+  if (translateMode) {
     if (!upstreamResp.ok) {
       const errBody = await upstreamResp.text().catch(() => "");
-      printRow(reqId, format, meta, 502, started, headersAt, 0, 0, 0, rowStats());
+      logResult({ status: 502, headersAt, stats: rowStats() });
       return errorResponse(502, "translation_failed", `upstream returned ${upstreamResp.status}: ${errBody.slice(0, 200)}`);
     }
     if (isSSE && upstreamResp.body) {
       const translated = anthropicSseToOpenaiSse(upstreamResp.body, meta.model);
       return translatedSseResponse(wireStats(translated, upstreamResp.status, null));
     }
-    return await translatedBatchResponse(clientReq, upstreamResp, meta.model, reqId, format, meta, started, headersAt);
-  }
-
-  if (translateAnthropicToOpenAI) {
-    if (!upstreamResp.ok) {
-      const errBody = await upstreamResp.text().catch(() => "");
-      printRow(reqId, format, meta, 502, started, headersAt, 0, 0, 0, rowStats());
-      return errorResponse(502, "translation_failed", `upstream returned ${upstreamResp.status}: ${errBody.slice(0, 200)}`);
-    }
-    if (isSSE && upstreamResp.body) {
-      const translated = openaiSseToAnthropicSse(upstreamResp.body, meta.model);
-      return translatedSseResponse(wireStats(translated, upstreamResp.status, null));
-    }
-    return await translatedOpenAIToAnthropicBatchResponse(clientReq, upstreamResp, reqId, format, meta, started, headersAt);
+    const { response, tokens } = await translatedBatchResponse(clientReq, upstreamResp, meta.model);
+    logResult({ status: response.status, headersAt, tokens });
+    return response;
   }
 
   if (isSSE && upstreamResp.body) {
     return passthroughResponse(upstreamResp, clientAcceptsGzip(clientReq), wireStats(upstreamResp.body, upstreamResp.status, upstreamResp.headers.get("content-encoding")));
   }
 
-  printRow(reqId, format, meta, upstreamResp.status, started, headersAt, 0, 0, 0, rowStats());
+  logResult({ status: upstreamResp.status, headersAt, stats: rowStats() });
   return passthroughResponse(upstreamResp, clientAcceptsGzip(clientReq));
-}
-
-export function shouldUseOrderedTransport(config: ProxyConfig, clientSession: ClientSessionResult | undefined, hasCustomFetchImpl: boolean): boolean {
-  if (hasCustomFetchImpl) return false;
-  return clientSession?.action === "enforce" || clientSession?.source === "explicit";
-}
-
-/**
- * Restrict an ordered-transport header-pair list's `accept-encoding` to codings
- * the transport can inflate itself (see ordered-transport.ts). Preserves the
- * client's token order, drops q-weights and unsupported tokens (including `*`),
- * and falls back to `identity` when nothing remains. Header order is untouched —
- * only the value at the existing position changes.
- */
-export function capOrderedAcceptEncoding(
-  pairs: UpstreamHeaderPair[],
-  supported: readonly string[] = orderedAdvertisedCodings(),
-): UpstreamHeaderPair[] {
-  const idx = pairs.findIndex(([name]) => name.toLowerCase() === "accept-encoding");
-  if (idx < 0) return pairs;
-  const advertised = pairs[idx][1];
-  const tokens = advertised
-    .split(",")
-    .map((token) => token.split(";")[0]!.trim().toLowerCase())
-    .filter((token) => token.length > 0);
-  const kept = tokens.filter((token) => token === "identity" || supported.includes(token));
-  if (kept.length === tokens.length) return pairs;
-  const next = kept.length > 0 ? kept.join(", ") : "identity";
-  return pairs.map((pair, i) => (i === idx ? [pair[0], next] as UpstreamHeaderPair : pair));
-}
-
-/** Max attempts (initial + 2 retries) for transient CONNECT-level failures. */
-export const MAX_CONNECT_ATTEMPTS = 3;
-
-/**
- * Connect-level retry ladder shared by the chat hot path and /v1/responses.
- * Transient connect failures (DNS blip, TLS reset, Bun "Unable to connect")
- * happen a few times a day against the gateway; the request never reached
- * upstream, so resending is side-effect-free.
- *
- * Contract (review P1/P2, PR #34/#35):
- *   - `attemptDispatch` must dispatch a FRESH request each call — a reused
- *     Request has its body stream marked used after the first fetch.
- *   - failures flagged `postWrite` (ordered transport already wrote the full
- *     request) are never retried — the upstream may have processed it.
- *   - no retry once the client aborted (`opts.isAborted`).
- */
-export async function dispatchWithConnectRetry(
-  attemptDispatch: () => Promise<Response>,
-  opts: { isAborted?: () => boolean; onRetry?: (attempt: number, err: Error) => void } = {},
-): Promise<Response> {
-  for (let attempt = 1; ; attempt++) {
-    if (opts.isAborted?.()) throw new Error("client aborted before upstream connect");
-    try {
-      return await attemptDispatch();
-    } catch (err) {
-      if ((err as { postWrite?: boolean }).postWrite) throw err;
-      if (attempt >= MAX_CONNECT_ATTEMPTS) throw err;
-      const backoffMs = 500 * attempt;
-      opts.onRetry?.(attempt, err as Error);
-      await new Promise((r) => setTimeout(r, backoffMs));
-    }
-  }
-}
-
-/**
- * True on runtimes whose fetch ignores Bun's `decompress: false` extension and
- * transparently inflates compressed response bodies while KEEPING the
- * `content-encoding`/`content-length` headers (verified empirically against
- * Node 22/26 undici and Bun 1.3: gzip, deflate and br are all decoded, headers
- * unchanged). Bun honors `decompress: false` (raw bytes + truthful header), so
- * no normalization is needed there.
- */
-const FETCH_AUTO_DECOMPRESSES = typeof Bun === "undefined";
-
-/** Content codings a `FETCH_AUTO_DECOMPRESSES` runtime inflates transparently. */
-const AUTO_DECODED_ENCODINGS = new Set(["gzip", "x-gzip", "deflate", "br"]);
-
-/**
- * Strip `content-encoding`/`content-length` from a Response whose body the
- * runtime fetch has ALREADY inflated. Without this, passthrough on Node would
- * forward a decoded body still labeled `content-encoding: gzip` — clients that
- * advertise gzip then fail to decompress it, and the `passthroughResponse`
- * safety net would double-decompress an already-inflated stream for clients
- * that don't. No-op for encodings the runtime leaves untouched. Returns a new
- * Response because a fetch Response's headers can be immutable.
- */
-export function stripAutoDecodedEncoding(resp: Response): Response {
-  const encoding = resp.headers.get("content-encoding")?.toLowerCase().trim() ?? "";
-  if (!encoding) return resp;
-  const codings = encoding.split(",").map((c) => c.trim());
-  if (!codings.every((c) => AUTO_DECODED_ENCODINGS.has(c))) return resp;
-  const headers = new Headers(resp.headers);
-  headers.delete("content-encoding");
-  headers.delete("content-length");
-  return new Response(resp.body, {
-    status: resp.status,
-    statusText: resp.statusText,
-    headers,
-  });
 }
 
 /**
@@ -940,109 +845,6 @@ function bumpEmptyStreamStreak(credKey: string, isEmpty: boolean): number {
   return next;
 }
 
-async function sendUpstreamRequest(
-  upstreamReq: Request,
-  headerPairs: UpstreamHeaderPair[],
-  body: string | undefined,
-  translateMode: boolean,
-  useOrderedTransport: boolean,
-  fetchImpl: typeof fetch,
-  abortSignal?: AbortSignal,
-  hasCustomFetchImpl = false,
-  egressProxy?: string | null,
-): Promise<Response> {
-  if (useOrderedTransport) {
-    return sendOrderedUpstreamRequest({
-      url: upstreamReq.url,
-      method: upstreamReq.method,
-      headers: headerPairs,
-      body,
-      decompress: translateMode,
-      signal: abortSignal,
-      proxy: egressProxy ?? undefined,
-    });
-  }
-  const fetchOpts: RequestInit & { decompress?: boolean } = translateMode ? {} : { decompress: false };
-  if (abortSignal) fetchOpts.signal = abortSignal;
-  const egressFetch = egressProxy ? makeProxiedFetcher(egressProxy, fetchImpl) : fetchImpl;
-  const resp = await egressFetch(upstreamReq, fetchOpts);
-  // Passthrough on a runtime whose fetch auto-decompresses (Node/undici in the
-  // Android bundle): the body arrives inflated while its headers still claim
-  // compression. Drop the stale labels so the body/header pairing downstream
-  // stays truthful. Skipped for injected fetch impls (tests) — their bodies are
-  // genuinely compressed and their decompression semantics are their own.
-  if (!translateMode && FETCH_AUTO_DECOMPRESSES && !hasCustomFetchImpl) {
-    return stripAutoDecodedEncoding(resp);
-  }
-  return resp;
-}
-
-/**
- * Create a passthrough response that streams the upstream body to the client.
- * Preserves status and the allowlisted headers, and honors the client's
- * `Accept-Encoding` for gzip.
- *
- * The upstream request FORWARDS the client's `accept-encoding` (only
- * defaulting to "gzip" when the client sent none — see
- * `buildUpstreamHeaderPairs`), so the upstream compresses only when the
- * client can decode it. If THIS client did not advertise gzip but the body
- * arrived gzip-compressed anyway, we decompress before forwarding and drop
- * the now-mismatched `content-encoding`/`content-length` headers — otherwise
- * clients whose HTTP stack does not auto-decompress (e.g. some Tauri-based
- * clients) receive raw gzip bytes and fail to parse the JSON body with
- * "non-JSON body" errors despite a 200 status.
- */
-function passthroughResponse(
-  upstream: Response,
-  clientAcceptsGzip: boolean,
-  body?: ReadableStream<Uint8Array>,
-): Response {
-  const headers = new Headers();
-  const forwardHeaders = [
-    "content-type",
-    "content-encoding",
-    "cache-control",
-    "x-request-id",
-    "anthropic-ratelimit-requests-limit",
-    "anthropic-ratelimit-requests-remaining",
-    "anthropic-ratelimit-requests-reset",
-    "anthropic-ratelimit-tokens-limit",
-    "anthropic-ratelimit-tokens-remaining",
-    "anthropic-ratelimit-tokens-reset",
-  ];
-
-  for (const h of forwardHeaders) {
-    const v = upstream.headers.get(h);
-    if (v) headers.set(h, v);
-  }
-
-  const upstreamEncoding = headers.get("content-encoding")?.toLowerCase() ?? "";
-  const source = body ?? upstream.body;
-  if (upstreamEncoding.includes("gzip") && !clientAcceptsGzip && source) {
-    const gunzip = new DecompressionStream("gzip") as unknown as ReadableWritablePair<Uint8Array, Uint8Array>;
-    const decompressed = source.pipeThrough(gunzip);
-    headers.delete("content-encoding");
-    headers.delete("content-length");
-    return new Response(decompressed, {
-      status: upstream.status,
-      statusText: upstream.statusText,
-      headers,
-    });
-  }
-
-  return new Response(source, {
-    status: upstream.status,
-    statusText: upstream.statusText,
-    headers,
-  });
-}
-
-/** Build a JSON error response. Implementation lives in its own leaf module
- * (translated-response.ts) so the fork's admin dashboard can import it
- * without creating a handler → stats → admin/api → handler cycle. */
-import { errorResponse } from "./translated-response.js";
-export { errorResponse };
-
 /** Translate a parsed OpenAI request object to Anthropic. Returns error Response on
  * failure. `parsed` comes from the caller's single parse; `rawBody` is only
  * used for the empty-body check and error text. */
@@ -1060,296 +862,10 @@ function translateOpenAIBody(parsed: Record<string, unknown> | undefined, rawBod
   }
 }
 
-/** True when the client request explicitly accepts gzip (and has not disabled it via q=0). */
-function clientAcceptsGzip(req: Request): boolean {
-  const ae = req.headers.get("accept-encoding");
-  if (!ae) return false;
-  return /\bgzip\b(?!\s*;\s*q=0(?:\.0+)?\s*(?:,|$))/i.test(ae);
-}
-
-/** Build a translated batch (non-streaming) OpenAI response. Gzip if client accepts. */
-async function translatedBatchResponse(
-  clientReq: Request,
-  upstream: Response,
-  model: string,
-  reqId: string,
-  format: Format,
-  meta: RequestMeta,
-  started: number,
-  headersAt: number,
-): Promise<Response> {
-  const raw = await upstream.text();
-  let parsedAnthropic: AnthropicMessagesResponse;
-  try {
-    parsedAnthropic = JSON.parse(raw) as AnthropicMessagesResponse;
-  } catch (err) {
-    printRow(reqId, format, meta, 502, started, headersAt, 0, 0, 0);
-    return errorResponse(502, "translation_failed", `upstream returned non-JSON body: ${(err as Error).message}`);
-  }
-  if (!isAnthropicMessagesResponse(parsedAnthropic)) {
-    printRow(reqId, format, meta, 502, started, headersAt, 0, 0, 0);
-    return errorResponse(502, "translation_failed", `upstream returned invalid Anthropic message: ${raw.slice(0, 200)}`);
-  }
-  const openaiResp = translateResponseAnthropicToOpenAI(parsedAnthropic, model);
-  const json = JSON.stringify(openaiResp);
-  const payload = new TextEncoder().encode(json);
-
-  const respHeaders = new Headers();
-  respHeaders.set("content-type", "application/json");
-  for (const h of forwardedUpstreamHeaders()) {
-    const v = upstream.headers.get(h);
-    if (v) respHeaders.set(h, v);
-  }
-
-  if (clientAcceptsGzip(clientReq)) {
-    respHeaders.set("content-encoding", "gzip");
-    printRow(reqId, format, meta, upstream.status, started, headersAt, openaiResp.usage?.completion_tokens ?? 0, 0, 0);
-    return new Response(gzipSync(payload), {
-      status: upstream.status,
-      headers: respHeaders,
-    });
-  }
-  printRow(reqId, format, meta, upstream.status, started, headersAt, openaiResp.usage?.completion_tokens ?? 0, 0, 0);
-  return new Response(payload, {
-    status: upstream.status,
-    headers: respHeaders,
-  });
-}
-
-async function translatedOpenAIToAnthropicBatchResponse(
-  clientReq: Request,
-  upstream: Response,
-  reqId: string,
-  format: Format,
-  meta: RequestMeta,
-  started: number,
-  headersAt: number,
-): Promise<Response> {
-  const raw = await upstream.text();
-  let parsedOpenAI: OpenAIChatResponse;
-  try {
-    parsedOpenAI = JSON.parse(raw) as OpenAIChatResponse;
-  } catch (err) {
-    printRow(reqId, format, meta, 502, started, headersAt, 0, 0, 0);
-    return errorResponse(502, "translation_failed", `upstream returned non-JSON body: ${(err as Error).message}`);
-  }
-  const anthropicResp = translateResponseOpenAIToAnthropic(parsedOpenAI);
-  const json = JSON.stringify(anthropicResp);
-  const payload = new TextEncoder().encode(json);
-
-  const respHeaders = new Headers();
-  respHeaders.set("content-type", "application/json");
-  for (const h of forwardedUpstreamHeaders()) {
-    const v = upstream.headers.get(h);
-    if (v) respHeaders.set(h, v);
-  }
-
-  if (clientAcceptsGzip(clientReq)) {
-    respHeaders.set("content-encoding", "gzip");
-    printRow(reqId, format, meta, upstream.status, started, headersAt, anthropicResp.usage.output_tokens, 0, 0);
-    return new Response(gzipSync(payload), {
-      status: upstream.status,
-      headers: respHeaders,
-    });
-  }
-  printRow(reqId, format, meta, upstream.status, started, headersAt, anthropicResp.usage.output_tokens, 0, 0);
-  return new Response(payload, {
-    status: upstream.status,
-    headers: respHeaders,
-  });
-}
-
-function isAnthropicMessagesResponse(value: unknown): value is AnthropicMessagesResponse {
-  if (typeof value !== "object" || value === null) return false;
-  const candidate = value as Partial<AnthropicMessagesResponse>;
-  return candidate.type === "message" && candidate.role === "assistant" && Array.isArray(candidate.content);
-}
-
-function forwardedUpstreamHeaders(): string[] {
-  return [
-    "x-request-id",
-    "anthropic-ratelimit-requests-limit",
-    "anthropic-ratelimit-requests-remaining",
-    "anthropic-ratelimit-requests-reset",
-    "anthropic-ratelimit-tokens-limit",
-    "anthropic-ratelimit-tokens-remaining",
-    "anthropic-ratelimit-tokens-reset",
-  ];
-}
-
-function translatedSseResponse(body: ReadableStream<Uint8Array>): Response {
-  return new Response(body, {
-    status: 200,
-    headers: {
-      "content-type": "text/event-stream",
-      "cache-control": "no-cache",
-    },
-  });
-}
-
-interface RequestMeta {
-  model: string;
-  stream: boolean;
-}
-
 function peekBody(parsed: Record<string, unknown> | undefined): RequestMeta {
   if (!parsed) return { model: "-", stream: false };
   return {
     model: typeof parsed.model === "string" ? parsed.model : "-",
     stream: parsed.stream === true,
   };
-}
-
-let reqCounter = 0;
-let headerPrinted = false;
-
-/** Format a unix-ms timestamp as local HH:MM:SS in the host's timezone (not UTC). */
-function localTime(ms: number): string {
-  const d = new Date(ms);
-  const hh = String(d.getHours()).padStart(2, "0");
-  const mm = String(d.getMinutes()).padStart(2, "0");
-  const ss = String(d.getSeconds()).padStart(2, "0");
-  return `${hh}:${mm}:${ss}`;
-}
-
-function nextReqId(): string {
-  return `#${String(++reqCounter).padStart(3, "0")}`;
-}
-
-const DEBUG_BODY_PREVIEW = 200;
-// Shared with dump.ts so debug logs and dump files mask the SAME set —
-// the captcha verify params in particular were previously leaked in plain
-// text by the debug formatter while the dumper masked them.
-const SENSITIVE_HEADERS = SENSITIVE_HEADER_NAMES;
-
-function debugLine(reqId: string, msg: string): void {
-  console.log(`${reqId} debug: ${msg}`);
-}
-
-function debugError(reqId: string, kind: string, msg: string): void {
-  console.log(`${reqId} debug: ERROR ${kind}: ${msg}`);
-}
-
-function redactHeaderVal(key: string, val: string): string {
-  const k = key.toLowerCase();
-  if (!SENSITIVE_HEADERS.has(k)) return val;
-  if (k === "authorization") {
-    const sp = val.indexOf(" ");
-    return sp > 0 ? `${val.slice(0, sp)} <redacted>` : "<redacted>";
-  }
-  if (val.length <= 10) return "<redacted>";
-  return `${val.slice(0, 6)}...${val.slice(-4)}`;
-}
-
-function formatHeaderPairs(headers: Headers): string {
-  const pairs: string[] = [];
-  for (const [k, v] of headers.entries()) {
-    pairs.push(`${k}=${redactHeaderVal(k, v)}`);
-  }
-  return pairs.join(" ");
-}
-
-function formatResponseHeaders(headers: Headers): string {
-  const interesting = [
-    "content-type",
-    "content-encoding",
-    "content-length",
-    "x-request-id",
-    "anthropic-ratelimit-requests-remaining",
-    "anthropic-ratelimit-tokens-remaining",
-  ];
-  const pairs: string[] = [];
-  for (const h of interesting) {
-    const v = headers.get(h);
-    if (v) pairs.push(`${h}=${v}`);
-  }
-  return pairs.length > 0 ? pairs.join(" ") : "(no notable headers)";
-}
-
-function previewBody(body: string): string {
-  const flat = body.replace(/\s+/g, " ").trim();
-  if (flat.length <= DEBUG_BODY_PREVIEW) return flat;
-  return `${flat.slice(0, DEBUG_BODY_PREVIEW)}…(${flat.length} bytes total)`;
-}
-
-const COMPACT_LOG = process.env.ZCODE_LOG_FORMAT === "compact";
-
-function printHeader(): void {
-  if (headerPrinted) return;
-  headerPrinted = true;
-  if (COMPACT_LOG) return;
-  console.log(
-    "| #    | Time       | Fmt | Model       | Mode   | Stat |    TTFB |   Tok |  tok/s |   Total |",
-  );
-  console.log(
-    "|------|------------|-----|-------------|--------|------|---------|-------|--------|---------|",
-  );
-}
-
-function printRow(
-  reqId: string,
-  format: Format,
-  meta: RequestMeta,
-  status: number,
-  started: number,
-  headersAt: number,
-  tokens: number,
-  avgTps: number,
-  streamEndAt: number,
-  stats?: { retried?: boolean; credentialKey?: string; captchaMs?: number; inputTokens?: number; cacheReadTokens?: number },
-): void {
-  // fork: feed the admin dashboard's stats collector (recordStat dedups by
-  // id, so retry-loop re-prints for the same request collapse into one entry).
-  try {
-    recordStat({
-      id: reqId,
-      time: new Date(started).toISOString().slice(11, 19),
-      model: meta.model,
-      status,
-      ttfb: `${Math.max(0, headersAt - started)}ms`,
-      tokens: tokens > 0 ? String(tokens) : "-",
-      ...(stats?.inputTokens !== undefined ? { inputTokens: String(stats.inputTokens) } : {}),
-      ...(stats?.cacheReadTokens !== undefined ? { cacheReadTokens: String(stats.cacheReadTokens) } : {}),
-      ...(stats?.credentialKey ? { credentialKey: stats.credentialKey } : {}),
-      ...(stats?.retried ? { retried: true } : {}),
-      ...(stats?.captchaMs && stats.captchaMs > 0 ? { captchaMs: `${stats.captchaMs}ms` } : {}),
-    });
-  } catch { /* stats must never break the request path */ }
-
-  printHeader();
-  const tag = format === "anthropic" ? "ANT" : "OAI";
-  const mode = meta.stream ? "stream" : "batch";
-
-  if (COMPACT_LOG) {
-    const ttfbMs = headersAt - started;
-    const totalMs = streamEndAt > started ? streamEndAt - started : ttfbMs;
-    const ttfbStr = fmtMs(ttfbMs);
-    const tokStr = tokens > 0 ? `${tokens}tok` : "";
-    const tpsStr = avgTps > 0 ? `${avgTps.toFixed(0)}t/s` : "";
-    const parts = [reqId, tag, meta.model, String(status), mode];
-    if (meta.stream && streamEndAt > started) {
-      parts.push(`${ttfbStr}→${fmtMs(totalMs)}`);
-    } else {
-      parts.push(ttfbStr);
-    }
-    if (tokStr) parts.push(tokStr);
-    if (tpsStr) parts.push(tpsStr);
-    console.log(parts.join(" "));
-    return;
-  }
-
-  const ts = localTime(started);
-  const ttfb = `${headersAt - started}ms`;
-  const total = streamEndAt > started ? `${streamEndAt - started}ms` : "-";
-  const tok = tokens > 0 ? String(tokens) : "-";
-  const tps = avgTps > 0 ? avgTps.toFixed(1) : "-";
-  console.log(
-    `| ${reqId.padEnd(4)} | ${ts.padEnd(10)} | ${tag} | ${meta.model.padEnd(11)} | ${mode.padEnd(6)} | ${String(status).padStart(4)} | ${ttfb.padStart(7)} | ${tok.padStart(5)} | ${tps.padStart(6)} | ${total.padStart(7)} |`,
-  );
-}
-
-function fmtMs(ms: number): string {
-  if (ms < 1000) return `${ms}ms`;
-  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
-  return `${Math.floor(ms / 60_000)}m${Math.floor((ms % 60_000) / 1000)}s`;
 }

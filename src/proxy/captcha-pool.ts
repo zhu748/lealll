@@ -247,15 +247,14 @@ export class CaptchaTokenPool {
   async takeToken(cfg: CaptchaConfig): Promise<string> {
     this.cfg = cfg;
 
-    const readyBefore = this.tokens.length;
     const token = this.popFresh();
     if (token) {
-      this.onTokenTaken(false, readyBefore - 1);
+      this.onTokenTaken();
       void this.refill({ urgent: true });
       return token;
     }
 
-    this.onTokenTaken(true, 0);
+    this.onTokenTaken();
     // Re-size immediately from current demand (this take is already in the
     // window) so an empty-pool arrival widens the buffer right away.
     this.effectiveTarget = Math.max(this.effectiveTarget, this.computeActiveTarget());
@@ -395,7 +394,7 @@ export class CaptchaTokenPool {
     );
   }
 
-  private onTokenTaken(wasEmpty: boolean, readyAfter: number): void {
+  private onTokenTaken(): void {
     this.lastTakeAt = Date.now();
     this.takeTimestamps.push(this.lastTakeAt);
     this.pruneTakeWindow();

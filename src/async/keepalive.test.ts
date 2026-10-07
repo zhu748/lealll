@@ -13,22 +13,6 @@
 import { describe, it, expect } from "bun:test";
 import { keepaliveStream, keepaliveFrame } from "./keepalive.js";
 
-async function drain(stream: ReadableStream<Uint8Array>, maxMs: number = 1000): Promise<string> {
-  const reader = stream.getReader();
-  const chunks: Uint8Array[] = [];
-  const deadline = Date.now() + maxMs;
-  while (Date.now() < deadline) {
-    const readP = reader.read();
-    const timeoutP = new Promise<"timeout">((r) => setTimeout(() => r("timeout"), Math.max(10, deadline - Date.now())));
-    const result = await Promise.race([readP, timeoutP]);
-    if (result === "timeout") break;
-    if (result.done) break;
-    chunks.push(result.value);
-  }
-  reader.cancel().catch(() => {});
-  return new TextDecoder().decode(Buffer.concat(chunks));
-}
-
 describe("keepaliveStream", () => {
   it("first emit happens after intervalMs, not at t=0", async () => {
     const stream = keepaliveStream({ intervalMs: 50 });

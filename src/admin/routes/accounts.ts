@@ -1,3 +1,4 @@
+import { validateProxyUrl } from "../../utils/proxy-url.js";
 import {
   exportAccounts,
   exportSingleAccount,
@@ -14,7 +15,6 @@ import {
   setAccountPlan,
   setAccountProxy,
   switchAccount,
-  validateProxyUrl,
 } from "../../auth/store.js";
 import { errorResponse } from "../../proxy/translated-response.js";
 import { handleMutationResult, synchronizeActiveCredential } from "../account-actions.js";

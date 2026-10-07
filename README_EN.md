@@ -274,12 +274,12 @@ It's a "translator + courier": it translates the standard requests from your too
 ## 🛠️ Development
 
 ```bash
-bun test            # run tests
-bun x tsc --noEmit  # type check
+bun run test:offline # tests using mocks and loopback servers
+bun run typecheck    # type and unused-code checks
 bun run dev         # start the panel in dev mode
 ```
 
-For architecture and implementation details, see the comments inside the source files under [`src/`](src/).
+See the [code organization and maintenance guide](docs/code-organization.md) for module responsibilities and state ownership, and the comments under [`src/`](src/) for implementation details.
 
 ## Privacy
 

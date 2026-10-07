@@ -1,74 +1,42 @@
 /**
- * Global Proxy Pool
+ * Persistent global outbound proxy pool. An account's proxy override takes
+ * precedence; otherwise selection stays sticky until failure/removal, with
+ * request-local exclusions for gateway rotation.
  *
- * A persistent, refreshable pool of outbound HTTP proxies shared across all
- * accounts. The pool is consulted ONLY when an account has no per-account
- * proxy override (`cred.proxy`) — single-account proxy always wins over the
- * pool, mirroring the "优先级低于单账号设置的代理" requirement.
- *
- * Sources:
- *   - Manual proxies: added one-by-one or pasted/imported from a txt file.
- *   - URL imports: one or more remote txt lists (one proxy per line), e.g.
- *     https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/all/data.txt
- *
- * The pool auto-refreshes from the configured URL sources on a configurable
- * interval (default 5 minutes). A manual refresh returns the count of
- * added / removed / total proxies so the dashboard can show "本次更新新增 X，
- * 删除 Y".
- *
- * Proxy format expected (one per line):
- *   - `http://host:port`
- *   - `https://host:port`
- *   - `socks4://host:port`
- *   - `socks4a://host:port`
- *   - `socks5://host:port`
- *   - `socks5h://host:port`
- *   - `host:port`           (defaults to http://)
- *   - `user:pass@host:port` (credentials embedded)
- *
- * Lines starting with `#` are ignored. Empty lines are ignored.
- *
- * Persistence: ~/.zcode-proxy/proxy-pool.json (configurable via
- * ZCODE_PROXY_STORE_DIR). The file contains:
- *   {
- *     "version": 1,
- *     "config": { enabled, refreshIntervalMin, sourceUrls, rotateOnGatewayBlock },
- *     "proxies": [{ id, url, source, addedAt }],
- *     "lastRefreshAt": 1234567890,
- *     "lastRefreshResult": { added, removed, total, at }
- *   }
- *
- * Rotation: when the handler detects a 405 / WAF block (gateway interception),
- * it calls `pool.next(excluding)` to rotate to a different proxy and retries
- * the request. The current cursor is per-request (in-memory), so concurrent
- * requests use different proxies.
+ * Owns file/cache state, selection locks and source refresh scheduling.
+ * Parsing, normalization, selection and background tests live in pool-* leaves.
+ * See docs/code-organization.md for module responsibilities and lock ordering.
  */
-import { parseStrictNonNegativeInteger } from "../utils/numbers.js";
 import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { atomicWriteFile, createMutex } from "../utils/fs.js";
-import { validateProxyUrl } from "../auth/store.js";
 import { PROXY_POOL as PROXY_POOL_CONST } from "../utils/constants.js";
 import { runtimeLog, runtimeWarn } from "../utils/log.js";
-import { wrapFetchWithSocksBridge } from "./proxied-fetch.js";
 // v0.3.7.1: host-captured timers — these guards/loops run per-request,
 // often concurrent with captcha solve epochs; the bare globals resolve
 // through the solver window alias there and get cancelled on window
 // destruction (the 429-retry permanent hang). See utils/host-timers.ts.
 import { hostClearInterval, hostClearTimeout, hostSetInterval, hostSetTimeout } from "../utils/host-timers.js";
 
-// --------------------------------------------------------------------
-// Types
-// --------------------------------------------------------------------
-
 import type { PoolProxy, ProxyPoolConfig, RefreshResult, PoolFile } from "./pool-types.js";
-export type { PoolProxy, ProxyPoolConfig, RefreshResult } from "./pool-types.js";
+import { proxyIdForUrl, parseProxyText, proxyValidationError, validateProxySourceUrl } from "./pool-format.js";
+import {
+  DEFAULT_CONFIG, cloneProxyPoolConfig, normalizeProxyPoolConfig,
+  patchProxyPoolConfig, cloneRefreshResult, normalizePoolFile,
+} from "./pool-normalization.js";
+import { createProxyPoolTestJobs } from "./pool-test-jobs.js";
 import { PoolProxyIndex, isProxyCoolingDown, selectPoolProxy } from "./pool-selection.js";
 import {
   mapWithConcurrency, readProxySourceText, truncateProxyPoolError,
-  resolveProxySourceMaxBytes, resolveSourceFetchConcurrency,
+  resolveSourceFetchConcurrency,
 } from "./pool-source.js";
+
+// Compatibility entry points for existing pool callers.
+export type { PoolProxy, ProxyPoolConfig, RefreshResult } from "./pool-types.js";
+export { normalizeProxyLine, parseProxyText, validateProxySourceUrl } from "./pool-format.js";
+export { resolveTestJobResultTtlMs } from "./pool-test-jobs.js";
+export type { TestJobState } from "./pool-test-jobs.js";
 export { resolveProxySourceMaxBytes, resolveSourceFetchConcurrency, _readProxySourceTextForTesting } from "./pool-source.js";
 
 // --------------------------------------------------------------------
@@ -82,177 +50,6 @@ function resolveStoreDir(): string {
 let STORE_DIR = resolveStoreDir();
 let POOL_FILE = join(STORE_DIR, "proxy-pool.json");
 
-const DEFAULT_CONFIG: ProxyPoolConfig = {
-  enabled: false,
-  refreshIntervalMin: 5,
-  sourceUrls: [],
-  rotateOnGatewayBlock: true,
-  maxRotations: 3,
-};
-const MAX_TIMER_MS = 2_147_483_647;
-const MAX_REFRESH_INTERVAL_MIN = Math.floor(2_147_483_647 / 60_000);
-const MAX_PROXY_ROTATIONS = 20;
-
-function hasOwn(obj: object, key: string): boolean {
-  return Object.prototype.hasOwnProperty.call(obj, key);
-}
-
-function normalizeBoolean(raw: unknown, fallback: boolean): boolean {
-  if (typeof raw === "boolean") return raw;
-  if (typeof raw === "string") {
-    const normalized = raw.trim().toLowerCase();
-    if (normalized === "true") return true;
-    if (normalized === "false") return false;
-  }
-  return fallback;
-}
-
-function normalizeNonNegativeInt(raw: unknown, fallback: number, max = Number.MAX_SAFE_INTEGER): number {
-  const n = parseStrictNonNegativeInteger(raw);
-  if (n === undefined) return fallback;
-  return Math.min(n, max);
-}
-
-function normalizeOptionalNonNegativeInt(raw: unknown, max = Number.MAX_SAFE_INTEGER): number | undefined {
-  const n = normalizeNonNegativeInt(raw, -1, max);
-  return n >= 0 ? n : undefined;
-}
-
-function normalizeSourceUrls(raw: unknown): string[] {
-  if (!Array.isArray(raw)) return [];
-  const out: string[] = [];
-  const seen = new Set<string>();
-  for (const value of raw) {
-    if (typeof value !== "string") continue;
-    const validation = validateProxySourceUrl(value);
-    if (!validation.ok || seen.has(validation.url)) continue;
-    seen.add(validation.url);
-    out.push(validation.url);
-  }
-  return out;
-}
-
-export function validateProxySourceUrl(raw: string): { ok: true; url: string } | { ok: false; message: string } {
-  const trimmed = raw.trim();
-  if (!trimmed) return { ok: false, message: "source URL cannot be empty" };
-
-  let parsed: URL;
-  try {
-    parsed = new URL(trimmed);
-  } catch {
-    return { ok: false, message: `Invalid source URL: ${trimmed}` };
-  }
-
-  const scheme = parsed.protocol.toLowerCase();
-  if (scheme !== "http:" && scheme !== "https:") {
-    return { ok: false, message: `Source URL scheme "${parsed.protocol}" is not allowed. Use http:// or https://` };
-  }
-  const host = parsed.hostname;
-  if (!host) return { ok: false, message: "Source URL is missing a hostname" };
-  if (parsed.port === "0") return { ok: false, message: "Source URL port must be between 1 and 65535" };
-
-  const blocked = sourceUrlHostBlockReason(host);
-  if (blocked) {
-    return {
-      ok: false,
-      message: `Source URL host "${host}" is a ${blocked} — fetching proxy lists from cloud metadata or unspecified addresses is blocked.`,
-    };
-  }
-
-  return { ok: true, url: trimmed };
-}
-
-function sourceUrlHostBlockReason(host: string): string | null {
-  const ipHost = host.startsWith("[") && host.endsWith("]")
-    ? host.slice(1, -1)
-    : host;
-  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(ipHost)) {
-    const parts = ipHost.split(".").map(Number);
-    if (parts.some(p => p > 255)) return null;
-    const [a, b] = parts;
-    if (a === 0) return "0.0.0.0/8 unspecified address";
-    if (a === 169 && b === 254) return "169.254/16 link-local / cloud metadata endpoint";
-    return null;
-  }
-  const lower = ipHost.toLowerCase();
-  if (lower === "::") return ":: unspecified";
-  if (lower.startsWith("fe8") || lower.startsWith("fe9") || lower.startsWith("fea") || lower.startsWith("feb")) {
-    return "fe80::/10 IPv6 link-local";
-  }
-  return null;
-}
-
-function cloneProxyPoolConfig(config: ProxyPoolConfig): ProxyPoolConfig {
-  return {
-    ...config,
-    sourceUrls: normalizeSourceUrls(config.sourceUrls),
-  };
-}
-
-function normalizeProxyPoolConfig(config?: Partial<ProxyPoolConfig> | null): ProxyPoolConfig {
-  const merged = {
-    ...DEFAULT_CONFIG,
-    ...(config ?? {}),
-  };
-  return {
-    enabled: normalizeBoolean(merged.enabled, DEFAULT_CONFIG.enabled),
-    refreshIntervalMin: normalizeNonNegativeInt(
-      merged.refreshIntervalMin,
-      DEFAULT_CONFIG.refreshIntervalMin,
-      MAX_REFRESH_INTERVAL_MIN,
-    ),
-    sourceUrls: normalizeSourceUrls(merged.sourceUrls),
-    rotateOnGatewayBlock: normalizeBoolean(
-      merged.rotateOnGatewayBlock,
-      DEFAULT_CONFIG.rotateOnGatewayBlock,
-    ),
-    maxRotations: normalizeNonNegativeInt(
-      merged.maxRotations,
-      DEFAULT_CONFIG.maxRotations,
-      MAX_PROXY_ROTATIONS,
-    ),
-  };
-}
-
-function cloneRefreshResult(result?: RefreshResult): RefreshResult | undefined {
-  if (!result) return undefined;
-  return {
-    ...result,
-    errors: result.errors ? { ...result.errors } : undefined,
-  };
-}
-
-function normalizeRefreshErrors(raw: unknown): Record<string, string> | undefined {
-  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return undefined;
-  const out: Record<string, string> = {};
-  for (const [key, value] of Object.entries(raw)) {
-    const sourceUrl = typeof key === "string" ? key.trim() : "";
-    if (!sourceUrl || typeof value !== "string") continue;
-    try {
-      new URL(sourceUrl);
-    } catch {
-      continue;
-    }
-    out[sourceUrl] = truncateProxyPoolError(value);
-  }
-  return Object.keys(out).length > 0 ? out : undefined;
-}
-
-function normalizeRefreshResult(raw: unknown, fallbackAt?: number): RefreshResult | undefined {
-  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return undefined;
-  const r = raw as Record<string, unknown>;
-  const at = normalizeOptionalNonNegativeInt(r.at) ?? fallbackAt;
-  if (at === undefined) return undefined;
-  return {
-    added: normalizeOptionalNonNegativeInt(r.added) ?? 0,
-    removed: normalizeOptionalNonNegativeInt(r.removed) ?? 0,
-    total: normalizeOptionalNonNegativeInt(r.total) ?? 0,
-    at,
-    errors: normalizeRefreshErrors(r.errors),
-  };
-}
-
-const ALLOWED_SCHEMES = ["http:", "https:", "socks4:", "socks4a:", "socks5:", "socks5h:"];
 /**
  * Hard cap on pool entries: a single 10MB source response can otherwise mint
  * hundreds of thousands of unique proxies which then make every pickProxy O(n)
@@ -335,20 +132,17 @@ function reconcileCurrentWorkingProxy(pool: PoolFile): void {
 const poolMutex = createMutex();
 
 /**
- * v0.2.2+ FIX (race condition): separate mutex protecting in-memory sticky
- * state (`currentWorkingProxy`, `roundRobinCursor`, dirty failures counters).
- *
- * The disk-file mutex (`poolMutex`) is held during read+write cycles —
- * nesting it inside `pickProxy`/`markProxyFailed` would either deadlock
- * (non-reentrant) or serialize ALL proxy picks globally (every request
- * blocks on every other request's pool I/O). This lightweight state mutex
- * never nests `poolMutex`. readPool is cache-first and throttles external
- * mtime checks, so the common request path avoids repeated synchronous disk
- * stats while still preserving sticky-proxy consistency.
+ * Protects sticky selection and in-memory failure counters independently of
+ * disk writes. Warm-cache failures schedule a flush without taking poolMutex;
+ * the first uncached failure takes poolMutex to persist its initial counter.
+ * File mutations must not acquire stateMutex while holding poolMutex.
  */
 const stateMutex = createMutex();
-/** Serializes test-job check-then-act (startTestJob duplicate-job guard). */
-const testJobMutex = createMutex();
+const testJobs = createProxyPoolTestJobs({
+  loadProxies: async () => (await readPool()).proxies,
+  removeFailedProxies: removeTestJobFailedProxies,
+});
+export const { startTestJob, getTestJobState, cancelTestJob } = testJobs;
 
 /**
  * v0.2.2+ PERF: debounced disk flush for `failures` counters.
@@ -447,131 +241,6 @@ function scheduleFailureFlush(): void {
 // --------------------------------------------------------------------
 
 /** Cheap stable hash for ids (FNV-1a 32-bit, hex). */
-function hashId(input: string): string {
-  let h = 0x811c9dc5;
-  for (let i = 0; i < input.length; i++) {
-    h ^= input.charCodeAt(i);
-    h = (h * 0x01000193) >>> 0;
-  }
-  return h.toString(16).padStart(8, "0");
-}
-
-/**
- * Normalize a raw proxy line into a valid URL string.
- * - Empty / comment lines return null.
- * - Bare `host:port` becomes `http://host:port`.
- * - URLs without scheme get `http://` prepended.
- * - Invalid schemes / hosts return null.
- */
-export function normalizeProxyLine(raw: string): string | null {
-  const trimmed = raw.trim();
-  if (!trimmed) return null;
-  if (trimmed.startsWith("#")) return null;
-
-  let candidate = trimmed;
-  // If it has no scheme, prepend http://
-  if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(candidate)) {
-    // Heuristic: if it looks like `host:port` or `user:pass@host:port`, prepend http://
-    candidate = `http://${candidate}`;
-  }
-
-  let parsed: URL;
-  try {
-    parsed = new URL(candidate);
-  } catch {
-    return null;
-  }
-  if (!ALLOWED_SCHEMES.includes(parsed.protocol)) return null;
-  if (!parsed.hostname) return null;
-  // Reject HTML/JS metacharacters in the host (defense-in-depth, mirrors
-  // setAccountProxy validation).
-  if (/[<>'"\s]/.test(parsed.host)) return null;
-
-  // Re-serialize without hash/fragment and without trailing slash.
-  const port = parsed.port ? `:${parsed.port}` : "";
-  const auth = parsed.username
-    ? `${encodeURIComponent(parsed.username)}${parsed.password ? ":" + encodeURIComponent(parsed.password) : ""}@`
-    : "";
-  return `${parsed.protocol}//${auth}${parsed.hostname}${port}`;
-}
-
-/** Parse a multi-line text block into a list of normalized proxy URLs. */
-export function parseProxyText(text: string): string[] {
-  const out: string[] = [];
-  const seen = new Set<string>();
-  let lineStart = 0;
-  for (;;) {
-    const lineEnd = text.indexOf("\n", lineStart);
-    const end = lineEnd < 0 ? text.length : lineEnd;
-    const line = text.slice(lineStart, end);
-    const norm = normalizeProxyLine(line);
-    if (norm && !seen.has(norm)) {
-      seen.add(norm);
-      out.push(norm);
-    }
-    if (lineEnd < 0) break;
-    lineStart = lineEnd + 1;
-  }
-  return out;
-}
-
-/**
- * Run SSRF / scheme validation on a normalized URL. Returns null if valid,
- * or an error message string. Reuses store.ts `validateProxyUrl` for parity
- * with the per-account proxy gate.
- */
-function validateProxy(normalized: string): string | null {
-  const v = validateProxyUrl(normalized);
-  return v.ok ? null : v.message;
-}
-
-function normalizeProxySource(raw: unknown): string {
-  if (typeof raw !== "string") return "manual";
-  const source = raw.trim();
-  if (source === "manual") return source;
-  if (!source.startsWith("url:")) return "manual";
-  const sourceUrl = source.slice(4).trim();
-  if (!sourceUrl) return "manual";
-  try {
-    new URL(sourceUrl);
-    return `url:${sourceUrl}`;
-  } catch {
-    return "manual";
-  }
-}
-
-function normalizePoolProxies(raw: unknown): PoolProxy[] {
-  if (!Array.isArray(raw)) return [];
-  const out: PoolProxy[] = [];
-  const seenUrls = new Set<string>();
-  const now = Date.now();
-  for (const item of raw) {
-    if (typeof item !== "object" || item === null || Array.isArray(item)) continue;
-    const p = item as Record<string, unknown>;
-    if (typeof p.url !== "string") continue;
-    const url = normalizeProxyLine(p.url);
-    if (!url || validateProxy(url) || seenUrls.has(url)) continue;
-    seenUrls.add(url);
-
-    const addedAt = normalizeOptionalNonNegativeInt(p.addedAt) ?? now;
-    const proxy: PoolProxy = {
-      id: hashId(url),
-      url,
-      source: normalizeProxySource(p.source),
-      addedAt,
-    };
-    if (typeof p.note === "string" && p.note.trim()) proxy.note = p.note.trim().slice(0, 500);
-    const failures = normalizeOptionalNonNegativeInt(p.failures);
-    if (failures !== undefined) proxy.failures = failures;
-    const lastUsedAt = normalizeOptionalNonNegativeInt(p.lastUsedAt);
-    if (lastUsedAt !== undefined) proxy.lastUsedAt = lastUsedAt;
-    const lastFailedAt = normalizeOptionalNonNegativeInt(p.lastFailedAt);
-    if (lastFailedAt !== undefined) proxy.lastFailedAt = lastFailedAt;
-    out.push(proxy);
-  }
-  return out;
-}
-
 // --------------------------------------------------------------------
 // File I/O
 // --------------------------------------------------------------------
@@ -581,19 +250,8 @@ function readPoolUncached(): PoolFile | null {
   if (!existsSync(POOL_FILE)) return null;
   try {
     const raw = readFileSync(POOL_FILE, "utf-8");
-    const parsed = JSON.parse(raw) as PoolFile;
-    if (!parsed || parsed.version !== 1) {
-      // Unknown version — treat as empty rather than risk clobbering.
-      return { version: 1, config: cloneProxyPoolConfig(DEFAULT_CONFIG), proxies: [] };
-    }
-    const lastRefreshAt = normalizeOptionalNonNegativeInt(parsed.lastRefreshAt);
-    return {
-      version: 1,
-      config: normalizeProxyPoolConfig(parsed.config),
-      proxies: normalizePoolProxies(parsed.proxies),
-      lastRefreshAt,
-      lastRefreshResult: normalizeRefreshResult(parsed.lastRefreshResult, lastRefreshAt),
-    };
+    const parsed: unknown = JSON.parse(raw);
+    return normalizePoolFile(parsed);
   } catch {
     return null;
   }
@@ -720,29 +378,7 @@ export async function getPoolState(): Promise<{
 export async function updatePoolConfig(patch: Partial<ProxyPoolConfig>): Promise<ProxyPoolConfig> {
   return poolMutex.run(async () => {
     const pool = await readPool();
-    const current = normalizeProxyPoolConfig(pool.config);
-    const patchRecord = patch as Record<string, unknown>;
-    const newConfig: ProxyPoolConfig = {
-      enabled: hasOwn(patchRecord, "enabled")
-        ? normalizeBoolean(patchRecord.enabled, current.enabled)
-        : current.enabled,
-      refreshIntervalMin: hasOwn(patchRecord, "refreshIntervalMin")
-        ? normalizeNonNegativeInt(
-          patchRecord.refreshIntervalMin,
-          current.refreshIntervalMin,
-          MAX_REFRESH_INTERVAL_MIN,
-        )
-        : current.refreshIntervalMin,
-      sourceUrls: hasOwn(patchRecord, "sourceUrls") && Array.isArray(patchRecord.sourceUrls)
-        ? normalizeSourceUrls(patchRecord.sourceUrls)
-        : normalizeSourceUrls(current.sourceUrls),
-      rotateOnGatewayBlock: hasOwn(patchRecord, "rotateOnGatewayBlock")
-        ? normalizeBoolean(patchRecord.rotateOnGatewayBlock, current.rotateOnGatewayBlock)
-        : current.rotateOnGatewayBlock,
-      maxRotations: hasOwn(patchRecord, "maxRotations")
-        ? normalizeNonNegativeInt(patchRecord.maxRotations, current.maxRotations, MAX_PROXY_ROTATIONS)
-        : current.maxRotations,
-    };
+    const newConfig = patchProxyPoolConfig(pool.config, patch);
     pool.config = newConfig;
     await writePool(pool);
     scheduleAutoRefresh(newConfig);
@@ -766,14 +402,14 @@ export async function importFromText(
     const pool = await readPool();
     const now = Date.now();
     const newEntries: PoolProxy[] = urls.map((url, idx) => {
-      const validationErr = validateProxy(url);
+      const validationErr = proxyValidationError(url);
       if (validationErr) {
         // Skip invalid silently — the parse step already filtered most bad
         // inputs; the SSRF check just blocks metadata endpoints.
         return null;
       }
       return {
-        id: hashId(url),
+        id: proxyIdForUrl(url),
         url,
         source: "manual",
         addedAt: now,
@@ -871,8 +507,8 @@ async function importFromFetchedText(
     const existingIds = new Set(kept.map(p => p.id));
     const newEntries: PoolProxy[] = [];
     for (const u of urls) {
-      if (validateProxy(u)) continue;
-      const id = hashId(u);
+      if (proxyValidationError(u)) continue;
+      const id = proxyIdForUrl(u);
       if (existingIds.has(id)) continue;
       existingIds.add(id);
       newEntries.push({ id, url: u, source: sourceTag, addedAt: now });
@@ -997,8 +633,8 @@ async function refreshFromSourcesInner(
       continue;
     }
     for (const proxyUrl of parseProxyText(r.text)) {
-      if (validateProxy(proxyUrl)) continue;
-      const id = hashId(proxyUrl);
+      if (proxyValidationError(proxyUrl)) continue;
+      const id = proxyIdForUrl(proxyUrl);
       if (seenIds.has(id)) continue;
       seenIds.add(id);
       allEntries.push({ id, url: proxyUrl, source: sourceTag, addedAt: refreshedAt });
@@ -1395,328 +1031,6 @@ export async function initPool(fetchImpl: typeof fetch = fetch): Promise<void> {
 }
 
 // --------------------------------------------------------------------
-// Background test job (server-side, survives page close)
-// --------------------------------------------------------------------
-
-/**
- * State of a background test-all job. The job runs entirely on the server —
- * the dashboard starts it via POST /admin/api/proxy-pool/test-all and polls
- * GET /admin/api/proxy-pool/test-status for progress. Closing the browser
- * tab does NOT stop the job.
- */
-export interface TestJobState {
-  /** Whether the job is currently running. */
-  running: boolean;
-  /** Total proxies to test (captured at job start). */
-  total: number;
-  /** Number of proxies tested so far. */
-  tested: number;
-  /** Number of successful tests so far. */
-  okCount: number;
-  /** Number of failed tests so far. */
-  failCount: number;
-  /** Number of failed proxies auto-removed (0 if autoRemove is off). */
-  removedCount: number;
-  /** Batch size (concurrent tests per batch). */
-  batchSize: number;
-  /** Whether failed proxies are auto-removed after the job. */
-  autoRemove: boolean;
-  /** Job start time (Unix ms). */
-  startedAt: number;
-  /** Job finish time (Unix ms, set when job completes). */
-  finishedAt?: number;
-  /** Per-proxy results: { [proxyId]: { ok, latencyMs, status?, error? } }. */
-  results: Record<string, { ok: boolean; latencyMs: number; status?: number; error?: string; seq?: number }>;
-  /** Monotonic sequence assigned to test results, used for incremental polling. */
-  resultSeq: number;
-  /** Error message if the job itself failed (rare). */
-  error?: string;
-}
-
-let currentTestJob: TestJobState | null = null;
-let currentTestJobAbort: AbortController | null = null;
-let currentTestJobResultIds: string[] = [];
-let currentTestJobCleanupTimer: ReturnType<typeof setTimeout> | null = null;
-const DEFAULT_TEST_JOB_BATCH_SIZE = 5;
-const MIN_TEST_JOB_BATCH_SIZE = 1;
-const MAX_TEST_JOB_BATCH_SIZE = 50;
-
-function normalizeTestJobBatchSize(raw: unknown): number {
-  if (raw === undefined || raw === null) return DEFAULT_TEST_JOB_BATCH_SIZE;
-  if (typeof raw !== "number" || !Number.isSafeInteger(raw)) return DEFAULT_TEST_JOB_BATCH_SIZE;
-  return Math.max(MIN_TEST_JOB_BATCH_SIZE, Math.min(MAX_TEST_JOB_BATCH_SIZE, raw));
-}
-
-export function resolveTestJobResultTtlMs(raw = process.env.ZCODE_PROXY_POOL_TEST_JOB_TTL_MS): number {
-  if (raw === undefined || raw === null || String(raw).trim() === "") {
-    return PROXY_POOL_CONST.TEST_JOB_RESULT_TTL_MS;
-  }
-  const n = parseStrictNonNegativeInteger(raw);
-  return n === undefined ? PROXY_POOL_CONST.TEST_JOB_RESULT_TTL_MS : Math.min(n, MAX_TIMER_MS);
-}
-
-function clearTestJobCleanupTimer(): void {
-  if (!currentTestJobCleanupTimer) return;
-  try { hostClearTimeout(currentTestJobCleanupTimer); } catch {}
-  currentTestJobCleanupTimer = null;
-}
-
-function clearCompletedTestJob(job: TestJobState): void {
-  if (currentTestJob !== job || job.running) return;
-  currentTestJob = null;
-  currentTestJobResultIds = [];
-  if (currentTestJobAbort) {
-    try { currentTestJobAbort.abort(); } catch {}
-    currentTestJobAbort = null;
-  }
-  clearTestJobCleanupTimer();
-}
-
-function pruneExpiredTestJob(now = Date.now()): void {
-  const job = currentTestJob;
-  if (!job || job.running || job.finishedAt === undefined) return;
-  const ttlMs = resolveTestJobResultTtlMs();
-  if (ttlMs <= 0 || now - job.finishedAt >= ttlMs) {
-    clearCompletedTestJob(job);
-  }
-}
-
-function scheduleCompletedTestJobCleanup(job: TestJobState): void {
-  clearTestJobCleanupTimer();
-  if (currentTestJob !== job || job.running || job.finishedAt === undefined) return;
-  const ttlMs = resolveTestJobResultTtlMs();
-  if (ttlMs <= 0) {
-    clearCompletedTestJob(job);
-    return;
-  }
-  const delay = Math.max(0, job.finishedAt + ttlMs - Date.now());
-  currentTestJobCleanupTimer = hostSetTimeout(() => {
-    if (currentTestJob === job) pruneExpiredTestJob();
-  }, delay);
-  if (typeof currentTestJobCleanupTimer.unref === "function") {
-    currentTestJobCleanupTimer.unref();
-  }
-}
-
-/** Get the current test job state (for polling). Null if no job has ever run. */
-export function getTestJobState(options: { sinceSeq?: number } = {}): TestJobState | null {
-  pruneExpiredTestJob();
-  if (!currentTestJob) return null;
-  const sinceSeq = Number.isFinite(options.sinceSeq) && options.sinceSeq !== undefined
-    ? Math.max(0, Math.floor(options.sinceSeq))
-    : undefined;
-  if (sinceSeq !== undefined && sinceSeq >= currentTestJob.resultSeq) {
-    return { ...currentTestJob, results: {} };
-  }
-  const results: TestJobState["results"] = {};
-  if (sinceSeq !== undefined) {
-    // Incremental polling should stay incremental. Scanning the full results
-    // object on every dashboard poll made large proxy tests progressively
-    // slower (N results × N polls). Result sequence numbers start at 1, so
-    // slice(sinceSeq) returns ids whose seq is greater than sinceSeq.
-    for (let i = sinceSeq; i < currentTestJobResultIds.length; i++) {
-      const id = currentTestJobResultIds[i];
-      const result = currentTestJob.results[id];
-      if (!result || (result.seq ?? 0) <= sinceSeq) continue;
-      results[id] = { ...result };
-    }
-    return { ...currentTestJob, results };
-  }
-  for (const [id, result] of Object.entries(currentTestJob.results)) {
-    results[id] = { ...result };
-  }
-  return { ...currentTestJob, results };
-}
-
-function recordTestJobResult(
-  job: TestJobState,
-  proxyId: string,
-  result: Omit<TestJobState["results"][string], "seq">,
-): TestJobState["results"][string] {
-  const withSeq = { ...result, seq: ++job.resultSeq };
-  job.results[proxyId] = withSeq;
-  if (currentTestJob === job) {
-    currentTestJobResultIds.push(proxyId);
-  }
-  return withSeq;
-}
-
-/**
- * Start a background test-all job. If a job is already running, returns its
- * state without starting a new one (idempotent).
- *
- * The job runs fire-and-forget on the server. The caller gets back the
- * initial state immediately and can poll `getTestJobState()` for progress.
- *
- * @param options batchSize (1-50, default 5), autoRemove (default false),
- *                fetchImpl (for testing), testTarget (override target URL).
- * @returns The job state.
- */
-export async function startTestJob(options: {
-  batchSize?: number;
-  autoRemove?: boolean;
-  fetchImpl?: typeof fetch;
-  testTarget?: string;
-}): Promise<TestJobState> {
-  pruneExpiredTestJob();
-  // Serialize the check-then-act: the running-job check used to straddle an
-  // `await readPool()`, so two concurrent POST /test-all could BOTH pass it,
-  // spawn parallel jobs, and orphan the first job's AbortController (leaving
-  // it uncancellable). The job itself runs fire-and-forget outside the hold.
-  return testJobMutex.run(async () => {
-    // If a job is already running, return its state (don't start a duplicate).
-    if (currentTestJob && currentTestJob.running) {
-      return getTestJobState()!;
-    }
-    clearTestJobCleanupTimer();
-
-    const pool = await readPool();
-    const proxies = pool.proxies;
-    const batchSize = normalizeTestJobBatchSize(options.batchSize);
-    const autoRemove = options.autoRemove === true;
-    const jobAbort = new AbortController();
-
-    const job: TestJobState = {
-      running: true,
-      total: proxies.length,
-      tested: 0,
-      okCount: 0,
-      failCount: 0,
-      removedCount: 0,
-      batchSize,
-      autoRemove,
-      startedAt: Date.now(),
-      results: {},
-      resultSeq: 0,
-    };
-    currentTestJob = job;
-    currentTestJobAbort = jobAbort;
-    currentTestJobResultIds = [];
-
-    // Fire-and-forget — run the job in the background. Errors are captured
-    // into job.error so the dashboard can surface them.
-    runTestJob(job, proxies, options.fetchImpl ?? fetch, options.testTarget, jobAbort.signal)
-      .catch(e => {
-        job.error = (e as Error).message;
-        job.running = false;
-        job.finishedAt = Date.now();
-      })
-      .finally(() => {
-        if (currentTestJob === job && currentTestJobAbort === jobAbort) {
-          currentTestJobAbort = null;
-        }
-        if (!job.running && job.finishedAt === undefined) {
-          job.finishedAt = Date.now();
-        }
-        scheduleCompletedTestJobCleanup(job);
-      });
-
-    return getTestJobState()!;
-  });
-}
-
-/**
- * Internal: run the test job. Processes proxies in batches of `batchSize`,
- * updating `job` in real-time so pollers see progress. After all batches
- * complete, auto-removes failed proxies if `autoRemove` is true.
- */
-async function runTestJob(
-  job: TestJobState,
-  proxies: PoolProxy[],
-  fetchImpl: typeof fetch,
-  testTargetOverride?: string,
-  jobSignal?: AbortSignal,
-): Promise<void> {
-  const failedProxies: PoolProxy[] = [];
-  const total = proxies.length;
-  // Wrap fetchImpl once so every proxy in the batch (HTTP, HTTPS, or SOCKS)
-  // is handled correctly. SOCKS proxies are transparently routed through
-  // the local HTTP-CONNECT→SOCKS bridge (Bun's native fetch would otherwise
-  // throw UnsupportedProxyProtocol for socks4:// / socks5:// schemes).
-  const wrappedFetch = wrapFetchWithSocksBridge(fetchImpl);
-
-  for (let i = 0; i < total; i += job.batchSize) {
-    // If job was cancelled (a new job started), stop early.
-    if (!job.running || jobSignal?.aborted) {
-      job.running = false;
-      job.finishedAt ??= Date.now();
-      return;
-    }
-
-    const batch = proxies.slice(i, i + job.batchSize);
-    const promises = batch.map(async p => {
-      if (!job.running || jobSignal?.aborted) return;
-      const target = testTargetOverride ?? "https://api.z.ai";
-      const started = Date.now();
-      const ctrl = new AbortController();
-      const timer = hostSetTimeout(() => ctrl.abort(), 10_000);
-      if (typeof timer.unref === "function") timer.unref();
-      const onJobAbort = () => ctrl.abort();
-      if (jobSignal) {
-        if (jobSignal.aborted) ctrl.abort();
-        else jobSignal.addEventListener("abort", onJobAbort, { once: true });
-      }
-      try {
-        const resp = await wrappedFetch(target, {
-          method: "HEAD",
-          signal: ctrl.signal,
-          redirect: "follow",
-          ...(p.url ? { proxy: p.url } : {}),
-        } as any);
-        const latencyMs = Date.now() - started;
-        try { await resp.body?.cancel(); } catch {}
-        if (!job.running || jobSignal?.aborted) {
-          recordTestJobResult(job, p.id, { ok: false, latencyMs, error: "Test cancelled" });
-          return;
-        }
-        recordTestJobResult(job, p.id, { ok: true, latencyMs, status: resp.status });
-        job.okCount++;
-      } catch (err) {
-        const latencyMs = Date.now() - started;
-        const rawErrMsg = (err as Error).message || String(err);
-        if (!job.running || jobSignal?.aborted) {
-          recordTestJobResult(job, p.id, { ok: false, latencyMs, error: "Test cancelled" });
-          return;
-        }
-        const isTimeout = ctrl.signal.aborted || /abort/i.test(rawErrMsg);
-        recordTestJobResult(job, p.id, { ok: false, latencyMs, error: isTimeout ? "Connection timed out after 10s" : truncateProxyPoolError(rawErrMsg) });
-        job.failCount++;
-        failedProxies.push(p);
-      } finally {
-        hostClearTimeout(timer);
-        if (jobSignal) jobSignal.removeEventListener("abort", onJobAbort);
-        job.tested++;
-      }
-    });
-    await Promise.all(promises);
-  }
-
-  if (!job.running || jobSignal?.aborted) {
-    job.running = false;
-    job.finishedAt ??= Date.now();
-    return;
-  }
-
-  // Auto-remove failed proxies if enabled.
-  if (job.autoRemove && failedProxies.length > 0) {
-    job.removedCount = await removeTestJobFailedProxies(failedProxies);
-  }
-
-  job.running = false;
-  job.finishedAt = Date.now();
-}
-
-/** Cancel the current test job (if any). The job stops after the current batch. */
-export function cancelTestJob(): void {
-  currentTestJobAbort?.abort();
-  if (currentTestJob) {
-    currentTestJob.running = false;
-    currentTestJob.finishedAt ??= Date.now();
-    scheduleCompletedTestJobCleanup(currentTestJob);
-  }
-}
-
-// --------------------------------------------------------------------
 // Test helpers
 // --------------------------------------------------------------------
 
@@ -1734,7 +1048,7 @@ export function _resetForTesting(): void {
   }
   autoRefreshInFlight = false;
   refreshSourcesInFlight = null;
-  clearTestJobCleanupTimer();
+  testJobs.reset();
   if (failureFlushTimer) {
     hostClearTimeout(failureFlushTimer);
     failureFlushTimer = null;
@@ -1745,15 +1059,11 @@ export function _resetForTesting(): void {
   roundRobinCursor = 0;
   proxyIndex.clear();
   currentWorkingProxy = null;
-  currentTestJob = null;
-  currentTestJobAbort?.abort();
-  currentTestJobAbort = null;
-  currentTestJobResultIds = [];
 }
 
 /** @internal Current incremental test-result index length (for tests). */
 export function _testJobResultOrderLengthForTesting(): number {
-  return currentTestJobResultIds.length;
+  return testJobs.resultOrderLength();
 }
 
 /** @internal Flush debounced failure counters immediately (for tests). */

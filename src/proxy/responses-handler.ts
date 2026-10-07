@@ -20,13 +20,13 @@ import { SSEFramer } from "../utils/sse-framer.js";
  * State management: in-memory only (process restart clears the store); see
  * `responses/store.ts`.
  */
-import { transformRequestBody, transformParsedBody } from "./body-transformer.js";
+import { transformParsedBody } from "./body-transformer.js";
 import { getProvider } from "../provider/providers.js";
 import type { ProxyConfig } from "../config/types.js";
 import type { AuthManager } from "../auth/manager.js";
 import { buildUpstreamRequest, buildUpstreamHeaderPairs, type UpstreamHeaderPair } from "./upstream.js";
 import { isCaptchaChallenged, retryOnCaptchaChallenge } from "./captcha-retry.js";
-import { dispatchWithConnectRetry } from "./handler.js";
+import { dispatchWithConnectRetry } from "./upstream-dispatch.js";
 import type * as CaptchaExports from "./captcha.js";
 
 // Lazy, runtime-gated module load (exception to the static-import rule, same
