@@ -359,7 +359,15 @@ describe("sendWithClientSigning", () => {
   it("re-handshakes and retries once after a VERIFY 401", async () => {
     const fixture = await buildHandshakeFixture();
     const calls: MockCalls = { gate: 0, handshakes: [] };
-    const manager = new ClientSigningManager({ identity, fetchImpl: signingFetchFixture(fixture, calls) });
+    // Controlled monotonic clock: two signs inside the same wall-clock
+    // millisecond would emit identical X-Client-Ts and flake the assertion
+    // below (observed on fast CI runners).
+    let tick = 1_700_000_000_000;
+    const manager = new ClientSigningManager({
+      identity,
+      fetchImpl: signingFetchFixture(fixture, calls),
+      now: () => (tick += 5),
+    });
     const sends: UpstreamHeaderPair[][] = [];
     const resp = await sendWithClientSigning(manager, {
       url: LLM_URL,

@@ -333,7 +333,10 @@ export class ClientSigningManager {
     sessionId: string,
     appVersion: string,
   ): Promise<UpstreamHeaderPair[] | null> {
-    const ts = String(Date.now());
+    // this.now (not Date.now directly): the injectable clock keeps the
+    // re-sign/retry tests deterministic — two signs inside the same wall-clock
+    // millisecond would otherwise emit identical X-Client-Ts values.
+    const ts = String(this.now());
     const nonce = randomHex(NONCE_BYTES);
     let pow: string;
     let sig: string;
@@ -523,7 +526,7 @@ export class ClientSigningManager {
   }
 
   private async performHandshake(parsedCred: ParsedCredential, origin: string): Promise<CryptoKey> {
-    const ts = String(Date.now());
+    const ts = String(this.now());
     const nonce = randomHex(NONCE_BYTES);
     const sig = await handshakeSignature(
       parsedCred.apiKeySecret,
