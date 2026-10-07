@@ -82,7 +82,7 @@ describe("ensureConfigFile", () => {
     try {
       expect(ensureConfigFile(path)).toBe(true);
       const created = readFileSync(path, "utf-8");
-      expect(created).toContain("plan: coding-plan");
+      expect(created).toContain("plan: start-plan");
       // Second call: already exists → no rewrite (returns false, content kept)
       const before = readFileSync(path, "utf-8");
       expect(ensureConfigFile(path)).toBe(false);

@@ -30,6 +30,12 @@ const CONFIG: ProxyConfig = {
 
 const auth = { getCredential: async () => ({ apiKey: "testkey.testsecret", userId: "u1" }) } as unknown as import("../auth/manager.js").AuthManager;
 
+// Start-plan paths authenticate with the OAuth JWT — the only credential the
+// zcode.z.ai plane accepts (4.8.0 plan resolution degrades a start-plan tag
+// WITHOUT a JWT to coding-plan), so start-plan tests carry a JWT exactly like
+// production start-plan credentials do.
+const startPlanAuth = { getCredential: async () => ({ apiKey: "testkey.testsecret", userId: "u1", jwt: "eyJhbGciOiJub25lIn0.startplanpayload.sig" }) } as unknown as import("../auth/manager.js").AuthManager;
+
 function chatUpstream(body: string, status = 200): typeof fetch {
   return (async (): Promise<Response> => new Response(body, { status, headers: { "content-type": "application/json" } })) as unknown as typeof fetch;
 }
@@ -267,7 +273,7 @@ describe("handleResponses captcha (start-plan)", () => {
 
     const captcha = fakeCaptcha();
     const resp = await handleResponses(makeReq({ model: "glm-5.2", input: "hi" }), {
-      config: START_PLAN, auth, fetchImpl, captcha: captcha.module,
+      config: START_PLAN, auth: startPlanAuth, fetchImpl, captcha: captcha.module,
     });
     expect(resp.status).toBe(200);
     expect(seen).toEqual(["token-1"]);
@@ -288,7 +294,7 @@ describe("handleResponses captcha (start-plan)", () => {
 
     const captcha = fakeCaptcha();
     const resp = await handleResponses(makeReq({ model: "glm-5.2", input: "hi" }), {
-      config: START_PLAN, auth, fetchImpl, captcha: captcha.module,
+      config: START_PLAN, auth: startPlanAuth, fetchImpl, captcha: captcha.module,
     });
     expect(resp.status).toBe(200);
     const body = await resp.json();
@@ -309,7 +315,7 @@ describe("handleResponses captcha (start-plan)", () => {
 
     const captcha = fakeCaptcha();
     const resp = await handleResponses(makeReq({ model: "glm-5.2", input: "hi" }), {
-      config: START_PLAN, auth, fetchImpl, captcha: captcha.module,
+      config: START_PLAN, auth: startPlanAuth, fetchImpl, captcha: captcha.module,
     });
     expect(resp.status).toBe(200);
     expect(seen).toEqual(["token-1", "token-2"]);
@@ -326,7 +332,7 @@ describe("handleResponses captcha (start-plan)", () => {
 
     const captcha = fakeCaptcha();
     const resp = await handleResponses(makeReq({ model: "glm-5.2", input: "hi" }), {
-      config: START_PLAN, auth, fetchImpl, captcha: captcha.module,
+      config: START_PLAN, auth: startPlanAuth, fetchImpl, captcha: captcha.module,
     });
     expect(calls).toBe(2);
     expect(resp.status).toBe(400);
@@ -369,7 +375,7 @@ describe("handleResponses captcha (start-plan)", () => {
     // single-file runs and leaking solver state into later tests.
     const startPlanCaptcha = fakeCaptcha();
     await handleResponses(makeReq({ model: "glm-5.2", input: "hi" }), { config: CONFIG, auth, fetchImpl: codingFetch });
-    await handleResponses(makeReq({ model: "glm-5.2", input: "hi" }), { config: START_PLAN, auth, fetchImpl: startFetch, captcha: startPlanCaptcha.module });
+    await handleResponses(makeReq({ model: "glm-5.2", input: "hi" }), { config: START_PLAN, auth: startPlanAuth, fetchImpl: startFetch, captcha: startPlanCaptcha.module });
 
     // The account uuid ("u1") is never transmitted — account_uuid is hardcoded
     // empty in the bundle (UIo); no session resolution on this path → "".
@@ -454,7 +460,7 @@ describe("handleResponses resilience (CL-08)", () => {
     } as unknown as CaptchaModule;
 
     const resp = await handleResponses(makeReq({ model: "glm-5.2", input: "hi" }), {
-      config: START_PLAN, auth, fetchImpl, captcha,
+      config: START_PLAN, auth: startPlanAuth, fetchImpl, captcha,
     });
     expect(resp.status).toBe(502);
     const body = await resp.json();
@@ -477,7 +483,7 @@ describe("handleResponses resilience (CL-08)", () => {
     } as unknown as CaptchaModule;
 
     const resp = await handleResponses(makeReq({ model: "glm-5.2", input: "hi" }), {
-      config: START_PLAN, auth, fetchImpl, captcha,
+      config: START_PLAN, auth: startPlanAuth, fetchImpl, captcha,
     });
     expect(resp.status).toBe(503);
     const body = await resp.json();

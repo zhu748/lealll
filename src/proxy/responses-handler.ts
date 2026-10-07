@@ -177,7 +177,11 @@ export async function handleResponses(
   // must feed buildUpstreamHeaderPairs/buildUpstreamRequest too, otherwise a
   // start-plan credential would carry start-plan body transforms but a
   // coding-plan URL/auth scheme.
-  const currentPlan = cred.plan ?? (cred.jwt ? "start-plan" : opts.config.plan);
+  // 4.8.0 harden (mirrors handler.ts effectivePlanForCred): a start-plan tag
+  // without a JWT degrades to coding-plan — the start-plan plane rejects
+  // JWT-less credentials outright.
+  const _resolvedPlan = cred.plan ?? (cred.jwt ? "start-plan" : opts.config.plan);
+  const currentPlan = _resolvedPlan === "start-plan" && !cred.jwt ? "coding-plan" : _resolvedPlan;
   const startPlan = currentPlan === "start-plan";
   const upstreamFormat: "openai" | "anthropic" = "anthropic";
   let upstreamRequestBody: string;

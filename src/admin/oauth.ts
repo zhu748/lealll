@@ -130,7 +130,10 @@ export async function handleOauthRoutes(context: AdminRouteContext): Promise<Res
       if (body.plan !== undefined && body.plan !== "coding-plan" && body.plan !== "start-plan") {
         return errorResponse(400, "invalid_param", "plan must be coding-plan or start-plan");
       }
-      const oauthPlan = (body.plan ?? "coding-plan") as "coding-plan" | "start-plan";
+      // 4.8.0-fork.1: default start-plan — OAuth logins capture a JWT and the
+      // free/trial tier lives on the zcode.z.ai start-plan plane. The dashboard
+      // selector still lets users pick coding-plan explicitly.
+      const oauthPlan = (body.plan ?? "start-plan") as "coding-plan" | "start-plan";
 
       // Server-mediated poll login (ZCode 3.12.3+ default): open the returned
       // authorize URL on ANY device — the flow completes server-side while the

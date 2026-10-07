@@ -15,10 +15,12 @@ function config() {
 }
 
 describe("configured credential selection", () => {
-  it("uses the static key and configured plan without reading OAuth storage", async () => {
+  it("uses the static key and coerces a start-plan tag to coding-plan without reading OAuth storage", async () => {
     const c = config(); c.provider = "zai"; c.plan = "start-plan"; c.auth = { mode: "apikey", apiKey: "static.secret" };
     const selected = await resolveConfiguredCredential(c, async () => { throw new Error("OAuth storage must not be read"); });
-    expect(selected).toMatchObject({ apiKey: "static", secret: "secret", plan: "start-plan", provider: "zai" });
+    // 4.8.0: start-plan routes need the OAuth JWT + captcha — a static API key
+    // credential is coerced back to coding-plan (createApiKeyCredential).
+    expect(selected).toMatchObject({ apiKey: "static", secret: "secret", plan: "coding-plan", provider: "zai" });
     const auth = createConfiguredAuthManager(c);
     auth.setOAuthCredential(credential);
     expect(await auth.getCredential()).toEqual(selected!);

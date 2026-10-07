@@ -181,8 +181,14 @@ export async function proxyRequest(
   // start-plan JWT) wins over config.yaml — switching accounts mid-retry may
   // also switch plans (coding-plan ↔ start-plan), which changes the upstream
   // URL, auth headers, and captcha behavior.
-  const effectivePlanForCred = (c: Credential): "coding-plan" | "start-plan" =>
-    c.plan ?? (c.jwt ? "start-plan" : config.plan);
+  // 4.8.0 harden: a start-plan tag WITHOUT a JWT can never authenticate on the
+  // zcode.z.ai plane (Bearer JWT + captcha) — legacy store rows or manual keys
+  // mis-tagged before the add-key guard degrade to coding-plan instead of
+  // failing every request with 401.
+  const effectivePlanForCred = (c: Credential): "coding-plan" | "start-plan" => {
+    const plan = c.plan ?? (c.jwt ? "start-plan" : config.plan);
+    return plan === "start-plan" && !c.jwt ? "coding-plan" : plan;
+  };
   let currentPlan = effectivePlanForCred(cred);
   if (currentPlan !== config.plan) {
     // Request-local only: do NOT write back to config.plan. The config object is

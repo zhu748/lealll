@@ -12,6 +12,12 @@ import type { ProviderId } from "../provider/types.js";
  * - `{apiKey}` — no secret (Bigmodel or Z.AI key-only)
  * - `{apiKey}.{secret}` — Z.AI format with API key + secret
  *
+ * `plan` is coerced to "coding-plan" when callers pass "start-plan" (e.g.
+ * apikey mode inheriting the flipped 4.8.0 config default): start-plan
+ * upstream routes authenticate with the OAuth JWT + captcha, which a static
+ * API key credential never has — tagging it start-plan would route every
+ * request to a plane it cannot authenticate against.
+ *
  * @throws Error if `key` is empty.
  */
 export function createApiKeyCredential(provider: ProviderId, key: string, plan: PlanId = "coding-plan"): Credential {
@@ -19,6 +25,7 @@ export function createApiKeyCredential(provider: ProviderId, key: string, plan: 
     throw new Error("API key must not be empty");
   }
 
+  const safePlan: PlanId = plan === "start-plan" ? "coding-plan" : plan;
   const trimmed = key.trim();
   const dotIdx = trimmed.indexOf(".");
 
@@ -28,8 +35,8 @@ export function createApiKeyCredential(provider: ProviderId, key: string, plan: 
   if (dotIdx > 0 && dotIdx < trimmed.length - 1) {
     const apiKey = trimmed.slice(0, dotIdx);
     const secret = trimmed.slice(dotIdx + 1);
-    return { apiKey, secret, provider, plan };
+    return { apiKey, secret, provider, plan: safePlan };
   }
 
-  return { apiKey: trimmed, provider, plan };
+  return { apiKey: trimmed, provider, plan: safePlan };
 }

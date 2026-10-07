@@ -43,9 +43,9 @@ auth:
 provider: zai
 
 # Which plan tier to use:
-#   "coding-plan" (default) — direct upstream endpoints, permanent API key
-#   "start-plan"            — routes through zcode.z.ai with JWT auth (requires `auth login`)
-plan: coding-plan
+#   "start-plan"   (default) — routes through zcode.z.ai with JWT auth (requires `auth login`)
+#   "coding-plan"           — direct upstream endpoints, permanent API key
+plan: start-plan
 
 providers:
   zai:

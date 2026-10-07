@@ -955,9 +955,10 @@ async function authLogin(args: string[]): Promise<void> {
   const pasteMode =
     args.includes("--paste") || /^(1|true|yes)$/i.test(process.env.ZCODE_OAUTH_PASTE ?? "");
   // Fork layer: explicit plan selection. The release start scripts pass
-  // --plan= on every menu item; omitted flags default to coding-plan.
+  // --plan= on every menu item; omitted flags default to start-plan (4.8.0:
+  // OAuth logins capture a JWT, which only the start-plan plane uses).
   const planFlag = args.find(a => a.startsWith("--plan="));
-  let plan: PlanId = "coding-plan";
+  let plan: PlanId = "start-plan";
   if (planFlag) {
     const rawPlan = planFlag.slice("--plan=".length);
     if (rawPlan === "coding-plan" || rawPlan === "start-plan") {
@@ -979,8 +980,8 @@ async function authLogin(args: string[]): Promise<void> {
     process.exit(1);
   }
   if (!planFlag && !importMode) {
-    console.log(`[hint] --plan= not specified, defaulting to coding-plan.`);
-    console.log(`[hint] If you meant to use start-plan, re-run with: --plan=start-plan`);
+    console.log(`[hint] --plan= not specified, defaulting to start-plan.`);
+    console.log(`[hint] If you meant to use coding-plan, re-run with: --plan=coding-plan`);
     console.log();
   }
 

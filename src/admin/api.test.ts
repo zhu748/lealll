@@ -2740,7 +2740,9 @@ describe("/admin/api/config PUT — requiresRestart detection", () => {
     const liveCred = await auth.getCredential();
     expect(liveCred.provider).toBe("bigmodel");
     expect(liveCred.apiKey).toBe("new-live-key");
-    expect(liveCred.plan).toBe("start-plan");
+    // 4.8.0: apikey-mode credentials coerce a start-plan config tag back to
+    // coding-plan — static keys have no JWT for the zcode.z.ai plane.
+    expect(liveCred.plan).toBe("coding-plan");
   });
 
   it("hot-switches auth mode to oauth and loads the active stored credential", async () => {

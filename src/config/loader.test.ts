@@ -364,7 +364,7 @@ clientIdentity:
     const start = loadConfig(writeYaml("plan: start-plan\n"));
     expect(start.plan).toBe("start-plan");
     const dflt = loadConfig(writeYaml("server:\n  port: 8080\n"));
-    expect(dflt.plan).toBe("coding-plan");
+    expect(dflt.plan).toBe("start-plan");
   });
 
   it("plan: THROWS on a typo'd value instead of silently falling back (CL-07)", () => {

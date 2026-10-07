@@ -137,7 +137,10 @@ export class KeyResolver {
     accessToken: string,
     provider: ProviderId,
     userId?: string,
-    plan: PlanId = "coding-plan",
+    // 4.8.0-fork.1: default start-plan — OAuth flows always capture a JWT and
+    // the free/trial tier lives on the start-plan plane. Callers that want a
+    // coding-plan credential pass it explicitly (CLI flag / dashboard select).
+    plan: PlanId = "start-plan",
     email?: string,
   ): Promise<Credential> {
     if (provider === "zai") {

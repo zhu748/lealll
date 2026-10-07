@@ -56,7 +56,11 @@ const DEFAULTS = {
   PORT: 8080,
   HOST: "0.0.0.0",
   PROVIDER: "zai" as const,
-  PLAN: "coding-plan" as const,
+  // 4.8.0-fork.1: default flipped to start-plan — OAuth logins capture a JWT,
+  // which is the only credential the zcode.z.ai start-plan plane accepts, and
+  // the free/trial tier lives there. API-key credentials (no JWT) are coerced
+  // back to coding-plan by createApiKeyCredential, so apikey mode is unaffected.
+  PLAN: "start-plan" as const,
   DEFAULT_MODEL: "glm-4.6",
   LOG_LEVEL: "info" as const,
   ZAI_ANTHROPIC_BASE: "https://api.z.ai/api/anthropic",
@@ -532,7 +536,7 @@ function resolveProvider(raw: unknown): "zai" | "bigmodel" {
 /**
  * Resolve and validate the plan tier. Mirrors `resolveProvider`'s hard
  * validation style: an unrecognized value (e.g. `start_plan`/`startplan`
- * typos) THROWS instead of silently falling back to coding-plan — a silent
+ * typos) THROWS instead of silently falling back to the default — a silent
  * fallback sent users to the wrong upstream (401/403, no captcha/quota flow)
  * with nothing pointing at the config typo.
  */
