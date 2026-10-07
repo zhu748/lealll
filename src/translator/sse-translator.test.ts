@@ -4,6 +4,23 @@
  */
 import { describe, it, expect } from "bun:test";
 import { anthropicSseToOpenaiSse, openaiSseToAnthropicSse, parseSSEChunk } from "./sse-translator.js";
+import { SSE } from "../utils/constants.js";
+import { SSEFrameTooLargeError } from "../utils/sse-framer.js";
+
+for (const [name, translate] of [
+  ["Anthropic → OpenAI", anthropicSseToOpenaiSse],
+  ["OpenAI → Anthropic", openaiSseToAnthropicSse],
+] as const) {
+  it(`${name}: stops and cancels an oversized upstream event`, async () => {
+    let cancelled = false;
+    const upstream = new ReadableStream<Uint8Array>({ start(controller) {
+      controller.enqueue(new TextEncoder().encode("data: " + "x".repeat(SSE.MAX_TRANSLATED_STREAM_BUFFERED_EVENT_BYTES)));
+    }, cancel() { cancelled = true; } });
+    await expect(new Response(translate(upstream)).text()).rejects.toBeInstanceOf(SSEFrameTooLargeError);
+    expect(cancelled).toBe(true);
+    expect(upstream.locked).toBe(false);
+  });
+}
 
 function makeStream(text: string): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder();

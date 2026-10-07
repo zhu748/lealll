@@ -1826,12 +1826,13 @@ function waitFor(cond, timeoutMs = 15_000, intervalMs = 40) {
 }
 
 // -- createDom --------------------------------------------------------------
-async function createDom(region, prefix) {
-  let cookies = [];
+async function createDom(region, prefix, options: { cookies?: string[]; html?: string } = {}) {
+  let cookies = options.cookies ?? [];
   const now = Date.now();
-  if (_cookieCache.ts > 0 && now - _cookieCache.ts < COOKIE_CACHE_TTL_MS) {
+  // Supplying cookies and HTML lets lifecycle tests use an isolated local DOM.
+  if (options.cookies === undefined && _cookieCache.ts > 0 && now - _cookieCache.ts < COOKIE_CACHE_TTL_MS) {
     cookies = _cookieCache.cookies;
-  } else {
+  } else if (options.cookies === undefined) {
     try {
       const res = await fetch("https://zcode.z.ai/", {
         headers: {
@@ -2005,7 +2006,7 @@ async function createDom(region, prefix) {
   w.eval(GUEST_EVAL_PATCH);
 
   // Write the page HTML (loads the SDK script)
-  w.document.write(HTML);
+  w.document.write(options.html ?? HTML);
 
   w.AliyunCaptchaConfig = { region, prefix };
 

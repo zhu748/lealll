@@ -43,6 +43,7 @@
  * the request. The current cursor is per-request (in-memory), so concurrent
  * requests use different proxies.
  */
+import { parseStrictNonNegativeInteger } from "../utils/numbers.js";
 import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -61,76 +62,14 @@ import { hostClearInterval, hostClearTimeout, hostSetInterval, hostSetTimeout } 
 // Types
 // --------------------------------------------------------------------
 
-/** A single proxy entry in the pool. */
-export interface PoolProxy {
-  /** Stable unique id (sha-ish 12-char hex of the normalized URL). */
-  id: string;
-  /** Normalized URL (always with scheme). */
-  url: string;
-  /** Source: "manual" | "url:<n>" where n is the source URL index. */
-  source: string;
-  /** When this entry was added (Unix ms). */
-  addedAt: number;
-  /** Optional human-readable label (e.g. the original line for non-URL form). */
-  note?: string;
-  /**
-   * Consecutive failure counter (incremented on rotation due to gateway
-   * block). Used to deprioritize bad proxies without removing them.
-   */
-  failures?: number;
-  /** Last time this proxy was used (Unix ms). */
-  lastUsedAt?: number;
-  /**
-   * v0.2.2+: Timestamp of the last markProxyFailed call. Used by pickProxy
-   * to skip recently-failed proxies (FAILURE_COOLDOWN_MS). Not set on
-   * freshly-imported proxies — they're eligible immediately.
-   */
-  lastFailedAt?: number;
-}
-
-/** Pool configuration. */
-export interface ProxyPoolConfig {
-  /** Master switch. When false, the pool is not consulted at all. */
-  enabled: boolean;
-  /** Auto-refresh interval in minutes. 0 = disabled. Default 5. */
-  refreshIntervalMin: number;
-  /** URL sources for auto-refresh. Empty = no URL sources. */
-  sourceUrls: string[];
-  /**
-   * Whether to rotate proxies on 405 / WAF gateway block errors. When true
-   * (default), the handler will pick a different proxy and retry the request.
-   */
-  rotateOnGatewayBlock: boolean;
-  /**
-   * Maximum retries via different proxies on a gateway block before giving
-   * up. Default 3. Set to 0 to disable proxy rotation entirely (the pool
-   * is still consulted for the INITIAL proxy choice).
-   */
-  maxRotations: number;
-}
-
-/** Result of a refresh operation. */
-export interface RefreshResult {
-  /** Number of new proxies added in this refresh. */
-  added: number;
-  /** Number of proxies removed (no longer in any source). */
-  removed: number;
-  /** Total proxies in the pool after refresh. */
-  total: number;
-  /** When the refresh happened (Unix ms). */
-  at: number;
-  /** Per-source errors (if any), keyed by source URL. */
-  errors?: Record<string, string>;
-}
-
-/** On-disk file format. */
-interface PoolFile {
-  version: 1;
-  config: ProxyPoolConfig;
-  proxies: PoolProxy[];
-  lastRefreshAt?: number;
-  lastRefreshResult?: RefreshResult;
-}
+import type { PoolProxy, ProxyPoolConfig, RefreshResult, PoolFile } from "./pool-types.js";
+export type { PoolProxy, ProxyPoolConfig, RefreshResult } from "./pool-types.js";
+import { PoolProxyIndex, isProxyCoolingDown, selectPoolProxy } from "./pool-selection.js";
+import {
+  mapWithConcurrency, readProxySourceText, truncateProxyPoolError,
+  resolveProxySourceMaxBytes, resolveSourceFetchConcurrency,
+} from "./pool-source.js";
+export { resolveProxySourceMaxBytes, resolveSourceFetchConcurrency, _readProxySourceTextForTesting } from "./pool-source.js";
 
 // --------------------------------------------------------------------
 // Constants
@@ -314,7 +253,6 @@ function normalizeRefreshResult(raw: unknown, fallbackAt?: number): RefreshResul
 }
 
 const ALLOWED_SCHEMES = ["http:", "https:", "socks4:", "socks4a:", "socks5:", "socks5h:"];
-const DEFAULT_MAX_SOURCE_BYTES = 10 * 1024 * 1024;
 /**
  * Hard cap on pool entries: a single 10MB source response can otherwise mint
  * hundreds of thousands of unique proxies which then make every pickProxy O(n)
@@ -322,9 +260,6 @@ const DEFAULT_MAX_SOURCE_BYTES = 10 * 1024 * 1024;
  * truncate beyond the cap (manual entries survive first). Env-overridable.
  */
 const PROXY_POOL_MAX_ENTRIES = Math.max(100, Number(process.env.ZCODE_PROXY_POOL_MAX_ENTRIES) || 5000);
-const PROXY_POOL_ERROR_MAX_CHARS = 500;
-const DEFAULT_SOURCE_FETCH_CONCURRENCY = 5;
-const MAX_SOURCE_FETCH_CONCURRENCY = 20;
 const DEFAULT_POOL_MTIME_CHECK_INTERVAL_MS = 1000;
 const MIN_POOL_MTIME_CHECK_INTERVAL_MS = 100;
 const MAX_POOL_MTIME_CHECK_INTERVAL_MS = 60_000;
@@ -342,18 +277,8 @@ let refreshTimer: ReturnType<typeof setInterval> | null = null;
 let autoRefreshInFlight = false;
 let refreshSourcesInFlight: Promise<RefreshResult> | null = null;
 let roundRobinCursor = 0;
+const proxyIndex = new PoolProxyIndex();
 const POOL_MTIME_CHECK_INTERVAL_MS = resolvePoolMtimeCheckIntervalMs();
-
-function parseStrictNonNegativeInteger(raw: unknown): number | undefined {
-  if (typeof raw === "number") {
-    return Number.isSafeInteger(raw) && raw >= 0 ? raw : undefined;
-  }
-  if (raw === undefined || raw === null) return undefined;
-  const trimmed = String(raw).trim();
-  if (!/^\d+$/.test(trimmed)) return undefined;
-  const n = Number(trimmed);
-  return Number.isSafeInteger(n) ? n : undefined;
-}
 
 export function resolvePoolMtimeCheckIntervalMs(raw = process.env.ZCODE_PROXY_POOL_MTIME_CHECK_MS): number {
   if (raw === undefined || raw === null || String(raw).trim() === "") {
@@ -367,128 +292,6 @@ export function resolvePoolMtimeCheckIntervalMs(raw = process.env.ZCODE_PROXY_PO
     MIN_POOL_MTIME_CHECK_INTERVAL_MS,
     Math.min(MAX_POOL_MTIME_CHECK_INTERVAL_MS, n),
   );
-}
-
-export function resolveProxySourceMaxBytes(raw = process.env.ZCODE_PROXY_POOL_MAX_SOURCE_BYTES): number {
-  if (raw === undefined || raw === null || String(raw).trim() === "") return DEFAULT_MAX_SOURCE_BYTES;
-  return parseStrictNonNegativeInteger(raw) ?? DEFAULT_MAX_SOURCE_BYTES;
-}
-
-export function resolveSourceFetchConcurrency(raw = process.env.ZCODE_PROXY_POOL_SOURCE_CONCURRENCY): number {
-  if (raw === undefined || raw === null || String(raw).trim() === "") return DEFAULT_SOURCE_FETCH_CONCURRENCY;
-  const n = parseStrictNonNegativeInteger(raw);
-  if (n === undefined) return DEFAULT_SOURCE_FETCH_CONCURRENCY;
-  return Math.max(1, Math.min(MAX_SOURCE_FETCH_CONCURRENCY, n));
-}
-
-async function mapWithConcurrency<T, R>(
-  items: readonly T[],
-  limit: number,
-  worker: (item: T, index: number) => Promise<R>,
-): Promise<R[]> {
-  if (items.length === 0) return [];
-  const concurrency = Math.max(1, Math.min(Math.floor(limit), items.length));
-  const results = new Array<R>(items.length);
-  let nextIndex = 0;
-  await Promise.all(Array.from({ length: concurrency }, async () => {
-    for (;;) {
-      const index = nextIndex++;
-      if (index >= items.length) return;
-      results[index] = await worker(items[index], index);
-    }
-  }));
-  return results;
-}
-
-function parseContentLength(headers: Headers): number | undefined {
-  const raw = headers.get("content-length");
-  if (!raw) return undefined;
-  const trimmed = raw.trim();
-  if (!/^\d+$/.test(trimmed)) return undefined;
-  const n = Number(trimmed);
-  return Number.isSafeInteger(n) ? n : undefined;
-}
-
-function truncateProxyPoolError(message: string): string {
-  if (message.length <= PROXY_POOL_ERROR_MAX_CHARS) return message;
-  const omitted = message.length - PROXY_POOL_ERROR_MAX_CHARS;
-  return `${message.slice(0, PROXY_POOL_ERROR_MAX_CHARS)}...(truncated ${omitted} chars)`;
-}
-
-function normalizeSourceReadTimeoutMs(raw: number): number {
-  const safe = Number.isFinite(raw) && raw > 0 ? raw : PROXY_POOL_CONST.SOURCE_FETCH_TIMEOUT_MS;
-  return Math.min(MAX_TIMER_MS, Math.max(1, Math.floor(safe)));
-}
-
-async function readSourceChunkWithTimeout(
-  reader: ReadableStreamDefaultReader<Uint8Array>,
-  timeoutMs: number,
-): ReturnType<ReadableStreamDefaultReader<Uint8Array>["read"]> {
-  const timeout = normalizeSourceReadTimeoutMs(timeoutMs);
-  let timer: ReturnType<typeof setTimeout> | null = null;
-  const result = await Promise.race([
-    reader.read(),
-    new Promise<"timeout">(resolve => {
-      timer = hostSetTimeout(() => resolve("timeout"), timeout);
-      timer.unref?.();
-    }),
-  ]).finally(() => {
-    if (timer) {
-      hostClearTimeout(timer);
-      timer = null;
-    }
-  });
-  if (result === "timeout") {
-    const err = new Error(`proxy source response read timeout after ${timeout}ms`);
-    void reader.cancel(err).catch(() => {});
-    throw err;
-  }
-  return result;
-}
-
-async function readProxySourceText(
-  resp: Response,
-  maxBytes = resolveProxySourceMaxBytes(),
-  timeoutMs: number = PROXY_POOL_CONST.SOURCE_FETCH_TIMEOUT_MS,
-): Promise<string> {
-  const limit = Number.isFinite(maxBytes) && maxBytes > 0 ? Math.floor(maxBytes) : 0;
-  const declaredLength = parseContentLength(resp.headers);
-  if (limit > 0 && declaredLength !== undefined && declaredLength > limit) {
-    try { await resp.body?.cancel(); } catch {}
-    throw new Error(`proxy source response exceeds ${limit} byte limit (content-length ${declaredLength})`);
-  }
-  if (!resp.body) return "";
-
-  const reader = resp.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  try {
-    while (true) {
-      const { done, value } = await readSourceChunkWithTimeout(reader, timeoutMs);
-      if (done) break;
-      if (!value) continue;
-      total += value.byteLength;
-      if (limit > 0 && total > limit) {
-        try { await reader.cancel(); } catch {}
-        throw new Error(`proxy source response exceeds ${limit} byte limit`);
-      }
-      chunks.push(value);
-    }
-  } finally {
-    try { reader.releaseLock(); } catch {}
-  }
-
-  const bytes = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return new TextDecoder().decode(bytes);
-}
-
-export async function _readProxySourceTextForTesting(resp: Response, maxBytes: number, timeoutMs?: number): Promise<string> {
-  return readProxySourceText(resp, maxBytes, timeoutMs);
 }
 
 /**
@@ -517,12 +320,14 @@ function refreshPoolPathFromEnv(): void {
   cachedSize = -1;
   lastMtimeCheckAt = 0;
   roundRobinCursor = 0;
+  proxyIndex.clear();
   currentWorkingProxy = null;
 }
 
 function reconcileCurrentWorkingProxy(pool: PoolFile): void {
+  proxyIndex.sync(pool.proxies);
   if (!currentWorkingProxy) return;
-  if (!pool.proxies.some(p => p.url === currentWorkingProxy)) {
+  if (!proxyIndex.get(pool.proxies, currentWorkingProxy)) {
     currentWorkingProxy = null;
   }
 }
@@ -821,6 +626,7 @@ async function writePool(pool: PoolFile): Promise<void> {
     // cached pool object in-place before calling writePool(), also drop the
     // cache so the next read goes back to the last durable on-disk state.
     cachedPool = null;
+    proxyIndex.clear();
     cachedMtimeMs = -1;
     cachedCtimeMs = -1;
     cachedSize = -1;
@@ -1417,61 +1223,18 @@ export async function pickProxy(excludeUrls?: Set<string>): Promise<string | nul
     if (!pool.config.enabled) return null;
     if (pool.proxies.length === 0) return null;
 
-    const poolUrls = new Set(pool.proxies.map(p => p.url));
-
-    // Sticky: if currentWorkingProxy is still valid (in pool + not excluded
-    // + not in failure cooldown), return it without advancing the cursor.
-    //
-    // v0.2.2+: the cooldown check here prevents the sticky proxy from
-    // being reused if it JUST failed (markProxyFailed clears sticky, but
-    // a race could set it back). Belt + suspenders.
-    if (currentWorkingProxy && poolUrls.has(currentWorkingProxy)) {
-      const isExcluded = !excludeUrls || !excludeUrls.has(currentWorkingProxy);
-      const stickyEntry = pool.proxies.find(p => p.url === currentWorkingProxy);
-      const inCooldown = stickyEntry?.lastFailedAt !== undefined
-        && (Date.now() - stickyEntry.lastFailedAt < PROXY_POOL_CONST.FAILURE_COOLDOWN_MS);
-      if (isExcluded && !inCooldown) {
-        return currentWorkingProxy;
-      }
-      // Sticky proxy is excluded or in cooldown. Fall through to pick a new one.
-    } else {
-      // Sticky proxy is stale (removed from pool). Clear it.
-      currentWorkingProxy = null;
-    }
-
-    // v0.2.2+: filter out proxies in failure cooldown. If ALL non-excluded
-    // proxies are in cooldown, fall through to the old behavior (pick any
-    // non-excluded one) — better to try a recently-failed proxy than to
-    // return null and force a direct connection that's guaranteed to fail
-    // (e.g. when the IP itself is WAF-blacklisted).
     const now = Date.now();
-    const isEligible = (p: PoolProxy): boolean => {
-      if (excludeUrls && excludeUrls.has(p.url)) return false;
-      if (p.lastFailedAt !== undefined && now - p.lastFailedAt < PROXY_POOL_CONST.FAILURE_COOLDOWN_MS) return false;
-      return true;
-    };
-    const hasAnyEligible = pool.proxies.some(isEligible);
-
-    // Advance round-robin to find a new proxy.
-    const n = pool.proxies.length;
-    for (let i = 0; i < n; i++) {
-      const idx = (roundRobinCursor + i) % n;
-      const candidate = pool.proxies[idx];
-      // If we have eligible (non-cooldown) proxies, skip cooldown ones.
-      // If NO proxies are eligible (all in cooldown), fall through to
-      // the old exclusion-only check so we still return something.
-      if (hasAnyEligible) {
-        if (!isEligible(candidate)) continue;
-      } else {
-        if (excludeUrls && excludeUrls.has(candidate.url)) continue;
-      }
-      // Found a new proxy — make it sticky.
-      roundRobinCursor = (idx + 1) % n;
-      currentWorkingProxy = candidate.url;
-      return candidate.url;
+    const stickyEntry = currentWorkingProxy ? proxyIndex.get(pool.proxies, currentWorkingProxy) : undefined;
+    if (stickyEntry && !excludeUrls?.has(stickyEntry.url) && !isProxyCoolingDown(stickyEntry, now)) {
+      return stickyEntry.url;
     }
-    // All excluded — return null (caller should fall through to direct/no-proxy).
-    return null;
+    if (!stickyEntry) currentWorkingProxy = null;
+
+    const index = selectPoolProxy(pool.proxies, roundRobinCursor, excludeUrls, now);
+    if (index === null) return null;
+    roundRobinCursor = (index + 1) % pool.proxies.length;
+    currentWorkingProxy = pool.proxies[index].url;
+    return currentWorkingProxy;
   });
 }
 
@@ -1545,7 +1308,7 @@ export async function markProxyFailed(url: string): Promise<void> {
     }
     // Mutate the in-memory cache directly (no disk I/O here).
     if (cachedPool) {
-      const entry = cachedPool.proxies.find(p => p.url === url);
+      const entry = proxyIndex.get(cachedPool.proxies, url);
       if (entry) {
         entry.failures = (entry.failures ?? 0) + 1;
         // v0.2.2+: record the failure timestamp so pickProxy can skip
@@ -1564,7 +1327,7 @@ export async function markProxyFailed(url: string): Promise<void> {
       try {
         await poolMutex.run(async () => {
           const pool = await readPool();
-          const entry = pool.proxies.find(p => p.url === url);
+          const entry = proxyIndex.get(pool.proxies, url);
           if (!entry) return;
           entry.failures = (entry.failures ?? 0) + 1;
           entry.lastFailedAt = Date.now();
@@ -1980,6 +1743,7 @@ export function _resetForTesting(): void {
   failureMutationSeq = 0;
   failureFlushBeforeWriteHook = null;
   roundRobinCursor = 0;
+  proxyIndex.clear();
   currentWorkingProxy = null;
   currentTestJob = null;
   currentTestJobAbort?.abort();

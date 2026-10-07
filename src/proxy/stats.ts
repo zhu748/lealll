@@ -1,19 +1,12 @@
 import type { Format } from "../translator/types.js";
-import { recordStat } from "../admin/api.js";
+import { recordStat } from "../admin/stats.js";
 import { runtimeLog, shouldEmitRuntimeLog } from "../utils/log.js";
 import { SSE as SSE_CONST } from "../utils/constants.js";
-
-// Inlined from the fork's response-body.ts (the rest of that module drags in
-// the fork retry pipeline, which upstream 4.x replaces with its own
-// ordered-transport / connect-retry ladder).
-const utf8ByteLengthEncoder = new TextEncoder();
+import { SSEFramer, SSEFrameTooLargeError } from "../utils/sse-framer.js";
+import { extractSSEData } from "../utils/sse.js";
 
 function isCompressedContentEncoding(value: string | null): boolean {
   return !!value && value.trim().toLowerCase() !== "identity";
-}
-
-function utf8ByteLength(value: string): number {
-  return utf8ByteLengthEncoder.encode(value).byteLength;
 }
 
 export interface RequestMeta {
@@ -152,11 +145,23 @@ export function createStatsTransform(
     inputTokens: 0,
     thinkingTokens: 0,
     cacheReadTokens: 0,
-    sseBuffer: "",
-    statsParsingDisabled: false,
     firstChunkAt: 0,
   };
   const decoder = compressed ? null : new TextDecoder();
+  let framer = compressed ? null : new SSEFramer(SSE_CONST.MAX_STATS_BUFFERED_EVENT_BYTES);
+  const observe = (text: string, final = false): void => {
+    if (!framer) return;
+    try {
+      for (const frame of final ? framer.finish(text) : framer.push(text)) {
+        const data = extractSSEData(frame);
+        if (data) observeStreamParseDataLine(data, state);
+      }
+    } catch (err) {
+      if (!(err instanceof SSEFrameTooLargeError)) throw err;
+      // Observability must never interrupt the original bytes sent to clients.
+      framer = null;
+    }
+  };
 
   let finished = false;
   let resolveDone: () => void;
@@ -165,17 +170,7 @@ export function createStatsTransform(
     if (finished) return;
     finished = true;
     try {
-      if (!compressed && !state.statsParsingDisabled) {
-        const tail = decoder!.decode();
-        if (tail) state.sseBuffer += tail;
-      }
-      if (!compressed && !state.statsParsingDisabled && utf8ByteLength(state.sseBuffer) > SSE_CONST.MAX_STATS_BUFFERED_EVENT_BYTES) {
-        state.sseBuffer = "";
-        state.statsParsingDisabled = true;
-      }
-      if (!compressed && !state.statsParsingDisabled && state.sseBuffer) {
-        observeStreamParseSse(state.sseBuffer, state);
-      }
+      if (framer) observe(decoder!.decode(), true);
       const endAt = Date.now();
       const ttfbMs = (state.firstChunkAt > 0 ? state.firstChunkAt : endAt) - requestSentAt;
       const totalMs = endAt - requestSentAt;
@@ -197,18 +192,7 @@ export function createStatsTransform(
     transform(chunk, controller) {
       if (state.firstChunkAt === 0) state.firstChunkAt = Date.now();
       hooks?.onChunk?.(chunk);
-      if (!compressed && !state.statsParsingDisabled) {
-        state.sseBuffer += decoder!.decode(chunk, { stream: true });
-        const idx = state.sseBuffer.lastIndexOf("\n");
-        if (idx >= 0) {
-          observeStreamParseSse(state.sseBuffer.slice(0, idx), state);
-          state.sseBuffer = state.sseBuffer.slice(idx + 1);
-        }
-        if (utf8ByteLength(state.sseBuffer) > SSE_CONST.MAX_STATS_BUFFERED_EVENT_BYTES) {
-          state.sseBuffer = "";
-          state.statsParsingDisabled = true;
-        }
-      }
+      if (framer) observe(decoder!.decode(chunk, { stream: true }));
       // Pass the chunk straight through to the client — no buffering.
       controller.enqueue(chunk);
     },
@@ -285,21 +269,6 @@ export function observeStatsStream(
       }
     },
   });
-}
-
-function observeStreamParseSse(text: string, state: {
-  tokens: number; inputTokens: number; thinkingTokens: number; cacheReadTokens: number;
-}): void {
-  let lineStart = 0;
-  for (;;) {
-    const lineEnd = text.indexOf("\n", lineStart);
-    const end = lineEnd < 0 ? text.length : lineEnd;
-    if (text.startsWith("data:", lineStart)) {
-      observeStreamParseDataLine(text.slice(lineStart + 5, end).trimStart(), state);
-    }
-    if (lineEnd < 0) break;
-    lineStart = lineEnd + 1;
-  }
 }
 
 function observeStreamParseDataLine(dataStr: string, state: {

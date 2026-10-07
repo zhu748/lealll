@@ -39,6 +39,17 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, utimesSync, write
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
+test("proxy source decoding preserves UTF-8 characters split across reads", async () => {
+  const text = "# 中文😀\nhttp://proxy.example:8080\n";
+  const bytes = new TextEncoder().encode(text);
+  const body = new ReadableStream<Uint8Array>({ start(controller) {
+    for (const byte of bytes) controller.enqueue(Uint8Array.of(byte));
+    controller.close();
+  } });
+  expect(await _readProxySourceTextForTesting(new Response(body), bytes.length)).toBe(text);
+  expect(body.locked).toBe(false);
+});
+
 let testStoreDir: string | null = null;
 let POOL_FILE = _poolFilePath();
 

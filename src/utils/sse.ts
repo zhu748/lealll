@@ -76,9 +76,9 @@ export function parseSSEChunk(raw: string): ParsedSSE[] {
   return results;
 }
 
-function parseSSEBlock(block: string, results: ParsedSSE[]): void {
+function readSSEFields(block: string): { event: string; data: string } | null {
   const trimmedBlock = block.trim();
-  if (!trimmedBlock) return;
+  if (!trimmedBlock) return null;
 
   let eventType = "";
   const dataLines: string[] = [];
@@ -101,9 +101,25 @@ function parseSSEBlock(block: string, results: ParsedSSE[]): void {
     if (lineEnd < 0) break;
   }
 
-  if (dataLines.length === 0) return;
-  const dataStr = dataLines.join("\n");
-  if (!dataStr || dataStr === "[DONE]") return;
+  return dataLines.length === 0 ? null : { event: eventType, data: dataLines.join("\n") };
+}
+
+/** Read a normalized frame's data without JSON parsing, including multi-line fields. */
+export function extractSSEData(frame: string): string | null {
+  return readSSEFields(frame)?.data ?? null;
+}
+
+function parseSSEBlock(block: string, results: ParsedSSE[]): void {
+  const parsed = parseSSEEvent(block);
+  if (parsed) results.push(parsed);
+}
+
+/** Parse one normalized frame emitted by SSEFramer, without allocating an event array. */
+export function parseSSEEvent(block: string): ParsedSSE | null {
+  const fields = readSSEFields(block);
+  if (!fields) return null;
+  const dataStr = fields.data;
+  if (!dataStr || dataStr === "[DONE]") return null;
 
   let data: unknown;
   try {
@@ -112,7 +128,7 @@ function parseSSEBlock(block: string, results: ParsedSSE[]): void {
     warnMalformedSseJson((err as Error).message, dataStr);
     data = dataStr; // preserve raw string so callers can decide what to do
   }
-  results.push({ event: eventType, data });
+  return { event: fields.event, data };
 }
 
 /**

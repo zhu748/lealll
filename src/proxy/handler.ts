@@ -32,7 +32,7 @@ import { gzipSync } from "node:zlib";
 // --- fork multi-account resilience layer ---
 import { maskApiKey, switchAccount, exportAccounts, credentialStatsKey } from "../auth/store.js";
 import { sleep } from "../utils/sleep.js";
-import { recordStat } from "../admin/api.js";
+import { recordStat } from "../admin/stats.js";
 import type { Credential } from "../auth/types.js";
 
 // captcha.ts is loaded lazily inside the `startPlan` branch (only path that
@@ -53,7 +53,8 @@ import type { OpenAIChatRequest, OpenAIChatResponse, AnthropicMessagesRequest, A
 import { dumpPhase, dumpHeaders, dumpBody, dumpEnabled, SENSITIVE_HEADERS as SENSITIVE_HEADER_NAMES } from "./dump.js";
 import { createStatsTransform, observeStatsStream } from "./stats.js";
 import { recordHeaders } from "../utils/header-debug.js";
-import { inflateWithCap } from "./inflate.js";
+import { readBody, RequestBodyTooLargeError, InflatedBodyTooLargeError } from "./request-body.js";
+export { readBody, RequestBodyTooLargeError, InflatedBodyTooLargeError } from "./request-body.js";
 import { buildAnthropicMetadataUserId } from "./trace-headers.js";
 
 /** Options for the proxy handler. */
@@ -974,111 +975,6 @@ async function sendUpstreamRequest(
     return stripAutoDecodedEncoding(resp);
   }
   return resp;
-}
-
-/**
- * Read the request body as a string, returning undefined for empty bodies.
- * Transparently inflates `content-encoding: gzip` request bodies (the OpenAI /
- * Anthropic upstreams accept gzipped request bodies; without this, clients
- * that send them got a misleading "body is not valid JSON" 400). Corrupt gzip
- * throws a descriptive Error; inflation past `MAX_INFLATED_BODY_BYTES` throws
- * `InflatedBodyTooLargeError` (streamed + aborted early, so a small wire
- * payload cannot expand into unbounded proxy memory). When a positive
- * `maxBytes` cap is supplied (from `server.maxRequestBodyBytes`), plain bodies
- * past the cap throw `RequestBodyTooLargeError` (streamed + aborted early).
- */
-export async function readBody(req: Request, maxBytes?: number): Promise<string | undefined> {
-  if (req.method === "GET" || req.method === "HEAD") return undefined;
-  const encoding = req.headers.get("content-encoding")?.toLowerCase().trim() ?? "";
-  const bytes = await readBodyBytes(req, maxBytes);
-  if (bytes.byteLength === 0) return undefined;
-  if (encoding === "gzip" || encoding === "x-gzip") {
-    return new TextDecoder().decode(await inflateGzipBody(bytes));
-  }
-  return new TextDecoder().decode(bytes);
-}
-
-/**
- * Thrown when a request body exceeds the configured `server.maxRequestBodyBytes` cap.
- */
-export class RequestBodyTooLargeError extends Error {
-  constructor(limit: number) {
-    super(`request body exceeds ${limit} byte cap (server.maxRequestBodyBytes; 0 disables)`);
-    this.name = "RequestBodyTooLargeError";
-  }
-}
-
-/**
- * Read the raw request body bytes, honoring an optional byte cap.
- * With a cap active, oversized Content-Length is rejected up front and chunked
- * bodies are drained incrementally so a body with no declared length cannot
- * grow proxy memory unbounded (mirrors async/handler.ts readBody).
- * `maxBytes` undefined/0/NaN → uncapped (legacy behavior; long-context LLM
- * requests legitimately reach several MB).
- */
-async function readBodyBytes(req: Request, maxBytes?: number): Promise<Uint8Array> {
-  const cap = typeof maxBytes === "number" && Number.isFinite(maxBytes) && maxBytes > 0 ? maxBytes : 0;
-  if (cap === 0) return new Uint8Array(await req.arrayBuffer());
-
-  const contentLength = req.headers.get("content-length");
-  if (contentLength) {
-    const cl = parseInt(contentLength, 10);
-    if (Number.isFinite(cl) && cl > cap) {
-      // NOTE: deliberately NOT cancelling the body stream. Cancelling the Web
-      // body aborts Readable.toWeb(req)'s source, and Bun's node:http shim
-      // then finalizes the response by itself — the client gets a default
-      // empty 200 instead of our 413. Leaving the stream unconsumed is still
-      // memory-safe: node:http destroys the connection once the (413)
-      // response is written, and unread request bytes only ever sit in the
-      // kernel socket buffer (TCP backpressure), never in proxy memory.
-      throw new RequestBodyTooLargeError(cap);
-    }
-  }
-  if (!req.body) return new Uint8Array(0);
-  const reader = req.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    total += value.byteLength;
-    if (total > cap) {
-      // Same as above: stop consuming, surface the 413 — do NOT cancel.
-      throw new RequestBodyTooLargeError(cap);
-    }
-    chunks.push(value);
-  }
-  const out = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    out.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return out;
-}
-
-/**
- * Decompressed-size ceiling for gzip request bodies. Generous by design:
- * plain bodies on `/v1/*` routes are intentionally uncapped (long-context LLM
- * requests reach several MB), so this only rejects pathological amplification.
- */
-const MAX_INFLATED_BODY_BYTES = 64 * 1024 * 1024;
-
-/** Thrown when a gzip request body expands past MAX_INFLATED_BODY_BYTES. */
-export class InflatedBodyTooLargeError extends Error {
-  constructor(limit: number) {
-    super(`gzip request body exceeds ${limit} bytes after decompression`);
-    this.name = "InflatedBodyTooLargeError";
-  }
-}
-
-async function inflateGzipBody(bytes: Uint8Array): Promise<Uint8Array> {
-  const result = await inflateWithCap(bytes, MAX_INFLATED_BODY_BYTES);
-  if (!result.ok) {
-    if (result.reason === "too_large") throw new InflatedBodyTooLargeError(MAX_INFLATED_BODY_BYTES);
-    throw new Error(`request body is marked content-encoding: gzip but failed to decompress: ${result.detail}`);
-  }
-  return result.bytes;
 }
 
 /**

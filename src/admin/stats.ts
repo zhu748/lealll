@@ -68,9 +68,9 @@ const modelTtfbTotals = new Map<string, number>();
 
 const seenIds = new Map<string, SeenStat>();
 
-const credentialStatLastSeen = new Map<string, number>();
-
-let credentialStatSeq = 0;
+// Insertion order tracks least-recently-used credentials without sorting all
+// buckets on every request. Delete+set refreshes an existing key's position.
+const credentialStatLastSeen = new Map<string, true>();
 
 function isSuccessStatus(status: number): boolean {
   return status >= 200 && status < 300;
@@ -93,7 +93,7 @@ function statNumber(value: string | undefined): number {
 
 function resolveModelBucket(model: string): string {
   if (stats.models[model]) return model;
-  if (Object.keys(stats.models).length >= MAX_MODEL_STATS) return "_other";
+  if (modelTtfbTotals.size >= MAX_MODEL_STATS) return "_other";
   return model;
 }
 
@@ -138,17 +138,15 @@ function updateModelStatsForRetry(oldBucket: string, oldEntry: StatsRequestEntry
 type CredentialStatEntry = Pick<StatsRequestEntry, "credentialKey" | "status" | "inputTokens" | "tokens"> & { time?: string };
 
 function touchCredentialStat(key: string): void {
-  credentialStatLastSeen.set(key, ++credentialStatSeq);
+  credentialStatLastSeen.delete(key);
+  credentialStatLastSeen.set(key, true);
 }
 
 function pruneCredentialStats(): void {
-  const keys = Object.keys(stats.byCredential);
-  if (keys.length <= MAX_CREDENTIAL_STATS) return;
-  keys.sort((a, b) => (credentialStatLastSeen.get(a) ?? 0) - (credentialStatLastSeen.get(b) ?? 0));
-  const overflow = keys.length - MAX_CREDENTIAL_STATS;
-  for (let i = 0; i < overflow; i++) {
-    delete stats.byCredential[keys[i]];
-    credentialStatLastSeen.delete(keys[i]);
+  while (credentialStatLastSeen.size > MAX_CREDENTIAL_STATS) {
+    const key = credentialStatLastSeen.keys().next().value!;
+    delete stats.byCredential[key];
+    credentialStatLastSeen.delete(key);
   }
 }
 
@@ -378,7 +376,6 @@ function resetStats(): void {
   modelTtfbTotals.clear();
   seenIds.clear();
   credentialStatLastSeen.clear();
-  credentialStatSeq = 0;
 }
 
 export function _resetStatsForTesting(): void {

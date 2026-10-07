@@ -1,5 +1,6 @@
 import { createBackpressuredStream } from "../utils/stream.js";
-import { waitForBackpressure } from "../utils/sse.js";
+import { extractSSEData, waitForBackpressure } from "../utils/sse.js";
+import { SSEFramer } from "../utils/sse-framer.js";
 /**
  * POST /v1/responses request handler.
  *
@@ -69,7 +70,8 @@ import {
   type ResponsesOutputItem,
 } from "../translator/responses-types.js";
 import { ResponseStore, type StoredResponse } from "../responses/store.js";
-import { errorResponse, readBody, InflatedBodyTooLargeError, RequestBodyTooLargeError } from "./handler.js";
+import { errorResponse } from "./translated-response.js";
+import { readBody, InflatedBodyTooLargeError, RequestBodyTooLargeError } from "./request-body.js";
 
 export interface ResponsesHandlerOptions {
   config: ProxyConfig;
@@ -405,36 +407,18 @@ function streamResponse(upstreamResp: Response, context: StreamResponseContext):
         const reader = upstreamResp.body!.getReader();
         upstreamReader = reader;
         const decoder = new TextDecoder();
-        let buffer = "";
-        let errored = false;
+        const framer = new SSEFramer();
         for (;;) {
-          if (errored) break;
           const { done, value } = await reader.read();
           if (cancelled) return;
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
-          // SSE chunks are separated by `\n\n`; process complete frames.
-          let nl: number;
-          while ((nl = buffer.indexOf("\n\n")) >= 0) {
-            const frame = buffer.slice(0, nl);
-            buffer = buffer.slice(nl + 2);
-            const dataLine = extractSseData(frame);
+          const frames = done ? framer.finish(decoder.decode()) : framer.push(decoder.decode(value, { stream: true }));
+          for (const frame of frames) {
+            const dataLine = extractSSEData(frame);
             if (!dataLine || dataLine === "[DONE]") continue;
-            try {
-              const chunk = JSON.parse(dataLine);
-              for (const evt of chatChunkToResponsesEvents(chunk, state)) await send(evt);
-            } catch (err) {
-              errored = true;
-              // Release the upstream reader too — without the cancel the
-              // upstream connection lingers until GC. Fire-and-forget so a
-              // slow cancel never delays the client-visible error. The
-              // errored-flag + early-return semantics (anti-pattern #24) are
-              // unchanged: no further reads, no finalize, no close().
-              reader.cancel().catch(() => {});
-              controller.error(err);
-              return;
-            }
+            const chunk = JSON.parse(dataLine);
+            for (const evt of chatChunkToResponsesEvents(chunk, state)) await send(evt);
           }
+          if (done) break;
         }
         if (cancelled) return;
         const finalEvents = finalizeResponsesStream(state);
@@ -477,13 +461,6 @@ function streamResponse(upstreamResp: Response, context: StreamResponseContext):
       connection: "keep-alive",
     },
   });
-}
-
-function extractSseData(frame: string): string | null {
-  for (const line of frame.split(/\r?\n/)) {
-    if (line.startsWith("data:")) return line.slice(5).replace(/^\s/, "");
-  }
-  return null;
 }
 
 // ─────────────────────────────────────────────

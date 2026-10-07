@@ -23,7 +23,8 @@ import type { ProxyConfig } from "../config/types.js";
 import type { AuthManager } from "../auth/manager.js";
 import type { Credential } from "../auth/types.js";
 import { credentialString } from "../auth/types.js";
-import { errorResponse } from "../proxy/handler.js";
+import { errorResponse } from "../proxy/translated-response.js";
+import { readRequestBytes, RequestBodyLimitError } from "../utils/request-body.js";
 import { transformRequestBody } from "../proxy/body-transformer.js";
 import { buildAnthropicMetadataUserId } from "../proxy/trace-headers.js";
 import { inflateWithCap } from "../proxy/inflate.js";
@@ -67,48 +68,21 @@ function resolveModel(req: { model?: string }, config: ProxyConfig): string {
 }
 
 async function readBody(req: Request): Promise<{ ok: true; body: string } | { ok: false; response: Response }> {
-  // Reject oversized Content-Length up front; otherwise drain the stream incrementally
-  // and abort as soon as we exceed the cap. This prevents an attacker from exhausting
-  // memory by sending a huge chunked body with no Content-Length.
-  const contentLength = req.headers.get("content-length");
-  if (contentLength) {
-    const cl = parseInt(contentLength, 10);
-    if (Number.isFinite(cl) && cl > MAX_REQUEST_BODY_BYTES) {
-      // NOTE: deliberately NOT cancelling the body stream — cancelling aborts
-      // Readable.toWeb(req)'s source, and Bun's node:http shim then finalizes
-      // the response itself (client sees a default empty 200, not our 413).
-      // Leaving the stream unconsumed is still memory-safe: the connection is
-      // destroyed once the 413 response is written; unread bytes stay in the
-      // kernel socket buffer under TCP backpressure, never in proxy memory.
-      return { ok: false, response: errorResponse(413, "request_too_large", `body exceeds ${MAX_REQUEST_BODY_BYTES} byte cap`) };
+  let bytes: Uint8Array;
+  try {
+    bytes = await readRequestBytes(req, MAX_REQUEST_BODY_BYTES);
+  } catch (err) {
+    if (err instanceof RequestBodyLimitError) {
+      return { ok: false, response: errorResponse(413, "request_too_large", err.message) };
     }
+    return { ok: false, response: errorResponse(400, "invalid_request_error", "could not read request body") };
   }
   if (!req.body) {
     return { ok: false, response: errorResponse(400, "invalid_request_error", "missing request body") };
   }
-  const reader = req.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      total += value.byteLength;
-      if (total > MAX_REQUEST_BODY_BYTES) {
-        // Stop consuming, surface the 413 — do NOT cancel (see note above).
-        return { ok: false, response: errorResponse(413, "request_too_large", `body exceeds ${MAX_REQUEST_BODY_BYTES} byte cap`) };
-      }
-      chunks.push(value);
-    }
-  } catch {
-    return { ok: false, response: errorResponse(400, "invalid_request_error", "could not read request body") };
-  } finally {
-    reader.releaseLock?.();
-  }
   // Inflate `content-encoding: gzip` request bodies with the cap enforced on
   // the DECOMPRESSED size — a small gzip bomb must not bypass the byte cap.
   const encoding = req.headers.get("content-encoding")?.toLowerCase().trim() ?? "";
-  let bytes: Uint8Array = Buffer.concat(chunks);
   if (encoding === "gzip" || encoding === "x-gzip") {
     const inflated = await inflateWithCap(bytes, MAX_REQUEST_BODY_BYTES);
     if (!inflated.ok) {

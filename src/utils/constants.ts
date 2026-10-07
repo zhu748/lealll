@@ -93,9 +93,9 @@ export const SSE = {
   MAX_TO_BATCH_BUFFERED_EVENT_BYTES: 1 * 1024 * 1024,
   /** Maximum content block index accepted during batch reassembly. */
   MAX_TO_BATCH_CONTENT_BLOCK_INDEX: 4096,
-  /** Maximum unfinished SSE event bytes/chars retained by streaming translators. */
+  /** Maximum unfinished SSE event bytes retained by streaming translators. */
   MAX_TRANSLATED_STREAM_BUFFERED_EVENT_BYTES: 1 * 1024 * 1024,
-  /** Maximum unfinished SSE line bytes/chars retained by the inline stats observer. */
+  /** Maximum unfinished SSE event bytes retained by the inline stats observer. */
   MAX_STATS_BUFFERED_EVENT_BYTES: 1 * 1024 * 1024,
   /** Substring markers used to short-circuit JSON.parse in stats observer. */
   STATS_INTERESTING_MARKERS: [

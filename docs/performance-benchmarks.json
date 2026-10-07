@@ -1,0 +1,18 @@
+{
+  "date": "2026-10-07",
+  "baselineCommit": "1c3bdbc",
+  "runtime": "Bun 1.4.0",
+  "measurement": "median of five runs after one warmup; local synthetic workloads",
+  "baseline": {
+    "sticky5000": 1304.315,
+    "stats10000": 262.905,
+    "fragmentedSse512KiB": 103.793,
+    "typicalSse10000": 23.747
+  },
+  "optimized": {
+    "sticky5000": 3.459,
+    "stats10000": 10.799,
+    "fragmentedSse512KiB": 3.042,
+    "typicalSse10000": 23.415
+  }
+}

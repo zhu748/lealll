@@ -17,6 +17,7 @@ import {
 // stack-sniffing dispatcher this replaced — in opposite directions.
 describe("guest timer ownership (lexical scope)", () => {
   const EVALUATE_SCRIPT = "Symbol(evaluateScript)";
+  const OFFLINE_DOM = { cookies: [], html: "<!doctype html><html><body></body></html>" };
   const GUEST_URL = "https://g.alicdn.com/captcha-frontend/FeiLin/1.5.1/feilin008.js";
 
   function evaluateScriptSymbol(w: object): symbol | undefined {
@@ -41,7 +42,7 @@ describe("guest timer ownership (lexical scope)", () => {
    * than fixed guesses.
    */
   async function ticksAcrossTeardown(guestSource: string): Promise<{ before: number; after: number }> {
-    const dom = await createDom("sgp", "no8xfe");
+    const dom = await createDom("sgp", "no8xfe", OFFLINE_DOM);
     const w = dom.window as unknown as Record<string | symbol, unknown>;
     let ticks = 0;
     (globalThis as Record<string, unknown>).__capTestTick = () => { ticks++; };
@@ -94,7 +95,7 @@ describe("guest timer ownership (lexical scope)", () => {
     // `var`/`function` declarations keep escaping. Wrapping in a function
     // swallowed them and `initAliyunCaptcha` never appeared — every solve
     // then timed out waiting for it.
-    const dom = await createDom("sgp", "no8xfe");
+    const dom = await createDom("sgp", "no8xfe", OFFLINE_DOM);
     const w = dom.window as unknown as Record<string | symbol, unknown>;
     try {
       const sym = evaluateScriptSymbol(w)!;

@@ -19,9 +19,10 @@
  * or downstream clients see inconsistent IDs, missing tool arguments, and
  * duplicate finish reasons.
  */
-import { initState, parseSSEChunk, translateEvent, SSE_FRAME_SPLIT, type TranslationState, type ParsedSSE } from "../translator/sse-translator.js";
+import { initState, translateEvent, type TranslationState, type ParsedSSE } from "../translator/sse-translator.js";
 import { createBackpressuredStream } from "../utils/stream.js";
-import { waitForBackpressure } from "../utils/sse.js";
+import { parseSSEEvent, waitForBackpressure } from "../utils/sse.js";
+import { SSEFramer } from "../utils/sse-framer.js";
 
 export function anthropicSseToOpenaiSseWithKeepalive(
   upstream: ReadableStream<Uint8Array>,
@@ -59,44 +60,39 @@ export function anthropicSseToOpenaiSseWithKeepalive(
       controller0 = controller;
       const reader = upstream.getReader();
       upstreamReader = reader;
-      let buffer = "";
+      const framer = new SSEFramer();
 
-      await reader.read().then(async function pump({ done, value }): Promise<unknown | undefined> {
-        if (errored) return;
-        if (done) {
-          // Flush trailing buffer
-          if (buffer.trim()) await processBlock(buffer, state);
-          buffer = "";
-          await emitDone();
-          try { controller.close(); } catch {}
-          return;
-        }
-        buffer += decoder.decode(value, { stream: true });
-        const blocks = buffer.split(SSE_FRAME_SPLIT);
-        buffer = blocks.pop() ?? "";
-        for (const block of blocks) {
-          await processBlock(block, state);
-          if (errored) {
-            // Early exit: stop draining the upstream bridge stream — leaving
-            // it open would keep consuming the LLM stream until req.signal
-            // fires indirectly.
-            await reader.cancel().catch(() => {});
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (errored) return;
+          const frames = done ? framer.finish(decoder.decode()) : framer.push(decoder.decode(value, { stream: true }));
+          for (const block of frames) {
+            await processBlock(block, state);
+            if (errored) {
+              void reader.cancel().catch(() => {});
+              try { controller.close(); } catch {}
+              return;
+            }
+          }
+          if (done) {
+            await emitDone();
             try { controller.close(); } catch {}
             return;
           }
         }
-        return reader.read().then(pump);
-      }).catch(async (err) => {
+      } catch (err) {
+        void reader.cancel(err).catch(() => {});
         if (!errored) {
           const errPayload = JSON.stringify({ error: { message: `async stream error: ${(err as Error).message}`, type: "server_error" } });
           await emit(`data: ${errPayload}\n\n`);
           await emitDone();
         }
         try { controller.close(); } catch {}
-      }).finally(() => {
+      } finally {
         if (upstreamReader === reader) upstreamReader = undefined;
         reader.releaseLock?.();
-      });
+      }
     },
 
     cancel(reason) {
@@ -145,9 +141,9 @@ export function anthropicSseToOpenaiSseWithKeepalive(
     }
 
     // Standard Anthropic event — parse + translate using shared state.
-    const parsed = parseSSEChunk(block);
-    for (const p of parsed) {
-      const out = translateEvent(st, p);
+    const parsed = parseSSEEvent(block);
+    if (parsed) {
+      const out = translateEvent(st, parsed);
       if (out) await emit(out);
     }
   }
