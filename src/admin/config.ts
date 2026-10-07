@@ -22,12 +22,32 @@ export const RETRY_DEFAULTS: RetryConfig = {
 
 export const CONFIG_SECRET_MASK = "***configured***";
 
-// Serialize atomic YAML writes so interrupted saves never leave a partial
-// config. All admin feature routes share this single write mutex.
+// Serialize read/merge/write/hot-apply together, not just the final YAML write.
 const configWriteMutex = createMutex();
+const savedServer = new WeakMap<ProxyConfig, { path: string; port: number; host: string }>();
+
+function configForSave(config: ProxyConfig, configPath?: string): ProxyConfig {
+  const saved = savedServer.get(config);
+  if (!saved || (configPath !== undefined && saved.path !== configPath)) return config;
+  return { ...config, server: { ...config.server, port: saved.port, host: saved.host } };
+}
+
+/** Read the body before entering this queue; slow uploads must not hold the save lock. */
+export function withConfigUpdate<T>(
+  config: ProxyConfig,
+  configPath: string,
+  update: (draft: ProxyConfig, save: (next: ProxyConfig) => Promise<void>) => Promise<T>,
+): Promise<T> {
+  return configWriteMutex.run(() => update(structuredClone(configForSave(config, configPath)), async (next) => {
+    await atomicWriteFile(configPath, configToYaml(next));
+    // The listening socket keeps its old address until restart. Other saves
+    // and GET /config must retain the address the user has already saved.
+    savedServer.set(config, { path: configPath, port: next.server.port, host: next.server.host });
+  }));
+}
 
 export const persistConfig = (config: ProxyConfig, configPath: string): Promise<void> =>
-  configWriteMutex.run(() => atomicWriteFile(configPath, configToYaml(config)));
+  configWriteMutex.run(() => atomicWriteFile(configPath, configToYaml(configForSave(config, configPath))));
 
 export function isConfigObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -55,6 +75,7 @@ function sanitizeProviderEndpoints(provider: ProxyConfig["providers"]["zai"]): R
 }
 
 export function sanitizeConfig(config: ProxyConfig): Record<string, unknown> {
+  config = configForSave(config);
   return {
     server: config.server,
     provider: config.provider,

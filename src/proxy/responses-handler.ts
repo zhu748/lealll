@@ -7,14 +7,14 @@ import { SSEFramer } from "../utils/sse-framer.js";
  * Pipeline:
  *   1. Parse body + credential.
  *   2. Resolve `previous_response_id` via `ResponseStore` (prepend stored history).
- *   3. Translate Responses → Chat Completions (`responsesToChatCompletions`):
+ *   3. Translate Responses → Chat Completions → Anthropic:
  *        - function / custom / namespace / tool_search tools → Chat tools.
  *        - web_search / web_search_preview / file_search / code_interpreter /
  *          computer_use / image_generation / mcp → stripped silently.
  *   4. Apply the standard body transform (stream_options, user_id, start-plan system).
- *   5. POST to the GLM Chat Completions upstream (reuse `buildUpstreamRequest`).
- *   6. Translate the Chat response → Responses (`chatCompletionsToResponses`
- *      or `chatChunkToResponsesEvents` for streaming).
+ *   5. POST to the Anthropic upstream (reuse `buildUpstreamRequest`).
+ *   6. Translate Anthropic → Chat → Responses, passing batch objects directly
+ *      and converting streaming events incrementally.
  *   7. Store the new response under its id (unless `store:false`).
  *
  * State management: in-memory only (process restart clears the store); see
@@ -119,6 +119,9 @@ export async function handleResponses(
   } catch (err) {
     return errorResponse(400, "invalid_request", `request body is not valid JSON: ${(err as Error).message}`);
   }
+  if (req === null || typeof req !== "object" || Array.isArray(req)) {
+    return errorResponse(400, "invalid_request", "request body must be a JSON object");
+  }
   if (typeof req.input !== "string" && !Array.isArray(req.input)) {
     return errorResponse(400, "invalid_request", "`input` must be a string or an array");
   }
@@ -162,7 +165,7 @@ export async function handleResponses(
     if (err instanceof ToolTranslationError) {
       return errorResponse(400, "tool_translation_error", err.message);
     }
-    throw err;
+    return errorResponse(400, "translation_failed", `Responses→Chat translation failed: ${(err as Error).message}`);
   }
   const { chatRequest, customToolNames, namespaceMap, hasToolSearch } = translated;
 
@@ -328,47 +331,27 @@ export async function handleResponses(
     return errorResponse(upstreamResp.status, "upstream_error", errText.slice(0, 500) || `upstream returned ${upstreamResp.status}`);
   }
 
-  if (upstreamFormat === "anthropic") {
-    // normalize the Anthropic upstream response into the OpenAI Chat shape the
-    // downstream Responses translators already consume (SSE + batch)
-    if (stream) {
-      if (!upstreamResp.body) {
-        return errorResponse(502, "translation_failed", "upstream returned no body for stream");
-      }
-      upstreamResp = new Response(anthropicSseToOpenaiSse(upstreamResp.body, req.model), {
-        status: upstreamResp.status,
-        headers: { "content-type": "text/event-stream" },
-      });
-    } else {
-      const rawAnthropic = await upstreamResp.text();
-      let parsedAnthropic: AnthropicMessagesResponse;
-      try {
-        parsedAnthropic = JSON.parse(rawAnthropic) as AnthropicMessagesResponse;
-      } catch (err) {
-        return errorResponse(502, "translation_failed", `upstream returned non-JSON body: ${(err as Error).message}`);
-      }
-      const openaiResp = translateResponseAnthropicToOpenAI(parsedAnthropic, req.model);
-      upstreamResp = new Response(JSON.stringify(openaiResp), {
-        status: upstreamResp.status,
-        headers: { "content-type": "application/json" },
-      });
-    }
-  }
-
-  // ── 8. translate Chat → Responses ──
+  // ── 8. translate Anthropic → Chat → Responses ──
   const responseId = generateResponsesId();
   const meta = { customToolNames, namespaceMap, hasToolSearch };
 
   if (stream) {
+    if (!upstreamResp.body) return errorResponse(502, "translation_failed", "upstream returned no body for stream");
+    upstreamResp = new Response(anthropicSseToOpenaiSse(upstreamResp.body, req.model), {
+      status: upstreamResp.status,
+      headers: { "content-type": "text/event-stream" },
+    });
     return streamResponse(upstreamResp, { responseId, model: req.model, meta, request: req, input, options: opts });
   }
 
-  const rawChatResp = await upstreamResp.text();
-  let chatRespJson;
+  // Keep the intermediate Chat object in memory: serializing it into a
+  // Response only to read and parse it again duplicates long output buffers.
+  let chatRespJson: ReturnType<typeof translateResponseAnthropicToOpenAI>;
   try {
-    chatRespJson = JSON.parse(rawChatResp);
+    const parsedAnthropic = JSON.parse(await upstreamResp.text()) as AnthropicMessagesResponse;
+    chatRespJson = translateResponseAnthropicToOpenAI(parsedAnthropic, req.model);
   } catch (err) {
-    return errorResponse(502, "translation_failed", `upstream returned non-JSON body: ${(err as Error).message}`);
+    return errorResponse(502, "translation_failed", `upstream returned an invalid Anthropic response: ${(err as Error).message}`);
   }
   const responsesResp = chatCompletionsToResponses(chatRespJson, req.model, {
     responseId,

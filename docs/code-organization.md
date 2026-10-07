@@ -24,6 +24,9 @@
 | 请求 ID、日志格式、脱敏和统计上报 | `src/proxy/request-log.ts` | 按请求绑定上下文，使用具名结果字段 |
 | 公共 JSON 错误响应 | `src/proxy/translated-response.ts` | 保持原有轻量错误响应入口 |
 | 串行状态更新与文件工具 | `src/utils/serial.ts`、`src/utils/fs.ts` | mutex 复用同一串行队列；文件工具负责原子替换 |
+| 管理配置保存与待重启监听地址 | `src/admin/config.ts` | `withConfigUpdate` 串行执行合并、落盘与热更新；保留已保存地址 |
+| 活跃账户与运行认证、计划同步 | `src/admin/account-actions.ts` | 共用凭证同步与配置保存队列，处理账户存储结果 |
+| 系统提示词默认值、匹配、最近请求对照 | `src/config/prompt-rewrite.ts`、`src/proxy/prompt-rewrite.ts`、`src/proxy/prompt-observation.ts` | 校验规则、改写系统文本、保存有界内存快照 |
 
 ## 状态与依赖规则
 
@@ -34,6 +37,7 @@
 - 复用传输时直接导入 `upstream-dispatch.ts`，例如 Responses 处理器的连接重试。展示与 URL 校验直接导入各自模块，减少对主入口的依赖。
 - 调用 `sendUpstreamRequest` 和请求日志时使用具名字段，避免位置参数混淆。日志与转储共享敏感请求头清单。
 - 连接重试通过 `utils/sleep.ts` 使用宿主计时器，避免验证码窗口销毁时取消重试等待。
+- 修改管理配置时，先读取并校验请求体，再调用 `withConfigUpdate`，在其回调内根据最新草稿合并并 `await save(draft)`，保存成功后热更新指定字段。不要在该回调中再调用 `persistConfig`，以免重复获取同一锁。账户存储已经提交的计划同步由 `synchronizeAccountConfig` 处理。
 
 ## 本轮精简与修正
 

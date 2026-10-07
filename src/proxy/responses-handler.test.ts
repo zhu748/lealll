@@ -73,6 +73,50 @@ function makeReq(body: unknown): Request {
 }
 
 describe("handleResponses", () => {
+  it.each([null, [], true, 42, "not an object"])("rejects non-object JSON (%j) before credential lookup or dispatch", async (body) => {
+    let credentials = 0, sends = 0;
+    const response = await handleResponses(makeReq(body), {
+      config: CONFIG,
+      auth: { getCredential: async () => { credentials++; return { apiKey: "test-key" }; } } as unknown as import("../auth/manager.js").AuthManager,
+      fetchImpl: (async () => { sends++; return new Response(anthropicMsg("unexpected")); }) as unknown as typeof fetch,
+    });
+    expect(response.status).toBe(400);
+    expect((await response.json()).error.type).toBe("invalid_request");
+    expect(credentials).toBe(0);
+    expect(sends).toBe(0);
+  });
+
+  it("returns a client error for malformed nested tools instead of rejecting the handler", async () => {
+    let sends = 0;
+    const response = await handleResponses(makeReq({ model: "glm-5.2", input: "hello", tools: [null] }), {
+      config: CONFIG, auth,
+      fetchImpl: (async () => { sends++; return new Response(anthropicMsg("unexpected")); }) as unknown as typeof fetch,
+    });
+    expect(response.status).toBe(400);
+    expect(sends).toBe(0);
+  });
+
+  it.each([null, [], { content: "wrong" }, { content: [null] }, { error: "unexpected" }])("returns 502 without storing malformed upstream JSON (%j)", async (body) => {
+    const store = new ResponseStore();
+    const response = await handleResponses(makeReq({ model: "glm-5.2", input: "hello" }), {
+      config: CONFIG, auth, endpointRouting: null, clientSigning: null, responseStore: store,
+      fetchImpl: chatUpstream(JSON.stringify(body)),
+    });
+    expect(response.status).toBe(502);
+    expect((await response.json()).error.type).toBe("translation_failed");
+    expect(store.size()).toBe(0);
+  });
+
+  it("returns 502 when reading the upstream batch body fails", async () => {
+    const body = new ReadableStream<Uint8Array>({ start(controller) { controller.error(new Error("upstream body disconnected")); } });
+    const response = await handleResponses(makeReq({ model: "glm-5.2", input: "hello" }), {
+      config: CONFIG, auth, endpointRouting: null, clientSigning: null,
+      fetchImpl: (async () => new Response(body)) as unknown as typeof fetch,
+    });
+    expect(response.status).toBe(502);
+    expect((await response.json()).error.message).toContain("upstream body disconnected");
+  });
+
   it("cancels and unlocks a stalled upstream stream without storing a completed response", async () => {
     let cancelled = false;
     const upstream = new ReadableStream<Uint8Array>({ cancel() { cancelled = true; } });

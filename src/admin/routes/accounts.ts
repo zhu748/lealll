@@ -17,8 +17,7 @@ import {
   switchAccount,
 } from "../../auth/store.js";
 import { errorResponse } from "../../proxy/translated-response.js";
-import { handleMutationResult, synchronizeActiveCredential } from "../account-actions.js";
-import { persistConfig } from "../config.js";
+import { handleMutationResult, synchronizeAccountConfig, synchronizeActiveCredential } from "../account-actions.js";
 import { appendLog } from "../logs.js";
 import { checkProxyConnectivity } from "../proxy-check.js";
 import { clearQuotaCache, clearQuotaCacheForAccount } from "../quota.js";
@@ -49,29 +48,8 @@ export async function handleAccountsRoutes(context: AdminRouteContext): Promise<
       if (errResp) return errResp;
       // Hot-swap the in-memory credential and sync plan
       const cred = await loadCredential();
-      let planSynced = false;
-      if (cred) {
-        opts.auth.setOAuthCredential(cred);
-        // Sync config.plan to match the account's plan, and persist to yaml
-        // so the change survives a server restart. Without this, users who
-        // switch plan via the dashboard find the change silently reverted
-        // after restart — leading to confusing "still coding-plan" reports.
-        if (cred.plan && cred.plan !== opts.config.plan) {
-          opts.config.plan = cred.plan;
-          planSynced = true;
-          appendLog("info", `Plan synced to ${cred.plan} (from account ${body.id})`);
-        }
-      }
+      await synchronizeAccountConfig(opts, cred);
       appendLog("info", `Switched active account to ${body.id}`);
-      // Persist the (possibly updated) plan to yaml so restart keeps it.
-      if (planSynced) {
-        try {
-          await persistConfig(opts.config, opts.configPath);
-          appendLog("info", `Persisted plan=${opts.config.plan} to ${opts.configPath}`);
-        } catch (e) {
-          appendLog("error", `Failed to persist plan to config: ${(e as Error).message}`);
-        }
-      }
       return jsonResp({ ok: true, plan: cred?.plan || opts.config.plan });
     } catch (err) {
       return errorResponse(500, "switch_failed", (err as Error).message);
@@ -118,24 +96,8 @@ export async function handleAccountsRoutes(context: AdminRouteContext): Promise<
       // plan. Without this, the proxy would keep using the old plan until
       // restart — defeating the purpose of the dashboard edit.
       const cred = await loadCredential();
-      if (cred) {
-        opts.auth.setOAuthCredential(cred);
-        if (cred.plan && cred.plan !== opts.config.plan) {
-          opts.config.plan = cred.plan;
-          appendLog("info", `Plan synced to ${cred.plan} (from account ${body.id})`);
-        }
-      }
+      await synchronizeAccountConfig(opts, cred, true);
       appendLog("info", `Account ${body.id} plan changed to ${body.plan}`);
-      // Persist the (possibly updated) plan to yaml so restart keeps it.
-      // Always write — even if plan matches config, the dashboard edit is
-      // an explicit user action worth persisting (in case config.yaml had
-      // been manually edited out of band).
-      try {
-        await persistConfig(opts.config, opts.configPath);
-        appendLog("info", `Persisted plan=${opts.config.plan} to ${opts.configPath}`);
-      } catch (e) {
-        appendLog("error", `Failed to persist plan to config: ${(e as Error).message}`);
-      }
       return jsonResp({ ok: true, plan: body.plan });
     } catch (err) {
       return errorResponse(500, "update_failed", (err as Error).message);

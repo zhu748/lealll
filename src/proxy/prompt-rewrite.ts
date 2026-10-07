@@ -73,10 +73,30 @@ export function captureSystemPrompt(body: Record<string, unknown> | undefined): 
   return { text, chars, blocks: texts.length, truncated: chars > MAX_SNAPSHOT_CHARS };
 }
 
-function applyRule(text: string, rule: PromptRewriteRule, result: PromptRuleResult, budget: { remaining: number }): string {
+interface CompiledRule {
+  rule: PromptRewriteRule;
+  keywords: string[];
+  replacement: string;
+  escapedReplacement: string;
+}
+
+function compileRule(rule: PromptRewriteRule): CompiledRule {
   const replacement = rule.action === "delete" ? "" : rule.replacement;
+  return {
+    rule,
+    keywords: rule.matchMode === "line" ? rule.match.split(/\r\n|\n|\r/).map(keyword => keyword.trim()).filter(Boolean) : [],
+    replacement,
+    // Escape dollar substitutions once, rather than calling a replacement
+    // function at every match or allocating a split array for dense deletes.
+    escapedReplacement: replacement.replaceAll("$", () => "$$"),
+  };
+}
+
+function applyRule(text: string, { rule, keywords, replacement, escapedReplacement }: CompiledRule, result: PromptRuleResult, budget: { remaining: number }): string {
   if (rule.matchMode === "line") {
-    const keywords = rule.match.split(/\r\n|\n|\r/).map((keyword) => keyword.trim()).filter(Boolean);
+    // Most system blocks do not contain a default keyword. Avoid allocating
+    // regex matches and scanning every line twice on that common path.
+    if (!keywords.some(keyword => text.includes(keyword))) return text;
     let growth = 0;
     let count = 0;
     for (const [line] of text.matchAll(/[^\r\n]*(?:\r\n|\n|\r|$)/g)) {
@@ -99,6 +119,7 @@ function applyRule(text: string, rule: PromptRewriteRule, result: PromptRuleResu
       return next;
     });
   }
+  if (!rule.match) return text;
   let count = 0;
   let offset = 0;
   while ((offset = text.indexOf(rule.match, offset)) !== -1) { count++; offset += rule.match.length; }
@@ -111,19 +132,23 @@ function applyRule(text: string, rule: PromptRewriteRule, result: PromptRuleResu
   }
   budget.remaining -= Math.max(0, growth);
   result.changes += count;
+  if (!replacement && count * rule.match.length === text.length) return "";
   // Literal replacement: '$&', '$1', backslashes and HTML stay ordinary text.
-  return text.split(rule.match).join(replacement);
+  return text.replaceAll(rule.match, escapedReplacement);
 }
 
 /** Ordered edits touch system text only, retaining block metadata and all user/tool content. */
 export function rewriteSystemPrompt(body: Record<string, unknown>, config: PromptRewriteConfig): PromptRewriteResult {
   const rules = config.rules.map((rule): PromptRuleResult => ({ id: rule.id, name: rule.name, enabled: rule.enabled, action: rule.action, matches: 0, changes: 0 }));
+  // Compile once per logical rewrite, shared by all system blocks. Do not
+  // cache mutable rule objects across requests: edits must apply immediately.
+  const compiled = config.enabled ? config.rules.map(compileRule) : [];
   let modified = false;
   const budget = { remaining: MAX_REPLACEMENT_GROWTH };
   const rewrite = (text: string): string => {
     let output = text;
     if (config.enabled) {
-      config.rules.forEach((rule, index) => { if (rule.enabled) output = applyRule(output, rule, rules[index], budget); });
+      compiled.forEach((entry, index) => { if (entry.rule.enabled) output = applyRule(output, entry, rules[index], budget); });
     }
     modified = modified || output !== text;
     return output;
@@ -131,15 +156,25 @@ export function rewriteSystemPrompt(body: Record<string, unknown>, config: Promp
   const rewriteContent = (content: unknown): unknown => {
     if (typeof content === "string") return rewrite(content);
     if (!Array.isArray(content)) return content;
-    return content.flatMap((block) => {
-      if (typeof block === "string") { const text = rewrite(block); return text === block || text.trim() ? [text] : []; }
+    let output: unknown[] | undefined;
+    for (let index = 0; index < content.length; index++) {
+      const block = content[index];
+      let next = block, removed = false;
+      if (typeof block === "string") {
+        next = rewrite(block);
+        removed = next !== block && !next.trim();
+      }
       if (block && typeof block === "object" && block.type === "text" && typeof block.text === "string") {
         const text = rewrite(block.text);
-        if (text === block.text) return [block];
-        return text.trim() ? [{ ...block, text }] : [];
+        if (text !== block.text) {
+          removed = !text.trim();
+          if (!removed) next = { ...block, text };
+        }
       }
-      return [block];
-    });
+      if (next !== block || removed) output ??= content.slice(0, index);
+      if (output && !removed) output.push(next);
+    }
+    return output ?? content;
   };
   if (config.enabled) {
     if ("system" in body) {

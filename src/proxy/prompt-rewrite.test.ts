@@ -73,7 +73,7 @@ describe("system-prompt rewrite", () => {
 
   it("treats dollar substitutions, HTML and backslashes as literal replacement text", () => {
     const body = { system: "old old" };
-    const replacement = String.raw`$& $1 </textarea><script>alert(1)</script> C:\temp`;
+    const replacement = "$& $1 $$ $` $' " + String.raw`</textarea><script>alert(1)</script> C:\temp`;
     const result = rewriteSystemPrompt(body, { enabled: true, rules: [rule({ replacement })] });
     expect(body.system).toBe(replacement + " " + replacement);
     expect(result.matches).toBe(2);

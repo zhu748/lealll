@@ -3104,7 +3104,7 @@ function movePromptRule(index,direction){
 }
 function restorePromptDefaults(){
   if(!promptDefaults){toast('请等待默认规则加载完成','warn');return;}
-  promptRules=structuredClone(promptDefaults.rules);
+  promptRules=cloneJson(promptDefaults.rules);
   document.getElementById('promptRewriteEnabled').checked=promptDefaults.enabled;
   markPromptDraft();renderPromptRules();
 }
@@ -3119,7 +3119,7 @@ async function loadPromptSettings(force=false){
     if(statusGeneration===promptStatusGeneration){promptLatest=status.latest;renderPromptObservation();}
     if(draftVersion!==promptDraftVersion||(promptDraftDirty&&!force))return;
     const settings=config.promptRewrite||status.defaults;
-    promptRules=structuredClone(settings.rules);promptRulesLoaded=true;promptDraftDirty=false;
+    promptRules=cloneJson(settings.rules);promptRulesLoaded=true;promptDraftDirty=false;
     document.getElementById('promptRewriteEnabled').checked=settings.enabled;
     document.getElementById('promptRewriteEnabled').disabled=false;
     document.getElementById('promptDraftState').textContent='规则已保存';renderPromptRules();

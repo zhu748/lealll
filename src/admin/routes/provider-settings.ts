@@ -1,7 +1,7 @@
 import type { ModelMapping, ResponsesThinkingConfig, RoutingRule } from "../../config/types.js";
 import { MODELS as GLM_CATALOG } from "../../provider/models.js";
 import { errorResponse } from "../../proxy/translated-response.js";
-import { persistConfig } from "../config.js";
+import { isConfigObject, withConfigUpdate } from "../config.js";
 import { appendLog } from "../logs.js";
 import { readJsonBody } from "../request-body.js";
 import { jsonResp } from "../security.js";
@@ -23,11 +23,13 @@ export async function handleProviderSettingsRoutes(context: AdminRouteContext): 
       const parsed = await readJsonBody<{ zai?: Record<string, unknown>; bigmodel?: Record<string, unknown> }>(req);
       if (!parsed.ok) return parsed.error;
       const body = parsed.body;
+      if (!isConfigObject(body)) return errorResponse(400, "invalid_param", "endpoints must be an object");
       // Validate first; only apply if all fields pass.
       const allowedFields = ["anthropicBase", "openaiBase"] as const;
       for (const provKey of ["zai", "bigmodel"] as const) {
         const prov = body[provKey];
-        if (!prov || typeof prov !== "object") continue;
+        if (prov === undefined) continue;
+        if (!isConfigObject(prov)) return errorResponse(400, "invalid_param", `providers.${provKey} must be an object`);
         for (const field of allowedFields) {
           const v = prov[field];
           if (v === undefined) continue;
@@ -50,12 +52,12 @@ export async function handleProviderSettingsRoutes(context: AdminRouteContext): 
           }
         }
       }
-      // Apply validated changes
-      if (body.zai) Object.assign(opts.config.providers.zai, body.zai);
-      if (body.bigmodel) Object.assign(opts.config.providers.bigmodel, body.bigmodel);
-      // Persist to disk so changes survive restart (vceshi0.0.5+ fix — previously
-      // the in-memory update was hot but lost on restart, silently reverting).
-      await persistConfig(opts.config, opts.configPath);
+      await withConfigUpdate(opts.config, opts.configPath, async (draft, save) => {
+        if (body.zai) Object.assign(draft.providers.zai, body.zai);
+        if (body.bigmodel) Object.assign(draft.providers.bigmodel, body.bigmodel);
+        await save(draft);
+        opts.config.providers = draft.providers;
+      });
       appendLog("info", "Proxy endpoints updated via admin dashboard");
       return jsonResp({ ok: true });
     } catch (err) {
@@ -74,12 +76,13 @@ export async function handleProviderSettingsRoutes(context: AdminRouteContext): 
       const parsed = await readJsonBody<{ rules?: Array<{ pattern?: string; provider?: string; endpoint?: string; note?: string }> }>(req);
       if (!parsed.ok) return parsed.error;
       const body = parsed.body;
-      if (!Array.isArray(body.rules)) {
+      if (!isConfigObject(body) || !Array.isArray(body.rules)) {
         return errorResponse(400, "invalid_request", "rules must be an array");
       }
       // Validate & normalize
       const cleaned: RoutingRule[] = [];
       for (const r of body.rules) {
+        if (!isConfigObject(r)) return errorResponse(400, "invalid_rule", "Each rule must be an object");
         if (typeof r.pattern !== "string" || r.pattern.trim() === "") {
           return errorResponse(400, "invalid_rule", "Each rule needs a non-empty 'pattern'");
         }
@@ -93,9 +96,11 @@ export async function handleProviderSettingsRoutes(context: AdminRouteContext): 
           note: typeof r.note === "string" && r.note.trim() ? r.note.trim() : undefined,
         });
       }
-      opts.config.routingRules = cleaned;
-      // Persist
-      await persistConfig(opts.config, opts.configPath);
+      await withConfigUpdate(opts.config, opts.configPath, async (draft, save) => {
+        draft.routingRules = cleaned;
+        await save(draft);
+        opts.config.routingRules = cleaned;
+      });
       appendLog("info", `Routing rules updated (${cleaned.length} rule(s))`);
       return jsonResp({ ok: true, rules: cleaned });
     } catch (err) {
@@ -114,12 +119,13 @@ export async function handleProviderSettingsRoutes(context: AdminRouteContext): 
       const parsed = await readJsonBody<{ mappings?: Array<{ from?: string; to?: string; note?: string }> }>(req);
       if (!parsed.ok) return parsed.error;
       const body = parsed.body;
-      if (!Array.isArray(body.mappings)) {
+      if (!isConfigObject(body) || !Array.isArray(body.mappings)) {
         return errorResponse(400, "invalid_request", "mappings must be an array");
       }
       const cleaned: ModelMapping[] = [];
       const seenFrom = new Set<string>();
       for (const m of body.mappings) {
+        if (!isConfigObject(m)) return errorResponse(400, "invalid_mapping", "Each mapping must be an object");
         if (typeof m.from !== "string" || m.from.trim() === "") {
           return errorResponse(400, "invalid_mapping", "Each mapping needs a non-empty 'from'");
         }
@@ -137,9 +143,11 @@ export async function handleProviderSettingsRoutes(context: AdminRouteContext): 
           note: typeof m.note === "string" && m.note.trim() ? m.note.trim() : undefined,
         });
       }
-      opts.config.modelMappings = cleaned;
-      // Persist
-      await persistConfig(opts.config, opts.configPath);
+      await withConfigUpdate(opts.config, opts.configPath, async (draft, save) => {
+        draft.modelMappings = cleaned;
+        await save(draft);
+        opts.config.modelMappings = cleaned;
+      });
       appendLog("info", `Model mappings updated (${cleaned.length} mapping(s))`);
       return jsonResp({ ok: true, mappings: cleaned });
     } catch (err) {
@@ -173,7 +181,7 @@ export async function handleProviderSettingsRoutes(context: AdminRouteContext): 
       const parsed = await readJsonBody<{ models?: unknown }>(req);
       if (!parsed.ok) return parsed.error;
       const body = parsed.body;
-      if (!Array.isArray(body.models)) {
+      if (!isConfigObject(body) || !Array.isArray(body.models)) {
         return errorResponse(400, "invalid_request", "models must be an array of strings");
       }
       const seen = new Set<string>();
@@ -190,8 +198,11 @@ export async function handleProviderSettingsRoutes(context: AdminRouteContext): 
         cleaned.push(id);
       }
       const cfg: ResponsesThinkingConfig = { models: cleaned };
-      opts.config.responsesThinking = cfg;
-      await persistConfig(opts.config, opts.configPath);
+      await withConfigUpdate(opts.config, opts.configPath, async (draft, save) => {
+        draft.responsesThinking = cfg;
+        await save(draft);
+        opts.config.responsesThinking = cfg;
+      });
       appendLog("info", `Responses thinking override updated (${cleaned.length} model(s))`);
       return jsonResp({ ok: true, models: cleaned });
     } catch (err) {
