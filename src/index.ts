@@ -2,7 +2,7 @@
  * Entry point — load config, create auth manager, start proxy server.
  * @see .omo/plans/zcode-proxy.md Task 7
  */
-import { loadConfig } from "./config/loader.js";
+import { loadConfig, DEFAULT_APP_VERSION } from "./config/loader.js";
 import { AuthManager } from "./auth/manager.js";
 import { configuredAuthOptions, createConfiguredAuthManager, resolveConfiguredCredential } from "./auth/selection.js";
 import { createSerialQueue } from "./utils/serial.js";
@@ -396,11 +396,14 @@ async function startServePanel(
 async function serve(configPath: string | undefined, debug: boolean): Promise<void> {
   const path = configPath ?? process.env.ZCODE_PROXY_CONFIG ?? "config.yaml";
   if (ensureConfigFile(path)) {
-    ensureDeviceMidInConfig(path);
     console.log(`Created ${path} from bundled template.`);
     console.log(`Run: zcode-proxy auth login <zai|bigmodel>`);
     console.log(`(or start the server and log in from the dashboard at /admin)\n`);
   }
+  // Self-heal EXISTING configs too: pre-deviceMid configs boot without an
+  // X-Device-Mid (billing preview → 3001, balance → HTTP 400) and old
+  // templates pin an appVersion the billing campaign list no longer serves.
+  ensureIdentitySelfHeal(path);
   const config = loadConfig(path);
 
   const panelSettings = resolvePanelSettings();
@@ -775,8 +778,9 @@ async function claimCommand(args: string[]): Promise<void> {
     process.exit(1);
   }
   // The billing gateway requires a stable X-Device-Mid — self-heal configs
-  // created before the deviceMid feature (idempotent: reuses existing value).
-  ensureDeviceMidInConfig(path);
+  // created before the deviceMid feature (idempotent: reuses existing value),
+  // and refresh a template-era appVersion pin (campaign list gate).
+  ensureIdentitySelfHeal(path);
   const config = loadConfig(path);
   try {
     const { runClaimCli } = await import("./claim/runtime.js");
@@ -798,7 +802,7 @@ async function quotaCommand(): Promise<void> {
     console.error(`Config file not found: ${path} (run serve once or create it).`);
     process.exit(1);
   }
-  ensureDeviceMidInConfig(path);
+  ensureIdentitySelfHeal(path);
   const config = loadConfig(path);
   try {
     const { collectQuotaSnapshot } = await import("./server/routes-quota.js");
@@ -1067,6 +1071,7 @@ function ensureConfigWithDeviceMid(): string {
   if (ensureConfigFile(path)) {
     console.log(`Created ${path} from bundled template.`);
   }
+  ensureIdentitySelfHeal(path);
   return ensureDeviceMidInConfig(path);
 }
 
@@ -1104,6 +1109,67 @@ export function ensureDeviceMidInConfig(path: string): string {
   atomicWriteFileSync(path, updated);
   console.log(`Device identity generated: ${mid.slice(0, 8)}… (stored in ${path})`);
   return mid;
+}
+
+/**
+ * Compare two dotted numeric version strings: true when `a` sorts strictly
+ * below `b`. Non-numeric segments (a hand-edited value like "beta") make the
+ * comparison fail safe — the value is treated as NOT stale and left alone.
+ */
+function isVersionOlderThan(a: string, b: string): boolean {
+  const parse = (v: string): number[] | null => {
+    const parts = v.trim().split(".").map((p) => Number(p));
+    return parts.length > 0 && parts.every((p) => Number.isInteger(p) && p >= 0) ? parts : null;
+  };
+  const pa = parse(a);
+  const pb = parse(b);
+  if (!pa || !pb) return false;
+  const len = Math.max(pa.length, pb.length);
+  for (let i = 0; i < len; i++) {
+    const x = pa[i] ?? 0;
+    const y = pb[i] ?? 0;
+    if (x !== y) return x < y;
+  }
+  return false;
+}
+
+/**
+ * Refresh a stale `identity.appVersion` pin in a YAML config (comments
+ * preserved): releases before v4.7.x wrote their template-era version into
+ * the config, and the billing gateway gates the claimable-plan list (and
+ * start-plan activation) on `app_version` — a stale pin hides every campaign
+ * even when the request is otherwise well-formed. Only upgrades values that
+ * are numerically OLDER than the current default; newer or custom non-numeric
+ * overrides are preserved. Function-local regexes: same boot-order constraint
+ * as ensureDeviceMidInConfig. Idempotent.
+ */
+function bumpStaleAppVersionInConfig(path: string): void {
+  const appVersionLine = /^([ \t]*)appVersion:[ \t]*(")?([^"\r\n]*)(")?[ \t]*$/m;
+  const raw = readFileSync(path, "utf-8");
+  const match = appVersionLine.exec(raw);
+  if (!match) return; // absent → the loader default already applies
+  const value = (match[3] ?? "").trim().replace(/^"|"$/g, "").trim();
+  if (!value || !isVersionOlderThan(value, DEFAULT_APP_VERSION)) return;
+  const updated = raw.replace(appVersionLine, `${match[1]}appVersion: "${DEFAULT_APP_VERSION}"`);
+  atomicWriteFileSync(path, updated);
+  console.log(`identity.appVersion updated: ${value} -> ${DEFAULT_APP_VERSION} (billing gates campaign visibility on app_version)`);
+}
+
+/**
+ * Self-heal the identity block of an EXISTING config on every boot:
+ *   1. deviceMid — releases before the deviceMid feature only generated one
+ *      when the config file was first created, so configs written earlier
+ *      never gained one. The billing gateway then requires a UUID
+ *      `X-Device-Mid` on authenticated billing calls: preview answers
+ *      {"code":3001,"msg":"parameter error"} and balance a bare HTTP 400
+ *      (same envelope, unparsed) — "权益领取不了 / 免费套餐刷不出来".
+ *   2. appVersion — old templates pinned their era's version (see
+ *      bumpStaleAppVersionInConfig).
+ * Idempotent; safe to call on every serve/TUI/CLI entry point.
+ */
+export function ensureIdentitySelfHeal(path: string): void {
+  ensureDeviceMidInConfig(path);
+  bumpStaleAppVersionInConfig(path);
 }
 
 async function authLogout(): Promise<void> {

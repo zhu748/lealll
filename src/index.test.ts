@@ -6,7 +6,8 @@ import { describe, it, expect, afterEach } from "bun:test";
 import { writeFileSync, readFileSync, rmSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { parseServeArgs, applyAndroidIdentityDefaults, ensureDeviceMidInConfig } from "./index.js";
+import { parseServeArgs, applyAndroidIdentityDefaults, ensureDeviceMidInConfig, ensureIdentitySelfHeal } from "./index.js";
+import { DEFAULT_APP_VERSION } from "./config/loader.js";
 import { buildIdentityHeaders } from "./proxy/identity.js";
 
 const IDENTITY_ENV_KEYS = [
@@ -163,5 +164,64 @@ other: 1
     const mid = ensureDeviceMidInConfig(p);
     const h = buildIdentityHeaders({ appVersion: "3.8.1", sourceTitle: "cli", refererOrigin: "https://zcode.z.ai", deviceMid: mid });
     expect(h["X-Device-Mid"]).toBe(mid);
+  });
+});
+
+describe("ensureIdentitySelfHeal", () => {
+  afterEach(() => {
+    rmSync(MID_TMP, { recursive: true, force: true });
+  });
+
+  it("fills a missing deviceMid AND bumps a template-era appVersion in one pass", () => {
+    const p = writeConfig(`identity:
+  appVersion: "3.9.2"
+  deviceMid: ""
+`);
+    ensureIdentitySelfHeal(p);
+    const after = readFileSync(p, "utf-8");
+    expect(after).toContain(`appVersion: "${DEFAULT_APP_VERSION}"`);
+    expect(after).toMatch(/deviceMid: "[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"/);
+  });
+
+  it("appends an identity block for pre-identity configs and bumps the pin", () => {
+    const p = writeConfig(`server:
+  port: 8080
+`);
+    ensureIdentitySelfHeal(p);
+    const after = readFileSync(p, "utf-8");
+    expect(after).toContain(`identity:\n  deviceMid: "`);
+    expect(after).not.toContain("appVersion"); // absent pin → loader default, nothing injected
+  });
+
+  it("preserves a NEWER or custom appVersion pin", () => {
+    const p = writeConfig(`identity:
+  appVersion: "99.0.0"
+  deviceMid: "0f1e2d3c-4b5a-4978-8796-a5b4c3d2e1f0"
+`);
+    const before = readFileSync(p, "utf-8");
+    ensureIdentitySelfHeal(p);
+    expect(readFileSync(p, "utf-8")).toBe(before);
+  });
+
+  it("preserves non-numeric custom values (fail-safe)", () => {
+    const p = writeConfig(`identity:
+  appVersion: "my-custom-build"
+  deviceMid: "0f1e2d3c-4b5a-4978-8796-a5b4c3d2e1f0"
+`);
+    const before = readFileSync(p, "utf-8");
+    ensureIdentitySelfHeal(p);
+    expect(readFileSync(p, "utf-8")).toBe(before);
+  });
+
+  it("is idempotent — a second pass changes nothing", () => {
+    const p = writeConfig(`identity:
+  appVersion: "3.10.0"
+  deviceMid: ""
+`);
+    ensureIdentitySelfHeal(p);
+    const once = readFileSync(p, "utf-8");
+    ensureIdentitySelfHeal(p);
+    expect(readFileSync(p, "utf-8")).toBe(once);
+    expect(once).toContain(`appVersion: "${DEFAULT_APP_VERSION}"`);
   });
 });

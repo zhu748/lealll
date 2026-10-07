@@ -43,11 +43,13 @@ const ZCODE_PLAN_BASE = "https://zcode.z.ai/api/v1/zcode-plan";
 // 2026-07-04: entitlement is now probed via billing/balance first. Activation
 // is irreversible, so the version only matters on the first successful query.
 //
-// v0.3.1: kept in lock-step with config/loader.ts DEFAULTS.APP_VERSION (3.9.2,
-// released 2026-08-26). This constant is only the LAST-resort fallback when a
-// caller passes neither a version nor an identity — every production caller
-// threads config.identity through, so the wire value tracks the config default.
-const DEFAULT_APP_VERSION = "3.9.2";
+// v0.3.1: kept in lock-step with config/loader.ts DEFAULTS.APP_VERSION (3.14.4,
+// released 2026-09-29 — the version the billing campaign list actually serves;
+// older values get an empty claimable-plan list). This constant is only the
+// LAST-resort fallback when a caller passes neither a version nor an identity —
+// every production caller threads config.identity through, so the wire value
+// tracks the config default.
+const DEFAULT_APP_VERSION = "3.14.4";
 const REQUEST_TIMEOUT_MS = 15_000;
 const MAX_QUOTA_JSON_BYTES = 2 * 1024 * 1024;
 const MAX_TIMER_MS = 2_147_483_647;

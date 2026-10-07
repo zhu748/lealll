@@ -19,7 +19,9 @@
 import os from "node:os";
 import { randomUUID, createHash } from "node:crypto";
 import { resolveConfiguredCredential } from "../auth/selection.js";
-import { fetchJsonWithDeadline, JsonHttpError } from "../utils/fetch-json.js";
+import { JsonHttpError } from "../utils/fetch-json.js";
+import { readJsonLimited } from "../auth/quota.js";
+import { hostSetTimeout, hostClearTimeout } from "../utils/host-timers.js";
 import { proxiedFetch } from "../proxy/proxied-fetch.js";
 import { loadCredential } from "../auth/store.js";
 import { buildIdentityHeaders, normalizePrintableHeaderValue } from "../proxy/identity.js";
@@ -118,17 +120,37 @@ export interface QuotaSnapshot {
   errors: string[];
 }
 
-/** Query one billing/monitor URL, tolerating per-endpoint failures. */
+/** Per-call timeout + byte cap for billing envelope fetches. */
+const BILLING_TIMEOUT_MS = 15_000;
+const BILLING_MAX_BYTES = 1024 * 1024;
+
 async function fetchBilling(
   origin: string,
   path: string,
   headers: Record<string, string>,
   fetchImpl: typeof fetch,
 ): Promise<{ code?: number; msg?: string; data?: unknown; success?: unknown } | null> {
+  const url = `${origin.replace(/\/+$/, "")}${path}`;
+  const controller = new AbortController();
+  const timer = hostSetTimeout(() => controller.abort(), BILLING_TIMEOUT_MS);
+  timer.unref?.();
   try {
-    return await fetchJsonWithDeadline(`${origin.replace(/\/+$/, "")}${path}`, { headers }, fetchImpl);
+    const resp = await fetchImpl(url, { headers, signal: controller.signal });
+    if (resp.ok) {
+      return await readJsonLimited(resp, BILLING_MAX_BYTES, BILLING_TIMEOUT_MS, controller.signal);
+    }
+    // The billing plane answers errors with a JSON envelope (e.g. HTTP 400 +
+    // {"code":3001,"msg":"parameter error"}). The generic fetchJsonWithDeadline
+    // throws before reading the body, which masked every 3001 as an opaque
+    // "HTTP 400" in the TUI/panel — surface the real code/msg instead.
+    const errEnvelope = await readJsonLimited(resp, BILLING_MAX_BYTES, BILLING_TIMEOUT_MS, controller.signal).catch(() => null);
+    const code = typeof errEnvelope?.code === "number" ? errEnvelope.code : resp.status;
+    const msg = typeof errEnvelope?.msg === "string" && errEnvelope.msg.trim() ? errEnvelope.msg.trim() : `HTTP ${resp.status}`;
+    return { code, msg };
   } catch (e) {
     return { code: e instanceof JsonHttpError ? e.status : -1, msg: String(e).slice(0, 120) };
+  } finally {
+    hostClearTimeout(timer);
   }
 }
 
@@ -228,7 +250,10 @@ async function buildQuotaSnapshot(config: ProxyConfig, cred: Credential, fetchIm
   // gets its monitor-plane limits below instead of a dead snapshot.
   const cOrigin = codingOrigin(config, cred.provider);
   const [balance, preview, cEnvelope, mcpUsage, subscriptionAvailability] = await Promise.all([
-    cred.jwt ? fetchBilling(origin, `/api/v1/zcode-plan/billing/balance?app_version=${encodeURIComponent(appVersion)}&platform=${encodeURIComponent(platform)}`, headers, fetchImpl) : null,
+    // billing/balance carries app_version ONLY on the 3.14.4 client
+    // (buildZaiStartPlanBalanceUrl); the extra &platform= the older snapshot
+    // sent is a fingerprint mismatch against that bundle.
+    cred.jwt ? fetchBilling(origin, `/api/v1/zcode-plan/billing/balance?app_version=${encodeURIComponent(appVersion)}`, headers, fetchImpl) : null,
     cred.jwt ? fetchBilling(origin, `/api/v1/zcode-plan/billing/preview?app_version=${encodeURIComponent(appVersion)}&platform=${encodeURIComponent(platform)}`, headers, fetchImpl) : null,
     cOrigin ? fetchBilling(cOrigin, "/api/monitor/usage/quota/limit", { authorization: credentialString(cred), accept: "application/json" }, fetchImpl) : null,
     config.mcp.usageEnabled === false ? null : fetchMcpUsage(cred, { origin, fetchImpl, identity }).catch(() => null),

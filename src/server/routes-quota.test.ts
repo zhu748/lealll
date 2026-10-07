@@ -176,12 +176,15 @@ describe("collectQuotaSnapshot fingerprint", () => {
       expect(snap.errors).toEqual([]);
       for (const c of billing) {
         const url = new URL(c.url);
-        expect(url.searchParams.get("platform")).toBe(expected);
-        expect(url.searchParams.get("app_version")).toBe("test-1.0.0");
         expect(c.headers["X-Platform"]).toBe(expected);
+        expect(url.searchParams.get("app_version")).toBe("test-1.0.0");
       }
+      // 3.14.4 parity: balance carries app_version ONLY (buildZaiStartPlanBalanceUrl);
+      // preview keeps app_version + platform (getManualClaimPlanPreviews).
       expect(billing[0].url).toContain("/billing/balance?");
+      expect(new URL(billing[0].url).searchParams.get("platform")).toBeNull();
       expect(billing[1].url).toContain("/billing/preview?");
+      expect(new URL(billing[1].url).searchParams.get("platform")).toBe(expected);
       // Coding plane mirror: bundle `wK` origin + `md` single raw-key header.
       expect(monitor[0].url).toBe("https://api.z.ai/api/monitor/usage/quota/limit");
       expect(monitor[0].headers["authorization"]).toBe("key-x.secret-y");
@@ -191,15 +194,17 @@ describe("collectQuotaSnapshot fingerprint", () => {
     });
   });
 
-  it("valid overrides → billing calls use the overridden fingerprint (coding plane unaffected)", async () => {
+  it("valid overrides → billing headers use the overridden fingerprint (coding plane unaffected)", async () => {
     await withEnv({ ZCODE_IDENTITY_PLATFORM: "linux", ZCODE_IDENTITY_ARCH: "x64" }, async () => {
       const { fetchImpl, calls } = makeBillingFetch();
       await collectQuotaSnapshot(makeConfig(), fetchImpl, loadFake);
       for (const c of planeCalls(calls, "billing")) {
-        const url = new URL(c.url);
-        expect(url.searchParams.get("platform")).toBe("linux-x64");
         expect(c.headers["X-Platform"]).toBe("linux-x64");
       }
+      // preview query keeps the overridden platform; balance has no platform param
+      const billing = planeCalls(calls, "billing");
+      expect(new URL(billing[0].url).searchParams.get("platform")).toBeNull();
+      expect(new URL(billing[1].url).searchParams.get("platform")).toBe("linux-x64");
     });
   });
 
@@ -208,8 +213,15 @@ describe("collectQuotaSnapshot fingerprint", () => {
       const { fetchImpl, calls } = makeBillingFetch();
       await collectQuotaSnapshot(makeConfig(), fetchImpl, loadFake);
       const expected = `${process.platform}-${os.arch()}`;
-      for (const c of planeCalls(calls, "billing")) {
-        expect(new URL(c.url).searchParams.get("platform")).toBe(expected);
+      // buildIdentityHeaders omits X-Platform entirely when either part is
+      // non-printable (bundle behavior) — the regression being guarded here is
+      // the URL param: it must never become "-x64" or "linux-".
+      const billing = planeCalls(calls, "billing");
+      expect(new URL(billing[1].url).searchParams.get("platform")).toBe(expected);
+      for (const c of billing) {
+        const p = c.headers["X-Platform"];
+        if (p !== undefined) expect(p).toBe(expected);
+        else expect(p).toBeUndefined();
       }
     });
   });
@@ -228,6 +240,26 @@ describe("collectQuotaSnapshot fingerprint", () => {
     const snap = await collectQuotaSnapshot(makeConfig(), fetchImpl, loadFake);
     expect(snap.errors.length).toBe(2);
     expect(snap.errors[0]).toContain("3012");
+  });
+
+  it("HTTP 400 + 3001 error envelope surfaces the real code/msg (was an opaque 'HTTP 400')", async () => {
+    // Live-observed: the gateway answers missing X-Device-Mid with HTTP 400 +
+    // {"code":3001,"msg":"parameter error"} — fetchJsonWithDeadline threw before
+    // reading that body, so the TUI showed "balance: 400 Error: HTTP 400".
+    const transport = (async (input: RequestInfo | URL) => {
+      const u = String(input);
+      if (u.includes("/api/v1/zcode-plan/billing/")) {
+        return new Response(JSON.stringify({ code: 3001, msg: "parameter error", logid: "x" }), { status: 400 });
+      }
+      if (u.includes("/api/monitor/usage/quota/limit")) {
+        return Response.json({ code: 0, msg: "ok", data: { level: "max", limits: [] } });
+      }
+      return Response.json({ code: 0, data: {} });
+    }) as unknown as typeof fetch;
+    const snap = await collectQuotaSnapshot(makeConfig(), transport, loadFake);
+    expect(snap.errors.length).toBe(2);
+    expect(snap.errors[0]).toBe("balance: 3001 parameter error");
+    expect(snap.errors[1]).toBe("preview: 3001 parameter error");
   });
 });
 

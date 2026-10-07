@@ -24,7 +24,7 @@ import { KeyResolver } from "../auth/resolver.js";
 import { openBrowser } from "../runtime/open-browser.js";
 import { pasteLoginInstructions, readPastedLine, boldIfTTY } from "../runtime/paste-login.js";
 import { isGuestOriginError, describeGuestError } from "../runtime/guest-error.js";
-import { ensureDeviceMidInConfig, VERSION, type ServeArgs } from "../index.js";
+import { ensureIdentitySelfHeal, VERSION, type ServeArgs } from "../index.js";
 import { collectQuotaSnapshot, type QuotaSnapshot } from "../server/routes-quota.js";
 import { appendFileSync } from "node:fs";
 import type { ProxyConfig } from "../config/types.js";
@@ -54,9 +54,12 @@ export async function runTui(args: ServeArgs): Promise<void> {
   let config: ProxyConfig;
   try {
     if (ensureConfigFile(path)) {
-      ensureDeviceMidInConfig(path);
       process.stderr.write(`Created ${path} from bundled template.\n`);
     }
+    // Self-heal EXISTING configs too: pre-deviceMid configs boot without an
+    // X-Device-Mid (billing preview → 3001, balance → HTTP 400) and old
+    // templates pin an appVersion the billing campaign list no longer serves.
+    ensureIdentitySelfHeal(path);
     config = loadConfig(path);
   } catch (err) {
     process.stderr.write(`zcode-proxy: config error: ${(err as Error).message}\n`);
