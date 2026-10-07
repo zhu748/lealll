@@ -1,5 +1,15 @@
 # zcode-proxy 使用说明
 
+> **v4.8.0-fork.1 — 默认套餐切换为 Start（免费层）+ 计费面自愈修复**
+>
+> - 默认套餐由 coding-plan 改为 **start-plan**：未指定 plan 的配置、CLI `auth login`、管理后台 OAuth 登录、TUI 与 Android 登录现在都默认走 zcode.z.ai 的 Start 免费套餐面（登录会捕获 JWT，正好是 start-plan 面所需的凭证）。需要 coding-plan 的用户在登录时显式传 `--plan=coding-plan` 或在下拉中选择即可。
+> - 计费面自愈：修复「权益领取不了 / 免费套餐刷不出来」——配置与环境变量都没有 `identity.deviceMid` 时（只读文件系统、env-only 部署），billing/balance、billing/preview、billing/claim 不再因缺 `X-Device-Mid` 而报 biz 3001 / HTTP 400，自动回退到进程级临时设备 ID（stderr 有一次性提示，建议在 config.yaml 固定 `identity.deviceMid`）。
+> - 配额探测修复：管理后台对「有 JWT 但无 plan 字段」的导入凭证自动按 start-plan 查询免费套餐余额，不再误走 coding-plan 配额面报「当前用户不存在coding plan」。
+> - 安全兜底：API Key 模式与手动添加的 Key（无 JWT）自动保持 coding-plan 标签；存量误标 start-plan 且无 JWT 的凭证在请求期降级到 coding-plan，避免整站 401。
+> - `claim`（周末活动领取）与闲时 `/async/*` 通道不受影响；闲时通道为 coding-plan 专属，默认 start-plan 下按需显式开启 config。
+>
+> 升级建议：桌面端替换对应平台压缩包，Android 安装新版 APK，或更新 Docker 镜像。现有配置与凭证格式保持兼容；已有账号可在后台账号表随时切换 plan。Release 压缩包、APK 和 Docker 镜像由 GitHub Actions 自动构建并发布。
+
 > **v4.7.9-fork.1 — 性能、代码结构与 Android 可用性优化**
 >
 > - 优化代理池选择、账号统计和 SSE 流式处理，减少热路径的重复扫描与内存分配；保留代理轮换、事件边界和客户端取消行为。
