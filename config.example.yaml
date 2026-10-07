@@ -70,6 +70,21 @@ models:
   - glm-5.3
   - glm-5.3-flash
 
+# System-prompt edits, applied in order on both plans after prompt assembly.
+# Omit rules to load the three built-in Claude Code rules. Set rules: [] to
+# keep no rules; enabled: false bypasses edits while preserving the comparison.
+# Dashboard: Global Settings > Prompt (hot-applied on save).
+promptRewrite:
+  enabled: true
+  # rules:
+  #   - id: custom-rule
+  #     name: Custom system text
+  #     enabled: true
+  #     action: replace       # replace | delete
+  #     matchMode: text       # text | line (one keyword per line)
+  #     match: "old text"
+  #     replacement: "new text"
+
 # Configurable identity headers injected on every upstream request to mimic the
 # ZCode desktop client (User-Agent, X-ZCode-App-Version, X-Title,
 # X-ZCode-Agent, HTTP-Referer). Runtime platform headers (X-Platform,

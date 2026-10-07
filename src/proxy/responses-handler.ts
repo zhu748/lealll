@@ -21,6 +21,10 @@ import { SSEFramer } from "../utils/sse-framer.js";
  * `responses/store.ts`.
  */
 import { transformParsedBody } from "./body-transformer.js";
+import { defaultPromptRewriteConfig } from "../config/prompt-rewrite.js";
+import { captureSystemPrompt, type PromptRewriteResult } from "./prompt-rewrite.js";
+import { beginPromptObservation, recordPromptDispatch } from "./prompt-observation.js";
+import { nextReqId } from "./request-log.js";
 import { getProvider } from "../provider/providers.js";
 import type { ProxyConfig } from "../config/types.js";
 import type { AuthManager } from "../auth/manager.js";
@@ -123,6 +127,10 @@ export async function handleResponses(
   }
 
   const stream = req.stream === true;
+  const promptObservation = beginPromptObservation(opts.config, {
+    id: nextReqId(), model: req.model, format: "responses", receivedAt: start,
+    received: captureSystemPrompt(req as unknown as Record<string, unknown>),
+  });
 
   // ── 2. resolve previous_response_id ──
   let historyItems: ResponsesInputItem[] = [];
@@ -185,6 +193,8 @@ export async function handleResponses(
   const startPlan = currentPlan === "start-plan";
   const upstreamFormat: "openai" | "anthropic" = "anthropic";
   let upstreamRequestBody: string;
+  let promptRewriteResult: PromptRewriteResult | null = null;
+  let upstreamPrompt = captureSystemPrompt(undefined);
   {
     let anthropicReq: AnthropicMessagesRequest;
     try {
@@ -205,7 +215,10 @@ export async function handleResponses(
       metadataUserId: buildAnthropicMetadataUserId(opts.config.identity.deviceMid, undefined),
       startPlan,
       provider: opts.config.provider,
+      promptRewrite: opts.config.promptRewrite ?? defaultPromptRewriteConfig(),
+      onPromptRewrite: (result) => { promptRewriteResult = result; },
     }) ?? JSON.stringify(anthropicReq);
+    upstreamPrompt = captureSystemPrompt(anthropicReq as unknown as Record<string, unknown>);
   }
   const transformedBody = upstreamRequestBody;
 
@@ -266,6 +279,7 @@ export async function handleResponses(
           headerDebugRecorded = true;
           recordHeaders(clientReq, req, "responses", "openai-responses", transformedBody, rawBody);
         }
+        recordPromptDispatch(opts.config, promptObservation, upstreamPrompt, promptRewriteResult);
         return egressFetch(req, { method: "POST", headers: Object.fromEntries(finalPairs), body: transformedBody ?? undefined, signal: clientReq.signal });
       },
     });

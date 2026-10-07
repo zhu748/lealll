@@ -53,6 +53,12 @@ models:
   - glm-5.3
   - glm-5.3-flash
 
+# System-prompt edits. Omit rules to use the three built-in Claude Code rules.
+# Set rules: [] for no rules, or enabled: false to bypass edits.
+# Edit in Global Settings > Prompt; saves apply to the next request.
+promptRewrite:
+  enabled: true
+
 # Configurable identity headers injected on every upstream request to mimic the
 # ZCode desktop client (User-Agent, X-ZCode-App-Version, X-Title,
 # X-ZCode-Agent, HTTP-Referer). Runtime platform headers (X-Platform,

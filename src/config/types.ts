@@ -346,6 +346,22 @@ export interface ClientSigningConfig {
   origin: string;
 }
 
+export interface PromptRewriteRule {
+  id: string;
+  name: string;
+  enabled: boolean;
+  action: "replace" | "delete";
+  /** Literal substring, or whole lines containing any newline-separated keyword. */
+  matchMode: "text" | "line";
+  match: string;
+  replacement: string;
+}
+
+export interface PromptRewriteConfig {
+  enabled: boolean;
+  rules: PromptRewriteRule[];
+}
+
 /** Top-level proxy configuration. */
 export interface ProxyConfig {
   server: {
@@ -460,6 +476,8 @@ export interface ProxyConfig {
   routingRules?: RoutingRule[];
   /** Client model id → GLM model id rewrite table (fork dashboard). Empty by default. */
   modelMappings?: ModelMapping[];
+  /** Ordered system-prompt edits. Dashboard saves apply to the next request. */
+  promptRewrite?: PromptRewriteConfig;
   /** Force-enable thinking on /v1/responses for specific models (fork dashboard). */
   responsesThinking?: ResponsesThinkingConfig;
   /**

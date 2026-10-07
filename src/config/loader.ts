@@ -5,6 +5,7 @@
 import { readFileSync, existsSync } from "node:fs";
 import { parse } from "yaml";
 import type { ClientIdentityConfig, ProxyConfig, ProviderEndpoints, ProxyIdentity, ResponsesConfig, McpConfig, AsyncConfig, EndpointRoutingConfig, ClientSigningConfig, ClaimConfig, RetryConfig, RoutingRule, ModelMapping, ResponsesThinkingConfig, ClientConfigConfig, SubscriptionConfig } from "./types.js";
+import { normalizePromptRewriteConfig } from "./prompt-rewrite.js";
 
 /** Environment variable keys that override YAML values. */
 const ENV = {
@@ -274,6 +275,7 @@ export function loadConfig(path: string): ProxyConfig {
     modelMappings,
     responsesThinking,
     thinkingLevel,
+    promptRewrite: normalizePromptRewriteConfig(parsed?.promptRewrite),
   };
 
   validate(config);

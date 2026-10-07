@@ -1,11 +1,11 @@
 {
   "name": "zcode-proxy",
-  "version": "4.8.1-fork.1",
+  "version": "4.8.2-fork.1",
   "type": "module",
   "scripts": {
     "dev": "bun run src/index.ts",
     "start": "bun run src/index.ts",
-    "test": "bun test",
+    "test": "bun run test:offline",
     "test:offline": "TZ=UTC bun test --preload ./scripts/test-local-only.ts",
     "typecheck": "tsc --noEmit",
     "build": "bun run scripts/build-fork-worker.ts && bun build --compile --define \"require.resolve=undefined\" src/index.ts --outfile zcode-proxy.exe",

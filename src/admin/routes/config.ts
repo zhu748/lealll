@@ -1,4 +1,5 @@
 import type { ProxyConfig, RetryConfig } from "../../config/types.js";
+import { normalizePromptRewriteConfig } from "../../config/prompt-rewrite.js";
 import { errorResponse } from "../../proxy/translated-response.js";
 import { synchronizeActiveCredential } from "../account-actions.js";
 import {
@@ -50,6 +51,7 @@ export async function handleConfigRoutes(context: AdminRouteContext): Promise<Re
       const loggingBody = optionalConfigObject(body, "logging");
       const providersBody = optionalConfigObject(body, "providers");
       const claimBody = optionalConfigObject(body, "claim");
+      const promptRewriteBody = optionalConfigObject(body, "promptRewrite");
       if (hasModels && !Array.isArray(body.models)) {
         throw new Error("models must be an array");
       }
@@ -90,6 +92,11 @@ export async function handleConfigRoutes(context: AdminRouteContext): Promise<Re
       }
       if (identityBody) {
         newConfig.identity = { ...opts.config.identity, ...identityBody };
+      }
+      if (promptRewriteBody) {
+        newConfig.promptRewrite = normalizePromptRewriteConfig({
+          ...(opts.config.promptRewrite ?? normalizePromptRewriteConfig(undefined)), ...promptRewriteBody,
+        });
       }
       // Deep-merge the claim section the same way as retry/identity — without
       // this a partial PUT like {"claim":{"planId":"x"}} would drop
@@ -205,6 +212,7 @@ export async function handleConfigRoutes(context: AdminRouteContext): Promise<Re
       opts.config.retry = newConfig.retry;
       opts.config.routingRules = newConfig.routingRules;
       opts.config.modelMappings = newConfig.modelMappings;
+      if (promptRewriteBody) opts.config.promptRewrite = newConfig.promptRewrite;
       if (newConfig.responsesThinking) opts.config.responsesThinking = newConfig.responsesThinking;
       // v0.2.0.4: forceStreamAnthropic removed — stream:true is now unconditional.
       if (newConfig.thinkingLevel !== undefined) opts.config.thinkingLevel = newConfig.thinkingLevel === "low" || newConfig.thinkingLevel === "high" ? newConfig.thinkingLevel : "max";
@@ -260,7 +268,7 @@ export async function handleConfigRoutes(context: AdminRouteContext): Promise<Re
         requiresRestart: restartFields.length > 0,
         restartFields,
         // hotApplied: fields that were applied to the live config without restart
-        hotApplied: ["provider", "plan", "defaultModel", "models", "identity", "logging", "retry", "routingRules", "modelMappings", "responsesThinking", "thinkingLevel", ...(authBody ? ["auth"] : []), ...(hasCorsAllowList ? ["corsAllowList"] : []), ...(providersBody ? ["providers"] : []), ...(newServer ? ["server"] : [])],
+        hotApplied: ["provider", "plan", "defaultModel", "models", "identity", "logging", "retry", "routingRules", "modelMappings", "responsesThinking", "thinkingLevel", ...(promptRewriteBody ? ["promptRewrite"] : []), ...(authBody ? ["auth"] : []), ...(hasCorsAllowList ? ["corsAllowList"] : []), ...(providersBody ? ["providers"] : []), ...(newServer ? ["server"] : [])],
       });
     } catch (err) {
       return errorResponse(500, "save_failed", (err as Error).message);

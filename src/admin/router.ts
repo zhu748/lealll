@@ -8,6 +8,7 @@ import { handleOauthRoutes } from "./oauth.js";
 import { handleQuotaRoutes } from "./quota.js";
 import { handleAccountsRoutes } from "./routes/accounts.js";
 import { handleConfigRoutes } from "./routes/config.js";
+import { handlePromptRewriteRoutes } from "./routes/prompt-rewrite.js";
 import { handleCredentialsRoutes } from "./routes/credentials.js";
 import { handleProviderSettingsRoutes } from "./routes/provider-settings.js";
 import { handleProxyPoolRoutes } from "./routes/proxy-pool.js";
@@ -42,6 +43,7 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
 
 const featureRoutes = new Map<string, AdminRouteHandler>([
   ["config", handleConfigRoutes],
+  ["prompt-rewrite", handlePromptRewriteRoutes],
   ["credentials", handleCredentialsRoutes],
   ["accounts", handleAccountsRoutes],
   ["import", handleCredentialsRoutes],

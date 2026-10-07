@@ -783,6 +783,26 @@ td input{font-family:var(--font-mono)}
 .tab-panel{display:none}
 .tab-panel.active{display:block;animation:fadeIn var(--t)}
 
+/* Prompt editor and recent-request comparison share the settings card layout. */
+.prompt-toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.prompt-toolbar .form-help{margin:0;flex:1;min-width:180px}
+.prompt-rule{border:1px solid var(--border);border-radius:var(--r-md);padding:16px;margin-top:14px;background:var(--bg-elev);min-width:0}
+.prompt-rule-head{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+.prompt-rule-head input[type="text"]{flex:1;min-width:140px}
+.prompt-rule-fields{display:grid;grid-template-columns:1fr 1fr;gap:14px;min-width:0}
+.prompt-rule-fields .form-group{min-width:0;margin-bottom:0}
+.prompt-rule textarea{font-family:var(--font-mono);font-size:12px;min-height:86px;resize:vertical}
+.prompt-rule-status{font-size:12px;color:var(--text-3);margin-top:10px;overflow-wrap:anywhere}
+.prompt-compare{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:16px;margin-top:16px}
+.prompt-compare-pane{min-width:0}
+.prompt-compare-head{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px;font-size:13px;font-weight:600}
+.prompt-compare pre{margin:0;padding:14px;min-height:180px;max-height:520px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px;line-height:1.7;font-family:var(--font-mono);color:var(--text-2);border:1px solid var(--border);border-radius:var(--r-md);background:var(--bg-elev)}
+.prompt-meta{display:flex;gap:8px 16px;flex-wrap:wrap;color:var(--text-3);font-size:12px;margin-top:10px}
+.prompt-hits{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
+#page-settings:has(.tab-panel[data-panel="prompt"].active)>.action-bar{display:none}
+@media(max-width:900px){.prompt-compare{grid-template-columns:1fr}.prompt-compare pre{max-height:360px}}
+@media(max-width:600px){.prompt-rule-fields{grid-template-columns:1fr}.prompt-rule{padding:12px}.prompt-rule-head{gap:8px}.prompt-rule-head input[type="text"]{width:100%;flex-basis:100%}.prompt-toolbar .btn{flex:1}}
+
 /* ============================================================
    Code Block / Misc
    ============================================================ */
@@ -1390,6 +1410,7 @@ td input{font-family:var(--font-mono)}
           <button class="tab" data-tab="models"><span class="tab-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></svg></span>模型</button>
           <button class="tab" data-tab="retry"><span class="tab-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg></span>重试</button>
           <button class="tab" data-tab="identity"><span class="tab-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg></span>身份</button>
+          <button class="tab" data-tab="prompt"><span class="tab-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16v12H8l-4 4V4z"/><path d="M8 8h8M8 12h5"/></svg></span>提示词</button>
           <button class="tab" data-tab="logs-cfg"><span class="tab-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/></svg></span>日志</button>
         </div>
 
@@ -1532,6 +1553,55 @@ td input{font-family:var(--font-mono)}
                 <label class="form-label">Referer Origin</label>
                 <input id="cfgReferer">
                 <div class="form-help">请求上游时携带的 Referer 头部 origin</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Tab: Prompt -->
+        <div class="tab-panel" data-panel="prompt">
+          <div class="card">
+            <div class="card-header">
+              <div class="card-title">系统提示词替换与删除</div>
+              <label class="switch" title="启用提示词规则"><input type="checkbox" id="promptRewriteEnabled" aria-label="启用提示词替换与删除" checked disabled><span class="slider"></span></label>
+            </div>
+            <div class="card-body">
+              <div class="prompt-toolbar">
+                <div class="form-help">按列表顺序处理系统提示词；保存后对下一次请求生效。</div>
+                <button class="btn btn-ghost btn-sm" onclick="addPromptRule()">添加规则</button>
+                <button class="btn btn-ghost btn-sm" onclick="restorePromptDefaults()">恢复默认规则</button>
+              </div>
+              <div id="promptRuleList"><div class="form-help">打开页签后加载规则…</div></div>
+              <div class="prompt-toolbar" style="margin-top:18px">
+                <button class="btn btn-primary" onclick="savePromptSettings()">保存提示词规则</button>
+                <button class="btn btn-ghost" onclick="loadPromptSettings(true)">重新加载规则</button>
+                <span class="form-help" id="promptDraftState" role="status">规则已保存</span>
+              </div>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-header">
+              <div class="card-title">最近一次系统提示词对照</div>
+              <div class="prompt-toolbar">
+                <button class="btn btn-ghost btn-sm" onclick="refreshPromptObservation()">刷新对照</button>
+                <button class="btn btn-ghost btn-sm" onclick="clearPromptPreview()">清空记录</button>
+              </div>
+            </div>
+            <div class="card-body">
+              <div id="promptObservationSummary" role="status" class="form-help">等待代理收到请求。对照仅保留最近一次，重启后清空。</div>
+              <div id="promptObservationMeta" class="prompt-meta"></div>
+              <div id="promptObservationHits" class="prompt-hits"></div>
+              <div class="prompt-compare">
+                <div class="prompt-compare-pane">
+                  <div class="prompt-compare-head"><span>客户端发来的系统提示词</span><button class="btn btn-ghost btn-sm" onclick="copyPromptPreview('received')">复制</button></div>
+                  <pre id="promptReceivedText">暂无请求</pre>
+                  <div class="form-help" id="promptReceivedSize"></div>
+                </div>
+                <div class="prompt-compare-pane">
+                  <div class="prompt-compare-head"><span>实际发给上游的系统提示词</span><button class="btn btn-ghost btn-sm" onclick="copyPromptPreview('upstream')">复制</button></div>
+                  <pre id="promptUpstreamText">暂无请求</pre>
+                  <div class="form-help" id="promptUpstreamSize"></div>
+                </div>
               </div>
             </div>
           </div>
@@ -2613,6 +2683,7 @@ function doLogout(){
   clearLogRenderTimer();
   clearLogFilterTimer();
   invalidateConfigSnapshot();
+  resetPromptPanel();
   clearProxyPoolPollTimer();
   clearProxyPoolProgressHideTimer();
   invalidateProxyPoolLoads();
@@ -2721,6 +2792,7 @@ document.querySelectorAll('#settingsTabs .tab').forEach(tab=>{
     document.querySelectorAll('#page-settings .tab-panel').forEach(p=>p.classList.remove('active'));
     tab.classList.add('active');
     document.querySelector(`#page-settings .tab-panel[data-panel="${tab.dataset.tab}"]`).classList.add('active');
+    if(tab.dataset.tab==='prompt')loadPromptSettings();
   });
 });
 
@@ -2948,6 +3020,167 @@ function formatDurationMs(ms){
   const m=Math.floor(s/60),ss=s%60;
   if(m>=60){const h=Math.floor(m/60);return `${h}h ${String(m%60).padStart(2,'0')}m`}
   return `${m}m ${String(ss).padStart(2,'0')}s`;
+}
+
+// --- Prompt rules (independent drafts; refreshing the comparison never reloads edits) ---
+let promptRules=[],promptRulesLoaded=false,promptDraftDirty=false,promptDraftVersion=0;
+let promptDefaults=null,promptLatest=null,promptLoadGeneration=0,promptStatusGeneration=0;
+function promptPanelVisible(){
+  return dashboardCanUpdate()&&document.getElementById('page-settings').classList.contains('active')&&document.querySelector('[data-panel="prompt"]').classList.contains('active');
+}
+function markPromptDraft(){
+  promptDraftDirty=true;promptDraftVersion++;
+  document.getElementById('promptDraftState').textContent='有未保存的修改';
+}
+function promptRuleResultText(rule){
+  if(!rule)return'上次请求未记录此规则';
+  if(!promptLatest?.rewrite?.enabled)return'上次请求：总开关关闭';
+  if(!rule.enabled)return'上次请求：规则关闭';
+  if(rule.error)return'上次请求：'+rule.error;
+  if(!rule.matches)return'上次请求：未命中';
+  return `上次请求：命中 ${rule.matches} 次 · ${rule.changes?'修改 '+rule.changes+' 处':'内容未改变'}`;
+}
+function renderPromptRuleStatuses(){
+  const results=promptLatest?.rewrite?.rules||[];
+  document.querySelectorAll('[data-prompt-status]').forEach(node=>{
+    const rule=results.find(r=>r.id===node.dataset.promptStatus);
+    node.textContent=promptDraftDirty?'草稿：保存后对下一次请求生效':promptRuleResultText(rule);
+  });
+}
+function renderPromptRules(){
+  const list=document.getElementById('promptRuleList');
+  if(!promptRules.length){list.innerHTML='<div class="form-help" style="margin-top:16px">暂无规则，点击「添加规则」或「恢复默认规则」。</div>';return;}
+  list.innerHTML=promptRules.map((rule,index)=>`<div class="prompt-rule" data-prompt-rule="${index}">
+    <div class="prompt-rule-head">
+      <label class="switch" title="启用此规则"><input type="checkbox" data-prompt-field="enabled" aria-label="启用规则 ${index+1}" ${rule.enabled?'checked':''}><span class="slider"></span></label>
+      <input type="text" class="form-input" data-prompt-field="name" aria-label="规则名称 ${index+1}" maxlength="120" value="${escapeHtml(rule.name)}">
+      <button class="btn btn-ghost btn-sm" onclick="movePromptRule(${index},-1)" aria-label="上移规则 ${index+1}" ${index===0?'disabled':''}>↑</button>
+      <button class="btn btn-ghost btn-sm" onclick="movePromptRule(${index},1)" aria-label="下移规则 ${index+1}" ${index===promptRules.length-1?'disabled':''}>↓</button>
+      <button class="btn btn-danger btn-sm" onclick="removePromptRule(${index})">删除规则</button>
+    </div>
+    <div class="prompt-rule-fields">
+      <div class="form-group"><label class="form-label">操作</label><select data-prompt-field="action" aria-label="规则操作 ${index+1}"><option value="replace" ${rule.action==='replace'?'selected':''}>替换为指定文本</option><option value="delete" ${rule.action==='delete'?'selected':''}>删除匹配内容</option></select></div>
+      <div class="form-group"><label class="form-label">匹配方式</label><select data-prompt-field="matchMode" aria-label="匹配方式 ${index+1}"><option value="text" ${rule.matchMode==='text'?'selected':''}>精确文本（可跨多行）</option><option value="line" ${rule.matchMode==='line'?'selected':''}>包含任一关键词的整行</option></select></div>
+      <div class="form-group"><label class="form-label">要匹配的文本</label><textarea data-prompt-field="match" aria-label="匹配文本 ${index+1}" rows="3" maxlength="16384" spellcheck="false">${escapeHtml(rule.match)}</textarea><div class="form-help">整行匹配时，每行填写一个关键词。</div></div>
+      <div class="form-group"><label class="form-label">替换后的文本</label><textarea data-prompt-field="replacement" aria-label="替换文本 ${index+1}" rows="3" maxlength="16384" spellcheck="false" ${rule.action==='delete'?'disabled':''} placeholder="留空表示删除">${escapeHtml(rule.replacement)}</textarea></div>
+    </div>
+    <div class="prompt-rule-status" data-prompt-status="${escapeHtml(rule.id)}"></div>
+  </div>`).join('');
+  renderPromptRuleStatuses();
+}
+document.addEventListener('input',event=>{
+  const target=event.target;
+  if(target.id==='promptRewriteEnabled'){markPromptDraft();return;}
+  const row=target.closest?.('[data-prompt-rule]'),field=target.dataset?.promptField;
+  if(!row||!field)return;
+  const rule=promptRules[Number(row.dataset.promptRule)];
+  if(!rule)return;
+  rule[field]=field==='enabled'?target.checked:target.value;
+  markPromptDraft();
+});
+document.addEventListener('change',event=>{
+  const target=event.target;
+  if(target.id==='promptRewriteEnabled'){markPromptDraft();renderPromptRuleStatuses();return;}
+  const row=target.closest?.('[data-prompt-rule]'),field=target.dataset?.promptField;
+  if(!row||!field)return;
+  const rule=promptRules[Number(row.dataset.promptRule)];
+  if(!rule)return;
+  rule[field]=field==='enabled'?target.checked:target.value;
+  if(rule.action==='delete')rule.replacement='';
+  markPromptDraft();
+  if(field==='action'||field==='matchMode')renderPromptRules();else renderPromptRuleStatuses();
+});
+function addPromptRule(){
+  if(!promptRulesLoaded){toast('请等待规则加载完成','warn');return;}
+  if(promptRules.length>=64){toast('最多添加 64 条规则','warn');return;}
+  promptRules.push({id:'rule-'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,8),name:'新规则',enabled:true,action:'replace',matchMode:'text',match:'',replacement:''});
+  markPromptDraft();renderPromptRules();
+}
+function removePromptRule(index){promptRules.splice(index,1);markPromptDraft();renderPromptRules();}
+function movePromptRule(index,direction){
+  const next=index+direction;if(next<0||next>=promptRules.length)return;
+  [promptRules[index],promptRules[next]]=[promptRules[next],promptRules[index]];
+  markPromptDraft();renderPromptRules();
+}
+function restorePromptDefaults(){
+  if(!promptDefaults){toast('请等待默认规则加载完成','warn');return;}
+  promptRules=structuredClone(promptDefaults.rules);
+  document.getElementById('promptRewriteEnabled').checked=promptDefaults.enabled;
+  markPromptDraft();renderPromptRules();
+}
+async function loadPromptSettings(force=false){
+  const generation=++promptLoadGeneration,draftVersion=promptDraftVersion;
+  const statusGeneration=++promptStatusGeneration;
+  const token=authToken,initGeneration=dashboardInitGeneration;
+  try{
+    const [config,status]=await Promise.all([fetchConfigSnapshot({force}),fetchJsonWithTimeout(API+'/admin/api/prompt-rewrite',{headers:authHeaders()})]);
+    if(generation!==promptLoadGeneration||!dashboardActionCurrent(initGeneration,token))return;
+    promptDefaults=status.defaults;
+    if(statusGeneration===promptStatusGeneration){promptLatest=status.latest;renderPromptObservation();}
+    if(draftVersion!==promptDraftVersion||(promptDraftDirty&&!force))return;
+    const settings=config.promptRewrite||status.defaults;
+    promptRules=structuredClone(settings.rules);promptRulesLoaded=true;promptDraftDirty=false;
+    document.getElementById('promptRewriteEnabled').checked=settings.enabled;
+    document.getElementById('promptRewriteEnabled').disabled=false;
+    document.getElementById('promptDraftState').textContent='规则已保存';renderPromptRules();
+  }catch(e){if(generation===promptLoadGeneration&&dashboardActionCurrent(initGeneration,token))toast(e.message||'加载提示词规则失败','error');}
+}
+async function savePromptSettings(){
+  if(!promptRulesLoaded){toast('请等待规则加载完成','warn');return;}
+  for(const rule of promptRules){
+    if(!rule.name.trim()||!rule.match.trim()){toast('每条规则都需要名称和匹配文本','error');return;}
+  }
+  if(!beginExclusiveAction('promptSave','提示词规则正在保存'))return;
+  const version=promptDraftVersion,token=authToken,initGeneration=dashboardInitGeneration;
+  try{
+    await fetchJsonMutationWithTimeout(API+'/admin/api/config',{method:'PUT',headers:authHeaders(),body:JSON.stringify({promptRewrite:{enabled:document.getElementById('promptRewriteEnabled').checked,rules:promptRules}})});
+    if(!dashboardActionCurrent(initGeneration,token))return;
+    invalidateConfigSnapshot();
+    if(version===promptDraftVersion){promptDraftDirty=false;document.getElementById('promptDraftState').textContent='规则已保存，对下一次请求生效';}
+    toast('提示词规则已保存（已热生效）','success');renderPromptRuleStatuses();
+  }catch(e){if(dashboardActionCurrent(initGeneration,token))toast(e.message||'保存提示词规则失败','error');}
+  finally{endExclusiveAction('promptSave');}
+}
+function renderPromptObservation(){
+  const latest=promptLatest,rewrite=latest?.rewrite;
+  document.getElementById('promptObservationSummary').textContent=!latest?'等待代理收到请求。对照仅保留最近一次，重启后清空。':!latest.sentAt?'已收到请求，尚未发给上游。':!rewrite?.enabled?'替换总开关关闭，此请求未执行规则。':rewrite.modified?`已修改系统提示词 · 命中 ${rewrite.matches} 次 · 修改 ${rewrite.changes} 处`:rewrite.matches?`命中 ${rewrite.matches} 次，最终内容未改变。`:'此请求没有命中提示词规则。';
+  document.getElementById('promptObservationMeta').textContent=latest?`${latest.id} · ${latest.model} · ${latest.format} · 收到于 ${formatTimestamp(latest.receivedAt)}${latest.sentAt?' · 发出于 '+formatTimestamp(latest.sentAt)+' · 发送 '+latest.attempts+' 次':''}`:'';
+  document.getElementById('promptObservationHits').innerHTML=(rewrite?.rules||[]).map(rule=>`<span class="badge ${rule.changes?'badge-success':rule.error?'badge-danger':'badge-muted'}">${escapeHtml(rule.name)} · ${!rewrite.enabled||!rule.enabled?'关闭':rule.error?'跳过':rule.matches?'命中 '+rule.matches+' / 修改 '+rule.changes:'未命中'}</span>`).join('');
+  for(const side of ['received','upstream']){
+    const value=latest?.[side],prefix=side==='received'?'promptReceived':'promptUpstream';
+    document.getElementById(prefix+'Text').textContent=value?(value.text||'（无系统提示词）'):latest?'尚未发给上游':'暂无请求';
+    document.getElementById(prefix+'Size').textContent=value?`${value.blocks} 个文本块 · ${value.chars.toLocaleString()} 字符${value.truncated?' · 仅显示前 128 Ki 字符，实际请求保留全文':''}`:'';
+  }
+  renderPromptRuleStatuses();
+}
+async function refreshPromptObservation(quiet=false){
+  const generation=++promptStatusGeneration,token=authToken,initGeneration=dashboardInitGeneration;
+  try{
+    const status=await fetchJsonWithTimeout(API+'/admin/api/prompt-rewrite',{headers:authHeaders()});
+    if(generation!==promptStatusGeneration||!dashboardActionCurrent(initGeneration,token))return;
+    promptDefaults=status.defaults;promptLatest=status.latest;renderPromptObservation();
+  }catch(e){if(!quiet&&dashboardActionCurrent(initGeneration,token))toast(e.message||'刷新对照失败','error');}
+}
+async function clearPromptPreview(){
+  const token=authToken,initGeneration=dashboardInitGeneration;++promptStatusGeneration;
+  try{
+    await fetchJsonMutationWithTimeout(API+'/admin/api/prompt-rewrite',{method:'DELETE',headers:authHeaders()});
+    if(!dashboardActionCurrent(initGeneration,token))return;
+    promptLatest=null;renderPromptObservation();
+  }catch(e){if(dashboardActionCurrent(initGeneration,token))toast(e.message||'清空记录失败','error');}
+}
+async function copyPromptPreview(side){
+  const text=promptLatest?.[side]?.text;
+  if(!text){toast('暂无可复制的提示词','info');return;}
+  try{if(navigator.clipboard?.writeText){await navigator.clipboard.writeText(text);toast('提示词已复制','success');return;}}catch{}
+  const input=document.createElement('textarea');input.value=text;input.style.position='fixed';input.style.left='-9999px';document.body.appendChild(input);
+  try{input.select();if(!document.execCommand('copy'))throw new Error('复制失败');toast('提示词已复制','success');}
+  catch{toast('无法复制，请手动选择提示词文本','error');}finally{input.remove();}
+}
+function resetPromptPanel(){
+  ++promptLoadGeneration;++promptStatusGeneration;promptRules=[];promptRulesLoaded=false;promptDraftDirty=false;promptDraftVersion++;
+  promptDefaults=null;promptLatest=null;document.getElementById('promptRewriteEnabled').disabled=true;
+  renderPromptRules();renderPromptObservation();
 }
 
 let settingsDirty=false,settingsDraftVersion=0,endpointsDirty=false,endpointsDraftVersion=0;
@@ -4991,6 +5224,7 @@ function invalidateStatsLoads(){
   statsLoadPending=false;
 }
 async function loadStats(){
+  if(promptPanelVisible())void refreshPromptObservation(true);
   if(statsLoadInFlight){statsLoadPending=true;return;}
   statsLoadPending=false;
   const generation=statsLoadGeneration;

@@ -48,6 +48,9 @@ import {
   formatHeaderPairs, formatResponseHeaders, previewBody, type RequestMeta,
 } from "./request-log.js";
 import { errorResponse } from "./translated-response.js";
+import { defaultPromptRewriteConfig } from "../config/prompt-rewrite.js";
+import { captureSystemPrompt, type PromptRewriteResult } from "./prompt-rewrite.js";
+import { beginPromptObservation, recordPromptDispatch } from "./prompt-observation.js";
 
 export { shouldUseOrderedTransport, capOrderedAcceptEncoding, MAX_CONNECT_ATTEMPTS, dispatchWithConnectRetry, stripAutoDecodedEncoding } from "./upstream-dispatch.js";
 export { errorResponse } from "./translated-response.js";
@@ -137,6 +140,9 @@ export async function proxyRequest(
   }
 
   const meta = peekBody(parsedBody);
+  const promptObservation = beginPromptObservation(config, {
+    id: reqId, model: meta.model, format, receivedAt: started, received: captureSystemPrompt(parsedBody),
+  });
   const logResult = createRequestLogger({ reqId, format, meta, started });
 
   if (dumpEnabled()) {
@@ -230,6 +236,14 @@ export async function proxyRequest(
   // Bundle `E2e` fires for EVERY anthropic-kind request (both plans) — the
   // injected user_id is the device/session blob, never the account uuid.
   const metadataUserId = buildAnthropicMetadataUserId(config.identity.deviceMid, clientSession?.sessionId);
+  // Freeze the rules for this logical request; an admin edit affects the next request.
+  const promptRewrite = config.promptRewrite ?? defaultPromptRewriteConfig();
+  let promptRewriteResult: PromptRewriteResult | null = null;
+  let upstreamPrompt = captureSystemPrompt(undefined);
+  const transformContext = (startPlanFlag: boolean) => ({
+    format: upstreamFormat, metadataUserId, startPlan: startPlanFlag, provider: config.provider, promptRewrite,
+    onPromptRewrite: (result: PromptRewriteResult) => { promptRewriteResult = result; },
+  });
   // fork: rebuildable — a mid-retry credential switch can flip startPlan,
   // which changes the injected system-prompt block / metadata shape.
   const applyBodyTransform = (startPlanFlag: boolean): string | undefined => {
@@ -237,20 +251,22 @@ export async function proxyRequest(
       // Object path: mutate the already-parsed body, re-serialize only when
       // something changed. NOTE: mutations accumulate on upstreamParsed —
       // rebuilds (plan flips) must pass a FRESH copy (see below).
-      return transformParsedBody(upstreamParsed, { format: upstreamFormat, metadataUserId, startPlan: startPlanFlag, provider: config.provider }) ?? upstreamBody;
+      const transformed = transformParsedBody(upstreamParsed, transformContext(startPlanFlag));
+      upstreamPrompt = captureSystemPrompt(upstreamParsed);
+      return transformed ?? upstreamBody;
     }
-    return transformRequestBody(upstreamBody, { format: upstreamFormat, metadataUserId, startPlan: startPlanFlag, provider: config.provider });
+    return transformRequestBody(upstreamBody, transformContext(startPlanFlag));
   };
   const rebuildTransformedBody = (): void => {
     if (upstreamParsed) {
-      // Plan flip re-injects the start-plan system block — rebuild from a
-      // fresh copy so the first transform's mutations aren't applied twice.
-      // Rare path (credential switch mid-retry): the clone cost is fine.
-      const fresh = structuredClone(upstreamParsed) as Record<string, unknown>;
-      transformedBody = transformParsedBody(fresh, { format: upstreamFormat, metadataUserId, startPlan, provider: config.provider }) ?? upstreamBody;
+      // Rebuild from the original serialized input, not the already-mutated
+      // object: otherwise plan flips duplicate injected blocks and reapply edits.
+      const fresh = JSON.parse(upstreamBody!) as Record<string, unknown>;
+      transformedBody = transformParsedBody(fresh, transformContext(startPlan)) ?? upstreamBody;
+      upstreamPrompt = captureSystemPrompt(fresh);
       return;
     }
-    transformedBody = transformRequestBody(upstreamBody, { format: upstreamFormat, metadataUserId, startPlan, provider: config.provider });
+    transformedBody = transformRequestBody(upstreamBody, transformContext(startPlan));
   };
   let transformedBody = applyBodyTransform(startPlan);
   if (debug && transformedBody !== upstreamBody) {
@@ -376,6 +392,7 @@ export async function proxyRequest(
           headerDebugRecorded = true;
           recordHeaders(clientReq, req, reqId, format, transformedBody, body);
         }
+        recordPromptDispatch(config, promptObservation, upstreamPrompt, promptRewriteResult);
         return sendUpstreamRequest({
           request: sendReq,
           headerPairs: finalPairs,

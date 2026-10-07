@@ -1,6 +1,7 @@
 import { stringify as stringifyYaml } from "yaml";
 import type { ModelMapping, ProxyConfig, RetryConfig, RoutingRule } from "../config/types.js";
 import { atomicWriteFile, createMutex } from "../utils/fs.js";
+import { normalizePromptRewriteConfig } from "../config/prompt-rewrite.js";
 
 /**
  * Fallback retry defaults (fork multi-account layer). Mirrors the loader's
@@ -77,6 +78,7 @@ export function sanitizeConfig(config: ProxyConfig): Record<string, unknown> {
     corsAllowList: config.corsAllowList ?? [],
     routingRules: config.routingRules ?? [],
     modelMappings: config.modelMappings ?? [],
+    promptRewrite: normalizePromptRewriteConfig(config.promptRewrite),
     responsesThinking: config.responsesThinking ?? { models: [] },
     // v0.2.0.4: forceStreamAnthropic removed — stream:true is now unconditional.
     thinkingLevel: config.thinkingLevel === "low" || config.thinkingLevel === "high" ? config.thinkingLevel : "max",
@@ -126,6 +128,7 @@ function configToYaml(config: ProxyConfig): string {
     defaultModel: config.defaultModel,
     models: config.models,
     identity: { ...config.identity },
+    promptRewrite: normalizePromptRewriteConfig(config.promptRewrite),
     // Keep upstream feature gates across any dashboard save/restart.
     // Omitting these sections silently re-enabled their loader defaults.
     clientIdentity: { ...config.clientIdentity },

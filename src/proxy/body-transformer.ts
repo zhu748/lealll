@@ -24,6 +24,8 @@
 import type { Format } from "../translator/types.js";
 import { buildStartPlanSystem, buildContextPrefixMessage } from "./system-prompt.js";
 import { resolveEnvPromptInfo } from "./identity.js";
+import type { PromptRewriteConfig } from "../config/types.js";
+import { rewriteSystemPrompt, type PromptRewriteResult } from "./prompt-rewrite.js";
 
 interface TransformContext {
   format: Format;
@@ -42,6 +44,8 @@ interface TransformContext {
    * by production callers alongside `startPlan`.
    */
   provider?: "zai" | "bigmodel";
+  promptRewrite?: PromptRewriteConfig;
+  onPromptRewrite?: (result: PromptRewriteResult) => void;
 }
 
 /**
@@ -89,6 +93,12 @@ export function transformParsedBody(parsed: Record<string, unknown>, ctx: Transf
     if (ctx.metadataUserId) {
       modified = applyAnthropicUserId(parsed, ctx.metadataUserId) || modified;
     }
+  }
+
+  if (ctx.promptRewrite) {
+    const result = rewriteSystemPrompt(parsed, ctx.promptRewrite);
+    modified = result.modified || modified;
+    ctx.onPromptRewrite?.(result);
   }
 
   return modified ? JSON.stringify(parsed) : undefined;

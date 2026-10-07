@@ -87,7 +87,7 @@ sed -i "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" package.json
 提交前本地先跑一遍，避免 push 上去才发现 CI 红：
 
 ```bash
-bun run test         # 必须全部通过
+bun run test:offline # 全量测试；阻止外网调用，与 CI / Release 门禁一致
 bun run typecheck    # 必须零错误
 ```
 
