@@ -24,7 +24,7 @@ import { KeyResolver } from "../auth/resolver.js";
 import { openBrowser } from "../runtime/open-browser.js";
 import { pasteLoginInstructions, readPastedLine, boldIfTTY } from "../runtime/paste-login.js";
 import { isGuestOriginError, describeGuestError } from "../runtime/guest-error.js";
-import { ensureIdentitySelfHeal, VERSION, type ServeArgs } from "../index.js";
+import { ensureIdentitySelfHeal, VERSION, exitWithError, type ServeArgs } from "../index.js";
 import { collectQuotaSnapshot, type QuotaSnapshot } from "../server/routes-quota.js";
 import { appendFileSync } from "node:fs";
 import type { ProxyConfig } from "../config/types.js";
@@ -43,11 +43,10 @@ const TOAST_MS = 2600;
 
 export async function runTui(args: ServeArgs): Promise<void> {
   if (!process.stdout.isTTY || !process.stdin.isTTY) {
-    process.stderr.write(
+    exitWithError(
       "zcode-proxy: TUI mode needs an interactive terminal (TTY). " +
         "For headless/CLI use run: zcode-proxy --cli serve\n",
     );
-    process.exit(1);
   }
 
   const path = args.configPath ?? process.env.ZCODE_PROXY_CONFIG ?? "config.yaml";
@@ -62,8 +61,7 @@ export async function runTui(args: ServeArgs): Promise<void> {
     ensureIdentitySelfHeal(path);
     config = loadConfig(path);
   } catch (err) {
-    process.stderr.write(`zcode-proxy: config error: ${(err as Error).message}\n`);
-    process.exit(1);
+    exitWithError(`zcode-proxy: config error: ${(err as Error).message}\n`);
   }
 
   const auth = createConfiguredAuthManager(config);
@@ -96,8 +94,7 @@ export async function runTui(args: ServeArgs): Promise<void> {
   // failure message must reach the real terminal, not the (not yet visible)
   // log pane, and nothing needs restoring if we never entered the alt screen.
   if (typeof (stdin as { setRawMode?: (m: boolean) => void }).setRawMode !== "function") {
-    realStderrWrite("zcode-proxy: tui requires a terminal with raw-mode input.\n");
-    process.exit(1);
+    exitWithError("zcode-proxy: tui requires a terminal with raw-mode input.\n");
   }
   // Alt screen + hide cursor + SGR mouse tracking (buttons clickable, wheel scrolls).
   const enterAltScreen = (): void => {
@@ -115,7 +112,6 @@ export async function runTui(args: ServeArgs): Promise<void> {
   // left unpatched would bypass the pane and write raw into the alt-screen
   // frame. Originals are kept for the pre-TUI error path and restore.
   const origConsole: Record<string, (...a: unknown[]) => void> = {};
-  const origError = console.error;
   const logFile = process.env.ZCODE_TUI_LOGFILE;
   const emit = (text: string, level: "info" | "warn" | "error"): void => {
     pane.push(text, level);
@@ -782,8 +778,7 @@ export async function runTui(args: ServeArgs): Promise<void> {
       return;
     }
     cleanup();
-    origError(`zcode-proxy: tui crashed: ${err.stack ?? String(err)}`);
-    process.exit(1);
+    exitWithError(`zcode-proxy: tui crashed: ${err.stack ?? String(err)}\n`);
   });
 
   // --- boot ---------------------------------------------------------------------

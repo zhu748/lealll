@@ -66,9 +66,43 @@ export function main(): void {
   try {
     runCli();
   } catch (err) {
-    process.stderr.write(`zcode-proxy: uncaught error: ${(err as Error).stack ?? String(err)}\n`);
-    process.exit(1);
+    exitWithError(`zcode-proxy: uncaught error: ${(err as Error).stack ?? String(err)}\n`);
   }
+}
+
+/**
+ * Print an error and exit — holding the console window open on Windows.
+ *
+ * Double-clicking zcode-proxy.exe spawns a cmd window that closes the
+ * instant the process exits, so any startup error written to stderr is
+ * invisible ("double-click flash-close": the user sees a window blink and
+ * vanish, with no way to read the actual reason). When stderr AND stdin are
+ * interactive TTYs — the double-click case always is — wait for Enter (or
+ * 60s) before exiting so the operator can read the message. Shells, pipes,
+ * services and Task Scheduler runs have a non-TTY stderr or stdin and exit
+ * immediately, preserving scripting semantics.
+ *
+ * @see start.bat — the guided Windows entry already `pause`s after every
+ * action; this guard covers the direct exe double-click path it cannot.
+ */
+export function exitWithError(message: string, code = 1): never {
+  process.stderr.write(message.endsWith("\n") ? message : `${message}\n`);
+  if (process.platform === "win32" && process.stderr.isTTY && process.stdin.isTTY) {
+    try {
+      process.stderr.write("\nPress Enter (or close this window) to exit...\n");
+      const finish = (): void => process.exit(code);
+      const timer = setTimeout(finish, 60_000);
+      process.stdin.resume();
+      process.stdin.once("data", () => { clearTimeout(timer); finish(); });
+      process.stdin.once("close", () => { clearTimeout(timer); finish(); });
+      // Deferred exit: the listeners / timeout above call finish(). Returning
+      // here would fall through to the immediate exit below, defeating the
+      // hold, so this line is statically unreachable — the never assertion
+      // just satisfies the signature.
+      return undefined as never;
+    } catch { /* stdin unusable — fall through to immediate exit */ }
+  }
+  process.exit(code);
 }
 
 function runCli(): void {
@@ -113,8 +147,7 @@ function dispatchCli(args: string[]): void {
     // bound by an orphaned process) must exit non-zero deterministically, not
     // surface as an unhandled rejection.
     runAndroid().catch((err: unknown) => {
-      process.stderr.write(`zcode-proxy: android entry failed: ${(err as Error).stack ?? String(err)}\n`);
-      process.exit(1);
+      exitWithError(`zcode-proxy: android entry failed: ${(err as Error).stack ?? String(err)}\n`);
     });
   } else if (cmd === "tui") {
     // Kept for muscle memory under `--cli`: the default dispatch already
@@ -128,8 +161,7 @@ function dispatchCli(args: string[]): void {
       // Same contract as the android entry: a startup failure (bad YAML,
       // EADDRINUSE, …) must exit non-zero deterministically instead of
       // surfacing as an unhandled rejection.
-      process.stderr.write(`zcode-proxy: serve failed: ${(err as Error).stack ?? String(err)}\n`);
-      process.exit(1);
+      exitWithError(`zcode-proxy: serve failed: ${(err as Error).stack ?? String(err)}\n`);
     });
   } else if (cmd === "version" || cmd === "--version" || cmd === "-v") {
     console.log(`zcode-proxy ${VERSION}`);
@@ -138,7 +170,7 @@ function dispatchCli(args: string[]): void {
   } else {
     console.error(`Unknown command: ${cmd}\n`);
     printHelp();
-    process.exit(1);
+    exitWithError("");
   }
 }
 
@@ -148,8 +180,7 @@ function launchTui(args: ServeArgs): void {
   import("./tui/app.js")
     .then((m) => m.runTui(args))
     .catch((err: unknown) => {
-      process.stderr.write(`zcode-proxy: tui failed: ${(err as Error).stack ?? String(err)}\n`);
-      process.exit(1);
+      exitWithError(`zcode-proxy: tui failed: ${(err as Error).stack ?? String(err)}\n`);
     });
 }
 

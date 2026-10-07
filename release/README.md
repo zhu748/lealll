@@ -1,5 +1,14 @@
 # zcode-proxy 使用说明
 
+> **v4.8.1-fork.1 — Windows 双击 exe 闪退修复（错误可见化）**
+>
+> - 修复「双击 zcode-proxy.exe 直接闪退」：此前任何启动错误（config 读取失败、终端不兼容、端口占用等）只往 stderr 打一行就退出，Windows 双击场景下控制台窗口瞬间关闭，用户完全看不到原因。
+> - 现在所有启动错误路径在 Windows 交互终端下会**显示完整报错并等待按回车（或 60 秒）才退出**，闪退变成可见错误；命令行/管道/服务方式运行（stderr 非 TTY）仍然立即退出，脚本语义不变。
+> - 覆盖路径：TUI 启动失败、config 加载错误、raw-mode 检测、TUI 运行中崩溃（crash 后先恢复终端再停住）、serve 启动失败、android 入口失败、未知命令、顶层未捕获异常。
+> - 正确的 Windows 用法不变：解压后双击 **start.bat**（菜单式入口，选项 1 启动服务、选项 4/5 登录 Start 套餐）；双击 exe 会进入 TUI 交互面板，需要键盘操作（s 启动 / l 登录 / q 退出）。
+>
+> 升级建议：桌面端替换对应平台压缩包，Android 安装新版 APK，或更新 Docker 镜像。配置与凭证格式保持兼容。Release 压缩包、APK 和 Docker 镜像由 GitHub Actions 自动构建并发布。
+
 > **v4.8.0-fork.1 — 默认套餐切换为 Start（免费层）+ 计费面自愈修复**
 >
 > - 默认套餐由 coding-plan 改为 **start-plan**：未指定 plan 的配置、CLI `auth login`、管理后台 OAuth 登录、TUI 与 Android 登录现在都默认走 zcode.z.ai 的 Start 免费套餐面（登录会捕获 JWT，正好是 start-plan 面所需的凭证）。需要 coding-plan 的用户在登录时显式传 `--plan=coding-plan` 或在下拉中选择即可。
