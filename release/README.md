@@ -1,5 +1,17 @@
 # zcode-proxy 使用说明
 
+> **v4.8.4-fork.1 — 对齐上游 v4.8.2 并通过 ZCode 3.15.3 官方包全量对齐验证（指纹 / 请求签名 / 福利领取）**
+>
+> - **指纹对齐 3.15.3**：默认 App 版本 3.15.1 → **3.15.3**（2026-10-13 官方构建）。`buildCliZCodeSourceHeaders`（Tlc）与 `buildZCodeSourceHeadersFromContext`（Fen，官方 3 处相同副本）已与官方 `buildLlmIdentityHeaders` 逐字节比对：头集合、条件分支、`unknown` 回退、`X-ZCode-Agent` 仅出现在 LLM 面、可打印 ASCII 门控、osCategory 映射、ZCODE_ENV 通道规则、默认 origin `zcode.z.ai`、telemetry v2 deviceMid 全部一致。
+> - **请求签名 V4**：握手路径 `/api/paas/c1f3a7e2/v2/client`、KDF 常量、`\n` 拼接的 HMAC/Ed25519/PoW 模板、PoW 计数器 hex `padStart(8)`、7 头集合与 sanitize-then-set、401 `VERIFY_*` 两次触发绕过、双形态凭证（project_access JWT / apiKeyId.secret）、origin 不匹配转 unsigned——全部与官方一致。新情报：3.15.3 将签名扩展到**任意 z.ai / bigmodel.cn 域访问**及镜像域 `{api.chatglm.site, zcode.chatglm.site}`（测试环境回退 origin 即镜像域）。
+> - **福利领取（claim）对齐**：3.15.3 官方在**所有** zcode 端点请求的调用者头之下合并完整身份基座（含 `X-Device-Mid`）；claim 客户端四处请求构造点已全部补齐 `identityHeaders`——此前文档化的 0828/0918 `X-Device-Mid` 偏差现为官方行为，权益/免费套餐领取不再因身份头缺失而失败。
+> - **高速抽卡对齐**：draw 请求体 `{task_id, provider: builtin:{family}-coding-plan, model}`、双鉴权头、`Bigmodel-Target-Type`、`X-Highspeed-Card-ID` 挂载、biz-3402 弃卡（Ho="3402"）、1 秒抽卡预算逐字节确认；保留 fork 文档化偏差（心跳循环忽略 next_draw_at、共享卡、10s 超时）。
+> - **修复**：project-token 铸造的 body `clientVersion` 现跟随配置的 appVersion（此前硬编码 3.15.1，官方发送自身构建版本）。
+> - **合并上游 v4.8.0→v4.8.2 的 21 个提交**：HighSpeed 加速卡（懒抽卡、挂卡改写模型 + 换装 JWT 鉴权、多账号切换弃卡重发）、签名 V4 重构（gate 探测移除、bigmodel OAuth 项目 JWT 铸造、mint 失败负缓存；保留 fork host-timers 与 MAX_SIGNER_STATES 防泄漏加固）、会话亲和收口（翻译后规范体血缘哈希 + traceBody 显式检测、SESSION_ID_HEADERS 扩展）、tok/s 生成窗口速率精确化、`parallel_tool_calls:false` Anthropic 映射补齐（issue #65）、配额窗口标签修复（MCP TIME_LIMIT 剔除）、`X-ZCode-Authorization` 路由头置于签名块后（3.16.2 线序）、bridge CRLF 原样转发 + SSE_FRAME_SPLIT、默认模型 glm-5.3、广告模型缩减、Docker 镜像单 bundle 瘦身、License 变更为 **CC BY-NC-SA 4.0**。
+> - fork 全部自研特性保留：/admin 管理面板、多账号故障转移、代理池、统计、MCP 反代、验证码、闲时通道、提示词规则与上游对照等。
+>
+> 升级建议：桌面端替换对应平台压缩包，Android 安装新版 APK，或更新 Docker 镜像（`ghcr.io/zhu748/zcode-proxy:latest`）。现有配置、凭证与提示词规则格式保持兼容；建议在 config.yaml 固化 `identity.deviceMid` 以获得最稳定的身份指纹。Release 压缩包、APK 和 Docker 镜像由 GitHub Actions 自动构建并发布。
+
 > **v4.8.3-fork.1 — 配置保存一致性与提示词处理优化**
 >
 > - 配置、端点、路由、模型映射和 Responses thinking 保存统一串行执行读取、合并、落盘与热更新，修复同时保存不同设置时相互覆盖，以及保存失败后运行状态提前变化的问题。
