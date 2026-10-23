@@ -49,9 +49,11 @@ const ENV = {
   RETRY_TOTAL_DEADLINE_MS: "ZCODE_RETRY_TOTAL_DEADLINE_MS",
 } as const;
 
-/** Pinned wire fingerprint (3.15.1 — static signing/highspeed rules live-verified
- * 2026-10-12); snapshot version is tracked separately in _reverse/MANIFEST.md. */
-export const DEFAULT_APP_VERSION = "3.15.1";
+/** Pinned wire fingerprint (3.15.3 — verified against the official 2026-10-13
+ * build via bundle extraction 2026-10-23: identity headers, signing V4, project
+ * token mint, claim/billing, highspeed cards all byte-aligned; snapshot version
+ * is tracked separately in _reverse/MANIFEST.md). */
+export const DEFAULT_APP_VERSION = "3.15.3";
 
 const DEFAULTS = {
   PORT: 8080,

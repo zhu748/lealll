@@ -235,6 +235,128 @@ describe("createClaimClient — campaign-gated X-Device-Mid deviation (0828/0918
   });
 });
 
+describe("createClaimClient — 3.15.3 withZCodeEndpointHeaders identity merge", () => {
+  // Mirrors the 3.15.3 apiClient base-header merge: the `Fen` context identity
+  // set (from buildIdentityHeaders) is laid down first and caller headers
+  // override/append — verified against the 2026-10-13 official bundle.
+  const identityHeaders = {
+    "User-Agent": "ZCode/3.15.3",
+    "HTTP-Referer": "https://zcode.z.ai",
+    "X-Title": "Z Code@cli",
+    "X-ZCode-App-Version": "3.15.3",
+    "X-Platform": "linux-x64",
+    "X-Release-Channel": "production",
+    "X-Client-Language": "zh-CN",
+    "X-Client-Timezone": "Asia/Shanghai",
+    "X-Os-Category": "linux",
+    "X-Os-Version": "6.1.0",
+    "X-Device-Mid": "11111111-2222-3333-4444-555555555555",
+  };
+
+  it("preview carries the identity base + Authorization (base positions preserved)", async () => {
+    let req: Request | undefined;
+    const fetchImpl = makeMockFetch((r) => {
+      req = r;
+      return Promise.resolve(jsonResp(PREVIEW_BODY));
+    });
+    const client = createClaimClient({
+      origin: "https://zcode.z.ai",
+      jwt: "jwt-1",
+      appVersion: "3.15.3",
+      platform: "linux-x64",
+      identityHeaders,
+      fetchImpl,
+    });
+
+    await client.getPreviews();
+
+    expect(req!.headers.get("user-agent")).toBe("ZCode/3.15.3");
+    expect(req!.headers.get("http-referer")).toBe("https://zcode.z.ai");
+    expect(req!.headers.get("x-title")).toBe("Z Code@cli");
+    expect(req!.headers.get("x-zcode-app-version")).toBe("3.15.3");
+    expect(req!.headers.get("x-platform")).toBe("linux-x64");
+    expect(req!.headers.get("x-release-channel")).toBe("production");
+    expect(req!.headers.get("x-client-language")).toBe("zh-CN");
+    expect(req!.headers.get("x-client-timezone")).toBe("Asia/Shanghai");
+    expect(req!.headers.get("x-os-category")).toBe("linux");
+    expect(req!.headers.get("x-os-version")).toBe("6.1.0");
+    expect(req!.headers.get("x-device-mid")).toBe("11111111-2222-3333-4444-555555555555");
+    expect(req!.headers.get("authorization")).toBe("Bearer jwt-1");
+    // X-ZCode-Agent never rides on the claim plane (context set has none).
+    expect(req!.headers.get("x-zcode-agent")).toBeNull();
+  });
+
+  it("claim merges caller headers over the base — version/platform override in place, captcha appends", async () => {
+    let req: Request | undefined;
+    const fetchImpl = makeMockFetch((r) => {
+      req = r;
+      return Promise.resolve(jsonResp({ code: 0, data: { plan: { plan_id: "weekend-free-1024", starts_at: 1, ends_at: 2 } } }));
+    });
+    const client = createClaimClient({
+      origin: "https://zcode.z.ai",
+      jwt: "jwt-1",
+      appVersion: "3.15.3",
+      platform: "linux-x64",
+      identityHeaders,
+      fetchImpl,
+    });
+
+    await client.claim("weekend-free-1024", { verifyParam: "cap-param", region: "cn-hangzhou" });
+
+    expect(req!.headers.get("authorization")).toBe("Bearer jwt-1");
+    expect(req!.headers.get("content-type")).toBe("application/json");
+    expect(req!.headers.get("x-aliyun-captcha-verify-param")).toBe("cap-param");
+    expect(req!.headers.get("x-aliyun-captcha-verify-region")).toBe("cn-hangzhou");
+    expect(req!.headers.get("x-zcode-app-version")).toBe("3.15.3");
+    expect(req!.headers.get("x-platform")).toBe("linux-x64");
+    expect(req!.headers.get("user-agent")).toBe("ZCode/3.15.3");
+    expect(req!.headers.get("x-device-mid")).toBe("11111111-2222-3333-4444-555555555555");
+    // fetch serializes Headers in sorted order on BOTH sides (official client
+    // and this proxy go through the same Headers normalization), so wire order
+    // is a fetch artifact — assert the full key SET instead.
+    expect([...req!.headers.keys()].sort()).toEqual([
+      "authorization",
+      "content-type",
+      "http-referer",
+      "user-agent",
+      "x-aliyun-captcha-verify-param",
+      "x-aliyun-captcha-verify-region",
+      "x-client-language",
+      "x-client-timezone",
+      "x-device-mid",
+      "x-os-category",
+      "x-os-version",
+      "x-platform",
+      "x-release-channel",
+      "x-title",
+      "x-zcode-app-version",
+    ]);
+  });
+
+  it("billing deviceMid overrides the identity base's X-Device-Mid", async () => {
+    let req: Request | undefined;
+    const fetchImpl = makeMockFetch((r) => {
+      req = r;
+      return Promise.resolve(jsonResp(PREVIEW_BODY));
+    });
+    const client = createClaimClient({
+      origin: "https://zcode.z.ai",
+      jwt: "jwt-1",
+      appVersion: "3.15.3",
+      platform: "linux-x64",
+      identityHeaders,
+      deviceMid: "99999999-2222-3333-4444-555555555555",
+      fetchImpl,
+    });
+
+    await client.getPreviews();
+
+    expect(req!.headers.get("x-device-mid")).toBe("99999999-2222-3333-4444-555555555555");
+    // Same position (overridden in place, not duplicated).
+    expect([...req!.headers.keys()].filter((k) => k === "x-device-mid")).toHaveLength(1);
+  });
+});
+
 describe("createClaimClient — claim", () => {
   function capture(req: Request) {
     return {

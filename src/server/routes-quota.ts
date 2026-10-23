@@ -587,6 +587,7 @@ export async function collectClaimSnapshot(
     jwt: cred.jwt,
     appVersion: config.identity.appVersion,
     platform: `${process.platform}-${os.arch()}`,
+    identityHeaders: buildIdentityHeaders(config.identity),
     deviceMid: resolveBillingDeviceMid(config.identity.deviceMid),
     fetchImpl: fetchImpl as unknown as (url: string | URL | Request, init?: RequestInit) => Promise<Response>,
   });
@@ -658,6 +659,7 @@ export async function handleQuotaClaimSubmit(
     jwt: cred.jwt,
     appVersion: config.identity.appVersion,
     platform: `${process.platform}-${os.arch()}`,
+    identityHeaders: buildIdentityHeaders(config.identity),
     deviceMid: resolveBillingDeviceMid(config.identity.deviceMid),
     fetchImpl: fetchImpl as unknown as (url: string | URL | Request, init?: RequestInit) => Promise<Response>,
   });

@@ -484,7 +484,7 @@ export class ClientSigningManager {
     if (now < this.mintNegUntil) return direct;
     if (this.mintInFlight) return this.mintInFlight;
 
-    const promise = this.mintProjectJwt(cred.oauthAccessToken, direct?.apiKeyId)
+    const promise = this.mintProjectJwt(cred.oauthAccessToken, direct?.apiKeyId, cred.appVersion)
       .then((minted) => {
         if (!minted) {
           // negative-cache so a stale OAuth token can't burn two doomed
@@ -513,13 +513,16 @@ export class ClientSigningManager {
   }
 
   /**
-   * Mirror of the 3.15.1 ProjectAccessTokenClient: getCustomerInfo (bare
+   * Mirror of the 3.15.1+ ProjectAccessTokenClient: getCustomerInfo (bare
    * OAuth token — no Bearer on bigmodel) resolves the default org/project
    * (name contains 默认机构/默认项目 preferred, else first, projectType "2"
    * excluded), then `…/api_keys/{apiKeyId}/access_tokens` (Bearer) mints the
-   * `project_access` JWT.
+   * `project_access` JWT. The mint body's clientVersion carries the client's
+   * own build version (`a2` = __ZCODE_VERSION__ in the 3.15.3 bundle, verified
+   * 2026-10-23) — this proxy sends the configured identity appVersion so the
+   * mint call can never contradict X-ZCode-App-Version on the same wire.
    */
-  private async mintProjectJwt(oauthAccessToken: string, apiKeyId: string | undefined): Promise<{ jwt: string; expMs: number } | null> {
+  private async mintProjectJwt(oauthAccessToken: string, apiKeyId: string | undefined, appVersion: string): Promise<{ jwt: string; expMs: number } | null> {
     if (!apiKeyId) {
       this.noteOnce("pt-key", "project token mint skipped: credential has no apiKeyId segment");
       return null;
@@ -553,7 +556,7 @@ export class ClientSigningManager {
       const ptResp = await this.fetchImpl(`https://bigmodel.cn/api/biz/v1/organization/${encodeURIComponent(org.organizationId)}/projects/${encodeURIComponent(project.projectId)}/api_keys/${encodeURIComponent(apiKeyId)}/access_tokens`, {
         method: "POST",
         headers: { Authorization: `Bearer ${bare}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ clientType: "zcode", clientVersion: "3.15.1" }),
+        body: JSON.stringify({ clientType: "zcode", clientVersion: appVersion.trim() || "3.15.3" }),
         redirect: "manual",
         signal: controller.signal,
       });

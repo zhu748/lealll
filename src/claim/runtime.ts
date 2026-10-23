@@ -10,7 +10,7 @@ import { formatUnixSeconds } from "./types.js";
 import { createClaimClient, ClaimPreviewError } from "./client.js";
 import { ClaimScheduler } from "./scheduler.js";
 import { getCaptchaToken } from "../proxy/captcha.js";
-import { resolveBillingDeviceMid } from "../proxy/identity.js";
+import { resolveBillingDeviceMid, buildIdentityHeaders } from "../proxy/identity.js";
 import { loadCredential } from "../auth/store.js";
 
 /**
@@ -49,6 +49,7 @@ export function startAutoClaim(config: ProxyConfig, auth: AuthManager): ClaimSch
         jwt,
         appVersion: config.identity.appVersion,
         platform: claimPlatform(),
+        identityHeaders: buildIdentityHeaders(config.identity),
         deviceMid,
       }),
     getCaptcha: async () => {
@@ -92,6 +93,7 @@ export async function runClaimCli(config: ProxyConfig, mode: "list" | "now"): Pr
     jwt,
     appVersion: config.identity.appVersion,
     platform: claimPlatform(),
+    identityHeaders: buildIdentityHeaders(config.identity),
     deviceMid: resolveDeviceMid(config),
   });
 

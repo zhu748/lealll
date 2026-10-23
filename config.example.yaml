@@ -88,8 +88,8 @@ promptRewrite:
 identity:
   # Mirrors process.env.ZCODE_APP_VERSION in the ZCode bundle.
   # Must be printable ASCII; non-conforming values fall back to the default.
-  # Default: "3.15.1" (current ZCode release). Override to match your real client.
-  appVersion: "3.15.1"
+  # Default: "3.15.3" (current ZCode release, verified 2026-10-23). Override to match your real client.
+  appVersion: "3.15.3"
   # X-Title suffix → "Z Code@{sourceTitle}". Default "cli".
   sourceTitle: "cli"
   # HTTP-Referer URL. Default "https://zcode.z.ai".
@@ -233,7 +233,7 @@ async:
 # client version or the server rejects with `ineligible` — an app_version
 # below the floor can also surface as a silently empty preview list
   # (measured floor 3.14.0 for the 2026-09 campaign; the default appVersion
-  # "3.15.1" satisfies it).
+  # "3.15.3" satisfies it).
 #
 # Env overrides: ZCODE_CLAIM_ENABLED, ZCODE_CLAIM_AUTO, ZCODE_CLAIM_ORIGIN,
 # ZCODE_CLAIM_POLL_INTERVAL_MS.
@@ -264,7 +264,7 @@ endpointRouting:
   enabled: true
   origin: "https://zcode.z.ai"
 
-# Client request signing V4 (mirrors the ZCode 3.15.1 static signing rule).
+# Client request signing V4 (mirrors the ZCode 3.15.3 static signing rule).
 # When enabled, coding-plan requests are always signed: handshake against
 # {provider}/api/paas/c1f3a7e2/v2/client, Ed25519 signature + proof-of-work
 # headers on every request, fail-open retry ladder (two 401 VERIFY rejections
@@ -274,7 +274,7 @@ endpointRouting:
 clientSigning:
   enabled: true
 
-# HighSpeed 加速卡 (mirrors the ZCode 3.15.1 HighspeedCardService — Coding Plan
+# HighSpeed 加速卡 (mirrors the ZCode 3.15.3 HighspeedCardService — Coding Plan
 # subscriber benefit, server-side random draw). Enabled by default, matching the
 # official client (which has no toggle): the first eligible coding-plan request
 # ignites a background draw loop (POST {origin}/api/v1/highspeed/draw at ~1/s —

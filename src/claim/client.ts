@@ -1,31 +1,31 @@
 /**
  * HTTP client for ZCode's manual-claim billing endpoints (weekend plans).
  *
- * Mirrors the ZCode 3.12.3 desktop client's `getManualClaimPlanPreviews` /
- * `claimManualPlan` EXACTLY — the claim plane carries a minimal header set,
- * NOT the identity bundle:
+ * Mirrors the ZCode 3.15.3 desktop client's `getManualClaimPlanPreviews` /
+ * `claimManualPlan` (host `BigModelCodingPlanSubscriptionProvider`) — since
+ * 3.15.3 every request to the ZCode endpoint origin goes through the
+ * apiClient's `withZCodeEndpointHeaders` merge: a base identity set
+ * (`buildZCodeSourceHeaders` — the `Fen` context shape with X-Device-Mid from
+ * telemetry-state) is laid down first and the caller's headers override/
+ * append on top. This proxy mirrors that merge via the `identityHeaders`
+ * option (built by `buildIdentityHeaders`):
  *
  *   - `GET  {origin}/api/v1/zcode-plan/billing/preview?app_version=&platform=`
- *     headers: `Authorization: Bearer {jwt}` only (omitted entirely when
- *     anonymous — no Content-Type, no Accept)
+ *     headers: identity base + `Authorization: Bearer {jwt}` (omitted when
+ *     anonymous)
  *   - `POST {origin}/api/v1/zcode-plan/billing/claim`  body `{plan_id}`
- *     headers (bundle order): Authorization, Content-Type,
+ *     headers: identity base + Authorization, Content-Type,
  *     X-Aliyun-Captcha-Verify-Param, [X-Aliyun-Captcha-Verify-Region],
- *     X-ZCode-App-Version, X-Platform
+ *     X-ZCode-App-Version, X-Platform (the last two override their base
+ *     positions — object-spread keeps overridden keys in place, matching
+ *     `Headers.set` semantics in the bundle)
  *
- * NOTE: an earlier revision sent the full identity set with X-Device-Mid
- * (empirically accepted during the 0828 campaign). The 3.12.3 client sends
- * the minimal set above — we now mirror that verbatim.
- *
- * DEVIATION (2026-09-18, wk-0918 campaign): the gateway again rejects
- * preview with biz 3001 "parameter error" unless the request carries a
- * UUID-format `X-Device-Mid` (re-verified empirically: minimal headers +
- * X-Device-Mid → 200 with the wk-0918 plan; the same request minus that
- * header → 3001; adding captcha headers alone does not help). Same gateway
- * behavior as the 0828 campaign — the 3.12.3 bundle itself is minimal, so
- * this is a deliberate deviation from the verbatim mirror: when
- * `deviceMid` is provided both calls append `X-Device-Mid` (last position,
- * matching its slot in the endpoint-routing `TV` identity set).
+ * HISTORY: 3.12.3 sent a minimal header set on this plane; the 0828/0918
+ * campaign gateways empirically required a UUID `X-Device-Mid` (biz 3001
+ * "parameter error" without it) — a documented deviation then, and exactly
+ * what 3.15.3 now does officially (full identity base incl. X-Device-Mid).
+ * The `deviceMid` option keeps the billing-mid resolution (env → config →
+ * ephemeral) authoritative for the X-Device-Mid position.
  *
  * @see _reverse/NOTEPAD.md "claim/billing 平面"
  */
@@ -41,8 +41,15 @@ export interface ClaimClientOptions {
   /** `${process.platform}-{arch}` in the real client (`u3()`). */
   platform: string;
   /**
-   * Campaign-gated gateway requirement (0828 + 0918): UUID-format
-   * `X-Device-Mid`. When omitted no device header is sent.
+   * 3.15.3 `withZCodeEndpointHeaders` base identity set (the `Fen`/context
+   * shape from `buildIdentityHeaders`). Merged under the caller headers so
+   * preview/claim carry the full official fingerprint. When omitted the
+   * calls fall back to the minimal legacy header set (tests / old callers).
+   */
+  identityHeaders?: Record<string, string>;
+  /**
+   * Billing-gateway deviceMid (env → config → ephemeral). Overrides the
+   * identity base's X-Device-Mid position when both exist.
    */
   deviceMid?: string;
   /** Per-call timeout in ms. Default `15000` (bundle `ss`). */
@@ -104,9 +111,23 @@ interface RawPlan {
 export function createClaimClient(opts: ClaimClientOptions): ClaimClient {
   const origin = opts.origin.replace(/\/+$/, "");
   const jwt = opts.jwt?.trim() || undefined;
+  const identityBase = opts.identityHeaders;
   const deviceMid = opts.deviceMid?.trim() || undefined;
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const fetchImpl = opts.fetchImpl ?? globalThis.fetch;
+
+  /**
+   * 3.15.3 `withZCodeEndpointHeaders` (`gAe`): base identity set first, then
+   * the caller's headers override/append — object spread keeps overridden
+   * keys at their base positions, matching the bundle's `Headers.set`
+   * semantics. The billing deviceMid (env → config → ephemeral) stays
+   * authoritative for the X-Device-Mid position.
+   */
+  function mergeHeaders(caller: Record<string, string>): Record<string, string> {
+    const merged: Record<string, string> = { ...identityBase, ...caller };
+    if (deviceMid) merged["X-Device-Mid"] = deviceMid;
+    return merged;
+  }
 
   function parseEntitlement(c: RawEntitlement): PlanEntitlement | null {
     const entitlementId = c.entitlement_id?.trim() ?? "";
@@ -188,11 +209,9 @@ export function createClaimClient(opts: ClaimClientOptions): ClaimClient {
   return {
     async getPreviews(signal?: AbortSignal): Promise<ClaimablePlan[]> {
       const url = `/api/v1/zcode-plan/billing/preview?app_version=${encodeURIComponent(opts.appVersion)}&platform=${encodeURIComponent(opts.platform)}`;
-      // Bundle: `Authorization: Bearer` only when a JWT exists; anonymous
-      // preview sends NO headers at all. X-Device-Mid is appended last when
-      // provided (campaign gateway requirement — see file header).
-      const headers: Record<string, string> = jwt ? { Authorization: `Bearer ${jwt}` } : {};
-      if (deviceMid) headers["X-Device-Mid"] = deviceMid;
+      // 3.15.3: identity base + `Authorization: Bearer` only when a JWT
+      // exists; anonymous preview carries just the identity base.
+      const headers = mergeHeaders(jwt ? { Authorization: `Bearer ${jwt}` } : {});
       const { status, json, text } = await request("GET", url, { headers, signal });
       // `data === null` (a {code:0,data:null} envelope) must surface as a
       // structured ClaimPreviewError — the old `=== undefined` check let null
@@ -210,18 +229,18 @@ export function createClaimClient(opts: ClaimClientOptions): ClaimClient {
 
     async claim(planId: string, captcha: { verifyParam: string; region?: string }, signal?: AbortSignal): Promise<ClaimOutcome> {
       if (!jwt) return { ok: false, planId, failureKind: "login_required", code: 401, message: "manual_claim_login_required" };
-      // Bundle `claimManualPlan` header order: Authorization, Content-Type,
-      // captcha param, [captcha region], X-ZCode-App-Version, X-Platform,
-      // [X-Device-Mid] (campaign-gated deviation, same as preview).
-      const headers: Record<string, string> = {
+      // 3.15.3 `claimManualPlan`: caller set = Authorization, Content-Type,
+      // captcha param, [captcha region], X-ZCode-App-Version, X-Platform —
+      // merged over the identity base (version/platform override their base
+      // positions; the rest append after the base keys).
+      const headers = mergeHeaders({
         Authorization: `Bearer ${jwt}`,
         "Content-Type": "application/json",
         "X-Aliyun-Captcha-Verify-Param": captcha.verifyParam,
-      };
+      });
       if (captcha.region) headers["X-Aliyun-Captcha-Verify-Region"] = captcha.region;
       headers["X-ZCode-App-Version"] = opts.appVersion;
       headers["X-Platform"] = opts.platform;
-      if (deviceMid) headers["X-Device-Mid"] = deviceMid;
       const { status, json, text } = await request("POST", "/api/v1/zcode-plan/billing/claim", { body: { plan_id: planId }, headers, signal });
 
       const data = json?.data as { plan?: RawPlan | RawClaimedPlan } | undefined;
