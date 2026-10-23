@@ -35,9 +35,9 @@ export const RELEASES_PAGE = "https://github.com/zhu748/lealll/releases";
 const USER_AGENT = "zcode-proxy-update-check";
 const REQUEST_TIMEOUT_MS = 10_000;
 /** `ZCODE_UPDATE_CHECK=off` disables the automatic startup check. */
-export const UPDATE_CHECK_ENV = "ZCODE_UPDATE_CHECK";
+const UPDATE_CHECK_ENV = "ZCODE_UPDATE_CHECK";
 /** `ZCODE_UPDATE_SKIP=v4.7.6,v4.7.7` mutes specific tags (Android's skipped_tag). */
-export const UPDATE_SKIP_ENV = "ZCODE_UPDATE_SKIP";
+const UPDATE_SKIP_ENV = "ZCODE_UPDATE_SKIP";
 const DISABLED_VALUES = new Set(["0", "false", "off", "no", "disable", "disabled"]);
 
 type Env = Record<string, string | undefined>;
@@ -154,20 +154,16 @@ export function detectContainerRuntime(
   env: Env = process.env,
   exists: (path: string) => boolean = existsSync,
 ): ContainerRuntime | null {
-  if (exists("/.dockerenv")) return "docker";
-  if (exists("/run/.containerenv")) return "podman";
+  // Explicit `container=` declaration wins over file markers: a nested setup
+  // (podman inside a docker-hosted CI) must honour its own declared runtime,
+  // and this keeps the probe hermetic for tests running on container hosts.
   const declared = (env.container ?? "").trim().toLowerCase();
   if (declared.includes("podman")) return "podman";
   if (declared.includes("docker")) return "docker";
-  return declared === "" ? null : "unknown";
-}
-
-/** Back-compat convenience wrapper around {@link detectContainerRuntime}. */
-export function isContainerRuntime(
-  env: Env = process.env,
-  exists: (path: string) => boolean = existsSync,
-): boolean {
-  return detectContainerRuntime(env, exists) !== null;
+  if (declared !== "") return "unknown";
+  if (exists("/.dockerenv")) return "docker";
+  if (exists("/run/.containerenv")) return "podman";
+  return null;
 }
 
 /** Update hint for the detected runtime; the image is immutable either way. */

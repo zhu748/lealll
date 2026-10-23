@@ -1,6 +1,5 @@
 /**
  * Tests for config loader.
- * @see .omo/plans/zcode-proxy.md Task 2
  */
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 import { writeFileSync, mkdirSync, rmSync } from "node:fs";
@@ -121,11 +120,12 @@ logging:
     expect(cfg.server.port).toBe(8080);
     expect(cfg.server.host).toBe("0.0.0.0");
     expect(cfg.provider).toBe("zai");
-    expect(cfg.defaultModel).toBe("glm-4.6");
+    expect(cfg.defaultModel).toBe("glm-5.3");
+    expect(cfg.models).toEqual(["glm-5.3", "glm-5.3-flash"]);
     expect(cfg.logging.level).toBe("info");
     expect(cfg.providers.zai.anthropicBase).toBe("https://api.z.ai/api/anthropic");
     expect(cfg.providers.bigmodel.openaiBase).toBe("https://open.bigmodel.cn/api/coding/paas/v4");
-    expect(cfg.clientIdentity).toEqual({ mode: "observe", ttlSeconds: 900, maxSessions: 1024 });
+    expect(cfg.clientIdentity).toEqual({ mode: "enforce", ttlSeconds: 900, maxSessions: 1024 });
     expect(cfg.responses).toEqual({ enabled: true, storeMaxEntries: 1000, storeTtlMs: 86400000 });
     expect(cfg.mcp).toEqual({ enabled: true, webSearch: true, webReader: false, zread: false, usageEnabled: true, gateway: { enabled: true, upstreamOrigin: "https://zcode.z.ai" } });
     expect(cfg.async).toEqual({
@@ -441,7 +441,7 @@ models:
     const path = writeYaml(`
 `);
     const cfg = loadConfig(path);
-    expect(cfg.identity.appVersion).toBe("3.14.4");
+    expect(cfg.identity.appVersion).toBe("3.15.1");
     expect(cfg.identity.sourceTitle).toBe("cli");
     expect(cfg.identity.refererOrigin).toBe("https://zcode.z.ai");
   });
@@ -475,6 +475,6 @@ identity:
   appVersion: "v3.3.3-中文"
 `);
     const cfg = loadConfig(path);
-    expect(cfg.identity.appVersion).toBe("3.14.4");
+    expect(cfg.identity.appVersion).toBe("3.15.1");
   });
 });

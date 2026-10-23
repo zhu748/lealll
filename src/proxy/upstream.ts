@@ -7,7 +7,6 @@
  * (since PR #34, 2026-08-29 — start-plan's old OpenAI gateway is retired);
  * OpenAI clients are translated before this builder is called.
  *
- * @see .omo/plans/zcode-proxy.md Task 6
  * @see _reverse/NOTEPAD.md "How Credential is Used for LLM Calls"
  */
 import type { Format } from "../translator/types.js";
@@ -42,33 +41,6 @@ const ANTHROPIC_VERSION = "2023-06-01";
 const ANTHROPIC_SDK_UA = "ai-sdk/anthropic/3.0.81";
 
 const STARTPLAN_ANTHROPIC_BASE = "https://zcode.z.ai/api/v1/zcode-plan";
-
-const STRIP_HEADERS = new Set([
-  "host",
-  "authorization",
-  "x-api-key",
-  "anthropic-version",
-  "content-length",
-  "connection",
-  "proxy-authorization",
-  "proxy-authenticate",
-  "transfer-encoding",
-  "x-request-id",
-  "x-zcode-trace-id",
-  "x-zcode-session-type",
-  "x-query-id",
-  "x-session-id",
-  // V4 signing headers are proxy-generated only; inbound copies must never
-  // reach the upstream (spoofed values would either fail verification or
-  // silently disable proxy signing via the existing-header guard).
-  "x-client-ts",
-  "x-client-version",
-  "x-client-sig",
-  "x-client-nonce",
-  "x-app-id",
-  "x-client-pow",
-  "x-client-sign-verified",
-]);
 
 /**
  * Build the upstream URL based on format + plan + provider.
@@ -111,8 +83,9 @@ export function buildUpstreamURL(format: Format, provider: ProviderDef, plan: "c
  *
  * Trace/attribution headers mirror the bundle's `Bdt`
  * ("createModelRequestAttributionHeaders") when an explicit/enforced trace
- * context exists. Default observe mode keeps the prior synthesized query/session
- * behavior for compatibility.
+ * context exists. Default enforce mode forwards the inferred conversation
+ * session id; sessions without a resolvable id fall back to a synthesized
+ * one (coding-plan must always carry x-session-id — signing requires it).
  */
 export function buildAuthHeaders(
   format: Format,
@@ -154,11 +127,18 @@ export function buildAuthHeaders(
 
 function buildTraceHeaders(plan: "coding-plan" | "start-plan", clientSession?: UpstreamClientSession): Record<string, string> {
   if (shouldUseExactTraceHeaders(plan, clientSession)) {
+    // Degenerate bodies (lineage failed) and requestId-only requests resolve
+    // to an exact context with NO session id — coding-plan would then ship
+    // without x-session-id and signing would skip (client-signing requires
+    // it), violating the "coding-plan 必签" invariant. Synthesize like the
+    // fallback branch; start-plan is never signed and keeps the omission.
+    const sessionId = sessionIdForHeader(clientSession)
+      ?? (plan === "coding-plan" ? crypto.randomUUID() : undefined);
     return buildZcodeTraceHeaders({
       requestId: clientSession?.requestId,
       traceId: clientSession?.traceId,
       queryId: clientSession?.queryId,
-      sessionId: sessionIdForHeader(clientSession),
+      sessionId,
     });
   }
 
@@ -179,7 +159,8 @@ function collectPassthroughHeaders(req: Request): Record<string, string> {
   const result: Record<string, string> = {};
   for (const [key, value] of req.headers.entries()) {
     const lower = key.toLowerCase();
-    if (STRIP_HEADERS.has(lower)) continue;
+    // Explicit allowlist: client auth, routing auth, trace and V4 signing
+    // headers are never forwarded. Their trusted values are rebuilt below.
     if (lower === "anthropic-beta") {
       result[lower] = value;
     }

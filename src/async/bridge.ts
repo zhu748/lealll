@@ -2,7 +2,7 @@ import { withAbort } from "../utils/abort.js";
 import { createBackpressuredStream, waitForStreamCapacity } from "../utils/stream.js";
 /**
  * Async bridge: core state machine turning sync client stream expectation
- * into off-peak async reality. See `.omo/plans/async-off-peak-bridge.md` §3.
+ * into off-peak async reality. See src/async/AGENTS.md for the state machine contract.
  *
  * State machine:
  *   WAIT   (queued)            → poll every pollIntervalMs (signal-aware); emit keepalives
@@ -26,6 +26,7 @@ import { keepaliveFrame } from "./keepalive.js";
 import { buildIdentityHeaders } from "../proxy/identity.js";
 import type { ProxyIdentity } from "../config/types.js";
 import { hostSetInterval, hostClearInterval, hostSetTimeout, hostClearTimeout } from "../utils/host-timers.js";
+import { SSE_FRAME_SPLIT } from "../translator/sse-translator.js";
 
 const EXPIRED_MARKER = "off-peak-ticket-expired";
 
@@ -47,7 +48,7 @@ export interface BridgeOptions {
   onTransition?: (info: BridgeTransition) => void;
 }
 
-export interface BridgeTransition {
+interface BridgeTransition {
   phase: "wait" | "ready" | "expired" | "done" | "abort" | "error";
   attempt: number;
   ticketId: string;
@@ -81,11 +82,20 @@ export function runAsyncBridge(opts: BridgeOptions): { stream: ReadableStream<Ui
   const cancellation = new AbortController();
   let activeReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
   const abort = () => {
+    if (aborted) return;
     aborted = true;
-    cancellation.abort(opts.clientSignal?.reason ?? new Error("client cancelled"));
-    void activeReader?.cancel(cancellation.signal.reason).catch(() => {});
+    const reason = opts.clientSignal?.reason ?? new Error("client cancelled");
+    cancellation.abort(reason);
     settleOnce(currentTicket.ticketId);
-    resolveOutcome({ attempts: attempt + 1, finalTicketId: currentTicket.ticketId, terminalPhase: "abort" });
+    // Outcome settles AFTER the in-flight upstream read is torn down, so a
+    // consumer awaiting the outcome observes the upstream cancel() callback
+    // has already run (mirrors upstream's settle-through-the-loop ordering).
+    const readerTeardown = activeReader
+      ? activeReader.cancel(reason).catch(() => {})
+      : Promise.resolve();
+    void readerTeardown.then(() => {
+      resolveOutcome({ attempts: attempt + 1, finalTicketId: currentTicket.ticketId, terminalPhase: "abort" });
+    });
   };
   const settledTickets = new Set<string>();
   function settleOnce(ticketId: string): void {
@@ -354,15 +364,16 @@ export function runAsyncBridge(opts: BridgeOptions): { stream: ReadableStream<Ui
           // DESIGN (fixes R3-2/R3-3/R4-1/R4-3 + bounds memory R4-5):
           //   - One TextDecoder for the whole streaming phase (handles partial
           //     multibyte UTF-8 correctly across chunk boundaries).
-          //   - Accumulate decoded text until a complete SSE frame (`\n\n` boundary).
+          //   - Accumulate decoded text until a complete SSE frame (LF/CRLF/CR).
+          //     Keep raw line endings: normalizing per chunk corrupts split CRLFs.
           //   - Scan the COMPLETE frame for the expired marker before forwarding.
           //     This catches markers split across any number of network chunks.
           //   - Forward via `encoder.encode(frame)` — re-encoding Unicode codepoints
           //     through UTF-16→UTF-8 is lossless for valid input, and avoids the
           //     raw-vs-decoded byte mismatch that previously dropped pre-commit
           //     chunks when the boundary spanned chunks.
-          //   - Cap `pending` at MAX_PENDING_FRAME_BYTES to prevent a malicious
-          //     upstream from exhausting memory by streaming without `\n\n`.
+          //   - Cap each frame at MAX_PENDING_FRAME_BYTES, measured as UTF-8.
+          //     A transport chunk can legitimately contain many smaller frames.
           //
           // State machine:
           //   Pre-commit (no frame forwarded yet): marker found → transparent retry.
@@ -381,8 +392,6 @@ export function runAsyncBridge(opts: BridgeOptions): { stream: ReadableStream<Ui
             // "\r", next starts with "\n") would normalize into TWO "\n"s —
             // a phantom blank line that tears one SSE frame in two and drops
             // the event type. Carry a lone trailing "\r" into the next chunk
-            // before normalizing (mirrors TextDecoder's multibyte holdback).
-            let crCarry = "";
             const MAX_PENDING_FRAME_BYTES = 1 * 1024 * 1024;
             try {
               while (true) {
@@ -393,49 +402,38 @@ export function runAsyncBridge(opts: BridgeOptions): { stream: ReadableStream<Ui
                 }
                 const { done, value } = await reader.read();
                 if (done) {
-                  // SSE spec: discard pending data at EOF if it lacks a terminating
-                  // blank line (incomplete event). Only flush if marker-free AND
-                  // properly terminated.
+                  // Complete frames were already consumed below. The remaining
+                  // tail is unterminated and must not be forwarded at EOF.
                   if (pending.length > 0 && !aborted && !midStreamExpiredPreCommit && !midStreamExpiredPostCommit) {
                     if (pending.includes(EXPIRED_MARKER)) {
                       if (!committed) midStreamExpiredPreCommit = true;
                       else midStreamExpiredPostCommit = true;
-                    } else if (pending.endsWith("\n\n")) {
-                      // Properly terminated final frame — safe to forward.
-                      try { await waitForStreamCapacity(controller, cancellation.signal); controller.enqueue(encoder.encode(pending)); } catch {}
                     }
-                    // else: unterminated event at EOF — discard per SSE spec.
                     pending = "";
                   }
                   break;
                 }
-                if (aborted) break;
-                let decoded = crCarry + streamDecoder.decode(value, { stream: true });
-                crCarry = "";
-                if (decoded.endsWith("\r")) {
-                  crCarry = "\r";
-                  decoded = decoded.slice(0, -1);
-                }
-                // Single pass: CRLF (or a lone CR) → LF.
-                pending += decoded.replace(/\r\n|\r/g, "\n");
-
-                // Bounded buffer: if pending exceeds the cap without a frame boundary,
-                // the upstream is malformed or malicious — terminate.
-                if (pending.length > MAX_PENDING_FRAME_BYTES) {
+                if (aborted) {
                   await reader.cancel().catch(() => {});
-                  emitTerminalError(controller, "async upstream SSE frame exceeded 1 MiB boundary", "api_error");
-                  settleOnce(currentTicket.ticketId);
-                  resolveOutcome({ attempts: attempt + 1, finalTicketId: currentTicket.ticketId, terminalPhase: "error" });
-                  return;
+                  break;
                 }
+                pending += streamDecoder.decode(value, { stream: true });
 
                 // Process all complete frames in `pending`.
                 let frameBoundaryFound = false;
                 while (true) {
-                  const idx = pending.indexOf("\n\n");
-                  if (idx === -1) break;
-                  const frame = pending.slice(0, idx + 2);
-                  pending = pending.slice(idx + 2);
+                  const boundary = SSE_FRAME_SPLIT.exec(pending);
+                  const end = boundary ? boundary.index + boundary[0].length : pending.length;
+                  const frame = pending.slice(0, end);
+                  if (Buffer.byteLength(frame, "utf8") > MAX_PENDING_FRAME_BYTES) {
+                    await reader.cancel().catch(() => {});
+                    emitTerminalError(controller, "async upstream SSE frame exceeded 1 MiB boundary", "api_error");
+                    settleOnce(currentTicket.ticketId);
+                    resolveOutcome({ attempts: attempt + 1, finalTicketId: currentTicket.ticketId, terminalPhase: "error" });
+                    return;
+                  }
+                  if (!boundary) break;
+                  pending = pending.slice(end);
 
                   if (frame.includes(EXPIRED_MARKER)) {
                     if (!committed) {
@@ -461,12 +459,6 @@ export function runAsyncBridge(opts: BridgeOptions): { stream: ReadableStream<Ui
               }
               // Flush decoder (no stream flag) to release internal partial-byte state.
               streamDecoder.decode();
-              // A trailing lone "\r" held back across the final chunk can never
-              // form CRLF — flush it as a normalized line ending.
-              if (crCarry) {
-                pending += "\n";
-                crCarry = "";
-              }
             } finally {
               activeReader = undefined;
               reader.releaseLock?.();
@@ -519,8 +511,9 @@ export function runAsyncBridge(opts: BridgeOptions): { stream: ReadableStream<Ui
           emitTerminalError(controller, `async bridge internal error: ${(err as Error).message}`, "api_error");
         }
         settleOnce(currentTicket.ticketId);
-        resolveOutcome({ attempts: attempt + 1, finalTicketId: currentTicket.ticketId, terminalPhase: "error" });
+        resolveOutcome({ attempts: attempt + 1, finalTicketId: currentTicket.ticketId, terminalPhase: aborted ? "abort" : "error" });
       } finally {
+        opts.clientSignal?.removeEventListener("abort", abort);
         stopKeepalive();
         opts.clientSignal?.removeEventListener("abort", abort);
         try {

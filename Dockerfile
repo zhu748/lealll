@@ -1,27 +1,24 @@
 # syntax=docker/dockerfile:1
 
-FROM oven/bun:1-alpine AS deps
+# Keep Bun aligned with CI and desktop builds. Only production dependencies
+# are needed even in the builder: both bundles use Bun's built-in bundler.
+FROM oven/bun:1.4.0-alpine AS build
 WORKDIR /app
 COPY package.json bun.lock ./
-# --production: only runtime deps ship in the image. The sole build step below
-# (build-fork-worker.ts) uses Bun built-ins only — devDependencies (@types/bun,
-# esbuild, tsc) would otherwise land in the final image (~+40MB of attack
-# surface and layer weight) with zero consumer.
 RUN bun install --frozen-lockfile --production
-
-FROM oven/bun:1-alpine
-WORKDIR /app
-COPY --from=deps /app/node_modules ./node_modules
-COPY package.json tsconfig.json config.example.yaml ./
+COPY tsconfig.json ./
 COPY src ./src
-COPY scripts ./scripts
-# The image runs TS sources — bundle the worker entry here (gitignored build
-# input) or the solver silently falls back to main-thread solving. Fail the
-# build if the asset is missing: a silent fallback ships the exact
-# main-thread-freezing mode the worker design exists to avoid.
+COPY scripts/build-fork-worker.ts ./scripts/build-fork-worker.ts
+# Preserve the worker file asset as well as the main bundle. Omitting it
+# degrades captcha solving to the main thread (issue #54).
 RUN bun run scripts/build-fork-worker.ts \
-  && test -f src/proxy/captcha-worker-entry.bundle.js \
-  && rm -rf scripts
+    && bun build --target=bun --minify --keep-names --define 'require.resolve=undefined' src/index.ts --outdir /app/dist
+
+FROM oven/bun:1.4.0-alpine
+WORKDIR /app
+# Runtime contains the bundled application and worker; no node_modules,
+# TypeScript sources, tests, or additional build tools enter this stage.
+COPY --from=build /app/dist ./
 RUN mkdir -p /data && chown bun:bun /data
 ENV ZCODE_PROXY_PORT=8080
 ENV ZCODE_PROXY_CONFIG=/data/config.yaml
@@ -29,4 +26,4 @@ EXPOSE 8080
 USER bun
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD wget -qO- "http://127.0.0.1:${ZCODE_PROXY_PORT:-8080}/health" >/dev/null 2>&1 || exit 1
-CMD ["bun", "run", "src/index.ts", "serve"]
+CMD ["bun", "index.js", "serve"]

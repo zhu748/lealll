@@ -146,15 +146,21 @@ export function createStatsTransform(
     thinkingTokens: 0,
     cacheReadTokens: 0,
     firstChunkAt: 0,
+    // 上游 v4.8.0 tok/s 精确化（StreamMetrics 语义）：速率只统计首/末非空
+    // 输出事件之间的生成窗口，排除 TTFT 与首个 token（SSE 分块不是 token；
+    // 有权威 usage 时以权威计数为准）。
+    firstOutputAt: 0,
+    lastOutputAt: 0,
   };
   const decoder = compressed ? null : new TextDecoder();
   let framer = compressed ? null : new SSEFramer(SSE_CONST.MAX_STATS_BUFFERED_EVENT_BYTES);
   const observe = (text: string, final = false): void => {
     if (!framer) return;
     try {
+      const receivedAt = Date.now();
       for (const frame of final ? framer.finish(text) : framer.push(text)) {
         const data = extractSSEData(frame);
-        if (data) observeStreamParseDataLine(data, state);
+        if (data) observeStreamParseDataLine(data, state, receivedAt);
       }
     } catch (err) {
       if (!(err instanceof SSEFrameTooLargeError)) throw err;
@@ -174,7 +180,10 @@ export function createStatsTransform(
       const endAt = Date.now();
       const ttfbMs = (state.firstChunkAt > 0 ? state.firstChunkAt : endAt) - requestSentAt;
       const totalMs = endAt - requestSentAt;
-      const avgTps = state.tokens > 0 && totalMs > 0 ? state.tokens / (totalMs / 1000) : 0;
+      // 生成窗口速率（排除 TTFT 与首 token）—— 比旧的全时长均值更接近真实
+      // 生成速度；无流式输出事件（如批量响应）时保持 0。
+      const generationMs = state.firstOutputAt > 0 ? state.lastOutputAt - state.firstOutputAt : 0;
+      const avgTps = state.tokens > 1 && generationMs > 0 ? (state.tokens - 1) * 1000 / generationMs : 0;
       printRow(reqId, format, meta, status, requestSentAt, requestSentAt + ttfbMs, state.tokens, avgTps, endAt, retried, state.inputTokens, credKey, captchaMs, state.cacheReadTokens, state.thinkingTokens);
       hooks?.onDone?.({
         tokens: state.tokens,
@@ -273,7 +282,14 @@ export function observeStatsStream(
 
 function observeStreamParseDataLine(dataStr: string, state: {
   tokens: number; inputTokens: number; thinkingTokens: number; cacheReadTokens: number;
-}): void {
+  firstOutputAt: number; lastOutputAt: number;
+}, receivedAt: number = Date.now()): void {
+  /** Mark a non-empty output event (text/thinking/tool delta) — feeds the
+   * generation-window tok/s metric. */
+  const noteOutput = (): void => {
+    if (state.firstOutputAt === 0) state.firstOutputAt = receivedAt;
+    state.lastOutputAt = receivedAt;
+  };
   if (!dataStr || dataStr === "[DONE]") return;
   // v0.2.2+ PERF: cheap substring check before JSON.parse. The markers
   // below cover every branch that actually updates state — anything
@@ -297,20 +313,20 @@ function observeStreamParseDataLine(dataStr: string, state: {
     if (j.usage?.input_tokens) { state.inputTokens = j.usage.input_tokens; }
     if (j.usage?.cache_read_input_tokens) { state.cacheReadTokens = j.usage.cache_read_input_tokens; }
     const oai = j.choices?.[0]?.delta?.content;
-    if (typeof oai === "string" && oai.length > 0) { state.tokens++; return; }
+    if (typeof oai === "string" && oai.length > 0) { state.tokens++; noteOutput(); return; }
     if (j.type === "content_block_delta" && j.delta?.type === "thinking_delta") {
       const t = j.delta?.thinking;
-      if (typeof t === "string" && t.length > 0) state.thinkingTokens++;
+      if (typeof t === "string" && t.length > 0) { state.thinkingTokens++; noteOutput(); }
       return;
     }
     if (j.type === "content_block_delta" && j.delta?.type === "text_delta") {
       const t = j.delta?.text;
-      if (typeof t === "string" && t.length > 0) state.tokens++;
+      if (typeof t === "string" && t.length > 0) { state.tokens++; noteOutput(); }
       return;
     }
     if (j.type === "response.output_text.delta") {
       const t = j.delta;
-      if (typeof t === "string" && t.length > 0) state.tokens++;
+      if (typeof t === "string" && t.length > 0) { state.tokens++; noteOutput(); }
       return;
     }
     if (j.type === "response.completed" && j.response?.usage) {

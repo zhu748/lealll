@@ -1,6 +1,8 @@
 # ZCode 内置提示词
 
-从 ZCode 客户端 `app.asar` (`out/host/index.js` + `_reverse/zcode.cjs`) 提取。
+> 2026-10-20 维护说明：下文保留带版本日期的历史提取记录，不能把 3.11.2 压缩符号用于当前 3.16.2 bundle。实际出线以 src/proxy/zcode_system.json、system-prompt.ts 与测试为准；源快照见 _reverse/MANIFEST.md。
+
+从 ZCode 客户端 `app.asar` (`out/host/index.js` + `_reverse/glm/zcode.cjs`) 提取。
 
 ZCode 的 system prompt 由多个模块化 section 组合注入，按 `injectionTarget` 分为 `system` 和 `meta_user` 两类，按 `cacheHint` 分为 `stable` 和 `dynamic`。
 

@@ -1,6 +1,5 @@
 /**
  * Type definitions for OpenAI and Anthropic API formats.
- * @see .omo/plans/zcode-proxy.md Task 5
  * @see https://platform.openai.com/docs/api-reference/chat
  * @see https://docs.anthropic.com/en/api/messages
  */
@@ -17,7 +16,7 @@ export type Format = "openai" | "anthropic";
 // ─────────────────────────────────────────────
 
 /** OpenAI message role. */
-type OpenAIRole = "system" | "user" | "assistant" | "tool";
+type OpenAIRole = "system" | "developer" | "user" | "assistant" | "tool";
 
 /** OpenAI message in a chat completion request. */
 export interface OpenAIMessage {
@@ -71,7 +70,7 @@ export interface OpenAIUsage {
   cache_read_input_tokens?: number;
   cache_creation_input_tokens?: number;
   /** Standard OpenAI reasoning-token breakdown (mirrors `prompt_tokens_details`). */
-  output_tokens_details?: { reasoning_tokens?: number; audio_tokens?: number };
+  completion_tokens_details?: { reasoning_tokens?: number; audio_tokens?: number };
 }
 
 /** Tool definition in OpenAI format. */
@@ -94,6 +93,7 @@ export interface OpenAIChatRequest {
   stream?: boolean;
   stop?: string | string[];
   max_tokens?: number;
+  max_completion_tokens?: number;
   presence_penalty?: number;
   frequency_penalty?: number;
   logit_bias?: Record<string, number>;
@@ -169,7 +169,7 @@ export interface OpenAIModelList {
 // ─────────────────────────────────────────────
 
 /** Anthropic image/video source: inline base64 payload or a remote URL. */
-export type AnthropicImageSource =
+type AnthropicImageSource =
   | { type: "base64"; media_type: string; data: string }
   | { type: "url"; url: string };
 
@@ -179,7 +179,7 @@ export type AnthropicImageSource =
  * the official ZCode client emits for `application/pdf` / `text/plain` files
  * (`_reverse` bundle 3.14.0, Anthropic request builder).
  */
-export type AnthropicDocumentSource =
+type AnthropicDocumentSource =
   | { type: "base64"; media_type: string; data: string }
   | { type: "text"; media_type: string; data: string }
   | { type: "url"; url: string };
@@ -213,7 +213,8 @@ export interface AnthropicMessagesRequest {
   stop_sequences?: string[];
   metadata?: { user_id?: string };
   tools?: AnthropicToolDefinition[];
-  tool_choice?: { type: "auto" | "any" | "tool"; name?: string };
+  /** `disable_parallel_tool_use` is the Anthropic-side home of OpenAI's `parallel_tool_calls:false` — there is no top-level flag. */
+  tool_choice?: { type: "auto" | "any" | "tool"; name?: string; disable_parallel_tool_use?: boolean };
   thinking?: AnthropicThinkingConfig;
   /** GLM-5.3+ reasoning-effort channel; the Anthropic upstream ignores `reasoning_effort`. */
   output_config?: AnthropicOutputConfig;

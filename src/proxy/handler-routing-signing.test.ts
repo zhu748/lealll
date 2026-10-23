@@ -40,7 +40,7 @@ const TEST_CONFIG: ProxyConfig = {
   clientIdentity: { mode: "off", ttlSeconds: 900, maxSessions: 1024 },
   responses: { enabled: true, storeMaxEntries: 1000, storeTtlMs: 86400000 },
   endpointRouting: { enabled: false, origin: "https://zcode.z.ai" },
-  clientSigning: { enabled: false, origin: "https://zcode.z.ai" },
+  clientSigning: { enabled: false }, highspeed: { enabled: false, origin: "https://zcode.z.ai", models: [] },
   mcp: { enabled: true, webSearch: true, webReader: false, zread: false, gateway: { enabled: true, upstreamOrigin: "https://zcode.chatglm.site" } },
   async: { enabled: false, origin: "https://zcode.z.ai", pollIntervalMs: 5000, keepAliveIntervalMs: 3000, maxWaitMs: 0, maxRetries: 3, settleTimeoutMs: 8000, controlTimeoutMs: 15000, defaultModel: "" },
   claim: { enabled: false, auto: true, origin: "https://zcode.z.ai", pollIntervalMs: 300000, cooldownMs: 600000, planId: "" },
@@ -110,12 +110,8 @@ async function buildSigningManagerFixture(): Promise<{ manager: ClientSigningMan
   for (const b of combined) cipherBinary += String.fromCharCode(b);
 
   const manager = new ClientSigningManager({
-    identity: IDENTITY,
     fetchImpl: (async (input: RequestInfo | URL) => {
       const url = String(input instanceof Request ? input.url : input);
-      if (url.endsWith("/api/v1/agent/configs")) {
-        return new Response(JSON.stringify({ code: 0, data: { codingPlanSignature: { enable: true } } }), { status: 200 });
-      }
       if (url.endsWith("/api/paas/c1f3a7e2/v2/client")) {
         return new Response(JSON.stringify({ code: 200, data: { privateCipher: btoa(cipherBinary) } }), { status: 200 });
       }
@@ -182,4 +178,34 @@ describe("proxyRequest endpoint-routing + client-signing wiring", () => {
     expect(capturedHeaders!.get("x-client-pow")).toBeNull();
     expect(capturedHeaders!.get("x-app-id")).toBeNull();
   });
+
+  // Regression: exact trace contexts without a resolvable session id
+  // (degenerate bodies / requestId-only requests) must still carry a
+  // synthesized x-session-id so coding-plan signing never silently skips.
+  for (const [label, cfg, headers, body] of [
+    ["enforce + degenerate body", { ...TEST_CONFIG, clientIdentity: { mode: "enforce" as const, ttlSeconds: 900, maxSessions: 1024 } }, {}, JSON.stringify({ model: "glm-4.6", max_tokens: 32 })],
+    ["observe + requestId-only", { ...TEST_CONFIG, clientIdentity: { mode: "observe" as const, ttlSeconds: 900, maxSessions: 1024 } }, { "x-request-id": "req_only_1" }, JSON.stringify({ model: "glm-4.6", max_tokens: 32, messages: [{ role: "user", content: "hi" }] })],
+  ] as const) {
+    it(`signs coding-plan requests with no resolvable session (${label})`, async () => {
+      const { manager } = await buildSigningManagerFixture();
+      let capturedHeaders: Headers | undefined;
+      const resp = await proxyRequest(new Request("http://localhost:8080/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json", ...headers },
+        body,
+      }), "anthropic", {
+        config: cfg,
+        auth: oauthAuth(CRED),
+        fetchImpl: Object.assign(async (input: RequestInfo | URL) => {
+          capturedHeaders = input instanceof Request ? input.headers : new Headers();
+          return anthropicOk();
+        }, { preconnect: () => {} }) as typeof fetch,
+        endpointRouting: null,
+        clientSigning: manager,
+      });
+      expect(resp.status).toBe(200);
+      expect(capturedHeaders!.get("x-session-id")).toMatch(/^[0-9a-f-]{36}$/);
+      expect(capturedHeaders!.get("x-client-sig")).toBeDefined();
+    });
+  }
 });

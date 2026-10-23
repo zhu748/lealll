@@ -1,15 +1,3 @@
-/**
- * Tests for `src/async/keepalive.ts`.
- *
- * Verifies:
- *   - cadence: emits at +/- 50ms of the configured interval
- *   - first emit happens AFTER the first interval (not at t=0)
- *   - newlines in text are replaced with spaces (frame integrity)
- *   - AbortSignal: stream closes gracefully on abort
- *   - pre-aborted signal: stream closes immediately with zero emits
- *   - consumer cancellation: underlying timer is cleaned up
- *   - keepaliveFrame: produces a single well-formed frame
- */
 import { describe, it, expect } from "bun:test";
 import { keepaliveStream, keepaliveFrame } from "./keepalive.js";
 

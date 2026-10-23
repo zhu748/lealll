@@ -1,6 +1,5 @@
 /**
  * Tests for OpenAI ↔ Anthropic translators.
- * @see .omo/plans/zcode-proxy.md Task 11
  */
 import { describe, it, expect } from "bun:test";
 import {
@@ -23,6 +22,20 @@ import type {
 } from "./types.js";
 
 describe("translateRequestOpenAIToAnthropic", () => {
+  it("preserves developer instructions and prefers the current completion limit", () => {
+    const result = translateRequestOpenAIToAnthropic({
+      model: "glm-4.6", max_tokens: 20, max_completion_tokens: 100, thinking: { type: "disabled" },
+      messages: [
+        { role: "system", content: "base" },
+        { role: "developer", content: [{ type: "text", text: "policy" }] },
+        { role: "user", content: "hello" },
+      ],
+    });
+    expect(result.system).toBe("base\n\npolicy");
+    expect(result.messages).toHaveLength(1);
+    expect(result.messages[0]!.role).toBe("user");
+    expect(result.max_tokens).toBe(100);
+  });
   it("extracts system message to top-level system field", () => {
     const req: OpenAIChatRequest = {
       model: "glm-4.6",
@@ -165,6 +178,52 @@ describe("translateRequestOpenAIToAnthropic", () => {
     const result = translateRequestOpenAIToAnthropic(req);
     expect(result.tool_choice).toBeUndefined();
     expect(result.tools).toBeUndefined();
+  });
+
+  it("parallel_tool_calls:false synthesizes tool_choice {type:'auto',disable_parallel_tool_use:true} (issue #65)", () => {
+    const req: OpenAIChatRequest = {
+      model: "glm-4.6",
+      messages: [{ role: "user", content: "Hi" }],
+      tools: [{ type: "function", function: { name: "fn" } }],
+      parallel_tool_calls: false,
+    };
+    const result = translateRequestOpenAIToAnthropic(req);
+    expect(result.tool_choice).toEqual({ type: "auto", disable_parallel_tool_use: true });
+  });
+
+  it("parallel_tool_calls:false merges into an explicit tool_choice", () => {
+    const req: OpenAIChatRequest = {
+      model: "glm-4.6",
+      messages: [{ role: "user", content: "Hi" }],
+      tools: [{ type: "function", function: { name: "fn" } }],
+      tool_choice: "required",
+      parallel_tool_calls: false,
+    };
+    const result = translateRequestOpenAIToAnthropic(req);
+    expect(result.tool_choice).toEqual({ type: "any", disable_parallel_tool_use: true });
+  });
+
+  it("parallel_tool_calls:false is not emitted without tools (Anthropic rejects tool_choice with empty tools)", () => {
+    const req: OpenAIChatRequest = {
+      model: "glm-4.6",
+      messages: [{ role: "user", content: "Hi" }],
+      parallel_tool_calls: false,
+    };
+    const result = translateRequestOpenAIToAnthropic(req);
+    expect(result.tool_choice).toBeUndefined();
+  });
+
+  it("parallel_tool_calls:true or omitted does not serialize disable_parallel_tool_use (upstream default)", () => {
+    for (const parallel_tool_calls of [true, undefined]) {
+      const req: OpenAIChatRequest = {
+        model: "glm-4.6",
+        messages: [{ role: "user", content: "Hi" }],
+        tools: [{ type: "function", function: { name: "fn" } }],
+        ...(parallel_tool_calls !== undefined ? { parallel_tool_calls } : {}),
+      };
+      const result = translateRequestOpenAIToAnthropic(req);
+      expect(result.tool_choice).toBeUndefined();
+    }
   });
 
   it("translates assistant message with tool_calls into assistant content with tool_use blocks", () => {

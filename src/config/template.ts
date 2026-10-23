@@ -38,18 +38,12 @@ providers:
     anthropicBase: "https://open.bigmodel.cn/api/anthropic"
     openaiBase: "https://open.bigmodel.cn/api/coding/paas/v4"
 
-defaultModel: glm-4.6
+# Default model used when a client request omits \`model\`.
+defaultModel: glm-5.3
 
+# Informational model list surfaced in the TUI / startup output; any other
+# model id still forwards upstream (no whitelist enforcement).
 models:
-  - glm-4.5-air
-  - glm-4.6
-  - glm-4.6v
-  - glm-4.7
-  - glm-5
-  - glm-5-turbo
-  - glm-5v-turbo
-  - glm-5.1
-  - glm-5.2
   - glm-5.3
   - glm-5.3-flash
 
@@ -68,8 +62,8 @@ promptRewrite:
 identity:
   # Mirrors process.env.ZCODE_APP_VERSION in the ZCode bundle.
   # Must be printable ASCII; non-conforming values fall back to the default.
-  # Default: "3.14.4" (current ZCode release). Override to match your real client.
-  appVersion: "3.14.4"
+  # Default: "3.15.1" (current ZCode release). Override to match your real client.
+  appVersion: "3.15.1"
   # X-Title suffix → "Z Code@{sourceTitle}". Default "cli".
   sourceTitle: "cli"
   # HTTP-Referer URL. Default "https://zcode.z.ai".
@@ -80,12 +74,13 @@ identity:
   # Leave empty on Android — the app injects ZCODE_IDENTITY_DEVICE_MID instead.
   deviceMid: ""
 
-# Local client-session inference for cache-affinity experiments.
-# "observe" (default) logs inferred sessions in debug mode but does not change
-# upstream x-session-id. "enforce" reuses a stable x-session-id for inferred
-# coding-plan sessions. "off" disables inference entirely.
+# Local client-session inference for upstream session affinity.
+# "enforce" (default) forwards a stable x-session-id for inferred sessions
+# (cache affinity + closer to the official client, whose signing template
+# always carries a session id). "observe" logs inferred sessions in debug
+# mode without changing upstream x-session-id. "off" disables inference.
 clientIdentity:
-  mode: observe
+  mode: enforce
   ttlSeconds: 900
   maxSessions: 1024
 
@@ -99,16 +94,31 @@ endpointRouting:
   enabled: true
   origin: "https://zcode.z.ai"
 
-# Client request signing V4 (mirrors the ZCode 3.9.1 ClientRequestSigningV4Signer).
-# When enabled, the proxy probes {origin}/api/v1/agent/configs (cached 1h) and,
-# only if the server sets data.codingPlanSignature.enable=true, signs coding-plan
-# requests: handshake against {provider}/api/paas/c1f3a7e2/v2/client, Ed25519
-# signature + proof-of-work headers on every request, fail-open retry ladder
-# (two 401 VERIFY rejections -> permanent unsigned bypass). Start-plan and
-# off-peak paths are never signed. Env override: ZCODE_CLIENT_SIGNING=false.
+# Client request signing V4 (mirrors the ZCode 3.15.1 static signing rule).
+# When enabled, coding-plan requests are always signed: handshake against
+# {provider}/api/paas/c1f3a7e2/v2/client, Ed25519 signature + proof-of-work
+# headers on every request, fail-open retry ladder (two 401 VERIFY rejections
+# -> permanent unsigned bypass). Start-plan and off-peak paths are never
+# signed (the old agent/configs codingPlanSignature gate is gone on both
+# sides). Env override: ZCODE_CLIENT_SIGNING=false.
 clientSigning:
   enabled: true
+
+# HighSpeed 加速卡 (mirrors the ZCode 3.15.1 HighspeedCardService — Coding Plan
+# subscriber benefit, server-side random draw). Enabled by default, matching the
+# official client (which has no toggle): the first eligible coding-plan request
+# ignites a background draw loop (POST {origin}/api/v1/highspeed/draw at ~1/s —
+# the measured token-bucket refill rate; server next_draw_at is ignored on a
+# miss); on a hit, requests inside the card window are rewritten to the card
+# model with the highspeed auth set (X-Highspeed-Card-ID) and stay unsigned,
+# exactly like the official client. The loop self-extinguishes 5 minutes after
+# the last eligible request; account unavailability (503/3404) is
+# negative-cached 10min, HTTP 429 backs off 30s. task_id reuses the local
+# client-session affinity inference. Env override: ZCODE_HIGHSPEED_ENABLED=false.
+highspeed:
+  enabled: true
   origin: "https://zcode.z.ai"
+  models: ["glm-5.3", "glm-5.2", "glm-5.1"]
 
 logging:
   level: info

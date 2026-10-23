@@ -11,15 +11,24 @@
  *   forwarded with body transforms only ("passthrough" mode,
  *   `decompress: false`).
  *
- * @see .omo/plans/zcode-proxy.md Task 6
  */
 import type { OpenAIChatRequest, Format } from "../translator/types.js";
 import type { ProxyConfig } from "../config/types.js";
 import type { AuthManager } from "../auth/manager.js";
 import { getProvider } from "../provider/providers.js";
-import { buildUpstreamHeaderPairs, buildUpstreamRequest } from "./upstream.js";
+import { buildUpstreamHeaderPairs, buildUpstreamRequest, type UpstreamHeaderPair } from "./upstream.js";
 import { getDefaultEndpointRouting, type EndpointRoutingService } from "./endpoint-routing.js";
 import { getDefaultClientSigning, sendWithClientSigning, type ClientSigningManager } from "./client-signing.js";
+import {
+  applyHighspeedCardHeaders,
+  getDefaultHighspeedManager,
+  highspeedAuthFrom,
+  isHighspeedCardRejection,
+  rewriteBodyModel,
+  type HighspeedAuth,
+  type HighspeedCard,
+  type HighspeedManager,
+} from "../highspeed/manager.js";
 import { credentialString } from "../auth/types.js";
 import { pickProxy, markProxyFailed, getMaxRotations } from "./proxy-pool.js";
 import { transformRequestBody, transformParsedBody } from "./body-transformer.js";
@@ -84,6 +93,8 @@ export interface ProxyHandlerOptions {
   endpointRouting?: EndpointRoutingService | null;
   /** Override the process-wide client signing manager (for testing). `null` disables. */
   clientSigning?: ClientSigningManager | null;
+  /** Override the process-wide highspeed card manager (for testing). `null` disables. */
+  highspeed?: HighspeedManager | null;
 }
 
 /**
@@ -192,7 +203,11 @@ export async function proxyRequest(
   // mis-tagged before the add-key guard degrade to coding-plan instead of
   // failing every request with 401.
   const effectivePlanForCred = (c: Credential): "coding-plan" | "start-plan" => {
-    const plan = c.plan ?? (c.jwt ? "start-plan" : config.plan);
+    // 上游 v4.8.x 语义：plan 只来自显式 cred.plan / config.plan —— coding-plan
+    // 凭据也携带 JWT（highspeed 鉴权需要它），JWT 不再推断 start-plan；
+    // fork 4.8.0 harden 保留：start-plan 标签但无 JWT 的凭据降级 coding-plan
+    //（start-plan 平面只收 JWT）。
+    const plan = c.plan ?? config.plan;
     return plan === "start-plan" && !c.jwt ? "coding-plan" : plan;
   };
   let currentPlan = effectivePlanForCred(cred);
@@ -214,11 +229,6 @@ export async function proxyRequest(
   let startPlan = currentPlan === "start-plan";
   const translateMode = format === "openai";
   const upstreamFormat: Format = "anthropic";
-  const clientSession = resolveSessionContext({ clientReq, body, parsedBody, upstreamFormat, model: meta.model, config });
-  if (debug && clientSession) {
-    const shortSession = clientSession.sessionId ? clientSession.sessionId.slice(0, 10) : "-";
-    debugLine(reqId, `clientIdentity source=${clientSession.source} action=${clientSession.action} confidence=${clientSession.confidence.toFixed(2)} session=${shortSession}`);
-  }
 
   let upstreamBody = body;
   // Object form matching `upstreamBody` (undefined when the body isn't a
@@ -231,6 +241,16 @@ export async function proxyRequest(
     upstreamParsed = translated;
     upstreamBody = JSON.stringify(translated);
     if (debug) debugLine(reqId, `translated OpenAI→Anthropic (bytes=${upstreamBody?.length ?? 0})`);
+  }
+
+  // Session affinity 在转换后的 anthropic 侧计算：上游请求恒为 Anthropic
+  // 形状，OpenAI 客户端与 Anthropic 客户端的同一逻辑对话得到同构的
+  // canonical 身份（hash 谱系/任务身份与上游会话对齐，而非客户端方言）。
+  // fork 热路径：`upstreamParsed` 是调用方单次解析产物，直接穿引免二次解析。
+  const clientSession = resolveSessionContext({ clientReq, body: upstreamBody, parsedBody: upstreamParsed, traceBody: body, upstreamFormat, model: meta.model, config });
+  if (debug && clientSession) {
+    const shortSession = clientSession.sessionId ? clientSession.sessionId.slice(0, 10) : "-";
+    debugLine(reqId, `clientIdentity source=${clientSession.source} action=${clientSession.action} confidence=${clientSession.confidence.toFixed(2)} session=${shortSession}`);
   }
 
   // Bundle `E2e` fires for EVERY anthropic-kind request (both plans) — the
@@ -291,7 +311,29 @@ export async function proxyRequest(
   const retryLoopStartedAt = Date.now();
   let hadRetryAttempt = false;
 
-  const useOrderedTransport = shouldUseOrderedTransport(config, clientSession, hasCustomFetchImpl);
+  // ── HighSpeed 加速卡（3.15.1 镜像，默认开）──
+  // coding-plan + 合格模型：懒触发抽卡（affinity task_id）；持卡窗口内改写
+  // 模型为卡上模型并替换鉴权套装（buildHighspeedTurnExecution 同构）。挂卡
+  // 请求不签名（官方静态规则：highspeed mode 永不签名）。fork 多账号下按
+  // 请求首凭据抽卡；中途切换账号时弃卡并重建请求体（见 maybeSwitchCredential）。
+  const highspeedManager = opts.highspeed !== undefined ? opts.highspeed : getDefaultHighspeedManager(config);
+  let highspeedCard: HighspeedCard | undefined;
+  let highspeedAuth: HighspeedAuth | undefined = undefined;
+  if (highspeedManager && !startPlan && highspeedManager.isEligibleModel(meta.model) && transformedBody) {
+    const auth = highspeedAuthFrom(cred);
+    if (auth) {
+      highspeedAuth = auth;
+      highspeedManager.onRequest(meta.model, clientSession?.upstreamSessionId, auth);
+      const card = highspeedManager.activeCardFor(meta.model);
+      if (card) {
+        transformedBody = rewriteBodyModel(transformedBody, card.model);
+        highspeedCard = card;
+        console.log(`${reqId} highspeed card applied (model=${card.model}, card ${card.cardId.slice(0, 12)}…, window ${Math.round((card.expiresAt - Date.now()) / 1000)}s)`);
+      }
+    }
+  }
+
+  const useOrderedTransport = shouldUseOrderedTransport(clientSession, hasCustomFetchImpl);
 
   const routing = opts.endpointRouting !== undefined ? opts.endpointRouting : getDefaultEndpointRouting(config);
   const signer = opts.clientSigning !== undefined ? opts.clientSigning : getDefaultClientSigning(config);
@@ -336,7 +378,7 @@ export async function proxyRequest(
   /** Dispatch with the CURRENT credential (fork: parameterized so the retry
    * loop can re-dispatch with a switched account). Body/headers rebuilt per
    * call — a reused Request has its body stream marked used after the first
-   * fetch. */
+   * fetch. Upstream 3.15.1：挂卡请求替换鉴权套装且永不签名（官方静态规则）。 */
   const dispatch = async (credNow: Credential, captchaHeaders: Record<string, string> | undefined): Promise<Response> => {
     // Egress resolution per dispatch: per-credential override → pool pick
     // (sticky via pickProxy; excluded proxies are skipped during rotation).
@@ -355,37 +397,57 @@ export async function proxyRequest(
     if (useOrderedTransport && translateMode) {
       pairs = capOrderedAcceptEncoding(pairs);
     }
-    const req = buildUpstreamRequest(clientReq, upstreamFormat, provider, credNow, transformedBody, config.identity, currentPlan, captchaHeaders, clientSession);
+    let req = buildUpstreamRequest(clientReq, upstreamFormat, provider, credNow, transformedBody, config.identity, currentPlan, captchaHeaders, clientSession);
+    if (highspeedCard && highspeedAuth) {
+      pairs = applyHighspeedCardHeaders(pairs, highspeedCard, highspeedAuth);
+      // buildUpstreamRequest derives its own (uncarded) header set; a carded
+      // dispatch must come from the swapped pairs so the card headers actually
+      // reach the wire.
+      req = new Request(req.url, {
+        method: req.method,
+        headers: Object.fromEntries(pairs),
+        body: transformedBody ?? undefined,
+      });
+    }
     let sendUrl = req.url;
+    let routingHeaderPairs: UpstreamHeaderPair[] | undefined;
     if (routing) {
-      const routed = await routing.resolve(req.url, credentialString(credNow));
+      const routed = await routing.resolve(req.url, credentialString(credNow), credNow.jwt);
       if (routed.routed) {
         sendUrl = routed.url;
+        routingHeaderPairs = routed.headers ? (Object.entries(routed.headers) as UpstreamHeaderPair[]) : undefined;
         if (debug) debugLine(reqId, `endpoint routing: ${req.url} -> ${routed.url}`);
       }
     }
     // Signing decisions (exempt-path, handshake origin, bypass keying) run
     // against the PRE-routing provider URL — the client's signer wraps the
     // routing transport, so its checks see the original URL too.
-    return sendWithClientSigning(signer, {
+    // 官方 3.15.1 静态规则：highspeed mode 的推理请求永不签名（`TUs` 返回 false）。
+    return sendWithClientSigning(highspeedCard ? null : signer, {
       url: req.url,
       headerPairs: pairs,
       credential: credentialString(credNow),
+      oauthAccessToken: credNow.oauthAccessToken,
+      provider: credNow.provider,
       appVersion: config.identity.appVersion,
       debug: debug ? (message) => debugLine(reqId, message) : undefined,
       send: (finalPairs) => {
+        // 3.16.2 X-ZCode-Authorization: the client appends it inside its
+        // routing wrapper, which sits INSIDE the signing wrapper — so on the
+        // wire it lands after the signature block, as the very last header.
+        const outboundPairs = routingHeaderPairs ? [...finalPairs, ...routingHeaderPairs] : finalPairs;
         if (dumpEnabled()) {
           dumpPhase(reqId, "wire_out", {
             url: sendUrl,
-            signed: finalPairs.some(([k]) => k.toLowerCase() === "x-client-sig"),
-            headers: dumpHeaders(new Headers(Object.fromEntries(finalPairs))),
+            signed: outboundPairs.some(([k]) => k.toLowerCase() === "x-client-sig"),
+            headers: dumpHeaders(new Headers(Object.fromEntries(outboundPairs))),
           });
         }
-        const sendReq = sendUrl === req.url && finalPairs === pairs
+        const sendReq = sendUrl === req.url && outboundPairs === pairs
           ? req
           : new Request(sendUrl, {
               method: req.method,
-              headers: Object.fromEntries(finalPairs),
+              headers: Object.fromEntries(outboundPairs),
               body: transformedBody ?? undefined,
             });
         if (headerDebugOn && !headerDebugRecorded) {
@@ -395,7 +457,9 @@ export async function proxyRequest(
         recordPromptDispatch(config, promptObservation, upstreamPrompt, promptRewriteResult);
         return sendUpstreamRequest({
           request: sendReq,
-          headerPairs: finalPairs,
+          // outboundPairs（含路由 X-ZCode-Authorization）也作为有序传输的
+          // 头源：3.16.2 该头必须落在签名块之后，不能在有序路径丢失。
+          headerPairs: outboundPairs,
           body: transformedBody,
           translateMode,
           useOrderedTransport,
@@ -440,6 +504,14 @@ export async function proxyRequest(
     cred = newCred;
     triedApiKeys.add(newCred.apiKey);
     consecutiveCredFailures = 0;
+    // 弃掉当前 highspeed 卡：卡是按前一凭据的鉴权套装抽的，新账号不能
+    // 复用旧卡头/模型改写。卡存在时 transformedBody 带有卡上模型，必须重建。
+    const hadHighspeedCard = highspeedCard !== undefined;
+    if (hadHighspeedCard) {
+      highspeedCard = undefined;
+      highspeedAuth = undefined;
+      console.log(`${reqId} highspeed card dropped — credential switched mid-request`);
+    }
     const newPlan = effectivePlanForCred(newCred);
     if (newPlan !== currentPlan) {
       console.log(`${reqId} plan synced to ${newPlan} (from new credential ${maskApiKey(newCred.apiKey)})`);
@@ -447,6 +519,8 @@ export async function proxyRequest(
       // request-local: see the comment on the initial plan resolution above
       startPlan = newPlan === "start-plan";
       rebuildTransformedBody();
+    } else if (hadHighspeedCard) {
+      rebuildTransformedBody(); // 套餐未变也需剥离卡上的模型改写
     }
     console.log(`${reqId} credential switched: ${maskApiKey(fromKey)} → ${maskApiKey(newCred.apiKey)}`);
     // Persist the switch so the dashboard reflects the new active account.
@@ -667,6 +741,36 @@ export async function proxyRequest(
         ttfbMs: headersAt - started,
         attempt,
       });
+    }
+
+    // highspeed selectionFallback（官方语义）：挂卡请求收到 401 / biz 3402
+    // （卡过期/拒绝）时弃卡，用原模型 + 常规 coding-plan 鉴权（恢复签名）重发一次。
+    // fork 适配：dispatch 每次全量重建头/请求体，弃卡后重建 transformedBody
+    // 即可回到会话模型，无需手工恢复头对。
+    if (highspeedCard && highspeedManager && (await isHighspeedCardRejection(upstreamResp))) {
+      console.log(`${reqId} highspeed card rejected upstream — falling back to session model`);
+      highspeedManager.dropCard("upstream_rejected");
+      highspeedCard = undefined;
+      highspeedAuth = undefined;
+      discardUpstreamBody();
+      rebuildTransformedBody(); // 剥离卡上的模型改写 → 回到会话模型
+      try {
+        upstreamResp = await dispatchWithConnectRetry(
+          () => dispatch(cred, captchaHeaders),
+          {
+            isAborted: () => clientReq.signal.aborted,
+            onRetry: (connectAttempt, err) => {
+              if (debug) debugError(reqId, "upstream_connect_retry", `attempt ${connectAttempt}/${MAX_CONNECT_ATTEMPTS - 1} failed (${err.message}), retrying in ${500 * connectAttempt}ms`);
+            },
+          },
+        );
+      } catch (err) {
+        if (debug) debugError(reqId, "upstream_unreachable", (err as Error).message);
+        logResult({ status: 502, headersAt: Date.now(), stats: rowStats() });
+        return errorResponse(502, "upstream_unreachable", (err as Error).message);
+      }
+      headersAt = Date.now();
+      if (debug) debugLine(reqId, `highspeed fallback dispatched (status=${upstreamResp.status})`);
     }
 
     if (upstreamResp.status === 401 && startPlan) {

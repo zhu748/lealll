@@ -1,6 +1,5 @@
 /**
  * Configuration types for zcode-proxy.
- * @see .omo/plans/zcode-proxy.md Task 2
  */
 
 /** Provider endpoint configuration (one per upstream provider). */
@@ -153,7 +152,11 @@ export interface ProxyIdentity {
 
 /** Local client-session inference mode for upstream session affinity. */
 export interface ClientIdentityConfig {
-  /** "observe" logs/instruments only; "enforce" reuses upstream x-session-id; "off" disables inference. */
+  /**
+   * "enforce" (default) forwards a stable x-session-id for inferred sessions
+   * (cache affinity; the official signing template always carries a session
+   * id); "observe" logs only; "off" disables inference.
+   */
   mode: "off" | "observe" | "enforce";
   /** In-memory session TTL in seconds. */
   ttlSeconds: number;
@@ -163,7 +166,7 @@ export interface ClientIdentityConfig {
 
 /**
  * Responses-API (`/v1/responses`) configuration. When `enabled`, the proxy
- * translates Codex-style Responses requests to the GLM Chat Completions upstream.
+ * translates Responses requests through Chat Completions to the Anthropic upstream.
  */
 export interface ResponsesConfig {
   /** Enable the `/v1/responses` route. Default `true`. */
@@ -196,15 +199,15 @@ export interface McpGatewayConfig {
   upstreamOrigin: string;
 }
 
-/** GLM MCP hosted-tool configuration. Endpoints are derived from the active provider. */
+/** Legacy hosted-tool switches (unwired) plus the active official MCP gateway. */
 export interface McpConfig {
-  /** Enable MCP interception (web_search) and function-tool injection (web_reader/zread). Default `true`. */
+  /** Legacy compatibility field, currently unwired. Default `true`. */
   enabled: boolean;
-  /** Intercept `web_search` / `web_search_preview` hosted tools via GLM `web_search_prime` MCP. Default `true`. */
+  /** Legacy hosted-search preference; no search executor is wired. Default `true`. */
   webSearch: boolean;
-  /** Inject `webReader` as a function tool the model can call. Default `false` (off by default to limit scope). */
+  /** Legacy reader preference, currently unwired. Default `false`. */
   webReader: boolean;
-  /** Inject the three `zread` tools as function tools. Default `false`. */
+  /** Legacy repository-reader preference, currently unwired. Default `false`. */
   zread: boolean;
   /**
    * MCP gateway usage quota (3.14.4 supplemental, v4.7.5-fork.1).
@@ -331,19 +334,34 @@ export interface EndpointRoutingConfig {
 }
 
 /**
- * Client request signing V4 — mirrors the ZCode 3.9.1
- * `ClientRequestSigningV4Signer`. When enabled, the proxy probes the same
- * feature gate the client uses (`GET {origin}/api/v1/agent/configs` →
- * `data.codingPlanSignature.enable`) and, only if the server turns the feature
- * on, signs coding-plan upstream requests (handshake + Ed25519 + proof-of-work,
- * with the client's fail-open retry ladder). Start-plan and off-peak paths are
- * permanently exempt.
+ * Client request signing V4 — mirrors the ZCode 3.15.1
+ * `requiresClientRequestSigning` static rule (bundle `TUs`): coding-plan
+ * credentials are always signed (handshake + Ed25519 + proof-of-work, with
+ * the client's fail-open retry ladder); start-plan, off-peak and highspeed
+ * paths are never signed. The 3.12.3–3.14.4 `agent/configs`
+ * `codingPlanSignature` gate probe no longer exists on either side.
  */
 export interface ClientSigningConfig {
-  /** Enable gate probing + signing. Default `true`. */
+  /** Enable signing. Default `true`. */
   enabled: boolean;
-  /** Base origin of the feature-gate endpoint. Default `"https://zcode.z.ai"`. */
+}
+
+/**
+ * HighSpeed 加速卡（ZCode 3.15.1 HighspeedCardService 镜像，见
+ * `_reverse/NOTEPAD.md` §C）。coding-plan 请求到达时懒触发抽卡
+ * (`POST {origin}/api/v1/highspeed/draw`)；命中后窗口内（服务端 expires_at，
+ * 设计基准 5min）的合格请求共享该卡：模型改写为卡上模型 + 鉴权替换为
+ * JWT 套装 + `X-Highspeed-Card-ID`，且该请求不签名（官方静态规则）。
+ * task_id 复用 client-session affinity 推断。账号未灰度（503/3404）时
+ * 负缓存 10min，fail-open 回普通转发。
+ */
+export interface HighspeedConfig {
+  /** Enable the highspeed card worker. Default `true` (the official client has no toggle at all). */
+  enabled: boolean;
+  /** Base origin of the highspeed gateway. Default `"https://zcode.z.ai"`. */
   origin: string;
+  /** Eligible model prefixes that trigger draws / accept cards. Default `["glm-5.3", "glm-5.2", "glm-5.1"]`. */
+  models: string[];
 }
 
 export interface PromptRewriteRule {
@@ -416,8 +434,10 @@ export interface ProxyConfig {
   responses: ResponsesConfig;
   /** Server-controlled upstream URL remapping (ultra endpoints). */
   endpointRouting: EndpointRoutingConfig;
-  /** Client request signing V4 (Ed25519 + PoW, gate-driven). */
+  /** Client request signing V4 (Ed25519 + PoW, static coding-plan rule). */
   clientSigning: ClientSigningConfig;
+  /** HighSpeed 加速卡 worker (enabled by default — the official client has no toggle). */
+  highspeed: HighspeedConfig;
   /** GLM MCP hosted-tool configuration. */
   mcp: McpConfig;
   /**

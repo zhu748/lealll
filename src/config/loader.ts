@@ -1,10 +1,9 @@
 /**
  * YAML config loader with env-var overrides and validation.
- * @see .omo/plans/zcode-proxy.md Task 2
  */
 import { readFileSync, existsSync } from "node:fs";
 import { parse } from "yaml";
-import type { ClientIdentityConfig, ProxyConfig, ProviderEndpoints, ProxyIdentity, ResponsesConfig, McpConfig, AsyncConfig, EndpointRoutingConfig, ClientSigningConfig, ClaimConfig, RetryConfig, RoutingRule, ModelMapping, ResponsesThinkingConfig, ClientConfigConfig, SubscriptionConfig } from "./types.js";
+import type { ClientIdentityConfig, ProxyConfig, ProviderEndpoints, ProxyIdentity, ResponsesConfig, McpConfig, AsyncConfig, EndpointRoutingConfig, ClientSigningConfig, HighspeedConfig, ClaimConfig, RetryConfig, RoutingRule, ModelMapping, ResponsesThinkingConfig, ClientConfigConfig, SubscriptionConfig } from "./types.js";
 import { normalizePromptRewriteConfig } from "./prompt-rewrite.js";
 
 /** Environment variable keys that override YAML values. */
@@ -25,6 +24,7 @@ const ENV = {
   CLAIM_POLL_INTERVAL_MS: "ZCODE_CLAIM_POLL_INTERVAL_MS",
   ENDPOINT_ROUTING_ENABLED: "ZCODE_ENDPOINT_ROUTING",
   CLIENT_SIGNING_ENABLED: "ZCODE_CLIENT_SIGNING",
+  HIGHSPEED_ENABLED: "ZCODE_HIGHSPEED_ENABLED",
   MCP_GATEWAY_ENABLED: "ZCODE_MCP_GATEWAY",
   MCP_GATEWAY_ORIGIN: "ZCODE_MCP_GATEWAY_ORIGIN",
   MCP_USAGE_ENABLED: "ZCODE_MCP_USAGE_ENABLED",
@@ -49,9 +49,9 @@ const ENV = {
   RETRY_TOTAL_DEADLINE_MS: "ZCODE_RETRY_TOTAL_DEADLINE_MS",
 } as const;
 
-/** Mirrors the ZCode desktop release (`_reverse/NOTEPAD.md`); bump per client
- *  release or User-Agent/X-ZCode-App-Version become distinguishable. */
-export const DEFAULT_APP_VERSION = "3.14.4";
+/** Pinned wire fingerprint (3.15.1 — static signing/highspeed rules live-verified
+ * 2026-10-12); snapshot version is tracked separately in _reverse/MANIFEST.md. */
+export const DEFAULT_APP_VERSION = "3.15.1";
 
 const DEFAULTS = {
   PORT: 8080,
@@ -62,7 +62,9 @@ const DEFAULTS = {
   // the free/trial tier lives there. API-key credentials (no JWT) are coerced
   // back to coding-plan by createApiKeyCredential, so apikey mode is unaffected.
   PLAN: "start-plan" as const,
-  DEFAULT_MODEL: "glm-4.6",
+  // 上游 v4.8.2: 默认模型对齐官方当前档位；广告模型缩减为两个主档。
+  DEFAULT_MODEL: "glm-5.3",
+  MODELS: ["glm-5.3", "glm-5.3-flash"],
   LOG_LEVEL: "info" as const,
   ZAI_ANTHROPIC_BASE: "https://api.z.ai/api/anthropic",
   ZAI_OPENAI_BASE: "https://api.z.ai/api/coding/paas/v4",
@@ -71,7 +73,7 @@ const DEFAULTS = {
   APP_VERSION: DEFAULT_APP_VERSION,
   SOURCE_TITLE: "cli",
   REFERER_ORIGIN: "https://zcode.z.ai",
-  CLIENT_IDENTITY_MODE: "observe" as const,
+  CLIENT_IDENTITY_MODE: "enforce" as const,
   CLIENT_IDENTITY_TTL_SECONDS: 900,
   CLIENT_IDENTITY_MAX_SESSIONS: 1024,
   RESPONSES_ENABLED: true,
@@ -113,6 +115,10 @@ const DEFAULTS = {
   ENDPOINT_ROUTING_ORIGIN: "https://zcode.z.ai",
   CLIENT_SIGNING_ENABLED: true,
   CLIENT_SIGNING_ORIGIN: "https://zcode.z.ai",
+  // --- upstream v4.8.x: HighSpeed 加速卡（3.15.1 镜像，默认开）---
+  HIGHSPEED_ENABLED: true,
+  HIGHSPEED_ORIGIN: "https://zcode.z.ai",
+  HIGHSPEED_MODELS: ["glm-5.3", "glm-5.2", "glm-5.1"],
   // --- fork multi-account / resilience extensions ---
   AUTH_MODE: "oauth" as const,
   UPSTREAM_TIMEOUT_MS: 0,
@@ -199,7 +205,7 @@ export function loadConfig(path: string): ProxyConfig {
 
   // --- models ---
   const defaultModel = typeof parsed?.defaultModel === "string" ? parsed.defaultModel : DEFAULTS.DEFAULT_MODEL;
-  const models = Array.isArray(parsed?.models) ? parsed.models : [defaultModel];
+  const models = Array.isArray(parsed?.models) ? parsed.models : [...DEFAULTS.MODELS];
 
   // --- logging ---
   const logLevel = resolveLogLevel(parsed?.logging?.level);
@@ -224,6 +230,7 @@ export function loadConfig(path: string): ProxyConfig {
   const claimCfg = resolveClaimConfig(parsed?.claim);
   const endpointRouting = resolveEndpointRoutingConfig(parsed?.endpointRouting);
   const clientSigning = resolveClientSigningConfig(parsed?.clientSigning);
+  const highspeed = resolveHighspeedConfig(parsed?.highspeed);
 
   // --- fork dashboard / resilience extensions ---
   const retry = resolveRetry(parsed?.retry);
@@ -263,6 +270,7 @@ export function loadConfig(path: string): ProxyConfig {
     responses,
     endpointRouting,
     clientSigning,
+  highspeed,
     mcp,
     ...(clientConfig ? { clientConfig } : {}),
     ...(subscription ? { subscription } : {}),
@@ -454,12 +462,24 @@ function resolveEndpointRoutingConfig(raw: unknown): EndpointRoutingConfig {
 function resolveClientSigningConfig(raw: unknown): ClientSigningConfig {
   const obj = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
   const enabledEnv = process.env[ENV.CLIENT_SIGNING_ENABLED];
-  const origin = (typeof obj.origin === "string" ? obj.origin : DEFAULTS.CLIENT_SIGNING_ORIGIN).trim()
-    || DEFAULTS.CLIENT_SIGNING_ORIGIN;
-  validateOrigin(origin, "clientSigning.origin");
   return {
     enabled: enabledEnv !== undefined ? resolveBool(enabledEnv, DEFAULTS.CLIENT_SIGNING_ENABLED) : resolveBool(obj.enabled, DEFAULTS.CLIENT_SIGNING_ENABLED),
+  };
+}
+
+function resolveHighspeedConfig(raw: unknown): HighspeedConfig {
+  const obj = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
+  const enabledEnv = process.env[ENV.HIGHSPEED_ENABLED];
+  const origin = (typeof obj.origin === "string" ? obj.origin : DEFAULTS.HIGHSPEED_ORIGIN).trim()
+    || DEFAULTS.HIGHSPEED_ORIGIN;
+  validateOrigin(origin, "highspeed.origin");
+  const models = Array.isArray(obj.models)
+    ? obj.models.filter((m): m is string => typeof m === "string" && m.trim().length > 0).map((m) => m.trim())
+    : DEFAULTS.HIGHSPEED_MODELS;
+  return {
+    enabled: enabledEnv !== undefined ? resolveBool(enabledEnv, DEFAULTS.HIGHSPEED_ENABLED) : resolveBool(obj.enabled, DEFAULTS.HIGHSPEED_ENABLED),
     origin,
+    models,
   };
 }
 

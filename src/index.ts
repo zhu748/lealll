@@ -1,6 +1,5 @@
 /**
  * Entry point — load config, create auth manager, start proxy server.
- * @see .omo/plans/zcode-proxy.md Task 7
  */
 import { loadConfig, DEFAULT_APP_VERSION } from "./config/loader.js";
 import { AuthManager } from "./auth/manager.js";
@@ -28,6 +27,7 @@ import {
   type PanelSettings,
 } from "./server/panel.js";
 import { checkForUpdate } from "./update/check.js";
+import { shutdownAllHighspeed } from "./highspeed/manager.js";
 import { readFileSync, existsSync, writeFileSync, chmodSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { ensureNodeFetchNoTimeouts } from "./runtime/node-fetch-compat.js";
@@ -59,7 +59,7 @@ export function parseServeArgs(args: string[]): ServeArgs {
   return { configPath, debug };
 }
 
-export function main(): void {
+function main(): void {
   // Fire-and-forget is race-safe: the dynamic import resolves in a microtask,
   // before the listener's event-loop callback can admit a request.
   void ensureNodeFetchNoTimeouts();
@@ -258,6 +258,15 @@ function installLogTee(): LogBuffer {
 }
 
 /**
+ * Loopback spellings that keep the panel unexposed (same set the config loader
+ * accepts for http:// origins). Anything else was an explicit `ZCODE_PANEL_HOST`
+ * and gets the startup warning below.
+ */
+function isLoopbackPanelHost(host: string): boolean {
+  return host === "127.0.0.1" || host === "localhost" || host === "::1";
+}
+
+/**
  * Start the optional web panel for `serve`. `serve` has no TUI, so this is the
  * only way to see quota, read live logs or switch provider/plan on a headless
  * box without `docker exec`.
@@ -416,10 +425,19 @@ async function startServePanel(
 
   const panel = await startPanelServer({
     port: settings.port,
+    hostname: settings.host,
     token: settings.token,
     handleControl,
   });
   console.log(`panel: http://${panel.hostname}:${panel.port} (token required)`);
+  // A non-loopback bind (the Docker bridge escape hatch, `ZCODE_PANEL_HOST`)
+  // is safe only as long as the token is strong and the port stays firewalled
+  // past the host that needs it — say so at startup, not only in the docs.
+  if (!isLoopbackPanelHost(panel.hostname)) {
+    console.warn(
+      `panel: bound to ${panel.hostname} — anyone who reaches this port with the token can stop the proxy, log out, or shut down`,
+    );
+  }
 
   return panel;
 }
@@ -579,6 +597,8 @@ async function serve(configPath: string | undefined, debug: boolean): Promise<vo
     console.log(`\n${signal} received — shutting down...`);
     try { claimScheduler?.stop(); } catch { /* already stopped */ }
     try { captchaModule?.shutdownCaptcha(); } catch { /* pool not started */ }
+    // heartbeats are unref'd but stopped explicitly on shutdown (upstream v4.8.x)
+    try { shutdownAllHighspeed(); } catch { /* loop never ignited */ }
     serverRef.current?.stop(false);
     const force = setTimeout(() => process.exit(0), 5000);
     force.unref?.();

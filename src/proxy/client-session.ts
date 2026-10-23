@@ -3,6 +3,16 @@
  *
  * The resolver stores only hashes and generated IDs. It deliberately avoids
  * prompt markers, response mutation, and full prompt persistence.
+ *
+ * Lineage keys form a Merkle chain: chain[0] hashes the identity head
+ * (format/model/system/developer/tools/tool_choice), chain[i] folds in
+ * message i. One O(body) hashing pass per request then yields the exact-node
+ * key AND every prefix key, so parent matching at any depth costs a single
+ * Map lookup instead of re-stringifying the whole prefix.
+ *
+ * Both `nodes` and `sessions` are recency-ordered Maps (delete+set on touch):
+ * TTL sweeps stop at the first fresh entry and cap eviction pops from the
+ * front — O(expired)/O(1) instead of the former full-map scan per request.
  */
 import nodeCrypto from "node:crypto";
 import type { Format } from "../translator/types.js";
@@ -23,7 +33,6 @@ export interface ClientSessionResult {
 }
 
 interface StoredNode {
-  nodeHash: string;
   sessionId: string;
   upstreamSessionId: string;
   lastSeenAt: number;
@@ -31,7 +40,7 @@ interface StoredNode {
 
 interface CanonicalRequest {
   model: string;
-  identity: unknown;
+  head: Record<string, unknown>;
   messages: unknown[];
 }
 
@@ -44,84 +53,119 @@ interface ExplicitTraceContext {
 
 export interface ClientSessionResolver {
   /**
-   * `parsed` (optional): the request body already parsed by the caller —
-   * the proxy hot path parses each body exactly once and threads the object
-   * here, so the resolver never re-parses. When omitted, the legacy
-   * parse-on-demand behavior applies (tests, non-proxy callers).
+   * @param body canonical body for lineage hashing — the POST-TRANSLATION
+   *   Anthropic-shaped upstream body (session identity aligns with the
+   *   upstream conversation, not the client dialect).
+   * @param traceBody raw client body for explicit trace-metadata detection
+   *   (client attribution intent lives in the client's own body; OpenAI→
+   *   Anthropic translation drops foreign metadata fields). When omitted,
+   *   `body` is parsed once and shared with lineage hashing.
+   * @param parsed (fork hot-path) the canonical `body` already parsed by the
+   *   caller — the proxy parses each body exactly once and threads the object
+   *   here, so the resolver never re-parses. When omitted, parse-on-demand
+   *   applies (tests, non-proxy callers).
    */
-  resolve(req: Request, body: string | undefined, format: Format, model: string, config: ClientIdentityConfig, parsed?: Record<string, unknown>): ClientSessionResult;
+  resolve(req: Request, body: string | undefined, format: Format, model: string, config: ClientIdentityConfig, traceBody?: string, parsed?: Record<string, unknown>): ClientSessionResult;
 }
+
+/**
+ * Prefix depths tried for parent matching, shallowest first. Depth 2 is the
+ * canonical assistant+user turn append; 3–4 catch tool rounds that append a
+ * variable number of messages (e.g. parallel tool results split across user
+ * messages). A match at any depth requires the truncated prefix to have been
+ * an actually-seen request node, so unrelated conversations never fuse.
+ * Depth 1 is deliberately excluded: a bare single-message append is a new
+ * conversation (fork isolation, see the forked-continuation test).
+ */
+const PARENT_DEPTHS = [2, 3, 4] as const;
+
+/** Hard cap on lineage nodes independent of the session cap (per-session
+ * agentic rounds each store a node; 32× leaves generous headroom before an
+ * active session's nodes could be LRU'd out from under it). */
+const NODES_PER_SESSION_CAP = 32;
 
 export function createClientSessionResolver(now: () => number = () => Date.now()): ClientSessionResolver {
   const nodes = new Map<string, StoredNode>();
   const sessions = new Map<string, StoredNode>();
 
+  /** Re-insert to refresh recency order (Map.set alone keeps the old slot). */
+  function touch<K>(map: Map<K, StoredNode>, key: K, node: StoredNode): void {
+    map.delete(key);
+    map.set(key, node);
+  }
+
+  /** Pop oldest-first until under cap (front of a recency-ordered Map). */
+  function evictOverCap<K>(map: Map<K, StoredNode>, cap: number): void {
+    while (map.size > cap) {
+      const oldest = map.keys().next();
+      if (oldest.done) break;
+      map.delete(oldest.value);
+    }
+  }
+
+  /** Drop expired entries; recency order lets us stop at the first fresh one. */
+  function sweepExpired<K>(map: Map<K, StoredNode>, cutoff: number): void {
+    for (const [key, node] of map) {
+      if (node.lastSeenAt >= cutoff) break;
+      map.delete(key);
+    }
+  }
+
   function remember(nodeHash: string, session: StoredNode, config: ClientIdentityConfig): void {
-    const stored = { ...session, nodeHash, lastSeenAt: now() };
-    nodes.set(nodeHash, stored);
-    sessions.set(stored.sessionId, stored);
-    prune(config);
-  }
-
-  function prune(config: ClientIdentityConfig): void {
-    const cutoff = now() - config.ttlSeconds * 1000;
-    for (const [hash, node] of nodes.entries()) {
-      if (node.lastSeenAt < cutoff) nodes.delete(hash);
-    }
-    for (const [id, node] of sessions.entries()) {
-      if (node.lastSeenAt < cutoff) sessions.delete(id);
-    }
-    while (sessions.size > config.maxSessions) {
-      let oldestId = "";
-      let oldestAt = Infinity;
-      for (const [id, node] of sessions.entries()) {
-        if (node.lastSeenAt < oldestAt) {
-          oldestAt = node.lastSeenAt;
-          oldestId = id;
-        }
-      }
-      if (!oldestId) break;
-      sessions.delete(oldestId);
-      for (const [hash, node] of nodes.entries()) {
-        if (node.sessionId === oldestId) nodes.delete(hash);
-      }
-    }
-  }
-
-  function action(config: ClientIdentityConfig): ClientSessionAction {
-    return config.mode;
+    // Keep a distinct timestamp per lineage node. Sharing this object across
+    // node keys makes their timestamps advance without refreshing each Map
+    // position, which breaks the ordered TTL sweep's early-exit invariant.
+    const stored = { ...session, lastSeenAt: now() };
+    touch(nodes, nodeHash, stored);
+    touch(sessions, stored.sessionId, stored);
+    evictOverCap(sessions, config.maxSessions);
+    evictOverCap(nodes, config.maxSessions * NODES_PER_SESSION_CAP);
   }
 
   return {
-    resolve(req, body, format, model, config, parsed) {
+    resolve(req, body, format, model, config, traceBody, parsed) {
       if (config.mode === "off") return { source: "none", action: "off", confidence: 0 };
 
-      prune(config);
-      const explicitTrace = requestTraceContext(req, body, parsed);
+      const cutoff = now() - config.ttlSeconds * 1000;
+      sweepExpired(nodes, cutoff);
+      sweepExpired(sessions, cutoff);
+
+      // Explicit trace detection prefers the RAW client body (translation
+      // drops client-dialect metadata); when it is absent or identical to
+      // the canonical body, the single shared parse serves both purposes.
+      const traceParsed = traceBody !== undefined && traceBody !== body
+        ? parseJsonObject(traceBody)
+        : parsed ?? parseJsonObject(body);
+      const explicitTrace = requestTraceContext(req, traceParsed);
       if (explicitTrace.sessionId) return explicitResult(explicitTrace, config);
 
-      const canonical = canonicalize(body, format, model, parsed);
+      const canonical = canonicalize(parsed ?? parseJsonObject(body), format, model);
       if (!canonical) {
         if (hasTraceContext(explicitTrace)) return explicitResult(explicitTrace, config);
-        return { source: "none", action: action(config), confidence: 0 };
+        return { source: "none", action: config.mode, confidence: 0 };
       }
 
-      const nodeHash = hashJson(canonical.identity);
-      const existing = nodes.get(nodeHash);
+      const chain = chainHashes(canonical.head, canonical.messages);
+      const exactKey = chain[chain.length - 1];
+      const existing = nodes.get(exactKey);
       if (existing) {
-        remember(nodeHash, existing, config);
-        return withTraceContext(result("lineage", action(config), existing, 0.95), explicitTrace);
+        remember(exactKey, existing, config);
+        return withTraceContext(result("lineage", config.mode, existing, 0.95), explicitTrace);
       }
 
-      const parent = findLinearParent(canonical, nodes);
-      if (parent) {
-        remember(nodeHash, parent, config);
-        return withTraceContext(result("lineage", action(config), parent, 0.9), explicitTrace);
+      for (const depth of PARENT_DEPTHS) {
+        const k = canonical.messages.length - depth;
+        if (k < 1) continue;
+        const parent = nodes.get(chain[k]);
+        if (parent) {
+          remember(exactKey, parent, config);
+          return withTraceContext(result("lineage", config.mode, parent, depth === 2 ? 0.9 : 0.85), explicitTrace);
+        }
       }
 
       const fresh = newSession();
-      remember(nodeHash, fresh, config);
-      return withTraceContext(result("lineage", action(config), fresh, 0.75), explicitTrace);
+      remember(exactKey, fresh, config);
+      return withTraceContext(result("lineage", config.mode, fresh, 0.75), explicitTrace);
     },
   };
 }
@@ -138,13 +182,39 @@ function result(source: ClientSessionSource, action: ClientSessionAction, node: 
   };
 }
 
-function requestTraceContext(req: Request, body: string | undefined, parsed?: Record<string, unknown>): ExplicitTraceContext {
-  const bodyTrace = bodyMetadataTrace(body, parsed);
+// Explicit session-id headers, tool-specific before generic (first match wins).
+// Evidence (2026-10-11, real-source survey):
+// - x-opencode-session            OpenCode harness
+// - x-claude-code-session-id      Claude Code 2.1.87+ (gateway protocol; also
+//                                 paired with x-app: cli / x-stainless-*)
+// - claude-code-session-id        non-x variant some Claude Code SDK clients send
+// - x-vscode-sessionid            VSCode family — Google Antigravity sends it
+//                                 per app launch (agproxy/Antigravity-Manager 抓包)
+// - x-session-id                  generic convention
+// - x-parent-session-id           subagent lineage
+// - helicone-session-id           Helicone proxy convention
+// Not added: x-machine-id (machine-granular — would fuse every conversation of
+// a machine into one affinity session); x-claude-code-agent-id/-parent-agent-id
+// (agent lineage, not conversation identity). SillyTavern has NO native session
+// header (thin-server: its Express backend sends only auth/content-type plus
+// user-configured additional headers — users can set x-session-id themselves).
+const SESSION_ID_HEADERS = [
+  "x-opencode-session",
+  "x-claude-code-session-id",
+  "claude-code-session-id",
+  "x-vscode-sessionid",
+  "x-session-id",
+  "x-parent-session-id",
+  "helicone-session-id",
+];
+
+function requestTraceContext(req: Request, parsed: Record<string, unknown> | undefined): ExplicitTraceContext {
+  const bodyTrace = metadataTrace(parsed);
   return {
-    requestId: firstHeader(req.headers, ["x-request-id"]) ?? bodyTrace.requestId,
+    requestId: firstHeader(req.headers, ["x-request-id", "x-client-request-id"]) ?? bodyTrace.requestId,
     traceId: firstHeader(req.headers, ["x-zcode-trace-id"]) ?? bodyTrace.traceId,
     queryId: firstHeader(req.headers, ["x-query-id"]) ?? bodyTrace.queryId,
-    sessionId: firstHeader(req.headers, ["x-opencode-session", "x-claude-code-session-id", "x-session-id", "x-parent-session-id", "helicone-session-id"])
+    sessionId: firstHeader(req.headers, SESSION_ID_HEADERS)
       ?? bodyTrace.sessionId,
   };
 }
@@ -183,23 +253,26 @@ function firstHeader(headers: Headers, names: string[]): string | null {
   return null;
 }
 
-function bodyMetadataTrace(body: string | undefined, parsed?: Record<string, unknown>): ExplicitTraceContext {
-  if (!body && !parsed) return {};
-  let obj: Record<string, unknown> | undefined = parsed;
-  if (!obj) {
-    try {
-      obj = JSON.parse(body as string) as Record<string, unknown>;
-    } catch {
-      return {};
-    }
+function parseJsonObject(body: string | undefined): Record<string, unknown> | undefined {
+  if (!body) return undefined;
+  try {
+    const parsed = JSON.parse(body);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    return parsed as Record<string, unknown>;
+  } catch {
+    return undefined;
   }
-  const metadata = obj?.metadata as Record<string, unknown> | undefined;
+}
+
+function metadataTrace(parsed: Record<string, unknown> | undefined): ExplicitTraceContext {
+  const metadata = parsed?.metadata;
   if (!metadata || typeof metadata !== "object") return {};
+  const meta = metadata as Record<string, unknown>;
   return {
-    requestId: stringProperty(metadata, ["requestId", "request_id"]),
-    traceId: stringProperty(metadata, ["traceId", "trace_id"]),
-    queryId: stringProperty(metadata, ["queryId", "query_id"]),
-    sessionId: stringProperty(metadata, ["sessionId", "session_id", "conversationId", "conversation_id"]),
+    requestId: stringProperty(meta, ["requestId", "request_id"]),
+    traceId: stringProperty(meta, ["traceId", "trace_id"]),
+    queryId: stringProperty(meta, ["queryId", "query_id"]),
+    sessionId: stringProperty(meta, ["sessionId", "session_id", "conversationId", "conversation_id"]),
   };
 }
 
@@ -211,51 +284,43 @@ function stringProperty(obj: Record<string, unknown>, names: string[]): string |
   return undefined;
 }
 
-function canonicalize(body: string | undefined, format: Format, fallbackModel: string, parsed?: Record<string, unknown>): CanonicalRequest | null {
-  if (!body && !parsed) return null;
-  let obj: Record<string, unknown> | undefined = parsed;
-  if (!obj) {
-    try {
-      obj = JSON.parse(body as string) as Record<string, unknown>;
-    } catch {
-      return null;
-    }
-  }
-  if (!obj || typeof obj !== "object") return null;
-
-  const model = typeof obj.model === "string" ? obj.model : fallbackModel;
-  const messages = Array.isArray(obj.messages) ? obj.messages : [];
+function canonicalize(parsed: Record<string, unknown> | undefined, format: Format, fallbackModel: string): CanonicalRequest | null {
+  if (!parsed) return null;
+  const model = typeof parsed.model === "string" ? parsed.model : fallbackModel;
+  const messages = Array.isArray(parsed.messages) ? parsed.messages : [];
   if (messages.length === 0) return null;
 
-  const identity = {
+  const head = {
     format,
     model,
-    system: obj.system,
+    system: parsed.system,
     developer: messages.filter((m: unknown) => typeof m === "object" && m !== null && (m as Record<string, unknown>).role === "developer"),
-    tools: obj.tools,
-    tool_choice: obj.tool_choice,
-    messages,
+    tools: parsed.tools,
+    tool_choice: parsed.tool_choice,
   };
-  return { model, identity, messages };
+  return { model, head, messages };
 }
 
-function findLinearParent(canonical: CanonicalRequest, nodes: Map<string, StoredNode>): StoredNode | null {
-  if (canonical.messages.length < 3) return null;
-  const prefix = {
-    ...(canonical.identity as Record<string, unknown>),
-    messages: canonical.messages.slice(0, -2),
-  };
-  if ((prefix.messages as unknown[]).length === 0) return null;
-  return nodes.get(hashJson(prefix)) ?? null;
+/**
+ * Merkle chain over the conversation: chain[0] covers the identity head,
+ * chain[i] folds in message i (index i-1 in `messages`). chain[n] is the
+ * exact-request key; chain[k] is the key of "this conversation after k
+ * messages" — a prefix that was itself a prior request.
+ */
+function chainHashes(head: Record<string, unknown>, messages: unknown[]): string[] {
+  const chain: string[] = [hashJson(head)];
+  for (let i = 0; i < messages.length; i++) {
+    chain.push(hashString(`${chain[i]}\n${hashJson(messages[i])}`));
+  }
+  return chain;
 }
 
 function newSession(): StoredNode {
-  const upstreamSessionId = crypto.randomUUID();
+  const upstreamSessionId = nodeCrypto.randomUUID();
   return {
-    nodeHash: "",
     sessionId: `ses_${upstreamSessionId.replace(/-/g, "").slice(0, 12)}`,
     upstreamSessionId,
-    lastSeenAt: Date.now(),
+    lastSeenAt: 0, // stamped by remember() on the injected clock
   };
 }
 

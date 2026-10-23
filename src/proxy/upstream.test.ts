@@ -1,6 +1,5 @@
 /**
  * Tests for upstream request builder and proxy handler.
- * @see .omo/plans/zcode-proxy.md Task 6
  */
 import { describe, it, expect, mock } from "bun:test";
 import { gzipSync } from "node:zlib";
@@ -445,35 +444,33 @@ describe("proxyRequest", () => {
     clientIdentity: { mode: "observe", ttlSeconds: 900, maxSessions: 1024 },
     responses: { enabled: true, storeMaxEntries: 1000, storeTtlMs: 86400000 },
   endpointRouting: { enabled: false, origin: "https://zcode.z.ai" },
-  clientSigning: { enabled: false, origin: "https://zcode.z.ai" },
+  clientSigning: { enabled: false }, highspeed: { enabled: false, origin: "https://zcode.z.ai", models: [] },
   mcp: { enabled: true, webSearch: true, webReader: false, zread: false, gateway: { enabled: true, upstreamOrigin: "https://zcode.chatglm.site" } },
   async: { enabled: false, origin: "https://zcode.z.ai", pollIntervalMs: 5000, keepAliveIntervalMs: 3000, maxWaitMs: 0, maxRetries: 3, settleTimeoutMs: 8000, controlTimeoutMs: 15000, defaultModel: "" },
   claim: { enabled: false, auto: true, origin: "https://zcode.z.ai", pollIntervalMs: 300000, cooldownMs: 600000, planId: "" },
   logging: { level: "info" },
   };
 
-  it("uses ordered transport for session-aware start-plan requests only outside injected fetch tests", () => {
-    const startPlanConfig: ProxyConfig = { ...testConfig, plan: "start-plan" };
-
-    expect(shouldUseOrderedTransport(startPlanConfig, {
+  it("uses ordered transport for session-aware requests only outside injected fetch tests", () => {
+    expect(shouldUseOrderedTransport({
       source: "lineage",
       action: "observe",
       confidence: 0.95,
       upstreamSessionId: "11111111-1111-4111-8111-111111111111",
     }, false)).toBe(false);
-    expect(shouldUseOrderedTransport(startPlanConfig, {
+    expect(shouldUseOrderedTransport({
       source: "lineage",
       action: "enforce",
       confidence: 0.95,
       upstreamSessionId: "11111111-1111-4111-8111-111111111111",
     }, false)).toBe(true);
-    expect(shouldUseOrderedTransport(startPlanConfig, {
+    expect(shouldUseOrderedTransport({
       source: "explicit",
       action: "observe",
       confidence: 1,
       upstreamSessionId: "sess_thread_1",
     }, false)).toBe(true);
-    expect(shouldUseOrderedTransport(startPlanConfig, {
+    expect(shouldUseOrderedTransport({
       source: "explicit",
       action: "observe",
       confidence: 1,
@@ -656,7 +653,7 @@ describe("proxyRequest — OpenAI translation mode (coding-plan → Anthropic up
     clientIdentity: { mode: "observe", ttlSeconds: 900, maxSessions: 1024 },
     responses: { enabled: true, storeMaxEntries: 1000, storeTtlMs: 86400000 },
   endpointRouting: { enabled: false, origin: "https://zcode.z.ai" },
-  clientSigning: { enabled: false, origin: "https://zcode.z.ai" },
+  clientSigning: { enabled: false }, highspeed: { enabled: false, origin: "https://zcode.z.ai", models: [] },
   mcp: { enabled: true, webSearch: true, webReader: false, zread: false, gateway: { enabled: true, upstreamOrigin: "https://zcode.chatglm.site" } },
   async: { enabled: false, origin: "https://zcode.z.ai", pollIntervalMs: 5000, keepAliveIntervalMs: 3000, maxWaitMs: 0, maxRetries: 3, settleTimeoutMs: 8000, controlTimeoutMs: 15000, defaultModel: "" },
   claim: { enabled: false, auto: true, origin: "https://zcode.z.ai", pollIntervalMs: 300000, cooldownMs: 600000, planId: "" },
@@ -919,7 +916,7 @@ describe("client gzip handling", () => {
     clientIdentity: { mode: "observe", ttlSeconds: 900, maxSessions: 1024 },
     responses: { enabled: true, storeMaxEntries: 1000, storeTtlMs: 86400000 },
   endpointRouting: { enabled: false, origin: "https://zcode.z.ai" },
-  clientSigning: { enabled: false, origin: "https://zcode.z.ai" },
+  clientSigning: { enabled: false }, highspeed: { enabled: false, origin: "https://zcode.z.ai", models: [] },
     mcp: { enabled: true, webSearch: true, webReader: false, zread: false, gateway: { enabled: true, upstreamOrigin: "https://zcode.chatglm.site" } },
     async: { enabled: false, origin: "https://zcode.z.ai", pollIntervalMs: 5000, keepAliveIntervalMs: 3000, maxWaitMs: 0, maxRetries: 3, settleTimeoutMs: 8000, controlTimeoutMs: 15000, defaultModel: "" },
   claim: { enabled: false, auto: true, origin: "https://zcode.z.ai", pollIntervalMs: 300000, cooldownMs: 600000, planId: "" },
@@ -1052,7 +1049,7 @@ describe("proxyRequest — Anthropic compatibility mode (coding-plan)", () => {
     clientIdentity: { mode: "observe", ttlSeconds: 900, maxSessions: 1024 },
     responses: { enabled: true, storeMaxEntries: 1000, storeTtlMs: 86400000 },
   endpointRouting: { enabled: false, origin: "https://zcode.z.ai" },
-  clientSigning: { enabled: false, origin: "https://zcode.z.ai" },
+  clientSigning: { enabled: false }, highspeed: { enabled: false, origin: "https://zcode.z.ai", models: [] },
   mcp: { enabled: true, webSearch: true, webReader: false, zread: false, gateway: { enabled: true, upstreamOrigin: "https://zcode.chatglm.site" } },
   async: { enabled: false, origin: "https://zcode.z.ai", pollIntervalMs: 5000, keepAliveIntervalMs: 3000, maxWaitMs: 0, maxRetries: 3, settleTimeoutMs: 8000, controlTimeoutMs: 15000, defaultModel: "" },
   claim: { enabled: false, auto: true, origin: "https://zcode.z.ai", pollIntervalMs: 300000, cooldownMs: 600000, planId: "" },
@@ -1400,7 +1397,7 @@ describe("proxyRequest — tool-call roundtrip (OpenAI client → Anthropic upst
     clientIdentity: { mode: "observe", ttlSeconds: 900, maxSessions: 1024 },
     responses: { enabled: true, storeMaxEntries: 1000, storeTtlMs: 86400000 },
   endpointRouting: { enabled: false, origin: "https://zcode.z.ai" },
-  clientSigning: { enabled: false, origin: "https://zcode.z.ai" },
+  clientSigning: { enabled: false }, highspeed: { enabled: false, origin: "https://zcode.z.ai", models: [] },
   mcp: { enabled: true, webSearch: true, webReader: false, zread: false, gateway: { enabled: true, upstreamOrigin: "https://zcode.chatglm.site" } },
   async: { enabled: false, origin: "https://zcode.z.ai", pollIntervalMs: 5000, keepAliveIntervalMs: 3000, maxWaitMs: 0, maxRetries: 3, settleTimeoutMs: 8000, controlTimeoutMs: 15000, defaultModel: "" },
   claim: { enabled: false, auto: true, origin: "https://zcode.z.ai", pollIntervalMs: 300000, cooldownMs: 600000, planId: "" },
@@ -1565,7 +1562,7 @@ describe("proxyRequest — thinking endpoint matrix", () => {
     clientIdentity: { mode: "observe", ttlSeconds: 900, maxSessions: 1024 },
     responses: { enabled: true, storeMaxEntries: 1000, storeTtlMs: 86400000 },
   endpointRouting: { enabled: false, origin: "https://zcode.z.ai" },
-  clientSigning: { enabled: false, origin: "https://zcode.z.ai" },
+  clientSigning: { enabled: false }, highspeed: { enabled: false, origin: "https://zcode.z.ai", models: [] },
   mcp: { enabled: true, webSearch: true, webReader: false, zread: false, gateway: { enabled: true, upstreamOrigin: "https://zcode.chatglm.site" } },
   async: { enabled: false, origin: "https://zcode.z.ai", pollIntervalMs: 5000, keepAliveIntervalMs: 3000, maxWaitMs: 0, maxRetries: 3, settleTimeoutMs: 8000, controlTimeoutMs: 15000, defaultModel: "" },
   claim: { enabled: false, auto: true, origin: "https://zcode.z.ai", pollIntervalMs: 300000, cooldownMs: 600000, planId: "" },

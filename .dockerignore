@@ -17,3 +17,7 @@ _reverse
 Android-APP
 release
 *.md
+.codegraph
+**/AGENTS.md
+**/*.test.ts
+src/proxy/captcha-worker-entry.bundle.js

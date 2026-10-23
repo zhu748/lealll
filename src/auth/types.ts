@@ -1,6 +1,5 @@
 /**
  * Credential and auth type definitions.
- * @see .omo/plans/zcode-proxy.md Task 4
  * @see _reverse/NOTEPAD.md "How Credential is Used"
  */
 import type { ProviderId } from "../provider/types.js";
@@ -15,7 +14,7 @@ export type PlanId = "coding-plan" | "start-plan";
 export interface Credential {
   /** The API key portion (e.g. Z.AI API key id, or Bigmodel API key). */
   apiKey: string;
-  /** The secret portion (Z.AI only — appended as `{apiKey}.{secret}`). */
+  /** The secret portion (required for Z.AI, optional for Bigmodel — appended as `{apiKey}.{secret}`). */
   secret?: string;
   /** Which provider this credential is for. */
   provider: ProviderId;
@@ -23,7 +22,7 @@ export interface Credential {
   plan?: PlanId;
   /** Unix timestamp (ms) when the credential expires. Present only for OAuth. */
   expiresAt?: number;
-  /** Upstream user identifier (OAuth only). Injected as `metadata.user_id` on Anthropic-format requests. */
+  /** Upstream account identifier (OAuth only); LLM metadata.user_id uses a device/session JSON blob. */
   userId?: string;
   /** JWT token for start-plan (zcode.z.ai). Present when login captured the ZCode plan token. */
   jwt?: string;
@@ -83,13 +82,21 @@ export interface Credential {
    * Toggleable via the dashboard "禁用/启用" button. Default: false (enabled).
    */
   disabled?: boolean;
+  /**
+   * Raw provider OAuth access token (bigmodel). Required by the 3.15.1
+   * project-access-token plane: getCustomerInfo (bare) and
+   * `…/api_keys/{id}/access_tokens` (Bearer) mint the signing JWT
+   * (`project_access`, 5h). Absent for API-key imports and pre-patch logins
+   * — signing then falls back to the apiKey form and fails open.
+   */
+  oauthAccessToken?: string;
 }
 
 /**
  * Convert a `Credential` to the string sent upstream.
  *
  * - Z.AI: `{apiKey}.{secret}` (secret required)
- * - Bigmodel: `{apiKey}` (no secret)
+ * - Bigmodel: `{apiKey}.{secret}` when a secret exists, otherwise `{apiKey}`
  */
 export function credentialString(cred: Credential): string {
   if (cred.secret) {

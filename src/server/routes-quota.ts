@@ -8,7 +8,7 @@
  *  - coding plane: `GET {coding origin}/api/monitor/usage/quota/limit` with the
  *    stored coding-plan API key in `authorization` (bundle `wK`/`Z_`+`md`) —
  *    the windowed usage limits of individual coding plans (`data.limits[]`,
- *    `TIME_LIMIT` rows preferred by the official `Xj` picker).
+ *    TOKENS_LIMIT = prompt windows; TIME_LIMIT = tool-call window).
  *
  * The billing gateway requires a UUID `X-Device-Mid`: the config identity is
  * forwarded with resolveBillingDeviceMid applied (env > config > ephemeral
@@ -38,7 +38,7 @@ import { errorResponse } from "../proxy/handler.js";
 import { fetchMcpUsage, type McpUsageSnapshot } from "../auth/mcp-quota.js";
 import { fetchSubscriptionAvailability, type SubscriptionAvailability } from "../auth/subscription.js";
 
-export interface QuotaBalanceEntry {
+interface QuotaBalanceEntry {
   showName: string;
   remainingUnits: number;
   totalUnits: number;
@@ -47,7 +47,7 @@ export interface QuotaBalanceEntry {
   expiresAt?: number;
 }
 
-export interface QuotaPlanEntry {
+interface QuotaPlanEntry {
   planId: string;
   name: string;
   description?: string;
@@ -63,10 +63,12 @@ export interface QuotaPlanEntry {
 
 /**
  * One usage window from the coding-plan monitor plane (`limits[]` entry).
- * `type` values are server-defined; `TIME_LIMIT` (the 5h/weekly prompt window
- * of individual coding plans) is the shape the official panel prefers.
+ * `type` values are server-defined. Live (2026-10-12, max tier): the 5h/weekly
+ * prompt windows are `TOKENS_LIMIT`; `TIME_LIMIT` is the MCP tool-call window
+ * (remaining counts tool calls, percentage = used share — the official panel's
+ * "工具调用" card), not a prompt window.
  */
-export interface QuotaCodingLimit {
+interface QuotaCodingLimit {
   type: string;
   unit?: string;
   /** Upstream `number` — window total (undefined = unlimited/unreported). */
@@ -79,7 +81,7 @@ export interface QuotaCodingLimit {
   nextResetTime?: number;
 }
 
-export interface QuotaCodingPlan {
+interface QuotaCodingPlan {
   /** Plan tier string from upstream (e.g. `"max"`); null when unreported. */
   level: string | null;
   limits: QuotaCodingLimit[];

@@ -38,6 +38,7 @@ const DUMP_MAX_TOTAL_BYTES = Math.max(
 /** Header names whose values must be masked before dumping/logging. */
 export const SENSITIVE_HEADERS = new Set([
   "authorization",
+  "x-zcode-authorization",
   "x-api-key",
   "proxy-authorization",
   "proxy-api-key",

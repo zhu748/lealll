@@ -315,10 +315,6 @@ export class CaptchaTokenPool {
     }
   }
 
-  requestUrgentRefill(): void {
-    void this.refill({ urgent: true });
-  }
-
   private poolHasCertifyId(certifyId: string): boolean {
     return this.tokens.some((t) => t.certifyId === certifyId);
   }
@@ -696,10 +692,6 @@ export interface CaptchaConfig {
 
 const pool = new CaptchaTokenPool();
 
-export function configureCaptchaPool(opts: CaptchaPoolOptions): void {
-  pool.configure(opts);
-}
-
 export function getCaptchaPoolStats(): {
   ready: number;
   target: number;
@@ -709,6 +701,10 @@ export function getCaptchaPoolStats(): {
   solverWorkers?: number;
 } {
   return pool.stats();
+}
+
+export function configureCaptchaPool(opts: CaptchaPoolOptions): void {
+  pool.configure(opts);
 }
 
 export function stopCaptchaPool(): void {
@@ -731,8 +727,4 @@ export function startCaptchaPoolRefill(cfg: CaptchaConfig): void {
 export async function prefillCaptchaPool(cfg: CaptchaConfig, count?: number): Promise<void> {
   if (!cfg.enabled || !cfg.prefix || !cfg.sceneId) return;
   await pool.prefill(cfg, count);
-}
-
-export function urgentCaptchaRefill(): void {
-  pool.requestUrgentRefill();
 }

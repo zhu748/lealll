@@ -1,6 +1,5 @@
 /**
  * Anthropic → OpenAI request translator and OpenAI → Anthropic response translator.
- * @see .omo/plans/zcode-proxy.md Task 11
  */
 import type {
   OpenAIChatRequest,
@@ -50,8 +49,8 @@ export function translateRequestAnthropicToOpenAI(req: AnthropicMessagesRequest)
   }
 
   // GLM-5.3+ Anthropic clients set reasoning effort via `output_config.effort`
-  // (the Anthropic upstream ignores `reasoning_effort`); the OpenAI-format
-  // upstream on start-plan reads `reasoning_effort` instead, so carry it over.
+  // (the Anthropic upstream ignores `reasoning_effort`). This reverse-format
+  // helper preserves it; production start-plan now uses Anthropic upstream.
   //
   // Scoped to the GLM-5.3 family, which is the only one that defines
   // `output_config`. Carrying it over unconditionally would let a client that
@@ -79,15 +78,24 @@ export function translateRequestAnthropicToOpenAI(req: AnthropicMessagesRequest)
     if (translated !== undefined) result.tool_choice = translated;
   }
 
+  // Mirror of the O→A direction: Anthropic hides the parallel-tools switch
+  // inside `tool_choice.disable_parallel_tool_use`; OpenAI surfaces it as the
+  // top-level `parallel_tool_calls`. Only meaningful when tools survive.
+  if (result.tools?.length && req.tool_choice?.disable_parallel_tool_use === true) {
+    result.parallel_tool_calls = false;
+  }
+
   return result;
 }
 
 /**
  * Map an Anthropic `tool_choice` to the OpenAI Chat Completions form.
  *
- * Anthropic: `{type:"auto"|"any"|"tool", name?}` (a top-level string is also
- * accepted by the API). There is no `none` — suppressing tools is done by
- * omitting the `tools` array entirely.
+ * Anthropic: `{type:"auto"|"any"|"tool", name?, disable_parallel_tool_use?}` (a
+ * top-level string is also accepted by the API). There is no `none` —
+ * suppressing tools is done by omitting the `tools` array entirely.
+ * `disable_parallel_tool_use` is handled by the caller (top-level
+ * `parallel_tool_calls`, only when tools are attached).
  * OpenAI:    `"auto" | "required"` or `{type:"function", function:{name}}`.
  * Note: Anthropic `any` (force some tool) maps to OpenAI `required`.
  */

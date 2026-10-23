@@ -32,7 +32,7 @@ import type { OAuthFlowTokens } from "../auth/oauth.js";
 import type { QuotaSnapshot } from "../server/routes-quota.js";
 
 /** Supported plan tiers. Mirrors `ProxyConfig.plan`. */
-export type PlanTier = "coding-plan" | "start-plan";
+type PlanTier = "coding-plan" | "start-plan";
 
 /** The control protocol: request shape for `POST /control`. */
 export type ControlCommand =
@@ -61,7 +61,7 @@ export type ControlOk =
   | { ok: true; event: "shuttingDown" };
 
 /** Failure response envelope. */
-export interface ControlError {
+interface ControlError {
   ok: false;
   error: string;
 }
@@ -69,12 +69,12 @@ export interface ControlError {
 export type ControlResponse = ControlOk | ControlError;
 
 /** Result type returned by lifecycle hooks (start/stop proxy). */
-export type LifecycleResult =
+type LifecycleResult =
   | { ok: true; port: number }
   | { ok: false; error: string };
 
 /** Result type returned by `setConfig` hook. */
-export type ConfigUpdateResult =
+type ConfigUpdateResult =
   | { ok: true; provider: ProviderId; plan: PlanTier }
   | { ok: false; error: string };
 

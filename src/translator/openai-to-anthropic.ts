@@ -1,6 +1,5 @@
 /**
  * OpenAI → Anthropic request translator and Anthropic → OpenAI response translator.
- * @see .omo/plans/zcode-proxy.md Task 11
  */
 import type {
   OpenAIChatRequest,
@@ -32,8 +31,8 @@ const DEFAULT_MAX_TOKENS = 4096;
 
 /** Translate an OpenAI chat request into an Anthropic messages request. */
 export function translateRequestOpenAIToAnthropic(req: OpenAIChatRequest): AnthropicMessagesRequest {
-  const systemMessages = req.messages.filter((m) => m.role === "system");
-  const nonSystemMessages = req.messages.filter((m) => m.role !== "system");
+  const systemMessages = req.messages.filter((m) => m.role === "system" || m.role === "developer");
+  const nonSystemMessages = req.messages.filter((m) => m.role !== "system" && m.role !== "developer");
 
   const system = systemMessages.length > 0
     ? systemMessages.map((m) => extractText(m)).join("\n\n")
@@ -44,7 +43,7 @@ export function translateRequestOpenAIToAnthropic(req: OpenAIChatRequest): Anthr
   const result: AnthropicMessagesRequest = {
     model: req.model,
     messages: anthropicMessages,
-    max_tokens: req.max_tokens ?? resolveDefaultMaxTokens(req.model),
+    max_tokens: req.max_completion_tokens ?? req.max_tokens ?? resolveDefaultMaxTokens(req.model),
   };
 
   if (system) result.system = system;
@@ -77,6 +76,17 @@ export function translateRequestOpenAIToAnthropic(req: OpenAIChatRequest): Anthr
   if (result.tools && req.tool_choice !== undefined && req.tool_choice !== "none") {
     const translated = translateToolChoice(req.tool_choice);
     if (translated) result.tool_choice = translated;
+  }
+  // OpenAI's `parallel_tool_calls:false` lives inside Anthropic's `tool_choice`
+  // as `disable_parallel_tool_use` — there is no top-level equivalent. Dropping
+  // it lets the model emit parallel tool_use blocks that sequential-execution
+  // clients cannot process (issue #65). Only meaningful when tools survive
+  // translation; `true`/omitted is the upstream default and is not serialized.
+  if (result.tools?.length && req.parallel_tool_calls === false) {
+    result.tool_choice = {
+      ...(result.tool_choice ?? { type: "auto" as const }),
+      disable_parallel_tool_use: true,
+    };
   }
 
   return result;

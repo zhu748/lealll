@@ -191,6 +191,10 @@ export class KeyResolver {
     if (email) cred.email = email;
     // 4.7.2-fork.1: bigmodel OAuth token doubles as the MAAS authorization.
     cred.maasToken = accessToken;
+    // 3.15.1 project-access-token plane: the raw OAuth token mints the signing
+    // JWT (`…/access_tokens`); without it signing falls back to the apiKey
+    // form and fails open on the bigmodel handshake.
+    cred.oauthAccessToken = accessToken;
     return cred;
   }
 
@@ -246,6 +250,7 @@ export class KeyResolver {
       };
       if (email) cred.email = email;
       cred.maasToken = accessToken;
+      cred.oauthAccessToken = accessToken;
       return cred;
     }
   }

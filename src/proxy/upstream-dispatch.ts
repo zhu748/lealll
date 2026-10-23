@@ -1,12 +1,11 @@
 /** Transport selection, connection retry and runtime decompression normalization. */
-import type { ProxyConfig } from "../config/types.js";
 import type { ClientSessionResult } from "./client-session.js";
 import type { UpstreamHeaderPair } from "./upstream.js";
 import { sendOrderedUpstreamRequest, orderedAdvertisedCodings } from "./ordered-transport.js";
 import { makeProxiedFetcher } from "./proxied-fetch.js";
 import { sleep } from "../utils/sleep.js";
 
-export function shouldUseOrderedTransport(_config: ProxyConfig, clientSession: ClientSessionResult | undefined, hasCustomFetchImpl: boolean): boolean {
+export function shouldUseOrderedTransport(clientSession: ClientSessionResult | undefined, hasCustomFetchImpl: boolean): boolean {
   if (hasCustomFetchImpl) return false;
   return clientSession?.action === "enforce" || clientSession?.source === "explicit";
 }

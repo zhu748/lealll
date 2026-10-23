@@ -14,26 +14,31 @@
  * a 2026-09-18 session briefly "corrected" these to spaces that way.
  *
  * Per-request Ed25519 signatures + proof-of-work over coding-plan traffic.
- * Everything here is fail-open, matching the client: gate disabled/unreachable
- * → unsigned; handshake failure → unsigned; two consecutive 401 VERIFY_*
- * rejections → permanent bypass for that (origin, credential) pair.
+ * Everything here is fail-open, matching the client: handshake failure →
+ * unsigned; two consecutive 401 VERIFY_* rejections → permanent bypass for
+ * that (origin, credential) pair.
  *
- * Start-plan gateway and off-peak LLM paths are permanently exempt (the
- * client's `isUnsignedModelRequestPath` set). Credentials without the
- * `{apiKeyId}.{apiKeySecret}` separator (legacy bigmodel keys issued before
- * the copy endpoint returned secretKeys) are silently skipped — the client
- * hard-throws there; skipping is a deliberate fail-open deviation. Both
- * providers now issue two-part keys, which sign normally.
+ * Enablement mirrors ZCode 3.15.1 (`_reverse/NOTEPAD.md` §B): the client no
+ * longer probes `agent/configs` for `data.codingPlanSignature` — signing is a
+ * static client-side rule (`TUs` requiresClientRequestSigning): coding-plan
+ * credentials (individual/team/API-key) are always signed; start-plan,
+ * off-peak and highspeed modes are never signed. This proxy applies the same
+ * rule structurally: the manager is wired only into the coding-plan request
+ * paths, and the client's `isUnsignedModelRequestPath` set below exempts the
+ * start-plan gateway + off-peak paths as defense-in-depth. The 3.12.3–3.14.4
+ * gate probe (GET /api/v1/agent/configs, 1h TTL) was removed in lockstep.
+ *
+ * Credentials without the `{apiKeyId}.{apiKeySecret}` separator (legacy
+ * bigmodel keys issued before the copy endpoint returned secretKeys) are
+ * silently skipped — the client hard-throws there; skipping is a deliberate
+ * fail-open deviation. Both providers now issue two-part keys, which sign
+ * normally.
  *
  * Full protocol: `_reverse/NOTEPAD.md` "Client Request Signing V4".
  */
 import type { UpstreamHeaderPair } from "./upstream.js";
-import { buildLlmIdentityHeaders, identityCacheKey } from "./identity.js";
-import type { ProxyIdentity } from "../config/types.js";
 import { hostSetTimeout, hostClearTimeout } from "../utils/host-timers.js";
 
-const DEFAULT_ORIGIN = "https://zcode.z.ai";
-const GATE_PATH = "/api/v1/agent/configs";
 const HANDSHAKE_PATH = "/api/paas/c1f3a7e2/v2/client";
 const APP_ID = "zcode";
 const POW_BITS = 8;
@@ -43,13 +48,9 @@ const KDF_SALT = "WD_CLIENT_SIGN_KDF_SALT";
 const KDF_INFO_HMAC = "getSignKey_hmac";
 const KDF_INFO_ED25519 = "ed25519_priv";
 const HANDSHAKE_METHOD = "get_sign_key";
-const GATE_TTL_MS = 3_600_000;
-/** Negative-cache cooldown after a gate fetch network failure. */
-const GATE_FAILURE_COOLDOWN_MS = 60_000;
-/** Negative-cache cooldown for "unavailable" gate responses (non-2xx / bad envelope). */
-const GATE_UNAVAILABLE_COOLDOWN_MS = 30_000;
-const GATE_TIMEOUT_MS = 15_000;
 const HANDSHAKE_TIMEOUT_MS = 10_000;
+/** Negative cache after a failed project-token mint (stale token / biz error). */
+const MINT_FAILURE_COOLDOWN_MS = 60_000;
 /** Cap on cached per-(origin, credential) signer states / notes (leak guard: credentials rotate). */
 const MAX_SIGNER_STATES = 512;
 const VERIFY_SIGNATURE_INVALID = "VERIFY_SIGNATURE_INVALID";
@@ -75,6 +76,14 @@ const SIGNING_HEADER_NAMES = new Set([
 export interface SigningCredential {
   credential: string;
   appVersion: string;
+  /**
+   * Raw provider OAuth access token (bigmodel OAuth logins). When present the
+   * manager mints a project-access JWT (`FSr` accessToken form) for the
+   * handshake instead of the `{apiKeyId}.{secret}` form — the official
+   * 3.15.1 client signs OAuth-provisioned accounts with that JWT.
+   */
+  oauthAccessToken?: string;
+  provider?: "zai" | "bigmodel";
 }
 
 export interface SignOutcome {
@@ -82,16 +91,22 @@ export interface SignOutcome {
   signed: boolean;
 }
 
-interface ParsedCredential {
+/**
+ * Dual-form signing credential — mirrors 3.15.1 `FSr`
+ * (parseClientSigningCredential):
+ * - JWT (3 dot-separated segments): `apiKeyId = payload.api_key`,
+ *   `secret = the whole JWT`, handshake body field `accessToken`
+ *   (`project_access` token, 5h, minted via `…/access_tokens`).
+ * - `{apiKeyId}.{secret}`: handshake body field `apiKey` (Z.AI keys, and
+ *   Bigmodel keys when no OAuth token is available).
+ */
+interface ParsedSigningCredential {
   apiKeyId: string;
-  apiKeySecret: string;
+  secret: string;
+  handshakeField: "apiKey" | "accessToken";
 }
 
 interface SignerState {
-  gateEnabled: boolean;
-  gateExpiresAt: number;
-  gateNegUntil: number;
-  gatePromise?: Promise<boolean>;
   privKey?: CryptoKey;
   handshake?: Promise<CryptoKey>;
   epoch: number;
@@ -216,13 +231,31 @@ async function createProofOfWork(apiKeyId: string, sessionId: string, ts: string
   throw new Error("Unable to solve client request proof of work");
 }
 
-function parseSigningCredential(credential: string): ParsedCredential | undefined {
+/**
+ * Dual-form credential parse (3.15.1 `FSr`). JWT form: `apiKeyId` comes from
+ * the `api_key` payload claim, `secret` is the whole JWT, and the handshake
+ * body field switches to `accessToken`.
+ */
+function parseSigningCredentialForm(credential: string): ParsedSigningCredential | undefined {
+  const segments = credential.split(".");
+  if (segments.length === 3 && segments[2]) {
+    try {
+      const decode = (s: string) => JSON.parse(Buffer.from(s.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8")) as Record<string, unknown>;
+      const header = decode(segments[0]!) as { alg?: string; typ?: string; sign_type?: string };
+      if (header.alg !== "HS256" || header.sign_type !== "SIGN") return undefined;
+      const payload = decode(segments[1]!) as { token_use?: string; api_key?: string };
+      if (payload.token_use !== "project_access" || typeof payload.api_key !== "string" || !payload.api_key.trim()) return undefined;
+      return { apiKeyId: payload.api_key, secret: credential, handshakeField: "accessToken" };
+    } catch {
+      return undefined;
+    }
+  }
   const dot = credential.indexOf(".");
   if (dot <= 0 || dot !== credential.lastIndexOf(".")) return undefined;
   const apiKeyId = credential.slice(0, dot);
-  const apiKeySecret = credential.slice(dot + 1);
-  if (!apiKeyId.trim() || !apiKeySecret.trim()) return undefined;
-  return { apiKeyId, apiKeySecret };
+  const secret = credential.slice(dot + 1);
+  if (!apiKeyId.trim() || !secret.trim()) return undefined;
+  return { apiKeyId, secret, handshakeField: "apiKey" };
 }
 
 function isUnsignedPath(pathname: string): boolean {
@@ -245,23 +278,22 @@ function findHeader(pairs: UpstreamHeaderPair[], name: string): string | undefin
 }
 
 export class ClientSigningManager {
-  private readonly gateUrl: string;
-  private readonly identity: ProxyIdentity;
   private readonly fetchImpl: typeof fetch;
   private readonly now: () => number;
   private readonly states = new Map<string, SignerState>();
   private readonly notedKeys = new Set<string>();
+  /** Cached project-access JWT (bigmodel OAuth): keyed by the api credential. */
+  private projectJwt: { credentialKey: string; jwt: string; expMs: number } | null = null;
+  /** Negative cache after a failed project-token mint (stale OAuth token etc.). */
+  private mintNegUntil = 0;
+  private mintInFlight: Promise<ParsedSigningCredential | undefined> | null = null;
   onEvent?: (message: string) => void;
 
   constructor(opts: {
-    identity: ProxyIdentity;
-    origin?: string;
     fetchImpl?: typeof fetch;
     now?: () => number;
     onEvent?: (message: string) => void;
-  }) {
-    this.gateUrl = `${(opts.origin?.trim() || DEFAULT_ORIGIN).replace(/\/+$/u, "")}${GATE_PATH}`;
-    this.identity = opts.identity;
+  } = {}) {
     this.fetchImpl = opts.fetchImpl ?? fetch;
     this.now = opts.now ?? Date.now;
     this.onEvent = opts.onEvent;
@@ -270,8 +302,8 @@ export class ClientSigningManager {
   /**
    * Add the V4 signing headers to an upstream header-pair list. Returns the
    * input pairs unchanged whenever signing does not apply: exempt path,
-   * bypass, non-signable credential, missing session id, gate off/unreachable,
-   * or handshake failure. Never throws.
+   * bypass, non-signable credential, missing session id, or handshake
+   * failure. Never throws.
    */
   async sign(url: string, pairs: UpstreamHeaderPair[], cred: SigningCredential): Promise<UpstreamHeaderPair[]> {
     return (await this.signWithStatus(url, pairs, cred)).pairs;
@@ -281,8 +313,8 @@ export class ClientSigningManager {
    * `sign` with a `signed` flag so the retry ladder can distinguish
    * "signed but rejected" from "never signed" without identity checks on the
    * returned array reference. Cheap local eligibility checks (credential
-   * separator, session id) run BEFORE the gate probe so non-signable
-   * credentials never pay for network fetches.
+   * separator, session id) run BEFORE the handshake fetch so non-signable
+   * credentials never pay for network round-trips.
    */
   async signWithStatus(url: string, pairs: UpstreamHeaderPair[], cred: SigningCredential): Promise<SignOutcome> {
     let parsed: URL;
@@ -299,7 +331,7 @@ export class ClientSigningManager {
     const state = this.stateFor(stateKey);
     if (state.bypass) return { pairs, signed: false };
 
-    const parsedCred = parseSigningCredential(cred.credential);
+    const parsedCred = await this.resolveParsedCredential(cred, stateKey);
     if (!parsedCred) {
       this.noteOnce(stateKey, "credential has no {apiKeyId}.{apiKeySecret} separator — signing skipped");
       return { pairs, signed: false };
@@ -310,8 +342,6 @@ export class ClientSigningManager {
       this.noteOnce(stateKey, "upstream request has no x-session-id — signing skipped");
       return { pairs, signed: false };
     }
-
-    if (!(await this.gateEnabled(state, cred))) return { pairs, signed: false };
 
     let privateKey: CryptoKey;
     try {
@@ -329,14 +359,11 @@ export class ClientSigningManager {
     stateKey: string,
     pairs: UpstreamHeaderPair[],
     privateKey: CryptoKey,
-    parsedCred: ParsedCredential,
+    parsedCred: ParsedSigningCredential,
     sessionId: string,
     appVersion: string,
   ): Promise<UpstreamHeaderPair[] | null> {
-    // this.now (not Date.now directly): the injectable clock keeps the
-    // re-sign/retry tests deterministic — two signs inside the same wall-clock
-    // millisecond would otherwise emit identical X-Client-Ts values.
-    const ts = String(this.now());
+    const ts = String(Date.now());
     const nonce = randomHex(NONCE_BYTES);
     let pow: string;
     let sig: string;
@@ -423,82 +450,129 @@ export class ClientSigningManager {
   private stateFor(stateKey: string): SignerState {
     let state = this.states.get(stateKey);
     if (!state) {
-      state = { gateEnabled: false, gateExpiresAt: 0, gateNegUntil: 0, epoch: 0, bypass: false };
+      state = { epoch: 0, bypass: false };
       this.states.set(stateKey, state);
-      // Simple insertion-order eviction: the working set is bounded by the
-      // number of distinct (origin, credential) pairs actually in use, so
-      // dropping the oldest entries only affects long-rotated credentials.
+      // Leak guard: credentials rotate; cap the per-(origin, credential) map.
       while (this.states.size > MAX_SIGNER_STATES) {
-        const oldest = this.states.keys().next().value;
-        if (oldest === undefined) break;
-        this.states.delete(oldest);
+        const oldest = this.states.keys().next();
+        if (oldest.done) break;
+        this.states.delete(oldest.value);
       }
     }
     return state;
   }
 
-  private async gateEnabled(state: SignerState, cred: SigningCredential): Promise<boolean> {
+  /**
+   * Resolve the signing credential form. Bigmodel OAuth logins mint a
+   * project-access JWT from the raw OAuth token (live-verified 2026-10-12:
+   * the apiKey form handshakes 200 but its privateCipher can never be
+   * decrypted on bigmodel) and cache it until 5 minutes before the JWT exp.
+   * Any mint failure falls back to the apiKey form (unsigned via the usual
+   * ladder). Z.AI keys pass through unchanged (apiKey form, live-verified).
+   */
+  private async resolveParsedCredential(cred: SigningCredential, stateKey: string): Promise<ParsedSigningCredential | undefined> {
+    const direct = parseSigningCredentialForm(cred.credential);
+    if (direct?.handshakeField === "accessToken") return direct;
+    if (!cred.oauthAccessToken || cred.provider !== "bigmodel") return direct;
+
     const now = this.now();
-    if (state.gateExpiresAt > now) return state.gateEnabled;
-    if (state.gateNegUntil > now) return false;
-    if (state.gatePromise) return state.gatePromise;
-    const promise = this.probeGate(state, cred).finally(() => {
-      if (state.gatePromise === promise) state.gatePromise = undefined;
-    });
-    state.gatePromise = promise;
+    if (this.projectJwt && this.projectJwt.credentialKey === cred.credential && this.projectJwt.expMs - 5 * 60_000 > now) {
+      const cached = parseSigningCredentialForm(this.projectJwt.jwt);
+      if (cached) return cached;
+      this.projectJwt = null; // stale/malformed cache entry — fall through to a fresh mint
+    }
+    if (now < this.mintNegUntil) return direct;
+    if (this.mintInFlight) return this.mintInFlight;
+
+    const promise = this.mintProjectJwt(cred.oauthAccessToken, direct?.apiKeyId)
+      .then((minted) => {
+        if (!minted) {
+          // negative-cache so a stale OAuth token can't burn two doomed
+          // fetches on every request (mirrors the highspeed manager's gate)
+          this.mintNegUntil = this.now() + MINT_FAILURE_COOLDOWN_MS;
+          return direct;
+        }
+        const parsed = parseSigningCredentialForm(minted.jwt);
+        if (!parsed) {
+          // strict parse rejected the minted token — don't cache it, don't
+          // disable signing; the apiKey form stays available
+          this.mintNegUntil = this.now() + MINT_FAILURE_COOLDOWN_MS;
+          this.noteOnce("pt-parse", "minted project token failed strict parse — falling back to apiKey form");
+          return direct;
+        }
+        this.projectJwt = { credentialKey: cred.credential, jwt: minted.jwt, expMs: minted.expMs };
+        // the private key is keyed to the previous secret — force a re-handshake
+        this.invalidateState(stateKey);
+        return parsed;
+      })
+      .finally(() => {
+        if (this.mintInFlight === promise) this.mintInFlight = null;
+      });
+    this.mintInFlight = promise;
     return promise;
   }
 
-  private async probeGate(state: SignerState, cred: SigningCredential): Promise<boolean> {
-    const now = this.now();
-    let outcome: "enabled" | "disabled" | "unavailable";
-    try {
-      outcome = await this.fetchGate(cred);
-    } catch {
-      state.gateNegUntil = now + GATE_FAILURE_COOLDOWN_MS;
-      return false;
+  /**
+   * Mirror of the 3.15.1 ProjectAccessTokenClient: getCustomerInfo (bare
+   * OAuth token — no Bearer on bigmodel) resolves the default org/project
+   * (name contains 默认机构/默认项目 preferred, else first, projectType "2"
+   * excluded), then `…/api_keys/{apiKeyId}/access_tokens` (Bearer) mints the
+   * `project_access` JWT.
+   */
+  private async mintProjectJwt(oauthAccessToken: string, apiKeyId: string | undefined): Promise<{ jwt: string; expMs: number } | null> {
+    if (!apiKeyId) {
+      this.noteOnce("pt-key", "project token mint skipped: credential has no apiKeyId segment");
+      return null;
     }
-    state.gateEnabled = outcome === "enabled";
-    if (outcome === "unavailable") {
-      // proxy deviation: the client re-probes unavailable gates on every request
-      // from a UI process; on the proxy hot path a short negative cache bounds
-      // the worst-case per-request latency to one probe per window
-      state.gateNegUntil = now + GATE_UNAVAILABLE_COOLDOWN_MS;
-    } else {
-      state.gateExpiresAt = now + GATE_TTL_MS;
-      state.gateNegUntil = 0;
-    }
-    if (state.gateEnabled) this.onEvent?.("client-signing: server enabled codingPlanSignature — signing requests");
-    return state.gateEnabled;
-  }
-
-  private async fetchGate(cred: SigningCredential): Promise<"enabled" | "disabled" | "unavailable"> {
-    // 3.12.3: the gate fetch reuses `g6n` (the LLM source-header set, WITH
-    // X-ZCode-Agent inline and no X-Device-Mid) via `ESs`; the request adds
-    // only `x-api-key` — no Accept header.
-    const identityHeaders = buildLlmIdentityHeaders(this.identity);
     const controller = new AbortController();
-    // Host-safe timer (see utils/host-timers.ts): gate probes run concurrently
-    // with captcha solve epochs.
-    const timer = hostSetTimeout(() => controller.abort(), GATE_TIMEOUT_MS);
+    const timer = hostSetTimeout(() => controller.abort(), 15_000);
     try {
-      const resp = await this.fetchImpl(this.gateUrl, {
-        method: "GET",
-        headers: { ...identityHeaders, "x-api-key": cred.credential },
+      const bare = oauthAccessToken.startsWith("Bearer ") ? oauthAccessToken.slice(7).trim() : oauthAccessToken;
+      const infoResp = await this.fetchImpl("https://bigmodel.cn/api/biz/customer/getCustomerInfo", {
+        headers: { Authorization: bare, "Content-Type": "application/json" },
         redirect: "manual",
         signal: controller.signal,
       });
-      if (!resp.ok) {
-        // Release the error body — an unconsumed response holds its socket.
-        void resp.body?.cancel().catch(() => {});
-        return "unavailable";
+      const info = await infoResp.json() as {
+        data?: {
+          organizations?: Array<{
+            organizationId?: string; organizationName?: string;
+            projects?: Array<{ projectId?: string; projectName?: string; projectType?: string | number }>;
+          }>;
+        };
+      };
+      const orgs = (info.data?.organizations ?? [])
+        .map((o) => ({ ...o, projects: (o.projects ?? []).filter((p) => String(p.projectType ?? "").trim() !== "2") }))
+        .filter((o) => o.organizationId && o.projects.length > 0);
+      const org = orgs.find((o) => o.organizationName?.includes("默认机构")) ?? orgs[0];
+      const project = org?.projects.find((p) => p.projectName?.includes("默认项目")) ?? org?.projects[0];
+      if (!org?.organizationId || !project?.projectId) {
+        this.noteOnce("pt-project", "project token mint failed: no usable org/project in getCustomerInfo (re-login may help)");
+        return null;
       }
-      const parsed = await resp.json() as Record<string, unknown>;
-      if (!parsed || parsed.code !== 0) return "unavailable";
-      const data = parsed.data as Record<string, unknown> | undefined;
-      if (!data || !Object.prototype.hasOwnProperty.call(data, "codingPlanSignature")) return "disabled";
-      const signature = data.codingPlanSignature as Record<string, unknown> | undefined;
-      return signature?.enable === true ? "enabled" : "disabled";
+      const ptResp = await this.fetchImpl(`https://bigmodel.cn/api/biz/v1/organization/${encodeURIComponent(org.organizationId)}/projects/${encodeURIComponent(project.projectId)}/api_keys/${encodeURIComponent(apiKeyId)}/access_tokens`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${bare}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ clientType: "zcode", clientVersion: "3.15.1" }),
+        redirect: "manual",
+        signal: controller.signal,
+      });
+      const pt = await ptResp.json() as { code?: number; data?: { accessToken?: string; enabled?: boolean } };
+      const jwt = pt.data?.accessToken;
+      if (pt.code !== 200 || !jwt) {
+        this.noteOnce("pt-mint", `project token mint rejected (code=${pt.code ?? ptResp.status})`);
+        return null;
+      }
+      let expMs = this.now() + 60 * 60_000;
+      try {
+        const payload = JSON.parse(Buffer.from(jwt.split(".")[1]!.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8")) as { exp?: number };
+        if (typeof payload.exp === "number") expMs = payload.exp * 1000;
+      } catch { /* keep fallback expiry */ }
+      this.noteOnce("pt-ok", "project access token minted — signing with the accessToken (JWT) form");
+      return { jwt, expMs };
+    } catch {
+      this.noteOnce("pt-network", "project token mint failed (network/timeout)");
+      return null;
     } finally {
       hostClearTimeout(timer);
     }
@@ -506,7 +580,7 @@ export class ClientSigningManager {
 
   private async ensurePrivateKey(
     state: SignerState,
-    parsedCred: ParsedCredential,
+    parsedCred: ParsedSigningCredential,
     origin: string,
   ): Promise<CryptoKey> {
     if (state.privKey) return state.privKey;
@@ -525,34 +599,42 @@ export class ClientSigningManager {
     return handshake;
   }
 
-  private async performHandshake(parsedCred: ParsedCredential, origin: string): Promise<CryptoKey> {
-    const ts = String(this.now());
+  private async performHandshake(parsedCred: ParsedSigningCredential, origin: string): Promise<CryptoKey> {
+    const ts = String(Date.now());
     const nonce = randomHex(NONCE_BYTES);
     const sig = await handshakeSignature(
-      parsedCred.apiKeySecret,
+      parsedCred.secret,
       `${HANDSHAKE_METHOD}\n${parsedCred.apiKeyId}\n${ts}\n${nonce}`,
     );
+
+    // accessToken form (project_access JWT): Bearer auth + accessToken body
+    // field, live-verified 2026-10-12; apiKey form keeps the bare
+    // `{id}.{secret}` auth and the full string as the apiKey body value.
+    const authHeader = parsedCred.handshakeField === "accessToken"
+      ? `Bearer ${parsedCred.secret}`
+      : `${parsedCred.apiKeyId}.${parsedCred.secret}`;
+    const authValue = parsedCred.handshakeField === "accessToken"
+      ? parsedCred.secret
+      : `${parsedCred.apiKeyId}.${parsedCred.secret}`;
+    const bodyKey = parsedCred.handshakeField === "accessToken" ? "accessToken" : "apiKey";
 
     const controller = new AbortController();
     const timer = hostSetTimeout(() => controller.abort(), HANDSHAKE_TIMEOUT_MS);
     try {
       const resp = await this.fetchImpl(`${origin}${HANDSHAKE_PATH}`, {
         method: "POST",
-        headers: { Authorization: `${parsedCred.apiKeyId}.${parsedCred.apiKeySecret}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ apiKey: `${parsedCred.apiKeyId}.${parsedCred.apiKeySecret}`, nonce, sig, ts }),
+        headers: { Authorization: authHeader, "Content-Type": "application/json" },
+        body: JSON.stringify({ [bodyKey]: authValue, nonce, sig, ts }),
         redirect: "manual",
         signal: controller.signal,
       });
-      if (resp.status !== 200) {
-        void resp.body?.cancel().catch(() => {});
-        throw new Error(`handshake_http_${resp.status}`);
-      }
+      if (resp.status !== 200) throw new Error(`handshake_http_${resp.status}`);
       const envelope = await resp.json() as { code?: unknown; msg?: unknown; data?: { privateCipher?: unknown } };
       if (envelope.code === 500) throw new Error("handshake_server_500");
       if (envelope.code !== 200) throw new Error(`handshake_rejected: ${String(envelope.msg)}`);
       const cipher = envelope.data?.privateCipher;
       if (typeof cipher !== "string" || !cipher) throw new Error("handshake_omitted_privateCipher");
-      return await decryptSigningPrivateKey(parsedCred.apiKeyId, parsedCred.apiKeySecret, cipher);
+      return await decryptSigningPrivateKey(parsedCred.apiKeyId, parsedCred.secret, cipher);
     } finally {
       hostClearTimeout(timer);
     }
@@ -561,10 +643,11 @@ export class ClientSigningManager {
   private noteOnce(stateKey: string, message: string): void {
     if (this.notedKeys.has(stateKey)) return;
     this.notedKeys.add(stateKey);
+    // Leak guard: pairs with (origin, credential); cap alongside the state map.
     while (this.notedKeys.size > MAX_SIGNER_STATES) {
-      const oldest = this.notedKeys.values().next().value;
-      if (oldest === undefined) break;
-      this.notedKeys.delete(oldest);
+      const oldest = this.notedKeys.values().next();
+      if (oldest.done) break;
+      this.notedKeys.delete(oldest.value);
     }
     this.onEvent?.(`client-signing: ${message}`);
   }
@@ -575,6 +658,9 @@ export interface SendWithSigningParams {
   headerPairs: UpstreamHeaderPair[];
   credential: string;
   appVersion: string;
+  /** Raw provider OAuth token — enables the project-access JWT signing form (bigmodel). */
+  oauthAccessToken?: string;
+  provider?: "zai" | "bigmodel";
   send: (headerPairs: UpstreamHeaderPair[]) => Promise<Response>;
   debug?: (message: string) => void;
 }
@@ -588,52 +674,43 @@ export async function sendWithClientSigning(
   signer: ClientSigningManager | null,
   params: SendWithSigningParams,
 ): Promise<Response> {
-  const { url, headerPairs, credential, appVersion, send, debug } = params;
+  const { url, headerPairs, credential, appVersion, oauthAccessToken, provider, send, debug } = params;
   if (!signer) return send(headerPairs);
 
-  const first = await signer.signWithStatus(url, headerPairs, { credential, appVersion });
+  const signingCred = { credential, appVersion, ...(oauthAccessToken ? { oauthAccessToken } : {}), ...(provider ? { provider } : {}) };
+  const first = await signer.signWithStatus(url, headerPairs, signingCred);
   let resp = await send(first.pairs);
   if (!first.signed || !await signer.isVerifyFailure(resp)) return resp;
 
   debug?.("401 VERIFY_SIGNATURE_* — invalidating signing key and retrying once");
   signer.invalidate(url, credential);
-  // The first response is discarded here — release its body so the socket
-  // doesn't dangle until GC.
-  await resp.body?.cancel().catch(() => {});
-  const second = await signer.signWithStatus(url, headerPairs, { credential, appVersion });
+  const second = await signer.signWithStatus(url, headerPairs, signingCred);
   resp = await send(second.pairs);
   if (!second.signed || !await signer.isVerifyFailure(resp)) return resp;
 
-  await resp.body?.cancel().catch(() => {});
   signer.setBypass(url, credential);
   debug?.("401 VERIFY_SIGNATURE_* twice — sending unsigned (signing bypassed)");
   return send(headerPairs);
 }
 
 let defaultSigner: ClientSigningManager | null = null;
-let defaultSignerKey = "";
 
 /**
- * Process-wide signing manager, shared across requests (gate + key caches).
- * Returns `null` when `clientSigning.enabled` is false. Recreated when the
- * relevant config values change (Android `setConfig`) — keyed on the full
- * identity because the manager embeds it in gate-fetch headers.
+ * Process-wide signing manager, shared across requests (handshake key caches).
+ * Returns `null` when `clientSigning.enabled` is false. The manager holds no
+ * config-derived state (3.15.1 removed the agent/configs gate), so a single
+ * instance serves every request regardless of identity/config churn.
  */
 export function getDefaultClientSigning(config: {
-  clientSigning: { enabled: boolean; origin: string };
-  identity: ProxyIdentity;
+  clientSigning: { enabled: boolean };
 }): ClientSigningManager | null {
   if (!config.clientSigning.enabled) return null;
-  const key = `${config.clientSigning.origin}\n${identityCacheKey(config.identity)}`;
-  if (!defaultSigner || key !== defaultSignerKey) {
+  if (!defaultSigner) {
     defaultSigner = new ClientSigningManager({
-      identity: config.identity,
-      origin: config.clientSigning.origin,
-      // Fail-open decisions (gate off, handshake failure, VERIFY bypass) are
-      // otherwise silent in production — surface each once per (origin, cred).
+      // Fail-open decisions (handshake failure, VERIFY bypass) are otherwise
+      // silent in production — surface each once per (origin, cred).
       onEvent: (message) => console.log(message),
     });
-    defaultSignerKey = key;
   }
   return defaultSigner;
 }

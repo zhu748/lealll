@@ -70,7 +70,7 @@ About the "API Key": if you've set `auth.proxyApiKey` in the config (or the envi
 # macOS / Linux
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8080
 export ANTHROPIC_AUTH_TOKEN=sk-1234
-export ANTHROPIC_MODEL=glm-4.7
+export ANTHROPIC_MODEL=glm-5.3
 claude
 ```
 
@@ -78,7 +78,7 @@ claude
 # Windows PowerShell
 $env:ANTHROPIC_BASE_URL = "http://127.0.0.1:8080"
 $env:ANTHROPIC_AUTH_TOKEN = "sk-1234"
-$env:ANTHROPIC_MODEL = "glm-4.7"
+$env:ANTHROPIC_MODEL = "glm-5.3"
 claude
 ```
 
@@ -111,7 +111,7 @@ In your tool's "Custom Provider" section, fill in:
 |--------|-----|
 | API address (Base URL) | `http://127.0.0.1:8080/v1` |
 | API Key | Your proxy key (anything, if unset) |
-| Model | `glm-4.7`, `glm-5.3`, `glm-4.6v`, etc. — see the model table below |
+| Model | `glm-5.3`, `glm-5.3-flash`, `glm-4.6v`, etc. — see the model table below |
 
 Anthropic-format tools (e.g. some Claude clients) should use `http://127.0.0.1:8080` as the address; the proxy handles the `/v1/messages` path automatically.
 
@@ -152,7 +152,7 @@ docker run -d --name zcode-proxy -p 8080:8080 \
   ghcr.io/tridefender/zcode-proxy:latest
 ```
 
-The image is multi-arch (amd64 / arm64) and runs as the `bun` user. With compose:
+The image is multi-arch (amd64 / arm64) and runs as the `bun` user. Its multi-stage build ships only the application bundle and captcha worker, with all features retained and no `node_modules`, sources, tests, or additional build tools in the runtime layer. See [Docker image notes](docs/docker-image.md) for size measurements and local build commands. With compose:
 
 ```yaml
 services:
@@ -184,17 +184,18 @@ The config file is `config.yaml` in the project root (auto-generated on first st
 | `ZCODE_LOG_FORMAT` | desktop table | Set to `compact` for single-line logs (good for narrow screens) |
 | `ZCODE_PANEL_ENABLED` | off | Set to `1`/`true` to start a local web panel in headless `serve` mode (including Docker) |
 | `ZCODE_PANEL_TOKEN` | none | Access token for the panel, **required when the panel is enabled** (without it the panel does not start, so the control endpoints are never left open) |
-| `ZCODE_PANEL_PORT` | `8090` | Panel port (bound to `127.0.0.1` only) |
+| `ZCODE_PANEL_PORT` | `8090` | Panel port |
+| `ZCODE_PANEL_HOST` | `127.0.0.1` | Panel bind address. Docker bridge networks cannot `-p`-map a loopback bind, so set `0.0.0.0` there; pair it with a **strong token** and do **not** expose the port publicly |
 | `ZCODE_UPDATE_CHECK` | on | Set to `off`/`0` to disable the startup "new version" check (it only notifies, it never updates in place) |
 | `ZCODE_UPDATE_SKIP` | none | Comma-separated tags to mute, e.g. `v4.7.6,v4.7.7` |
 
 The plan type (`plan`: `coding-plan` personal / `start-plan` trial) can be toggled in the panel with <kbd>t</kbd>, which writes the change back to config.yaml.
 
-Without a TUI (cloud server) you can use a browser instead: set `ZCODE_PANEL_ENABLED=1` and `ZCODE_PANEL_TOKEN=<your own random string>`, start the proxy, then forward the port and open `http://127.0.0.1:8090` — it shows status and quota, switches provider/plan, logs in and out, and tails the live logs plus the MCP list. The panel binds loopback only and requires the token on every API call; without a token it does not start. Commands are dispatched in process, so no extra control port is opened. Stopping the proxy from the page does not keep the process alive: SIGTERM/SIGINT and the panel's own shutdown all clear the background timers (auto-claim, captcha pool) before exiting. Logging out from the page also clears the live credential and stops the proxy, so a logged-out account is not spent any further.
+Without a TUI (cloud server) you can use a browser instead: set `ZCODE_PANEL_ENABLED=1` and `ZCODE_PANEL_TOKEN=<your own random string>`, start the proxy, then forward the port and open `http://127.0.0.1:8090` — it shows status and quota, switches provider/plan, logs in and out, and tails the live logs plus the MCP list. The panel binds loopback by default (`ZCODE_PANEL_HOST` overrides the address, see below) and requires the token on every API call; without a token it does not start. Commands are dispatched in process, so no extra control port is opened. Stopping the proxy from the page does not keep the process alive: SIGTERM/SIGINT and the panel's own shutdown all clear the background timers (auto-claim, captcha pool) before exiting. Logging out from the page also clears the live credential and stops the proxy, so a logged-out account is not spent any further.
 
 **Update notice**: on startup `serve` and the TUI ask GitHub once for the latest release, printing at most one extra log line (press <kbd>u</kbd> in the TUI to re-check manually). It never blocks startup and never affects the proxy: offline, blocked, rate-limited or unexpected answers are ignored silently. A manual check always answers — "already on the latest version" or "check unavailable". Container images are immutable, so the hint names the pull command of the **detected runtime** (Docker: `docker compose pull && docker compose up -d`, Podman: `podman compose pull && podman compose up -d`; when the runtime cannot be told apart it just says "pull the new image and recreate the container") rather than replacing files in place (release artifacts carry no checksums yet, so automatic download-and-replace is not offered). Set `ZCODE_UPDATE_CHECK=off` to disable the check, or `ZCODE_UPDATE_SKIP=v4.7.6` to mute a single tag.
 
-**Reaching the panel from Docker**: the panel listens on the *container's own* `127.0.0.1`, so with the default bridge network `-p 8080:8080` does not expose it, and adding `-p 8090:8090` does not help either (that maps a non-loopback container address). On a Linux server, use host networking so the container shares the host's loopback:
+**Reaching the panel from Docker**: the panel listens on the *container's own* `127.0.0.1` by default, so with the default bridge network `-p 8080:8080` does not expose it, and adding `-p 8090:8090` does not help either (that maps a non-loopback container address). Two ways out: ① add `ZCODE_PANEL_HOST=0.0.0.0` to the environment plus `-p 8090:8090` — the panel then binds every container interface, so the token must be strong and 8090 should only be reachable by whoever needs it; ② on a Linux server, use host networking so the container shares the host's loopback:
 
 ```yaml
 services:
@@ -237,19 +238,12 @@ and open `http://127.0.0.1:8090`. With host networking the proxy port is the hos
 
 ## 🧮 Available Models
 
-The proxy lists the models below under `/v1/models` (the list is for display only — any other model name is still forwarded as-is):
+The table below is for reference only:
 
 | Model | Context | Max Output |
 |------|--------|----------|
-| `glm-4.5-air` | 131K | 96K |
-| `glm-4.6` | 200K | 131K |
-| `glm-4.6v` (vision) | 131K | 32K |
-| `glm-4.7` | 200K | 131K |
-| `glm-5` / `glm-5-turbo` | 200K | 64K |
-| `glm-5v-turbo` (vision) | 200K | 131K |
-| `glm-5.1` | 200K | 64K |
-| `glm-5.2` | 1M | 128K |
-| `glm-5.3` / `glm-5.3-flash` | 1M | 128K |
+| `glm-5.3`  | 1M | 128K |
+| `glm-5.3-flash` (vision) | 1M | 128K |
 
 ## ❓ FAQ
 
@@ -290,4 +284,18 @@ keys.
 
 ## License
 
-MIT
+Copyright (c) 2026 TriDefender and the ZCode Proxy contributors.
+
+This project uses **[Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0)](https://creativecommons.org/licenses/by-nc-sa/4.0/)**. [LICENSE](LICENSE) contains the unmodified official standard text, preceded by the project's copyright and license notice.
+
+- **NonCommercial**: copying, sharing and adapting are permitted without a license fee when complying with the license. Uses primarily intended for commercial advantage or monetary compensation are not permitted.
+- **Attribution and notices**: when sharing the original or adaptations, retain attribution and supplied original copyright, license and disclaimer notices as required by the license, link to the license, and indicate modifications.
+- **ShareAlike**: publicly shared adaptations must use the same or a compatible license as permitted by CC BY-NC-SA 4.0. Do not impose additional legal terms or technical measures restricting the licensed rights.
+
+**Scope limits**: CC BY-NC-SA 4.0 does not require software source disclosure, cannot strictly guarantee a ban on closed-source distribution, and has no network-service source disclosure requirement. This project adds no such custom restrictions. CC [recommends against its licenses for software](https://creativecommons.org/faq/#can-i-apply-a-creative-commons-license-to-software); this project chooses its noncommercial, attribution and ShareAlike conditions. Independent tool outputs containing no licensed Project material are not automatically covered merely because the tool was used.
+
+Third-party components retain their own licenses. This license covers only material the rights holders may offer on these terms; valid earlier MIT grants are not retroactively revoked. This is a summary; see [LICENSE](LICENSE) and the [official legal code](https://creativecommons.org/licenses/by-nc-sa/4.0/legalcode.en) for the complete terms.
+
+## Protocol and maintenance notes
+
+See the [compatibility matrix](docs/compatibility.md) and [2026-10-20 audit](docs/audit-2026-10-20.md) for supported mappings, deliberate deviations and verification limits. Responses hosted search tools are not executed by this proxy.
