@@ -47,7 +47,10 @@ class NodeRunner(private val context: Context) {
     suspend fun ensureAssetsExtracted() = withContext(Dispatchers.IO) {
         val targetDir = File(context.filesDir, "server_bundle")
         val installedAt = context.packageManager.getPackageInfo(context.packageName, 0).lastUpdateTime
-        val names = listOf("server.cjs", "config.example.yaml", "webui.txt", "zcode_system.json")
+        // captcha-worker-entry.cjs: Android runs captcha solving STRICTLY in
+        // worker threads (ZCODE_CAPTCHA_REQUIRE_WORKER=1) — the Node process
+        // resolves it via ZCODE_CAPTCHA_WORKER, so it ships with the bundle.
+        val names = listOf("server.cjs", "captcha-worker-entry.cjs", "config.example.yaml", "webui.txt", "zcode_system.json")
         val extracted = BundleExtractor(targetDir).extract(installedAt.toString(), names) { name ->
             context.assets.open("server_bundle/$name")
         }
@@ -94,6 +97,12 @@ class NodeRunner(private val context: Context) {
             environment()["ZCODE_IDENTITY_DEVICE_MID"] = deviceMid
             environment()["ZCODE_PROXY_CONFIG"] = config.absolutePath
             environment()["ZCODE_LOG_FORMAT"] = "compact"
+            // Captcha solving: strict worker mode — a persistent warm pool of
+            // worker threads, never in-process (the main event loop must not
+            // block on the solver's Atomics.wait sync XHRs, issue #54).
+            environment()["ZCODE_CAPTCHA_WORKER"] = File(serverBundle, "captcha-worker-entry.cjs").absolutePath
+            environment()["ZCODE_CAPTCHA_REQUIRE_WORKER"] = "1"
+            environment()["ZCODE_CAPTCHA_WARM_WORKERS"] = "3"
         }
 
         val p = pb.start()

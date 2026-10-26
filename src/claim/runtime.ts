@@ -7,11 +7,14 @@ import type { AuthManager } from "../auth/manager.js";
 import type { ProxyConfig } from "../config/types.js";
 import type { ClaimablePlan, ClaimOutcome } from "./types.js";
 import { formatUnixSeconds } from "./types.js";
+import type { Credential } from "../auth/types.js";
+import { credentialString } from "../auth/types.js";
 import { createClaimClient, ClaimPreviewError } from "./client.js";
 import { ClaimScheduler } from "./scheduler.js";
 import { getCaptchaToken } from "../proxy/captcha.js";
 import { resolveBillingDeviceMid, buildIdentityHeaders } from "../proxy/identity.js";
 import { loadCredential } from "../auth/store.js";
+import { getDefaultEndpointRouting, requiresClaimCaptcha } from "../proxy/endpoint-routing.js";
 
 /**
  * Billing-gateway deviceMid resolution: `ZCODE_IDENTITY_DEVICE_MID` env
@@ -28,6 +31,15 @@ function resolveDeviceMid(config: ProxyConfig): string {
 /** `${process.platform}-${process.arch}` — mirrors the client's `TH()`. */
 function claimPlatform(): string {
   return `${process.platform}-${process.arch}`;
+}
+
+function claimCaptchaRequired(config: ProxyConfig, resolveCredential: () => Promise<Credential | null>): Promise<boolean> {
+  const routing = getDefaultEndpointRouting(config);
+  if (!routing) return Promise.resolve(true);
+  return resolveCredential()
+    .then((cred) => routing.getRequestVerificationConfig(cred ? credentialString(cred) : undefined))
+    .then((cfg) => requiresClaimCaptcha(cfg))
+    .catch(() => true);
 }
 
 export function startAutoClaim(config: ProxyConfig, auth: AuthManager): ClaimScheduler {
@@ -53,9 +65,18 @@ export function startAutoClaim(config: ProxyConfig, auth: AuthManager): ClaimSch
         deviceMid,
       }),
     getCaptcha: async () => {
-      const { verifyParam, region } = await getCaptchaToken(config.identity.appVersion);
-      return { verifyParam, region: region || undefined };
+      const token = await getCaptchaToken(config.identity.appVersion);
+      if (!token) throw new Error("captcha config flipped to disabled between gate and mint");
+      return { verifyParam: token.verifyParam, region: token.region || undefined };
     },
+    captchaRequired: () =>
+      claimCaptchaRequired(config, async () => {
+        try {
+          return await auth.getCredential();
+        } catch {
+          return await loadCredential().catch(() => null);
+        }
+      }),
     config: {
       planId: config.claim.planId || undefined,
       pollIntervalMs: config.claim.pollIntervalMs,
@@ -125,8 +146,14 @@ export async function runClaimCli(config: ProxyConfig, mode: "list" | "now"): Pr
   }
   if (target.planId !== plans[0].planId) console.log(`Claiming configured plan: ${target.planId}`);
 
-  const captcha = await getCaptchaToken(config.identity.appVersion);
-  const outcome = await client.claim(target.planId, { verifyParam: captcha.verifyParam, region: captcha.region || undefined });
+  const captchaRequired = await claimCaptchaRequired(config, async () => cred);
+  let captcha: { verifyParam: string; region?: string } | undefined;
+  if (captchaRequired) {
+    const token = await getCaptchaToken(config.identity.appVersion);
+    if (!token) throw new Error("captcha config flipped to disabled between gate and mint");
+    captcha = { verifyParam: token.verifyParam, region: token.region || undefined };
+  }
+  const outcome = await client.claim(target.planId, captcha);
   printOutcome(outcome);
   if (!outcome.ok) process.exit(1);
 }

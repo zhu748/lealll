@@ -244,6 +244,22 @@ export class CaptchaTokenPool {
     }
   }
 
+  /** Test-only: back to the never-configured boot state. The module-level
+   * singleton survives across bun test files in one process, and a take from
+   * an earlier file ramps `effectiveTarget` up (demand-based) — a later
+   * "pool not running" assertion then sees a phantom target. Reset the
+   * sizing/demand state so cross-file order can never leak. */
+  resetForTests(): void {
+    this.stopBackgroundRefill();
+    this.tokens = [];
+    this.cfg = null;
+    this.pausedUntil = 0;
+    this.takeTimestamps = [];
+    this.activeSolves = 0;
+    this.lastTakeAt = Date.now();
+    this.effectiveTarget = 0;
+  }
+
   async takeToken(cfg: CaptchaConfig): Promise<string> {
     this.cfg = cfg;
 
@@ -397,6 +413,21 @@ export class CaptchaTokenPool {
     this.wakeFromIdle();
     // Sizing is demand-driven via computeActiveTarget() on the next refill
     // tick; takes only need to restore the active floor instantly.
+  }
+
+  /**
+   * Refresh the demand/idle clock WITHOUT taking a token or widening the
+   * target: an in-flight request whose SSE is still producing is activity —
+   * its stream must not let the pool stay decayed AFTER the turn ends (the
+   * next tool-loop turn would land on a decayed pool, NOTEPAD "3.16.3
+   * 增补" §H). Fires at stream end: a stream longer than the scale-down
+   * idle still decays mid-flight to the keeper floor; this resets the idle
+   * clock so computeActiveTarget() restores the full target on the next
+   * refill tick. Unlike onTokenTaken this never pollutes takeTimestamps
+   * (the demand-sizing signal) — it only resets the idle decay levers.
+   */
+  touchDemand(): void {
+    this.lastTakeAt = Date.now();
   }
 
   private maybeScaleDown(): void {
@@ -712,11 +743,21 @@ export function stopCaptchaPool(): void {
   shutdownCaptchaSolver();
 }
 
+/** Test seam: reset the module-level pool to its never-configured state. */
+export function __resetCaptchaPoolForTests(): void {
+  pool.resetForTests();
+}
+
 export async function takeCaptchaToken(cfg: CaptchaConfig): Promise<string> {
   if (!cfg.enabled || !cfg.prefix || !cfg.sceneId) {
     throw new Error("Captcha config unavailable from ZCode API");
   }
   return pool.takeToken(cfg);
+}
+
+/** In-flight request activity (stream still producing) — see pool.touchDemand. */
+export function touchCaptchaDemand(): void {
+  pool.touchDemand();
 }
 
 export function startCaptchaPoolRefill(cfg: CaptchaConfig): void {

@@ -1,5 +1,19 @@
 # zcode-proxy 使用说明
 
+> **v4.8.6-fork.1 — 对齐上游 v4.8.6（云控验证码门控 / 用户空闲判断 / MCP 聚合端点 / start-plan 三块系统形态）**
+>
+> - **合并上游 v4.8.3→v4.8.6 共 8 个功能提交**，fork 全部自研特性（/admin 面板、多账号故障转移、代理池、统计、提示词规则、闲时通道、领取/重置）完整保留。
+> - **云控验证码门控（3.16.3 configs.captcha）**：端点路由快照同批解析 `data.configs.captcha`（`enabled` / `skip_model_request`），领取面按云控开关决定是否携带验证码头——服务端关闭时 claim 请求省略验证码段（与官方 3.16.3 `requiresRequestVerification` 门语义一致，省去无谓的验证码求解与指纹暴露）。
+> - **用户空闲判断完善（§H）**：验证码配置获取重构为官方同款——1h 快照 TTL、15s 全程超时（含响应体）、in-flight 去重、**无负缓存**（失败不写快照、下次立即重试），消除自造节奏造成的 #002「Captcha config unavailable」风暴；`lastGoodCfg` 断网回退保 region 不复活已禁用配置。**在飞即活动**：SSE 流结束/请求完成时刷新验证码池与高速抽卡空闲窗（长流式不再误判空闲抽干池），fork 的 wireStats 内联统计管线挂接 `noteInFlightEnded`，保留无 tee 架构。
+> - **start-plane 严格验证码获取**：获取失败有界重试（`CAPTCHA_ACQUIRE_BUDGET_MS`，默认 45s）后诚实 503，**绝不 fail-open 裸发**（ESA 边缘对裸发间歇性回空体 502）；`getCaptchaToken` 返回 null = 服务端明示禁用 → 无头即正确形态。fork 的多账号重试循环按 attempt 逐次取新票（Aliyun 参数不可跨次复用）。
+> - **MCP 聚合端点**：`/mcp/{key}` 逐插件中继升级为**单一** `/mcp` 聚合服务（streamable HTTP，initialize/ping/tools/list/tools/call、JSON-RPC 批量、通知）；全目录插件工具以 `{plugin}__{tool}` 命名空间合并（实测 15 个金融插件 134 工具），不可用插件降级记录于 `result._meta.unavailable`（TTL 退避）、会话过期一次重初始化、上游 JSON-RPC 错误原样透传；按凭证指纹缓存聚合（重登录自动重建）。`relay.ts` 移除（由 `aggregate.ts` + `upstream.ts` 取代），fork 的 GLM 托管工具（client/glm-tools）不受影响。
+> - **start-plan 三块系统形态（issue #71，2026-10-24 网关规则）**：客户端 system 不再强制 subagent 两块形态（已被网关全面拒绝），恒定官方三块 + main 会话，客户端 system 文本规范化后**追加**到稳定块尾部；翻译模式上游非 2xx **透传真实状态与 body**（405/3012、429/3009 是真实拒绝而非网关故障，不再包装 502 translation_failed）。
+> - **注入提示词完善**：`zcode_system.json` 稳定块补充官方字段；可视化目录会话 ID 改为 sha256 稳定哈希（`~/.zcode/v2/visualizations`）。
+> - **Android 求解进程增强**：验证码求解严格走常驻 worker 线程（`ZCODE_CAPTCHA_REQUIRE_WORKER=1`），`captcha-worker-entry.cjs` 随 bundle 发行（gradle 构建期完整性校验），NodeRunner 提取清单补齐该文件（保留 fork 的 BundleExtractor 版本感知提取）。
+> - **测试**：全套 1820 用例通过（0 失败），typecheck 干净。跨文件状态隔离加固：验证码池新增 `__resetCaptchaPoolForTests` 复位接缝（bun 单进程多文件运行时需求爬升会泄漏 `effectiveTarget`）。
+>
+> 升级建议：桌面端替换对应平台压缩包，Android 安装新版 APK，或更新 Docker 镜像。现有配置、凭证与提示词规则格式保持兼容；MCP 用户注意客户端从多个 `/mcp/{key}` 地址迁移到单一 `/mcp` 端点（工具名带 `{plugin}__` 前缀）。Release 压缩包、APK 和 Docker 镜像由 GitHub Actions 自动构建并发布。
+
 > **v4.8.4-fork.1 — 对齐上游 v4.8.2 并通过 ZCode 3.15.3 官方包全量对齐验证（指纹 / 请求签名 / 福利领取）**
 >
 > - **指纹对齐 3.15.3**：默认 App 版本 3.15.1 → **3.15.3**（2026-10-13 官方构建）。`buildCliZCodeSourceHeaders`（Tlc）与 `buildZCodeSourceHeadersFromContext`（Fen，官方 3 处相同副本）已与官方 `buildLlmIdentityHeaders` 逐字节比对：头集合、条件分支、`unknown` 回退、`X-ZCode-Agent` 仅出现在 LLM 面、可打印 ASCII 门控、osCategory 映射、ZCODE_ENV 通道规则、默认 origin `zcode.z.ai`、telemetry v2 deviceMid 全部一致。

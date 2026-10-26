@@ -654,6 +654,12 @@ describe("captcha-helper removal + pool stats on /admin/api/stats (v0.3.8)", () 
   });
 
   it("/admin/api/stats reports read-only captchaPool health (pool not running)", async () => {
+    // bun runs every test file in ONE process: an earlier file's captcha
+    // acquisition ramps the pool singleton's demand-based target up, and
+    // shutdownCaptcha() never resets it — reset to the boot state here so
+    // this "never configured" assertion is order-independent.
+    const { __resetCaptchaPoolForTests } = await import("../proxy/captcha-pool.js");
+    __resetCaptchaPoolForTests();
     const opts = makeAdminOpts();
     const resp = await callAdmin(authedReq("/admin/api/stats"), opts);
     expect(resp!.status).toBe(200);

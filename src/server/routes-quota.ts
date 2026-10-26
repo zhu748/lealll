@@ -680,12 +680,14 @@ export async function handleQuotaClaimSubmit(
     }
     // Captcha solved in-process (pool take + happy-dom solve) — the same flow
     // the CLI and scheduler use; the desktop solves the identical Aliyun
-    // widget locally before submitting.
+    // widget locally before submitting. `getCaptchaToken` returns null when
+    // the server-side configs gate disables captcha — since 3.16.3 the claim
+    // call then omits the captcha headers entirely (cloud-controlled shape).
     const captcha = await captchaImpl(config.identity.appVersion);
-    const outcome: ClaimOutcome = await client.claim(planId, {
-      verifyParam: captcha.verifyParam,
-      region: captcha.region || undefined,
-    });
+    const outcome: ClaimOutcome = await client.claim(
+      planId,
+      captcha ? { verifyParam: captcha.verifyParam, region: captcha.region || undefined } : undefined,
+    );
     return new Response(JSON.stringify(outcome, null, 1), {
       status: 200,
       headers: { "content-type": "application/json" },

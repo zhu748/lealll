@@ -15,10 +15,11 @@
  *     anonymous)
  *   - `POST {origin}/api/v1/zcode-plan/billing/claim`  body `{plan_id}`
  *     headers: identity base + Authorization, Content-Type,
- *     X-Aliyun-Captcha-Verify-Param, [X-Aliyun-Captcha-Verify-Region],
- *     X-ZCode-App-Version, X-Platform (the last two override their base
- *     positions — object-spread keeps overridden keys in place, matching
- *     `Headers.set` semantics in the bundle)
+ *     [X-Aliyun-Captcha-Verify-Param, [X-Aliyun-Captcha-Verify-Region]]
+ *     (omitted entirely when the 3.16.3 configs.captcha gate is off —
+ *     captcha arg undefined), X-ZCode-App-Version, X-Platform (the last two
+ *     override their base positions — object-spread keeps overridden keys in
+ *     place, matching `Headers.set` semantics in the bundle)
  *
  * HISTORY: 3.12.3 sent a minimal header set on this plane; the 0828/0918
  * campaign gateways empirically required a UUID `X-Device-Mid` (biz 3001
@@ -60,7 +61,7 @@ export interface ClaimClientOptions {
 
 export interface ClaimClient {
   getPreviews(signal?: AbortSignal): Promise<ClaimablePlan[]>;
-  claim(planId: string, captcha: { verifyParam: string; region?: string }, signal?: AbortSignal): Promise<ClaimOutcome>;
+  claim(planId: string, captcha?: { verifyParam: string; region?: string }, signal?: AbortSignal): Promise<ClaimOutcome>;
 }
 
 const DEFAULT_TIMEOUT_MS = 15_000;
@@ -227,18 +228,22 @@ export function createClaimClient(opts: ClaimClientOptions): ClaimClient {
       });
     },
 
-    async claim(planId: string, captcha: { verifyParam: string; region?: string }, signal?: AbortSignal): Promise<ClaimOutcome> {
+    async claim(planId: string, captcha?: { verifyParam: string; region?: string }, signal?: AbortSignal): Promise<ClaimOutcome> {
       if (!jwt) return { ok: false, planId, failureKind: "login_required", code: 401, message: "manual_claim_login_required" };
       // 3.15.3 `claimManualPlan`: caller set = Authorization, Content-Type,
-      // captcha param, [captcha region], X-ZCode-App-Version, X-Platform —
-      // merged over the identity base (version/platform override their base
-      // positions; the rest append after the base keys).
+      // [captcha param, [captcha region]] (omitted entirely when the 3.16.3
+      // configs.captcha gate is off — captcha arg undefined),
+      // X-ZCode-App-Version, X-Platform — merged over the identity base
+      // (version/platform override their base positions; the rest append
+      // after the base keys).
       const headers = mergeHeaders({
         Authorization: `Bearer ${jwt}`,
         "Content-Type": "application/json",
-        "X-Aliyun-Captcha-Verify-Param": captcha.verifyParam,
       });
-      if (captcha.region) headers["X-Aliyun-Captcha-Verify-Region"] = captcha.region;
+      if (captcha) {
+        headers["X-Aliyun-Captcha-Verify-Param"] = captcha.verifyParam;
+        if (captcha.region) headers["X-Aliyun-Captcha-Verify-Region"] = captcha.region;
+      }
       headers["X-ZCode-App-Version"] = opts.appVersion;
       headers["X-Platform"] = opts.platform;
       const { status, json, text } = await request("POST", "/api/v1/zcode-plan/billing/claim", { body: { plan_id: planId }, headers, signal });

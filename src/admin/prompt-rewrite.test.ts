@@ -154,8 +154,16 @@ describe("prompt rewrite admin and real dispatch", () => {
     const auth = new AuthManager({ listAllCredentials: async () => [first, second] });
     auth.setOAuthCredential(first);
     const wires: Record<string, unknown>[] = [];
+    // Start-plan credentials gate every dispatch behind a captcha token
+    // (NOTEPAD 3.16.3 §H strict acquire) — inject a deterministic stub so the
+    // test never touches the real solver/network and stays order-independent.
+    const captcha = {
+      RETRY_HEADERS: { PARAM: "x-aliyun-captcha-verify-param", REGION: "x-aliyun-captcha-verify-region" },
+      getCaptchaToken: async () => ({ verifyParam: `tok-${wires.length + 1}`, region: "sgp" }),
+      detectCaptchaChallenge: (resp: Response) => resp.headers.get("x-aliyun-captcha-verify-param"),
+    } as unknown as NonNullable<Parameters<typeof proxyRequest>[2]["captcha"]>;
     const response = await proxyRequest(request("old"), "anthropic", {
-      config: opts.config, auth, endpointRouting: null, clientSigning: null,
+      config: opts.config, auth, endpointRouting: null, clientSigning: null, captcha,
       fetchImpl: Object.assign(async (input: RequestInfo | URL) => {
         wires.push(await (input as Request).json());
         return wires.length === 1 ? Response.json({ error: { message: "retry", type: "overloaded_error" } }, { status: 529 }) : ok();

@@ -661,6 +661,16 @@ async function runAndroid(): Promise<void> {
   // the retry engine can failover across accounts on Android too.
   const auth = buildAuthManager(config);
 
+  // Captcha module handle for the start-plan pool warmup (started in
+  // startProxy, stopped whenever the proxy stops) — mirrors serve()'s
+  // warmup. On Android this also brings up the persistent captcha workers
+  // (ZCODE_CAPTCHA_WARM_WORKERS, injected by NodeRunner).
+  let captchaModule: { shutdownCaptcha: () => void } | null = null;
+  const stopCaptchaPoolRuntime = (): void => {
+    try { captchaModule?.shutdownCaptcha(); } catch {}
+    captchaModule = null;
+  };
+
   const serverRef: { current: ProxyServer | null } = { current: null };
 
   const runLifecycle = createSerialQueue();
@@ -674,6 +684,18 @@ async function runAndroid(): Promise<void> {
       const s = await startServer(buildServerOptions(config, auth, false, { configPath: path }));
       serverRef.current = s;
       console.log(`zcode-proxy listening on http://${s.hostname}:${s.port}`);
+      if (config.plan === "start-plan") {
+        // Mirror serve(): size the pool, start background refill and prefill
+        // — previously Android never initialized the pool at all (every take
+        // hit an empty-pool race + one urgent refill). The prefill also warms
+        // the persistent captcha workers on this platform.
+        import("./proxy/captcha.js")
+          .then(async (m) => {
+            captchaModule = m;
+            await m.startCaptchaPool(config.identity.appVersion);
+          })
+          .catch((err) => console.error(`[captcha] pool warmup failed: ${(err as Error).message}`));
+      }
       return { ok: true, port: s.port };
     } catch (err) {
       return { ok: false, error: (err as Error).message };
@@ -686,6 +708,7 @@ async function runAndroid(): Promise<void> {
     try {
       await s.stop(false);
       serverRef.current = null;
+      stopCaptchaPoolRuntime();
       console.log("zcode-proxy stopped");
       return { ok: true };
     } catch (err) {
@@ -752,6 +775,7 @@ async function runAndroid(): Promise<void> {
       // flush the log, exit.
       try { claimScheduler?.stop(); } catch { /* best-effort */ }
       try { serverRef.current?.stop(true); } catch { /* best-effort */ }
+      stopCaptchaPoolRuntime();
       const { flushLogFileForShutdown } = await import("./admin/api.js");
       const force = setTimeout(() => process.exit(0), 5000);
       if (typeof force.unref === "function") force.unref();
@@ -769,6 +793,7 @@ async function runAndroid(): Promise<void> {
     // Stop the claim scheduler too — its (now unref'd) hold timer would
     // otherwise let a SIGINT'd process linger until the next tick.
     try { claimScheduler?.stop(); } catch { /* best-effort */ }
+    stopCaptchaPoolRuntime();
     void controlListener.close().then(() => serverRef.current?.stop(true));
   };
   process.on("SIGINT", shutdown);

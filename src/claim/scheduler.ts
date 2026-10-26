@@ -19,7 +19,8 @@ import { ClaimPreviewError } from "./client.js";
 
 interface ClaimGateway {
   getPreviews(): Promise<ClaimablePlan[]>;
-  claim(planId: string, captcha: { verifyParam: string; region?: string }): Promise<ClaimOutcome>;
+  /** `captcha` omitted → claim without captcha headers (3.16.3 switch off). */
+  claim(planId: string, captcha?: { verifyParam: string; region?: string }): Promise<ClaimOutcome>;
 }
 
 interface ClaimSchedulerConfig {
@@ -33,6 +34,7 @@ export interface ClaimSchedulerDeps {
   getJwt(): Promise<string | undefined>;
   createClient(jwt: string): ClaimGateway;
   getCaptcha(): Promise<{ verifyParam: string; region?: string }>;
+  captchaRequired?: () => Promise<boolean> | boolean;
   config: ClaimSchedulerConfig;
   log?: (message: string) => void;
   now?: () => number;
@@ -133,11 +135,22 @@ export class ClaimScheduler {
       return { action: "idle" };
     }
 
-    let captcha: { verifyParam: string; region?: string };
-    try {
-      captcha = await this.deps.getCaptcha();
-    } catch (err) {
-      return this.errorBackoff(`captcha token failed: ${(err as Error).message}`);
+    let captchaRequired = true;
+    if (this.deps.captchaRequired) {
+      try {
+        captchaRequired = await this.deps.captchaRequired();
+      } catch {
+        captchaRequired = true;
+      }
+    }
+
+    let captcha: { verifyParam: string; region?: string } | undefined;
+    if (captchaRequired) {
+      try {
+        captcha = await this.deps.getCaptcha();
+      } catch (err) {
+        return this.errorBackoff(`captcha token failed: ${(err as Error).message}`);
+      }
     }
 
     let outcome: ClaimOutcome;
