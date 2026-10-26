@@ -1,0 +1,69 @@
+{
+  "baselineCommit": "f2352de",
+  "runtime": "Node v24.22.1",
+  "method": "One warmup, five samples, median; same machine and script. Local CPU paths only.",
+  "before": {
+    "writes10000With1000Histories": {
+      "medianMs": 135.226,
+      "samplesMs": [
+        147.745,
+        135.226,
+        123.607,
+        141.269,
+        127.427
+      ]
+    },
+    "writes10000With10000Histories": {
+      "medianMs": 833.976,
+      "samplesMs": [
+        787.632,
+        872.61,
+        816.436,
+        833.976,
+        909.442
+      ]
+    },
+    "canonicalBody512KiB200Transforms": {
+      "medianMs": 175.717,
+      "samplesMs": [
+        203.488,
+        186.654,
+        175.717,
+        163.761,
+        167.358
+      ]
+    }
+  },
+  "after": {
+    "writes10000With1000Histories": {
+      "medianMs": 12.464,
+      "samplesMs": [
+        16.011,
+        12.464,
+        14.989,
+        11.312,
+        9.984
+      ]
+    },
+    "writes10000With10000Histories": {
+      "medianMs": 25.731,
+      "samplesMs": [
+        27.786,
+        25.731,
+        30.812,
+        16.918,
+        21.188
+      ]
+    },
+    "canonicalBody512KiB200Transforms": {
+      "medianMs": 0.099,
+      "samplesMs": [
+        0.226,
+        0.176,
+        0.099,
+        0.072,
+        0.084
+      ]
+    }
+  }
+}

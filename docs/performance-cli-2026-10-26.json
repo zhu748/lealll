@@ -1,0 +1,49 @@
+{
+  "baseline": "Working tree after the first optimization round, before CLI extraction",
+  "runtime": "v24.22.1",
+  "method": "One warmup, five fresh Node processes per command; median wall time, build excluded.",
+  "before": {
+    "version": {
+      "medianMs": 136.954,
+      "samplesMs": [
+        136.954,
+        131.402,
+        132.891,
+        137.564,
+        139.174
+      ]
+    },
+    "help": {
+      "medianMs": 140.919,
+      "samplesMs": [
+        136.832,
+        151.105,
+        140.913,
+        145.699,
+        140.919
+      ]
+    }
+  },
+  "after": {
+    "version": {
+      "medianMs": 123.808,
+      "samplesMs": [
+        132.2,
+        126.024,
+        116.257,
+        114.137,
+        123.808
+      ]
+    },
+    "help": {
+      "medianMs": 120.924,
+      "samplesMs": [
+        122.079,
+        120.741,
+        119.425,
+        123.106,
+        120.924
+      ]
+    }
+  }
+}

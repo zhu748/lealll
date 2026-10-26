@@ -7,6 +7,7 @@
  * Used by the CLI (`auth login bigmodel --paste`) and the TUI (`L` key),
  * which suspend their own rendering before calling into these.
  */
+import { hostSetTimeout, hostClearTimeout } from "../utils/host-timers.js";
 import { createInterface } from "node:readline";
 
 /** Bold only when attached to a terminal — keeps piped output ANSI-free. */
@@ -66,11 +67,11 @@ export function readPastedLine(
     const settle = (fn: () => void): void => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      hostClearTimeout(timer);
       rl.close();
       fn();
     };
-    const timer = setTimeout(() => {
+    const timer = hostSetTimeout(() => {
       settle(() => reject(new Error("Authorization timed out. Please retry login.")));
     }, timeoutMs);
     rl.on("line", (line: string) => settle(() => resolve(line)));

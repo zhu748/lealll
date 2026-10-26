@@ -22,6 +22,7 @@
  * additionally need checksums published in the release (the artifacts have none
  * today) — see the issue.
  */
+import { hostSetTimeout, hostClearTimeout } from "../utils/host-timers.js";
 import { existsSync } from "node:fs";
 
 /** Newest stable release (the API excludes prereleases). */
@@ -202,7 +203,7 @@ export function buildUpdateNotice(
 export async function fetchLatestRelease(opts: UpdateCheckOptions = {}): Promise<ReleaseInfo | null> {
   const fetchImpl = opts.fetchImpl ?? (fetch as unknown as FetchLike);
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? REQUEST_TIMEOUT_MS);
+  const timer = hostSetTimeout(() => controller.abort(), opts.timeoutMs ?? REQUEST_TIMEOUT_MS);
   // A pending update check must never hold the process open.
   const unref = (timer as unknown as { unref?: () => void }).unref;
   if (typeof unref === "function") unref.call(timer);
@@ -223,7 +224,7 @@ export async function fetchLatestRelease(opts: UpdateCheckOptions = {}): Promise
   } catch {
     return null;
   } finally {
-    clearTimeout(timer);
+    hostClearTimeout(timer);
   }
 }
 

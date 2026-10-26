@@ -15,7 +15,7 @@
 import type { OpenAIChatRequest, Format } from "../translator/types.js";
 import type { ProxyConfig } from "../config/types.js";
 import type { AuthManager } from "../auth/manager.js";
-import { getProvider } from "../provider/providers.js";
+import { getConfiguredProvider } from "../provider/providers.js";
 import { buildUpstreamHeaderPairs, buildUpstreamRequest, type UpstreamHeaderPair } from "./upstream.js";
 import { getDefaultEndpointRouting, type EndpointRoutingService } from "./endpoint-routing.js";
 import { getDefaultClientSigning, sendWithClientSigning, type ClientSigningManager } from "./client-signing.js";
@@ -30,6 +30,9 @@ import {
   type HighspeedManager,
 } from "../highspeed/manager.js";
 import { credentialString } from "../auth/types.js";
+import { resolveEffectivePlan } from "../auth/plan.js";
+import { withRetryDefaults } from "../config/retry.js";
+import { loadCaptcha } from "./captcha-loader.js";
 import { pickProxy, markProxyFailed, getMaxRotations } from "./proxy-pool.js";
 import { transformRequestBody, transformParsedBody } from "./body-transformer.js";
 import { isCaptchaChallenged, retryOnCaptchaChallenge, resolveCaptchaAcquireBudgetMs, acquireCaptchaWithRetry, type CaptchaModuleLike } from "./captcha-retry.js";
@@ -65,17 +68,7 @@ export { shouldUseOrderedTransport, capOrderedAcceptEncoding, MAX_CONNECT_ATTEMP
 export { errorResponse } from "./translated-response.js";
 export { readBody, RequestBodyTooLargeError, InflatedBodyTooLargeError } from "./request-body.js";
 
-// captcha.ts is loaded lazily inside the `startPlan` branch (only path that
-// touches it). The solver itself (captcha-happy.ts) is dynamically imported
-// by captcha-solver.ts, so non-start-plan processes never pay its startup
-// cost. Desktop Bun keeps the same code path; the dynamic import resolves
-// synchronously enough on Bun's warm cache.
 type CaptchaModule = CaptchaModuleLike;
-let captchaModule: CaptchaModule | null = null;
-async function loadCaptcha(): Promise<CaptchaModule> {
-  if (!captchaModule) captchaModule = await import("./captcha.js");
-  return captchaModule;
-}
 
 /** Options for the proxy handler. */
 export interface ProxyHandlerOptions {
@@ -167,12 +160,7 @@ export async function proxyRequest(
     });
   }
 
-  const staticProvider = getProvider(config.provider);
-  const provider = {
-    ...staticProvider,
-    anthropicBaseURL: config.providers[config.provider].anthropicBase,
-    openaiBaseURL: config.providers[config.provider].openaiBase,
-  };
+  const provider = getConfiguredProvider(config);
 
   let cred: Credential;
   try {
@@ -183,36 +171,9 @@ export async function proxyRequest(
     return errorResponse(503, "credential_unavailable", (err as Error).message);
   }
 
-  // ---- fork multi-account retry layer: config fallbacks (field-by-field,
-  // matching admin RETRY_DEFAULTS so hand-built configs still retry sanely).
-  const retryCfg = {
-    maxRetries: config.retry?.maxRetries ?? 3,
-    initialDelayMs: config.retry?.initialDelayMs ?? 1000,
-    maxDelayMs: config.retry?.maxDelayMs ?? 8000,
-    backoffFactor: config.retry?.backoffFactor ?? 2,
-    retryableStatuses: config.retry?.retryableStatuses ?? [529, 429],
-    credentialSwitchThreshold: config.retry?.credentialSwitchThreshold ?? 2,
-    emptyStreamSwitchThreshold: config.retry?.emptyStreamSwitchThreshold ?? 3,
-    totalDeadlineMs: config.retry?.totalDeadlineMs ?? 300000,
-  };
-
-  // fork: credential-driven plan resolution. A credential's own plan (or its
-  // start-plan JWT) wins over config.yaml — switching accounts mid-retry may
-  // also switch plans (coding-plan ↔ start-plan), which changes the upstream
-  // URL, auth headers, and captcha behavior.
-  // 4.8.0 harden: a start-plan tag WITHOUT a JWT can never authenticate on the
-  // zcode.z.ai plane (Bearer JWT + captcha) — legacy store rows or manual keys
-  // mis-tagged before the add-key guard degrade to coding-plan instead of
-  // failing every request with 401.
-  const effectivePlanForCred = (c: Credential): "coding-plan" | "start-plan" => {
-    // 上游 v4.8.x 语义：plan 只来自显式 cred.plan / config.plan —— coding-plan
-    // 凭据也携带 JWT（highspeed 鉴权需要它），JWT 不再推断 start-plan；
-    // fork 4.8.0 harden 保留：start-plan 标签但无 JWT 的凭据降级 coding-plan
-    //（start-plan 平面只收 JWT）。
-    const plan = c.plan ?? config.plan;
-    return plan === "start-plan" && !c.jwt ? "coding-plan" : plan;
-  };
-  let currentPlan = effectivePlanForCred(cred);
+  const retryCfg = withRetryDefaults(config.retry);
+  // Request-local: a credential switch may also change the upstream plan.
+  let currentPlan = resolveEffectivePlan(cred, config.plan);
   if (currentPlan !== config.plan) {
     // Request-local only: do NOT write back to config.plan. The config object is
     // shared by every in-flight request plus the /async + /mcp plan gates and
@@ -516,7 +477,7 @@ export async function proxyRequest(
       highspeedAuth = undefined;
       console.log(`${reqId} highspeed card dropped — credential switched mid-request`);
     }
-    const newPlan = effectivePlanForCred(newCred);
+    const newPlan = resolveEffectivePlan(newCred, config.plan);
     if (newPlan !== currentPlan) {
       console.log(`${reqId} plan synced to ${newPlan} (from new credential ${maskApiKey(newCred.apiKey)})`);
       currentPlan = newPlan;

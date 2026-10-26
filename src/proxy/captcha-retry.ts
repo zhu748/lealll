@@ -16,6 +16,7 @@
  * callers and passed in as a value, so non-start-plan processes never pay
  * its startup cost.
  */
+import { hostSetTimeout, hostClearTimeout } from "../utils/host-timers.js";
 import type * as CaptchaExports from "./captcha.js";
 
 /** Shape the callers pass in — satisfied by the real captcha module or test fakes. */
@@ -72,7 +73,7 @@ export async function acquireCaptchaWithRetry<T>(
     stopped = signal?.reason instanceof Error ? signal.reason : new Error("Captcha acquisition aborted");
     rejectStop(stopped);
   };
-  const timer = setTimeout(() => {
+  const timer = hostSetTimeout(() => {
     stopped = timeoutError();
     rejectStop(stopped);
   }, options.budgetMs);
@@ -92,18 +93,18 @@ export async function acquireCaptchaWithRetry<T>(
         lastError = err instanceof Error ? err : new Error(String(err));
         options.onRetry?.(lastError);
       }
-      let backoff: ReturnType<typeof setTimeout> | undefined;
+      let backoff: ReturnType<typeof hostSetTimeout> | undefined;
       try {
         await Promise.race([
-          new Promise<void>((resolve) => { backoff = setTimeout(resolve, Math.min(2_000, Math.max(0, deadline - now()))); }),
+          new Promise<void>((resolve) => { backoff = hostSetTimeout(resolve, Math.min(2_000, Math.max(0, deadline - now()))); }),
           stop,
         ]);
       } finally {
-        if (backoff !== undefined) clearTimeout(backoff);
+        if (backoff !== undefined) hostClearTimeout(backoff);
       }
     }
   } finally {
-    clearTimeout(timer);
+    hostClearTimeout(timer);
     signal?.removeEventListener("abort", onAbort);
   }
 }

@@ -32,6 +32,21 @@ describe("isExpired", () => {
 });
 
 describe("AuthManager", () => {
+  it("stops account selection at the first usable candidate and isolates returned credentials", async () => {
+    const first = { apiKey: "current", provider: "zai" as const };
+    const second = { apiKey: "next", provider: "zai" as const };
+    let tailReads = 0;
+    const unused = { provider: "zai" as const, get apiKey() { tailReads++; return "unused"; } };
+    const manager = new AuthManager({ listAllCredentials: async () => [first, second, unused] });
+    manager.setOAuthCredential(first);
+    const selected = await manager.switchToNextCredential();
+    expect(selected?.apiKey).toBe("next");
+    expect(tailReads).toBe(0);
+    selected!.apiKey = "changed-by-caller";
+    expect((await manager.getCredential()).apiKey).toBe("next");
+    expect(second.apiKey).toBe("next");
+  });
+
   it("throws without a credential", async () => {
     const mgr = new AuthManager();
     expect(mgr.getCredential()).rejects.toThrow(/not available/);

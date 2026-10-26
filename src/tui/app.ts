@@ -9,9 +9,9 @@
  * renderer, input parser and width math are hand-rolled ANSI/VT (Bun- and
  * Node-compatible, bundles into both release artifacts).
  *
- * index.ts dispatches here via dynamic import (this module imports helpers
- * back from index.js), mirroring the claimCommand pattern.
+ * The CLI loads this runtime on demand; shared helpers live outside the entry.
  */
+import { hostSetTimeout, hostClearTimeout, hostSetInterval } from "../utils/host-timers.js";
 import { loadConfig } from "../config/loader.js";
 import { updateConfigYaml, ensureConfigFile } from "../config/edit.js";
 import { configuredAuthOptions, createConfiguredAuthManager, resolveConfiguredCredential } from "../auth/selection.js";
@@ -23,8 +23,12 @@ import { ZaiOAuthClient, BigmodelOAuthClient, BigmodelPollOAuthClient, LOGIN_TIM
 import { KeyResolver } from "../auth/resolver.js";
 import { openBrowser } from "../runtime/open-browser.js";
 import { pasteLoginInstructions, readPastedLine, boldIfTTY } from "../runtime/paste-login.js";
+import { createCaptchaRuntime } from "../runtime/captcha-runtime.js";
 import { isGuestOriginError, describeGuestError } from "../runtime/guest-error.js";
-import { ensureIdentitySelfHeal, VERSION, exitWithError, type ServeArgs } from "../index.js";
+import { ensureIdentitySelfHeal } from "../runtime/identity-config.js";
+import { exitWithError } from "../runtime/process-exit.js";
+import { VERSION } from "../version.js";
+import type { ServeArgs } from "../cli/args.js";
 import { collectQuotaSnapshot, type QuotaSnapshot } from "../server/routes-quota.js";
 import { appendFileSync } from "node:fs";
 import type { ProxyConfig } from "../config/types.js";
@@ -165,7 +169,7 @@ export async function runTui(args: ServeArgs): Promise<void> {
   process.stderr.write = routeToPane("warn") as typeof process.stderr.write;
 
   // --- rendering -----------------------------------------------------------
-  let renderTimer: ReturnType<typeof setTimeout> | null = null;
+  let renderTimer: ReturnType<typeof hostSetTimeout> | null = null;
   let lastRenderAt = 0;
   let activeRegions: ClickRegion[] = [];
   // Paste login (L key) hands the terminal back for a moment: renders and
@@ -174,7 +178,7 @@ export async function runTui(args: ServeArgs): Promise<void> {
   let inputSuspended = false;
   function renderNow(): void {
     if (rendersSuspended) return; // paste prompt owns the terminal
-    if (renderTimer) clearTimeout(renderTimer); // watchdog may fire mid-cycle
+    if (renderTimer) hostClearTimeout(renderTimer); // watchdog may fire mid-cycle
     renderTimer = null;
     lastRenderAt = Date.now();
     let frame: Frame;
@@ -220,14 +224,14 @@ export async function runTui(args: ServeArgs): Promise<void> {
   }
   function scheduleRender(): void {
     if (renderTimer) return;
-    renderTimer = setTimeout(renderNow, RENDER_MS);
+    renderTimer = hostSetTimeout(renderNow, RENDER_MS);
     if (typeof renderTimer.unref === "function") renderTimer.unref();
   }
-  let toastTimer: ReturnType<typeof setTimeout> | null = null;
+  let toastTimer: ReturnType<typeof hostSetTimeout> | null = null;
   function setToast(text: string, kind: "ok" | "err" | "info"): void {
     state.toast = { text, kind };
-    if (toastTimer) clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => {
+    if (toastTimer) hostClearTimeout(toastTimer);
+    toastTimer = hostSetTimeout(() => {
       state.toast = null;
       toastTimer = null;
       scheduleRender();
@@ -401,19 +405,21 @@ export async function runTui(args: ServeArgs): Promise<void> {
 
   // Captcha warmup + claim scheduler start once per process, even across
   // proxy stop/start cycles — the pools and scheduler are process-global.
+  const captchaRuntime = createCaptchaRuntime();
   let backgroundJobsStarted = false;
+  let claimScheduler: { stop(): void } | undefined;
   function startBackgroundJobsOnce(): void {
     if (backgroundJobsStarted) return;
     backgroundJobsStarted = true;
     if (config.plan === "start-plan") {
-      import("../proxy/captcha.js")
-        .then((m) => m.startCaptchaPool(config.identity.appVersion))
+      void captchaRuntime.start(config.identity.appVersion)
         .catch((err) => console.error(`[captcha] pool warmup failed: ${(err as Error).message}`));
     }
     if (config.claim.enabled && config.claim.auto) {
       import("../claim/runtime.js")
         .then((m) => {
-          m.startAutoClaim(config, auth);
+          if (closing) return;
+          claimScheduler = m.startAutoClaim(config, auth);
           console.log(`[claim] auto ON (poll ${Math.round(config.claim.pollIntervalMs / 1000)}s)`);
         })
         .catch((err) => console.error(`[claim] scheduler failed to start: ${(err as Error).message}`));
@@ -751,6 +757,8 @@ export async function runTui(args: ServeArgs): Promise<void> {
   function cleanup(): void {
     closing = true;
     loginEpoch++;
+    captchaRuntime.stop();
+    try { claimScheduler?.stop(); } catch { /* already stopped */ }
     void activeOauth?.client.close().catch(() => {});
     restore();
     restoreConsole();
@@ -763,7 +771,7 @@ export async function runTui(args: ServeArgs): Promise<void> {
   // whenever nothing has painted for 3s and un-pauses a stalled stdin, so the
   // worst-case freeze is bounded. Fires fine unref'd (timers only keep the
   // process alive when everything else is gone; the server handle already does).
-  const watchdog = setInterval(() => {
+  const watchdog = hostSetInterval(() => {
     try { if (stdin.isPaused()) stdin.resume(); } catch { /* stdin gone */ }
     if (Date.now() - lastRenderAt > 3000) renderNow();
   }, 2000);

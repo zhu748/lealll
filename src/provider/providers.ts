@@ -3,6 +3,7 @@
  * @see _reverse/NOTEPAD.md "Provider Endpoints"
  */
 import type { ProviderDef, ProviderId } from "./types.js";
+import type { ProxyConfig } from "../config/types.js";
 
 export const ZAI_PROVIDER: ProviderDef = {
   id: "zai",
@@ -32,4 +33,14 @@ export function getProvider(id: ProviderId): ProviderDef {
     throw new Error(`Unknown provider: "${id}"`);
   }
   return def;
+}
+
+/** Apply configured endpoints without changing the shared provider catalogue. */
+export function getConfiguredProvider(config: Pick<ProxyConfig, "provider" | "providers">): ProviderDef {
+  const endpoints = config.providers[config.provider];
+  return {
+    ...getProvider(config.provider),
+    anthropicBaseURL: endpoints.anthropicBase,
+    openaiBaseURL: endpoints.openaiBase,
+  };
 }

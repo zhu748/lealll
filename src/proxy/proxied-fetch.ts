@@ -155,25 +155,8 @@ export async function proxiedFetch(
  * `fetchImpl` is expected.
  */
 export function wrapFetchWithSocksBridge(baseFetch: typeof fetch = fetch): typeof fetch {
-  return (async (input: RequestInfo | URL, init?: RequestInit) => {
-    const proxyUrl = (init as { proxy?: string } | undefined)?.proxy;
-    if (!proxyUrl || !isSocksProxy(proxyUrl)) {
-      return baseFetch(input, init);
-    }
-    const { httpProxyUrl, release } = getSocksBridge(proxyUrl);
-    const { proxy: _drop, ...rest } = init as RequestInit & { proxy?: string };
-    void _drop;
-    try {
-      const resp = await baseFetch(input as RequestInfo | URL, {
-        ...rest,
-        proxy: httpProxyUrl,
-      } as RequestInit & { proxy: string });
-      return releaseAfterResponseBody(resp, release);
-    } catch (err) {
-      release();
-      throw err;
-    }
-  }) as typeof fetch;
+  return ((input: RequestInfo | URL, init?: RequestInit) =>
+    proxiedFetch(input, init, baseFetch)) as typeof fetch;
 }
 
 /**

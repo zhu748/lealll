@@ -6,6 +6,7 @@
 import { describe, it, expect } from "bun:test";
 import { gzipSync } from "node:zlib";
 import { detectInBodyChallenge, isCaptchaChallenged, retryOnCaptchaChallenge, resolveCaptchaAcquireBudgetMs, acquireCaptchaWithRetry, type CaptchaModuleLike } from "./captcha-retry.js";
+import { hostSetTimeout, hostClearTimeout } from "../utils/host-timers.js";
 
 function challengeBytes(): Uint8Array {
   return new TextEncoder().encode(JSON.stringify({ code: 3007, msg: "captcha verify failed" }));
@@ -177,6 +178,35 @@ describe("resolveCaptchaAcquireBudgetMs (§H)", () => {
 });
 
 describe("acquireCaptchaWithRetry", () => {
+  it("keeps its deadline alive when a captcha window shadows global timers", async () => {
+    const descriptor = Object.getOwnPropertyDescriptor(globalThis, "setTimeout")!;
+    let aliasReads = 0;
+    let resolveToken!: (token: string) => void;
+    const token = new Promise<string>((resolve) => { resolveToken = resolve; });
+    let result: Promise<string>;
+    Object.defineProperty(globalThis, "setTimeout", {
+      configurable: true,
+      get: () => { aliasReads++; return () => 0; },
+    });
+    try {
+      result = acquireCaptchaWithRetry(() => token, { budgetMs: 20 });
+    } finally {
+      Object.defineProperty(globalThis, "setTimeout", descriptor);
+    }
+    let guard: ReturnType<typeof hostSetTimeout> | undefined;
+    try {
+      const outcome = await Promise.race([
+        result.then(() => "unexpected token", (error: Error) => error.message),
+        new Promise<string>((resolve) => { guard = hostSetTimeout(() => resolve("deadline stalled"), 500); }),
+      ]);
+      expect(outcome).toContain("timed out");
+      expect(aliasReads).toBe(0);
+    } finally {
+      if (guard !== undefined) hostClearTimeout(guard);
+      resolveToken("late token");
+    }
+  });
+
   it("keeps the authoritative disabled result without retrying", async () => {
     let attempts = 0;
     expect(await acquireCaptchaWithRetry(async () => { attempts++; return null; }, { budgetMs: 1000 })).toBeNull();

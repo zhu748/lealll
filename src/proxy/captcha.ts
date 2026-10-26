@@ -13,6 +13,7 @@
  * correlates fingerprint stability across requests; randomizing per-solve
  * flags it as `verifyCode: F001`. See captcha-happy.ts.
  */
+import { hostSetTimeout, hostClearTimeout } from "../utils/host-timers.js";
 import { shutdownCaptchaSolver } from "./captcha-solver.js";
 import {
   configureCaptchaPool,
@@ -71,7 +72,7 @@ async function fetchCaptchaConfig(appVersion: string): Promise<FetchedCaptchaCon
   configsFetchInFlight = (async () => {
     const controller = new AbortController();
     let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
-    let timer: ReturnType<typeof setTimeout> | undefined;
+    let timer: ReturnType<typeof hostSetTimeout> | undefined;
     try {
       // Bound the entire fetch, including the body. A response that sends
       // headers but stalls its JSON must not pin the shared in-flight promise.
@@ -101,7 +102,7 @@ async function fetchCaptchaConfig(appVersion: string): Promise<FetchedCaptchaCon
         }
       };
       const timeout = new Promise<never>((_, reject) => {
-        timer = setTimeout(() => {
+        timer = hostSetTimeout(() => {
           reject(new Error("Captcha config request timed out"));
           controller.abort();
           void reader?.cancel().catch(() => {});
@@ -117,7 +118,7 @@ async function fetchCaptchaConfig(appVersion: string): Promise<FetchedCaptchaCon
     } catch {
       return null;
     } finally {
-      clearTimeout(timer);
+      hostClearTimeout(timer);
       configsFetchInFlight = null;
     }
   })();

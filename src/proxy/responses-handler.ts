@@ -1,6 +1,3 @@
-import { createBackpressuredStream } from "../utils/stream.js";
-import { extractSSEData, waitForBackpressure } from "../utils/sse.js";
-import { SSEFramer } from "../utils/sse-framer.js";
 /**
  * POST /v1/responses request handler.
  *
@@ -25,22 +22,16 @@ import { defaultPromptRewriteConfig } from "../config/prompt-rewrite.js";
 import { captureSystemPrompt, type PromptRewriteResult } from "./prompt-rewrite.js";
 import { beginPromptObservation, recordPromptDispatch } from "./prompt-observation.js";
 import { nextReqId } from "./request-log.js";
-import { getProvider } from "../provider/providers.js";
+import { getConfiguredProvider } from "../provider/providers.js";
 import type { ProxyConfig } from "../config/types.js";
 import type { AuthManager } from "../auth/manager.js";
 import { buildUpstreamRequest, buildUpstreamHeaderPairs, type UpstreamHeaderPair } from "./upstream.js";
 import { isCaptchaChallenged, retryOnCaptchaChallenge, resolveCaptchaAcquireBudgetMs, acquireCaptchaWithRetry, type CaptchaModuleLike } from "./captcha-retry.js";
 import { dispatchWithConnectRetry } from "./upstream-dispatch.js";
-
-// Lazy, runtime-gated module load (exception to the static-import rule, same
-// as handler.ts): pulling captcha.ts eagerly drags in the happy-dom solver, so
-// only start-plan — the one plan whose upstream is captcha-gated — pays for it.
-type CaptchaModule = CaptchaModuleLike;
-let captchaModule: CaptchaModule | null = null;
-async function loadCaptcha(): Promise<CaptchaModule> {
-  if (!captchaModule) captchaModule = await import("./captcha.js");
-  return captchaModule;
-}
+import { loadCaptcha } from "./captcha-loader.js";
+import { resolveEffectivePlan } from "../auth/plan.js";
+import { createResponsesStreamResponse } from "./responses-stream.js";
+import { buildStoredResponse, outputItemsAsInputItems } from "../responses/history.js";
 import { getDefaultEndpointRouting, type EndpointRoutingService } from "./endpoint-routing.js";
 import { getDefaultClientSigning, sendWithClientSigning, type ClientSigningManager } from "./client-signing.js";
 import { pickProxy } from "./proxy-pool.js";
@@ -60,30 +51,19 @@ import { buildAnthropicMetadataUserId } from "./trace-headers.js";
 import { recordHeaders } from "../utils/header-debug.js";
 import { credentialString } from "../auth/types.js";
 import { translateRequestOpenAIToAnthropic, translateResponseAnthropicToOpenAI } from "../translator/openai-to-anthropic.js";
-import { anthropicSseToOpenaiSse, AnthropicStreamError } from "../translator/sse-translator.js";
+import { anthropicSseToOpenaiSse } from "../translator/sse-translator.js";
 import type { AnthropicMessagesRequest, AnthropicMessagesResponse } from "../translator/types.js";
-import type { ProviderDef } from "../provider/types.js";
 import {
   responsesToChatCompletions,
   ToolTranslationError,
 } from "../translator/responses-to-chat.js";
-import {
-  chatCompletionsToResponses,
-  chatChunkToResponsesEvents,
-  finalizeResponsesStream,
-  failResponsesStream,
-  newResponsesStreamState,
-  responsesEventToSse,
-} from "../translator/chat-to-responses.js";
+import { chatCompletionsToResponses } from "../translator/chat-to-responses.js";
 import {
   generateResponsesId,
   type ResponsesInputItem,
   type ResponsesRequest,
-  type ResponsesResponse,
-  type ResponsesStreamEvent,
-  type ResponsesOutputItem,
 } from "../translator/responses-types.js";
-import { ResponseStore, type StoredResponse } from "../responses/store.js";
+import type { ResponseStore } from "../responses/store.js";
 import { errorResponse } from "./translated-response.js";
 import { readBody, InflatedBodyTooLargeError, RequestBodyTooLargeError } from "./request-body.js";
 
@@ -103,7 +83,7 @@ export interface ResponsesHandlerOptions {
   /** Override the process-wide highspeed card manager (for testing). `null` disables. */
   highspeed?: HighspeedManager | null;
   /** Override the lazily-imported captcha module (for testing). */
-  captcha?: CaptchaModule;
+  captcha?: CaptchaModuleLike;
 }
 
 /** Handle POST /v1/responses. */
@@ -188,26 +168,15 @@ export async function handleResponses(
   } catch (err) {
     return errorResponse(503, "credential_unavailable", (err as Error).message);
   }
-  const providerDef = resolveProviderDef(opts.config);
+  const providerDef = getConfiguredProvider(opts.config);
 
   // ── 5. body transform (start-plan system / anthropic cache_control + user_id) ──
   // Both plans post Anthropic upstream (mirrors handler.ts): the start-plan
   // OpenAI gateway was retired server-side (404 as of 2026-08-28), so the
   // Responses → Chat → Anthropic translator chain runs unconditionally.
-  // Plan resolution mirrors handler.ts effectivePlanForCred: the credential's
-  // own plan (or a start-plan JWT) wins over config.plan — request-local,
-  // never mutating the shared config object. `currentPlan` (not config.plan)
-  // must feed buildUpstreamHeaderPairs/buildUpstreamRequest too, otherwise a
-  // start-plan credential would carry start-plan body transforms but a
-  // coding-plan URL/auth scheme.
-  // 4.8.0 harden (mirrors handler.ts effectivePlanForCred): a start-plan tag
-  // without a JWT degrades to coding-plan — the start-plan plane rejects
-  // JWT-less credentials outright.
-  // 对齐 handler.ts：JWT 不推断 start-plan（coding-plan 凭据也带 JWT）。
-  const _resolvedPlan = cred.plan ?? opts.config.plan;
-  const currentPlan = _resolvedPlan === "start-plan" && !cred.jwt ? "coding-plan" : _resolvedPlan;
+  const currentPlan = resolveEffectivePlan(cred, opts.config.plan);
   const startPlan = currentPlan === "start-plan";
-  const upstreamFormat: "openai" | "anthropic" = "anthropic";
+  const upstreamFormat = "anthropic";
   let upstreamRequestBody: string;
   let promptRewriteResult: PromptRewriteResult | null = null;
   let upstreamPrompt = captureSystemPrompt(undefined);
@@ -223,7 +192,7 @@ export async function handleResponses(
     // anthropic 侧计算，同一逻辑对话与 /v1/messages 得到同构的会话身份——
     // trace 头、metadata.user_id 与 highspeed task_id 共用该结果。
     const anthropicBody = JSON.stringify(anthropicReq);
-    clientSession = resolveSessionContext({ clientReq, body: anthropicBody, traceBody: rawBody, upstreamFormat: "anthropic", model: req.model, config: opts.config });
+    clientSession = resolveSessionContext({ clientReq, body: anthropicBody, parsedBody: anthropicReq as unknown as Record<string, unknown>, traceBody: rawBody, upstreamFormat: "anthropic", model: req.model, config: opts.config });
     // userId mirrors handler.ts for BOTH plans: the bundle's `E2e` is
     // provider-kind gated only (never plan-gated), so start-plan carries the
     // same device/session blob as coding-plan.
@@ -298,312 +267,182 @@ export async function handleResponses(
     if (hsNoteEligible) highspeedManager?.noteActivity();
   };
 
-  const upstreamHeaders = buildUpstreamHeaderPairs(clientReq, upstreamFormat, cred, opts.config.identity, currentPlan, captchaHeaders, clientSession);
-  let wireHeaders = upstreamHeaders;
-  if (highspeedCard && highspeedAuth) {
-    highspeedOrigPairs = upstreamHeaders;
-    wireHeaders = applyHighspeedCardHeaders(upstreamHeaders, highspeedCard, highspeedAuth);
-  }
-  const upstreamReq = buildUpstreamRequest(clientReq, upstreamFormat, providerDef, cred, transformedBody, opts.config.identity, currentPlan, captchaHeaders, clientSession);
-  if (debug) console.log(`[responses] → POST ${upstreamReq.url}`);
-
-  // Egress proxy wiring (mirrors handler.ts): per-credential override wins,
-  // then the global pool. Null → direct fetch (unchanged behavior for
-  // unconfigured setups).
-  let egressProxy: string | null = cred.proxy?.trim() || null;
-  if (!egressProxy) {
-    try {
-      egressProxy = await pickProxy();
-    } catch { /* pool unreadable → direct */ }
-  }
-  const egressFetch = egressProxy ? makeProxiedFetcher(egressProxy, fetchImpl) : fetchImpl;
-
-  const routing = opts.endpointRouting !== undefined ? opts.endpointRouting : getDefaultEndpointRouting(opts.config);
-  // 官方 3.15.1 静态规则：highspeed mode 的推理请求永不签名（`TUs` 返回 false）。
-  let signer = highspeedCard ? null : (opts.clientSigning !== undefined ? opts.clientSigning : getDefaultClientSigning(opts.config));
-  // header-debug wiring (mirrors handler.ts): first dispatch attempt only.
-  const headerDebugOn = opts.config.logging?.headerDebug === true;
-  let headerDebugRecorded = false;
-  const dispatch = async (pairs: UpstreamHeaderPair[]): Promise<Response> => {
-    const routed = routing ? await routing.resolve(upstreamReq.url, credentialString(cred), cred.jwt) : null;
-    const sendUrl = routed?.routed ? routed.url : upstreamReq.url;
-    const routingHeaderPairs = routed?.headers
-      ? (Object.entries(routed.headers) as UpstreamHeaderPair[])
-      : undefined;
-    if (debug && routed?.routed) console.log(`[responses] endpoint routing: ${upstreamReq.url} -> ${sendUrl}`);
-    // signing decisions run against the PRE-routing provider URL (mirrors the
-    // client, whose signer wraps the routing transport)
-    return sendWithClientSigning(signer, {
-      url: upstreamReq.url,
-      headerPairs: pairs,
-      credential: credentialString(cred),
-      oauthAccessToken: cred.oauthAccessToken,
-      provider: cred.provider,
-      appVersion: opts.config.identity.appVersion,
-      debug: debug ? (message) => console.log(`[responses] ${message}`) : undefined,
-      send: (finalPairs) => {
-        // 3.16.2 X-ZCode-Authorization rides after the signature block (the
-        // client's routing wrapper sits inside its signing wrapper) — last on
-        // the wire, same as handler.ts.
-        const outboundPairs = routingHeaderPairs ? [...finalPairs, ...routingHeaderPairs] : finalPairs;
-        const req = new Request(sendUrl, {
-          method: "POST",
-          headers: Object.fromEntries(outboundPairs),
-          body: transformedBody ?? undefined,
-        });
-        if (headerDebugOn && !headerDebugRecorded) {
-          headerDebugRecorded = true;
-          recordHeaders(clientReq, req, "responses", "openai-responses", transformedBody, rawBody);
-        }
-        recordPromptDispatch(opts.config, promptObservation, upstreamPrompt, promptRewriteResult);
-        return egressFetch(req, { method: "POST", headers: Object.fromEntries(outboundPairs), body: transformedBody ?? undefined, signal: clientReq.signal });
-      },
-    });
-  };
-
-  let upstreamResp: Response;
+  // The stream takes over completion notification after a successful handoff.
+  let streamOwnsActivity = false;
   try {
-    // Connect-retry ladder mirrors the chat hot path (handler.ts): 3 attempts,
-    // fresh Request per dispatch (built inside `dispatch`), 500ms×attempt
-    // backoff, no retry once the client aborted.
-    upstreamResp = await dispatchWithConnectRetry(() => dispatch(wireHeaders), {
-      isAborted: () => clientReq.signal.aborted,
-    });
-  } catch (err) {
-    return errorResponse(502, "upstream_unreachable", (err as Error).message);
-  }
+    const upstreamHeaders = buildUpstreamHeaderPairs(clientReq, upstreamFormat, cred, opts.config.identity, currentPlan, captchaHeaders, clientSession);
+    let wireHeaders = upstreamHeaders;
+    if (highspeedCard && highspeedAuth) {
+      highspeedOrigPairs = upstreamHeaders;
+      wireHeaders = applyHighspeedCardHeaders(upstreamHeaders, highspeedCard, highspeedAuth);
+    }
+    const upstreamReq = buildUpstreamRequest(clientReq, upstreamFormat, providerDef, cred, transformedBody, opts.config.identity, currentPlan, captchaHeaders, clientSession);
+    if (debug) console.log(`[responses] → POST ${upstreamReq.url}`);
 
-  // highspeed selectionFallback（官方语义，与 handler.ts 同构）：挂卡请求收到
-  // 401 / biz 3402 → 弃卡 + 原模型 + 常规双头鉴权（恢复签名）重发一次。
-  if (highspeedCard && highspeedAuth && highspeedOrigBody !== undefined && highspeedOrigPairs !== undefined
-    && await isHighspeedCardRejection(upstreamResp)) {
-    console.log("[responses] highspeed card rejected upstream — falling back to session model");
-    highspeedManager?.dropCard("upstream_rejected");
-    transformedBody = highspeedOrigBody;
-    signer = opts.clientSigning !== undefined ? opts.clientSigning : getDefaultClientSigning(opts.config);
-    const retryPairs = highspeedOrigPairs;
+    // Egress proxy wiring (mirrors handler.ts): per-credential override wins,
+    // then the global pool. Null → direct fetch (unchanged behavior for
+    // unconfigured setups).
+    let egressProxy: string | null = cred.proxy?.trim() || null;
+    if (!egressProxy) {
+      try {
+        egressProxy = await pickProxy();
+      } catch { /* pool unreadable → direct */ }
+    }
+    const egressFetch = egressProxy ? makeProxiedFetcher(egressProxy, fetchImpl) : fetchImpl;
+
+    const routing = opts.endpointRouting !== undefined ? opts.endpointRouting : getDefaultEndpointRouting(opts.config);
+    // 官方 3.15.1 静态规则：highspeed mode 的推理请求永不签名（`TUs` 返回 false）。
+    let signer = highspeedCard ? null : (opts.clientSigning !== undefined ? opts.clientSigning : getDefaultClientSigning(opts.config));
+    // header-debug wiring (mirrors handler.ts): first dispatch attempt only.
+    const headerDebugOn = opts.config.logging?.headerDebug === true;
+    let headerDebugRecorded = false;
+    const dispatch = async (pairs: UpstreamHeaderPair[]): Promise<Response> => {
+      const routed = routing ? await routing.resolve(upstreamReq.url, credentialString(cred), cred.jwt) : null;
+      const sendUrl = routed?.routed ? routed.url : upstreamReq.url;
+      const routingHeaderPairs = routed?.headers
+        ? (Object.entries(routed.headers) as UpstreamHeaderPair[])
+        : undefined;
+      if (debug && routed?.routed) console.log(`[responses] endpoint routing: ${upstreamReq.url} -> ${sendUrl}`);
+      // signing decisions run against the PRE-routing provider URL (mirrors the
+      // client, whose signer wraps the routing transport)
+      return sendWithClientSigning(signer, {
+        url: upstreamReq.url,
+        headerPairs: pairs,
+        credential: credentialString(cred),
+        oauthAccessToken: cred.oauthAccessToken,
+        provider: cred.provider,
+        appVersion: opts.config.identity.appVersion,
+        debug: debug ? (message) => console.log(`[responses] ${message}`) : undefined,
+        send: (finalPairs) => {
+          // 3.16.2 X-ZCode-Authorization rides after the signature block (the
+          // client's routing wrapper sits inside its signing wrapper) — last on
+          // the wire, same as handler.ts.
+          const outboundPairs = routingHeaderPairs ? [...finalPairs, ...routingHeaderPairs] : finalPairs;
+          const req = new Request(sendUrl, {
+            method: "POST",
+            headers: Object.fromEntries(outboundPairs),
+            body: transformedBody ?? undefined,
+          });
+          if (headerDebugOn && !headerDebugRecorded) {
+            headerDebugRecorded = true;
+            recordHeaders(clientReq, req, "responses", "openai-responses", transformedBody, rawBody);
+          }
+          recordPromptDispatch(opts.config, promptObservation, upstreamPrompt, promptRewriteResult);
+          return egressFetch(req, { method: "POST", headers: Object.fromEntries(outboundPairs), body: transformedBody ?? undefined, signal: clientReq.signal });
+        },
+      });
+    };
+
+    let upstreamResp: Response;
     try {
-      upstreamResp = await dispatchWithConnectRetry(() => dispatch(retryPairs), {
+      // Connect-retry ladder mirrors the chat hot path (handler.ts): 3 attempts,
+      // fresh Request per dispatch (built inside `dispatch`), 500ms×attempt
+      // backoff, no retry once the client aborted.
+      upstreamResp = await dispatchWithConnectRetry(() => dispatch(wireHeaders), {
         isAborted: () => clientReq.signal.aborted,
       });
     } catch (err) {
       return errorResponse(502, "upstream_unreachable", (err as Error).message);
     }
-  }
 
-  // Captcha challenge retry (mirrors handler.ts via the shared captcha-retry
-  // seam): the gateway signals it either through the captcha response header
-  // or as HTTP 400 with {"code":3007} in the body. The challenged token is
-  // already spent, so retry once with a fresh pooled one.
-  if (startPlan && !upstreamResp.ok) {
-    const captcha = opts.captcha ?? (await loadCaptcha());
-    if (await isCaptchaChallenged(upstreamResp, captcha)) {
-      if (debug) console.log("[responses] captcha challenge — re-solving and retrying once");
-      const outcome = await retryOnCaptchaChallenge({
-        captcha,
-        appVersion: opts.config.identity.appVersion,
-        challengedResp: upstreamResp,
-        debug: debug ? (message) => console.log(`[responses] ${message}`) : undefined,
-        solveAndRetry: (retryHeaders) => dispatch(
-          buildUpstreamHeaderPairs(clientReq, upstreamFormat, cred, opts.config.identity, currentPlan, retryHeaders, clientSession),
-        ),
-        mapError: (err, phase) =>
-          phase === "solver"
-            ? errorResponse(503, "captcha_solver_failed", err.message)
-            : errorResponse(502, "upstream_unreachable", err.message),
-      });
-      if (!outcome.ok) return outcome.resp;
-      upstreamResp = outcome.resp;
-    }
-  }
-
-  if (!upstreamResp.ok) {
-    const errText = await upstreamResp.text().catch(() => "");
-    return errorResponse(upstreamResp.status, "upstream_error", errText.slice(0, 500) || `upstream returned ${upstreamResp.status}`);
-  }
-
-  // ── 8. translate Anthropic → Chat → Responses ──
-  const responseId = generateResponsesId();
-  const meta = { customToolNames, namespaceMap, hasToolSearch };
-
-  if (stream) {
-    if (!upstreamResp.body) return errorResponse(502, "translation_failed", "upstream returned no body for stream");
-    upstreamResp = new Response(anthropicSseToOpenaiSse(upstreamResp.body, req.model), {
-      status: upstreamResp.status,
-      headers: { "content-type": "text/event-stream" },
-    });
-    return streamResponse(upstreamResp, { responseId, model: req.model, meta, request: req, input, options: opts, onStreamEnd: noteInFlightEnded });
-  }
-
-  // Keep the intermediate Chat object in memory: serializing it into a
-  // Response only to read and parse it again duplicates long output buffers.
-  let chatRespJson: ReturnType<typeof translateResponseAnthropicToOpenAI>;
-  try {
-    const parsedAnthropic = JSON.parse(await upstreamResp.text()) as AnthropicMessagesResponse;
-    chatRespJson = translateResponseAnthropicToOpenAI(parsedAnthropic, req.model);
-  } catch (err) {
-    return errorResponse(502, "translation_failed", `upstream returned an invalid Anthropic response: ${(err as Error).message}`);
-  }
-  const responsesResp = chatCompletionsToResponses(chatRespJson, req.model, {
-    responseId,
-    meta,
-    ...(typeof req.instructions === "string" ? { instructions: req.instructions } : {}),
-    ...(prevId ? { previousResponseId: prevId } : {}),
-  });
-
-  // ── 9. store the response (unless `store:false`) ──
-  if (req.store !== false && opts.responseStore) {
-    const stored = buildStoredResponse(responsesResp, input, req.instructions);
-    opts.responseStore.set(stored);
-  }
-
-  if (debug) console.log(`[responses] ← ${responsesResp.status} (${Date.now() - start}ms)`);
-
-  noteInFlightEnded();
-  return new Response(JSON.stringify(responsesResp), {
-    status: 200,
-    headers: { "content-type": "application/json" },
-  });
-}
-
-// ─────────────────────────────────────────────
-// Streaming response
-// ─────────────────────────────────────────────
-
-interface StreamResponseContext {
-  responseId: string;
-  model: string;
-  meta: { customToolNames: Set<string>; namespaceMap: Map<string, { namespace: string; name: string }>; hasToolSearch: boolean };
-  request: ResponsesRequest;
-  input: ResponsesInputItem[];
-  options: ResponsesHandlerOptions;
-  /** Fired once when the client stream completes, errors, or is cancelled. */
-  onStreamEnd?: () => void;
-}
-
-function streamResponse(upstreamResp: Response, context: StreamResponseContext): Response {
-  if (!upstreamResp.body) {
-    return errorResponse(502, "translation_failed", "upstream returned no body for stream");
-  }
-  const state = newResponsesStreamState(context.model, { meta: context.meta, responseId: context.responseId });
-  let onStreamEnded = false;
-  const fireStreamEnd = (): void => {
-    if (onStreamEnded) return;
-    onStreamEnded = true;
-    try { context.onStreamEnd?.(); } catch {}
-  };
-
-  let upstreamReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
-  let cancelled = false;
-  const stream = createBackpressuredStream({
-    async start(controller) {
-      const encoder = new TextEncoder();
-      const send = async (evt: ResponsesStreamEvent) => {
-        await waitForBackpressure(controller);
-        if (cancelled) return;
-        controller.enqueue(encoder.encode(responsesEventToSse(evt)));
-      };
+    // highspeed selectionFallback（官方语义，与 handler.ts 同构）：挂卡请求收到
+    // 401 / biz 3402 → 弃卡 + 原模型 + 常规双头鉴权（恢复签名）重发一次。
+    if (highspeedCard && highspeedAuth && highspeedOrigBody !== undefined && highspeedOrigPairs !== undefined
+      && await isHighspeedCardRejection(upstreamResp)) {
+      console.log("[responses] highspeed card rejected upstream — falling back to session model");
+      // A discarded response may still own a socket or a SOCKS bridge handle.
+      void upstreamResp.body?.cancel().catch(() => {});
+      highspeedManager?.dropCard("upstream_rejected");
+      transformedBody = highspeedOrigBody;
+      signer = opts.clientSigning !== undefined ? opts.clientSigning : getDefaultClientSigning(opts.config);
+      const retryPairs = highspeedOrigPairs;
       try {
-        if (cancelled) return;
-        const reader = upstreamResp.body!.getReader();
-        upstreamReader = reader;
-        const decoder = new TextDecoder();
-        const framer = new SSEFramer();
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (cancelled) return;
-          const frames = done ? framer.finish(decoder.decode()) : framer.push(decoder.decode(value, { stream: true }));
-          for (const frame of frames) {
-            const dataLine = extractSSEData(frame);
-            if (!dataLine || dataLine === "[DONE]") continue;
-            const chunk = JSON.parse(dataLine);
-            for (const evt of chatChunkToResponsesEvents(chunk, state)) await send(evt);
-          }
-          if (done) break;
-        }
-        if (cancelled) return;
-        const finalEvents = finalizeResponsesStream(state);
-        for (const evt of finalEvents) await send(evt);
-        if (cancelled) return;
-        const finalEvent = finalEvents.find((evt) => evt.type === "response.completed" || evt.type === "response.incomplete");
-        if (finalEvent && context.request.store !== false && context.options.responseStore) {
-          context.options.responseStore.set(buildStoredResponse(finalEvent.response, context.input, context.request.instructions));
-        }
-        try { controller.close(); } catch {}
+        upstreamResp = await dispatchWithConnectRetry(() => dispatch(retryPairs), {
+          isAborted: () => clientReq.signal.aborted,
+        });
       } catch (err) {
-        if (cancelled) return;
-        try {
-          for (const evt of failResponsesStream(state, {
-            code: err instanceof AnthropicStreamError ? err.code : "upstream_error",
-            message: err instanceof Error ? err.message : String(err),
-          })) await send(evt);
-          controller.close();
-        } catch { try { controller.error(err); } catch {} }
-      } finally {
-        fireStreamEnd();
-        if (upstreamReader) {
-          void upstreamReader.cancel().catch(() => {});
-          try { upstreamReader.releaseLock(); } catch {}
-          upstreamReader = undefined;
-        }
+        return errorResponse(502, "upstream_unreachable", (err as Error).message);
       }
-    },
-    cancel(reason) {
-      context.options.debug === true && console.log(`[responses] stream cancelled: ${String(reason)}`);
-      cancelled = true;
-      fireStreamEnd();
-      void (upstreamReader ? upstreamReader.cancel(reason) : upstreamResp.body?.cancel(reason))?.catch(() => {});
-    },
-  });
+    }
 
-  return new Response(stream, {
-    status: 200,
-    headers: {
-      "content-type": "text/event-stream",
-      "cache-control": "no-cache",
-      connection: "keep-alive",
-    },
-  });
-}
+    // Captcha challenge retry (mirrors handler.ts via the shared captcha-retry
+    // seam): the gateway signals it either through the captcha response header
+    // or as HTTP 400 with {"code":3007} in the body. The challenged token is
+    // already spent, so retry once with a fresh pooled one.
+    if (startPlan && !upstreamResp.ok) {
+      const captcha = opts.captcha ?? (await loadCaptcha());
+      if (await isCaptchaChallenged(upstreamResp, captcha)) {
+        if (debug) console.log("[responses] captcha challenge — re-solving and retrying once");
+        const outcome = await retryOnCaptchaChallenge({
+          captcha,
+          appVersion: opts.config.identity.appVersion,
+          challengedResp: upstreamResp,
+          debug: debug ? (message) => console.log(`[responses] ${message}`) : undefined,
+          solveAndRetry: (retryHeaders) => dispatch(
+            buildUpstreamHeaderPairs(clientReq, upstreamFormat, cred, opts.config.identity, currentPlan, retryHeaders, clientSession),
+          ),
+          mapError: (err, phase) =>
+            phase === "solver"
+              ? errorResponse(503, "captcha_solver_failed", err.message)
+              : errorResponse(502, "upstream_unreachable", err.message),
+        });
+        if (!outcome.ok) return outcome.resp;
+        upstreamResp = outcome.resp;
+      }
+    }
 
-// ─────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────
+    if (!upstreamResp.ok) {
+      const errText = await upstreamResp.text().catch(() => "");
+      return errorResponse(upstreamResp.status, "upstream_error", errText.slice(0, 500) || `upstream returned ${upstreamResp.status}`);
+    }
 
-function resolveProviderDef(config: ProxyConfig): ProviderDef & { openaiBaseURL: string; anthropicBaseURL: string } {
-  const base = getProvider(config.provider);
-  const endpoints = config.providers[config.provider];
-  return {
-    ...base,
-    anthropicBaseURL: endpoints.anthropicBase,
-    openaiBaseURL: endpoints.openaiBase,
-  };
-}
+    // ── 8. translate Anthropic → Chat → Responses ──
+    const responseId = generateResponsesId();
+    const meta = { customToolNames, namespaceMap, hasToolSearch };
 
-/**
- * Cast stored output items back into input items so the next turn's history is
- * a flat list the translator can walk. Responses output and input item shapes
- * overlap enough that a structural cast is sound (the fields we read — `type`,
- * `call_id`, `name`, `arguments`, `content`, `role` — are shared).
- */
-function outputItemsAsInputItems(outputs: ResponsesOutputItem[]): ResponsesInputItem[] {
-  return outputs as unknown as ResponsesInputItem[];
-}
+    if (stream) {
+      if (!upstreamResp.body) return errorResponse(502, "translation_failed", "upstream returned no body for stream");
+      upstreamResp = new Response(anthropicSseToOpenaiSse(upstreamResp.body, req.model), {
+        status: upstreamResp.status,
+        headers: { "content-type": "text/event-stream" },
+      });
+      const response = createResponsesStreamResponse(upstreamResp, {
+        responseId, model: req.model, meta, request: req, input,
+        responseStore: opts.responseStore, debug: opts.debug, onStreamEnd: noteInFlightEnded,
+      });
+      streamOwnsActivity = true;
+      return response;
+    }
 
-function buildStoredResponse(
-  resp: ResponsesResponse,
-  input: ResponsesInputItem[],
-  instructions: string | undefined,
-): StoredResponse {
-  return {
-    id: resp.id,
-    model: resp.model,
-    status: (resp.status === "completed" || resp.status === "incomplete" || resp.status === "failed" ? resp.status : "completed"),
-    input,
-    output: resp.output,
-    usage: resp.usage,
-    instructions,
-    createdAt: Date.now(),
-    lastAccessedAt: Date.now(),
-  };
+    // Keep the intermediate Chat object in memory: serializing it into a
+    // Response only to read and parse it again duplicates long output buffers.
+    let chatRespJson: ReturnType<typeof translateResponseAnthropicToOpenAI>;
+    try {
+      const parsedAnthropic = JSON.parse(await upstreamResp.text()) as AnthropicMessagesResponse;
+      chatRespJson = translateResponseAnthropicToOpenAI(parsedAnthropic, req.model);
+    } catch (err) {
+      return errorResponse(502, "translation_failed", `upstream returned an invalid Anthropic response: ${(err as Error).message}`);
+    }
+    const responsesResp = chatCompletionsToResponses(chatRespJson, req.model, {
+      responseId,
+      meta,
+      ...(typeof req.instructions === "string" ? { instructions: req.instructions } : {}),
+      ...(prevId ? { previousResponseId: prevId } : {}),
+    });
+
+    // ── 9. store the response (unless `store:false`) ──
+    if (req.store !== false && opts.responseStore) {
+      const stored = buildStoredResponse(responsesResp, input, req.instructions);
+      opts.responseStore.set(stored);
+    }
+
+    if (debug) console.log(`[responses] ← ${responsesResp.status} (${Date.now() - start}ms)`);
+
+    return new Response(JSON.stringify(responsesResp), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  } finally {
+    if (!streamOwnsActivity) noteInFlightEnded();
+  }
 }

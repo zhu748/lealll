@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import { parseServeArgs, applyAndroidIdentityDefaults, ensureDeviceMidInConfig, ensureIdentitySelfHeal } from "./index.js";
 import { DEFAULT_APP_VERSION } from "./config/loader.js";
 import { buildIdentityHeaders } from "./proxy/identity.js";
+import { parse } from "yaml";
 
 const IDENTITY_ENV_KEYS = [
   "ZCODE_IDENTITY_PLATFORM",
@@ -165,6 +166,48 @@ other: 1
     const h = buildIdentityHeaders({ appVersion: "3.8.1", sourceTitle: "cli", refererOrigin: "https://zcode.z.ai", deviceMid: mid });
     expect(h["X-Device-Mid"]).toBe(mid);
   });
+
+  it("fills an unquoted empty value without swallowing the following line", () => {
+    const p = writeConfig("identity:\n  deviceMid:\n  appVersion: '3.8.1'\n");
+    const mid = ensureDeviceMidInConfig(p);
+    const value = parse(readFileSync(p, "utf-8"));
+    expect(mid).toMatch(UUID_RE);
+    expect(value.identity.deviceMid).toBe(mid);
+    expect(value.identity.appVersion).toBe("3.8.1");
+  });
+
+  it("fills a comment-only value and preserves its comment", () => {
+    const p = writeConfig("identity:\n  deviceMid: # keep identity stable\n  appVersion: '3.8.1'\n");
+    const mid = ensureDeviceMidInConfig(p);
+    const content = readFileSync(p, "utf-8");
+    expect(parse(content).identity.deviceMid).toBe(mid);
+    expect(content).toContain("# keep identity stable");
+  });
+
+  it("reuses single-quoted and inline identity maps without rewriting them", () => {
+    for (const content of ["identity:\n  deviceMid: 'existing-id' # keep\n", "identity: { deviceMid: existing-id, appVersion: '3.8.1' }\n"]) {
+      const p = writeConfig(content);
+      expect(ensureDeviceMidInConfig(p)).toBe("existing-id");
+      expect(readFileSync(p, "utf-8")).toBe(content);
+    }
+  });
+
+  it("does not mistake another section's deviceMid for the configured identity", () => {
+    const p = writeConfig("other:\n  deviceMid: unrelated\nidentity: {}\n");
+    const mid = ensureDeviceMidInConfig(p);
+    const value = parse(readFileSync(p, "utf-8"));
+    expect(mid).toMatch(UUID_RE);
+    expect(value.other.deviceMid).toBe("unrelated");
+    expect(value.identity.deviceMid).toBe(mid);
+  });
+
+  it.each(["identity: [broken\n", "identity: not-a-map\n", "- not-a-root-map\n"])(
+    "rejects malformed configuration before changing it (%s)", (content) => {
+      const p = writeConfig(content);
+      expect(() => ensureDeviceMidInConfig(p)).toThrow();
+      expect(readFileSync(p, "utf-8")).toBe(content);
+    },
+  );
 });
 
 describe("ensureIdentitySelfHeal", () => {
@@ -224,4 +267,32 @@ describe("ensureIdentitySelfHeal", () => {
     expect(readFileSync(p, "utf-8")).toBe(once);
     expect(once).toContain(`appVersion: "${DEFAULT_APP_VERSION}"`);
   });
+
+  it("updates an inline identity map without creating duplicate keys", () => {
+    const p = writeConfig("identity: { appVersion: '3.8.1', deviceMid: '' }\nother: keep\n");
+    ensureIdentitySelfHeal(p);
+    const value = parse(readFileSync(p, "utf-8"));
+    expect(value.identity.appVersion).toBe(DEFAULT_APP_VERSION);
+    expect(value.identity.deviceMid).toMatch(UUID_RE);
+    expect(value.other).toBe("keep");
+  });
+
+  it("updates a version with an inline comment and keeps unrelated version fields", () => {
+    const p = writeConfig("other:\n  appVersion: '1.0'\nidentity:\n  deviceMid: existing\n  appVersion: '3.8.1' # keep version comment\n");
+    ensureIdentitySelfHeal(p);
+    const content = readFileSync(p, "utf-8");
+    const value = parse(content);
+    expect(value.identity.appVersion).toBe(DEFAULT_APP_VERSION);
+    expect(value.other.appVersion).toBe("1.0");
+    expect(content).toContain("# keep version comment");
+  });
+
+  it.each(["3..1", "3.1.", "3.+1", "3.1e2", "3.9007199254740993"])(
+    "preserves malformed or unsafe version segments (%s)", (version) => {
+      const p = writeConfig(`identity:\n  deviceMid: existing\n  appVersion: '${version}'\n`);
+      const content = readFileSync(p, "utf-8");
+      ensureIdentitySelfHeal(p);
+      expect(readFileSync(p, "utf-8")).toBe(content);
+    },
+  );
 });

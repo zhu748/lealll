@@ -16,6 +16,7 @@
  */
 
 import type { ResponsesInputItem, ResponsesOutputItem, ResponsesUsage } from "../translator/responses-types.js";
+import { ExpiryIndex } from "./expiry-index.js";
 
 /** A stored response entry — enough to reconstruct the next turn's history. */
 export interface StoredResponse {
@@ -39,11 +40,19 @@ export interface ResponseStoreOptions {
    *  Entry-count bounds alone let 1000 long-context conversations occupy
    *  hundreds of MB of RSS; this evicts by size as well. */
   maxTotalBytes?: number;
+  /** Clock injection for deterministic expiry tests. Defaults to Date.now. */
+  now?: () => number;
 }
 
 const DEFAULT_MAX_ENTRIES = 1000;
 const DEFAULT_TTL_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_MAX_TOTAL_BYTES = 256 * 1024 * 1024;
+
+interface CachedResponse {
+  response: StoredResponse;
+  bytes: number;
+  expiresAt: number;
+}
 
 /**
  * Rough per-entry size estimate (the two history arrays dominate; fixed
@@ -60,48 +69,46 @@ function estimateEntryBytes(entry: StoredResponse): number {
 
 /**
  * Bounded LRU + TTL cache of stored responses. Iteration order = insertion
- * order; `get()` re-inserts to refresh LRU position. Stale entries are evicted
- * lazily on access and proactively on `set()` overflow.
+ * order; `get()` re-inserts to refresh LRU position. A separate expiry index
+ * avoids scanning every live history on writes. Deadlines and byte accounting
+ * belong to the cache; editing a returned response does not update them.
  */
 export class ResponseStore {
   private readonly maxEntries: number;
   private readonly ttlMs: number;
   private readonly maxTotalBytes: number;
-  private readonly map = new Map<string, StoredResponse>();
-  private readonly bytesById = new Map<string, number>();
+  private readonly now: () => number;
+  private readonly map = new Map<string, CachedResponse>();
+  private readonly expiry = new ExpiryIndex();
   private totalBytes = 0;
 
   constructor(opts: ResponseStoreOptions = {}) {
     this.maxEntries = opts.maxEntries ?? DEFAULT_MAX_ENTRIES;
     this.ttlMs = opts.ttlMs ?? DEFAULT_TTL_MS;
     this.maxTotalBytes = opts.maxTotalBytes ?? DEFAULT_MAX_TOTAL_BYTES;
+    this.now = opts.now ?? (() => Date.now());
   }
 
   /** Store a response. Overwrites on duplicate id. Evicts LRU entries on overflow (count OR bytes). */
   set(entry: StoredResponse): void {
-    const now = Date.now();
+    const now = this.now();
     // Expired entries must not force eviction of a still-live LRU entry.
-    for (const [id, stored] of this.map) {
-      if (now - stored.createdAt > this.ttlMs) this.delete(id);
+    for (let id = this.expiry.nextExpired(now); id !== undefined; id = this.expiry.nextExpired(now)) {
+      this.delete(id);
     }
     entry.createdAt = now;
     entry.lastAccessedAt = now;
-    if (this.map.has(entry.id)) {
-      this.totalBytes -= this.bytesById.get(entry.id) ?? 0;
-      this.bytesById.delete(entry.id);
-      this.map.delete(entry.id);
-    }
+    this.delete(entry.id);
     const bytes = estimateEntryBytes(entry);
-    if (bytes > this.maxTotalBytes || this.maxEntries < 1) return;
-    this.bytesById.set(entry.id, bytes);
+    if (!Number.isFinite(bytes) || bytes > this.maxTotalBytes || this.maxEntries < 1) return;
+    const expiresAt = now + this.ttlMs;
     this.totalBytes += bytes;
-    this.map.set(entry.id, entry);
+    this.map.set(entry.id, { response: entry, bytes, expiresAt });
+    this.expiry.set(entry.id, expiresAt);
     while (this.map.size > 0 && (this.map.size > this.maxEntries || this.totalBytes > this.maxTotalBytes)) {
       const oldestKey = this.map.keys().next().value;
       if (oldestKey === undefined) break;
-      this.map.delete(oldestKey);
-      this.totalBytes -= this.bytesById.get(oldestKey) ?? 0;
-      this.bytesById.delete(oldestKey);
+      this.delete(oldestKey);
     }
   }
 
@@ -112,32 +119,30 @@ export class ResponseStore {
   get(id: string): StoredResponse | undefined {
     const entry = this.map.get(id);
     if (!entry) return undefined;
-    const now = Date.now();
-    if (now - entry.createdAt > this.ttlMs) {
-      this.map.delete(id);
-      this.totalBytes -= this.bytesById.get(id) ?? 0;
-      this.bytesById.delete(id);
+    const now = this.now();
+    if (now > entry.expiresAt) {
+      this.delete(id);
       return undefined;
     }
-    entry.lastAccessedAt = now;
+    entry.response.lastAccessedAt = now;
     // Re-insert at the tail so the LRU eviction touches it last.
     this.map.delete(id);
     this.map.set(id, entry);
-    return entry;
+    return entry.response;
   }
 
   delete(id: string): boolean {
-    const removed = this.map.delete(id);
-    if (removed) {
-      this.totalBytes -= this.bytesById.get(id) ?? 0;
-      this.bytesById.delete(id);
-    }
-    return removed;
+    const entry = this.map.get(id);
+    if (!entry) return false;
+    this.totalBytes -= entry.bytes;
+    this.map.delete(id);
+    this.expiry.delete(id);
+    return true;
   }
 
   clear(): void {
     this.map.clear();
-    this.bytesById.clear();
+    this.expiry.clear();
     this.totalBytes = 0;
   }
 

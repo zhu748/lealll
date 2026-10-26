@@ -21,110 +21,10 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { Worker } from "node:worker_threads";
+import { syncFetchBlocking, shutdownSyncFetchWorker } from "./captcha-sync-fetch.js";
+import { readResponseBytes } from "../utils/response-body.js";
 
-// -- Blocking fetch for sync XHR (self-contained builds) --------------------
-// happy-dom implements sync XHR by spawning `process.argv[0] -e <script>`,
-// which fails inside a compiled Bun binary (argv[0] is the binary; `-e` is
-// not supported). We instead run the request on a worker thread that writes
-// the result into a SharedArrayBuffer and wakes the blocked host thread via
-// Atomics -- no child processes, no main-thread event loop dependency (a
-// postMessage-based handshake would deadlock: the main thread is blocked).
-const SYNC_FETCH_BUF_BYTES = 8 * 1024 * 1024;
-const SYNC_FETCH_HEADER_BYTES = 64;
-// A stalled sync XHR blocks its thread (Atomics.wait) — on the in-process
-// fallback path that thread is the proxy's main event loop, so a stalled
-// aliyuncs POST must not wedge every connection for half a minute (the
-// worker path is additionally bounded by the outer terminate).
-// Override: CAPTCHA_SYNC_FETCH_TIMEOUT_MS.
-const SYNC_FETCH_TIMEOUT_MS = Number(process.env.CAPTCHA_SYNC_FETCH_TIMEOUT_MS || 12_000);
-// SAB layout (Int32 words): [0]=state (0=wait,1=done,2=error), [1]=httpStatus,
-// [2]=statusTextLen, [3]=headersJsonLen, [4]=setCookieJsonLen, [5]=bodyLen,
-// [6..]=payload bytes (statusText, headersJson, setCookieJson, body)
-let _syncFetchWorker: Worker | null = null;
-
-const SYNC_WORKER_SRC = `
-  const { parentPort } = require("node:worker_threads");
-  const enc = new TextEncoder();
-  parentPort.on("message", (m) => {
-    (async () => {
-      const i32 = new Int32Array(m.sab);
-      const u8 = new Uint8Array(m.sab);
-      // Fixed-size header (bytes), NOT i32.length * 4 -- that is the whole SAB.
-      const payloadAt = 64;
-      const fail = (msg) => {
-        const b = enc.encode(msg);
-        u8.set(b, payloadAt);
-        i32[5] = b.length; i32[1] = 0; i32[2] = 0; i32[3] = 0; i32[4] = 0;
-        i32[0] = 2; Atomics.notify(i32, 0);
-      };
-      try {
-        const res = await fetch(m.url, m.init);
-        const body = Buffer.from(await res.arrayBuffer());
-        const headers = {};
-        for (const [k, v] of res.headers) headers[k] = v;
-        const setCookie = typeof res.headers.getSetCookie === "function" ? res.headers.getSetCookie() : [];
-        const statusText = enc.encode(res.statusText || "");
-        const headersJson = enc.encode(JSON.stringify(headers));
-        const setCookieJson = enc.encode(JSON.stringify(setCookie));
-        let off = payloadAt;
-        u8.set(statusText, off); i32[2] = statusText.length; off += statusText.length;
-        u8.set(headersJson, off); i32[3] = headersJson.length; off += headersJson.length;
-        u8.set(setCookieJson, off); i32[4] = setCookieJson.length; off += setCookieJson.length;
-        u8.set(body, off); i32[5] = body.length;
-        i32[1] = res.status;
-        i32[0] = 1; Atomics.notify(i32, 0);
-      } catch (err) {
-        fail(String((err && err.message) || err));
-      }
-    })();
-  });
-`;
-
-function ensureSyncFetchWorker(): Worker {
-  if (_syncFetchWorker) return _syncFetchWorker;
-  _syncFetchWorker = new Worker(SYNC_WORKER_SRC, { eval: true });
-  return _syncFetchWorker;
-}
-
-function syncFetchBlocking(url: string, init: Record<string, unknown>, timeoutMs = SYNC_FETCH_TIMEOUT_MS): {
-  status: number; statusText: string; headers: Record<string, string>;
-  setCookie: string[]; body: Buffer;
-} | { error: string } {
-  try {
-    const worker = ensureSyncFetchWorker();
-    const sab = new SharedArrayBuffer(SYNC_FETCH_HEADER_BYTES + SYNC_FETCH_BUF_BYTES);
-    const i32 = new Int32Array(sab);
-    const u8 = new Uint8Array(sab);
-    worker.postMessage({ sab, url, init });
-    const waitResult = Atomics.wait(i32, 0, 0, timeoutMs);
-    if (waitResult === "timed-out") return { error: "sync fetch timeout" };
-    const dec = new TextDecoder();
-    const payloadAt = SYNC_FETCH_HEADER_BYTES;
-    let off = payloadAt;
-    const readSlice = (len: number) => {
-      const slice = u8.subarray(off, off + len);
-      off += len;
-      return slice;
-    };
-    const statusText = dec.decode(readSlice(i32[2]));
-    const headers = i32[3] ? (JSON.parse(dec.decode(readSlice(i32[3]))) as Record<string, string>) : {};
-    const setCookie = i32[4] ? (JSON.parse(dec.decode(readSlice(i32[4]))) as string[]) : [];
-    const body = Buffer.from(readSlice(i32[5]));
-    if (i32[0] === 2) return { error: dec.decode(u8.subarray(payloadAt, payloadAt + i32[5])) || "sync fetch failed" };
-    return { status: i32[1], statusText, headers, setCookie, body };
-  } catch (err: any) {
-    // A crashed worker must not poison later solves -- reset it.
-    try { _syncFetchWorker?.terminate(); } catch {}
-    _syncFetchWorker = null;
-    return { error: `sync fetch error: ${err?.message ?? err}` };
-  }
-}
-
-function shutdownSyncFetchWorker(): void {
-  try { _syncFetchWorker?.terminate(); } catch {}
-  _syncFetchWorker = null;
-}
+const MAX_NETWORK_RESPONSE_BYTES = 8 * 1024 * 1024;
 
 const CDN_CACHE_DIR = path.join(os.homedir(), ".zcode-captcha-cdn-cache");
 const _memCdnCache = new Map();
@@ -255,8 +155,6 @@ function patchPeBundle(buf, url) {
 }
 
 // -- CDN cache access --------------------------------------------------------
-/** Cap for a single cached CDN response — an abnormal CDN reply can otherwise balloon memory. */
-const CDN_FETCH_MAX_BYTES = 5 * 1024 * 1024;
 /** Disk-cache hygiene: entries older than this are swept at solve-module load. */
 const CDN_CACHE_FILE_TTL_MS = 14 * 24 * 60 * 60 * 1000;
 /** Sweep the disk cache down to this total size, oldest first. */
@@ -313,45 +211,6 @@ function getCachedBody(url) {
     }
   } catch (_) {}
   return null;
-}
-
-async function fetchAndStore(url) {
-  try {
-    const res = await fetch(url, { headers: { "user-agent": fp.userAgent } });
-    // Size guard BEFORE buffering: arrayBuffer() on an abnormal (or hostile)
-    // CDN response would otherwise allocate the full payload in memory.
-    const declared = Number(res.headers.get("content-length") || 0);
-    if (declared > CDN_FETCH_MAX_BYTES) {
-      try { await res.body?.cancel(); } catch (_) {}
-      if (_DEBUG) process.stderr.write(`[cache-fetch-too-large] ${url}: ${declared}b\n`);
-      return null;
-    }
-    const buf = Buffer.from(await res.arrayBuffer());
-    if (buf.length > CDN_FETCH_MAX_BYTES) {
-      if (_DEBUG) process.stderr.write(`[cache-fetch-too-large] ${url}: ${buf.length}b (streamed)\n`);
-      return null;
-    }
-    if (buf.length > 0) {
-      rememberCdnBody(url, buf);
-      try {
-        const p = diskPathFor(url);
-        fs.mkdirSync(CDN_CACHE_DIR, { recursive: true });
-        fs.writeFileSync(p, buf);
-        // verify write completed (no partial file)
-        const stat = fs.statSync(p);
-        if (stat.size !== buf.length) {
-          process.stderr.write(`[cache-write-short] ${url} wrote ${stat.size}/${buf.length}b -- rewrite\n`);
-          fs.writeFileSync(p, buf);
-        }
-      } catch (err) {
-        if (_DEBUG) process.stderr.write(`[cache-write-err] ${url}: ${err.message}\n`);
-      }
-    }
-    return buf;
-  } catch (err) {
-    if (_DEBUG) process.stderr.write(`[loader-fetch-err] ${url}: ${err.message}\n`);
-    return null;
-  }
 }
 
 // -- Request header injection (every frame request: XHR, fetch, scripts) ----
@@ -471,18 +330,16 @@ function makeInterceptor(bypassPeCache = false) {
         const bs = new URL(url);
         const cookie = cookieHeader(request, w, global.__browserFrame);
         if (cookie) init.headers.cookie = cookie;
-        let hasBody = false;
         try {
           if (request.body) {
             const ab = await request.arrayBuffer();
             if (ab && ab.byteLength > 0) {
               init.body = ab;
-              hasBody = true;
             }
           }
         } catch (_) {}
         const res = await fetch(url, init);
-        const buf = Buffer.from(await res.arrayBuffer());
+        const buf = await readResponseBytes(res, MAX_NETWORK_RESPONSE_BYTES);
         storeSetCookies(res, url);
         if (_DEBUG && /captcha-open|verify\.|device\.saf|cloudauth-device|upload\./i.test(url) && buf.length && buf.length < 4096) {
           try {
@@ -558,8 +415,8 @@ function makeInterceptor(bypassPeCache = false) {
           if (ab && (ab as any).byteLength > 0) init.body = ab;
         }
       } catch (_) {}
-      const res = syncFetchBlocking(url, init as any) as any;
-      if (res.error) {
+      const res = syncFetchBlocking(url, init);
+      if ("error" in res) {
         process.stderr.write(`[sync-xhr-err] ${url}: ${res.error}\n`);
         return new w.Response("", { status: 503, statusText: "sync fetch failed" });
       }
@@ -787,7 +644,7 @@ function installEvalInstrumentation(w) {
           (async () => {
             try {
               const res = await fetch(filename, { headers: { "user-agent": fp.userAgent } });
-              const fresh = Buffer.from(await res.arrayBuffer());
+              const fresh = await readResponseBytes(res, MAX_NETWORK_RESPONSE_BYTES);
               process.stderr.write(
                 `[EVAL-CACHE-COMPARE] cachedLen=${src.length} freshLen=${fresh.length} freshSha1=${crypto.createHash("sha1").update(fresh).digest("hex")} http=${res.status}\n`,
               );
@@ -1985,7 +1842,7 @@ async function createDom(region, prefix, options: { cookies?: string[]; html?: s
         (async () => {
           try {
             const res = await fetch(url, { headers: { "user-agent": fp.userAgent } });
-            const fresh = Buffer.from(await res.arrayBuffer());
+            const fresh = await readResponseBytes(res, MAX_NETWORK_RESPONSE_BYTES);
             process.stderr.write(
               `[${kind}-CACHE-COMPARE] cachedLen=${s.length} freshLen=${fresh.length} freshSha1=${crypto.createHash("sha1").update(fresh).digest("hex")} http=${res.status}\n`,
             );

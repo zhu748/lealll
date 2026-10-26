@@ -1,24 +1,12 @@
 import { stringify as stringifyYaml } from "yaml";
-import type { ModelMapping, ProxyConfig, RetryConfig, RoutingRule } from "../config/types.js";
+import type { ModelMapping, ProxyConfig, RoutingRule } from "../config/types.js";
 import { atomicWriteFile, createMutex } from "../utils/fs.js";
 import { normalizePromptRewriteConfig } from "../config/prompt-rewrite.js";
 
-/**
- * Fallback retry defaults (fork multi-account layer). Mirrors the loader's
- * DEFAULTS — used when a hand-built / pre-upgrade config object lacks the
- * `retry` section (hand-written test configs, YAML files from older forks).
- * The proxy handler re-applies the same fallbacks field-by-field.
- */
-export const RETRY_DEFAULTS: RetryConfig = {
-  maxRetries: 3,
-  initialDelayMs: 1000,
-  maxDelayMs: 8000,
-  backoffFactor: 2,
-  retryableStatuses: [529, 429],
-  credentialSwitchThreshold: 2,
-  emptyStreamSwitchThreshold: 3,
-  totalDeadlineMs: 300000,
-};
+import { withRetryDefaults } from "../config/retry.js";
+
+// Preserve the public admin entry point for existing consumers.
+export { RETRY_DEFAULTS } from "../config/retry.js";
 
 export const CONFIG_SECRET_MASK = "***configured***";
 
@@ -162,7 +150,7 @@ function configToYaml(config: ProxyConfig): string {
     ...(config.clientConfig ? { clientConfig: { ...config.clientConfig } } : {}),
     ...(config.subscription ? { subscription: { ...config.subscription } } : {}),
     logging: { ...config.logging },
-    retry: config.retry ? { ...config.retry, retryableStatuses: [...config.retry.retryableStatuses] } : { ...RETRY_DEFAULTS, retryableStatuses: [...RETRY_DEFAULTS.retryableStatuses] },
+    retry: withRetryDefaults(config.retry),
     ...(config.corsAllowList && config.corsAllowList.length > 0
       ? { corsAllowList: [...config.corsAllowList] }
       : {}),

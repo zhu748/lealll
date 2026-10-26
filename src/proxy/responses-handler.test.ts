@@ -646,6 +646,61 @@ async function cardHoldingManager(): Promise<HighspeedManager> {
 }
 
 describe("handleResponses highspeed wiring", () => {
+  it("cancels a rejected card response before dispatching its replacement", async () => {
+    const manager = await cardHoldingManager();
+    let cancelled = false;
+    let attempts = 0;
+    const response = await handleResponses(makeReq({ model: "glm-5.2", input: "hello" }), {
+      config: CONFIG, auth: oauthJwtAuth(), endpointRouting: null, clientSigning: null, highspeed: manager,
+      fetchImpl: (async () => {
+        if (++attempts === 1) {
+          return new Response(new ReadableStream<Uint8Array>({ cancel() { cancelled = true; } }), { status: 401 });
+        }
+        expect(cancelled).toBe(true);
+        return new Response(anthropicMsg("answer"));
+      }) as unknown as typeof fetch,
+    });
+    expect(response.status).toBe(200);
+    expect(attempts).toBe(2);
+  });
+
+  it.each(["http-error", "invalid-json", "missing-stream-body"])(
+    "notifies eligible activity when a request ends with %s",
+    async (failure) => {
+      const base = await cardHoldingManager();
+      const manager = Object.create(base) as HighspeedManager;
+      let completions = 0;
+      manager.noteActivity = () => { completions++; };
+      const response = await handleResponses(makeReq({
+        model: "glm-5.2", input: "hello", stream: failure === "missing-stream-body",
+      }), {
+        config: CONFIG, auth: oauthJwtAuth(), endpointRouting: null, clientSigning: null, highspeed: manager,
+        fetchImpl: (async () => {
+          if (failure === "http-error") return new Response("unavailable", { status: 503 });
+          if (failure === "invalid-json") return new Response("not-json");
+          return new Response(null);
+        }) as unknown as typeof fetch,
+      });
+      expect(response.status).toBe(failure === "http-error" ? 503 : 502);
+      expect(completions).toBe(1);
+    },
+  );
+
+  it("hands activity completion to a stream and notifies once on cancellation", async () => {
+    const base = await cardHoldingManager();
+    const manager = Object.create(base) as HighspeedManager;
+    let completions = 0;
+    manager.noteActivity = () => { completions++; };
+    const response = await handleResponses(makeReq({ model: "glm-5.2", input: "hello", stream: true }), {
+      config: CONFIG, auth: oauthJwtAuth(), endpointRouting: null, clientSigning: null, highspeed: manager,
+      fetchImpl: (async () => new Response(new ReadableStream<Uint8Array>())) as unknown as typeof fetch,
+    });
+    expect(completions).toBe(0);
+    await response.body!.cancel("client disconnected");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(completions).toBe(1);
+  });
+
   it("does not extend the old account's draw loop after switching to a credential without JWT", async () => {
     const clock = { now: 1_000_000 };
     let draws = 0;

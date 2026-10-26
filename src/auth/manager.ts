@@ -145,18 +145,16 @@ export class AuthManager {
     const excluded = new Set<string>(excludeApiKeys);
     if (currentKey) excluded.add(currentKey);
 
-    const candidates = all.filter(c => !excluded.has(c.apiKey) && !c.disabled && !isExpired(c) && c.provider === (current?.provider ?? this.provider));
-    if (candidates.length === 0) return null;
+    const candidate = all.find(c =>
+      !excluded.has(c.apiKey) && !c.disabled && !isExpired(c)
+      && c.provider === (current?.provider ?? this.provider),
+    );
+    if (!candidate) return null;
 
     // Pick the first candidate. A round-robin based on a stored index could be
     // added later, but for now first-available is deterministic and simple.
-    const next = cloneCredential(candidates[0]);
-
-    if (this.mode === "oauth") {
-      this.oauthCred = cloneCredential(next);
-    } else {
-      this.cachedApiKeyCred = cloneCredential(next);
-    }
+    const next = cloneCredential(candidate);
+    this.oauthCred = next;
     return cloneCredential(next);
   }
 
@@ -179,7 +177,13 @@ export class AuthManager {
     if (!this.listAllCredentials) return 0;
     try {
       const all = await this.listAllCredentials();
-      return all.filter(c => !c.disabled && !isExpired(c) && c.provider === (this.oauthCred?.provider ?? this.provider)).length;
+      const provider = this.oauthCred?.provider ?? this.provider;
+      const now = Date.now();
+      let count = 0;
+      for (const credential of all) {
+        if (!credential.disabled && !isExpired(credential, now) && credential.provider === provider) count++;
+      }
+      return count;
     } catch {
       return 0;
     }

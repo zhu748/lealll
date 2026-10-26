@@ -6,6 +6,7 @@ import type { Credential } from "./types.js";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { saveCredential, invalidateStoreCache } from "./store.js";
 
 const credential: Credential = { provider: "zai", apiKey: "oauth-key", plan: "coding-plan" };
 function config() {
@@ -15,6 +16,29 @@ function config() {
 }
 
 describe("configured credential selection", () => {
+  it("connects the default configured manager to stored accounts for TUI failover", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "configured-failover-"));
+    const previousStore = process.env.ZCODE_PROXY_STORE_DIR;
+    process.env.ZCODE_PROXY_STORE_DIR = directory;
+    invalidateStoreCache();
+    try {
+      const current = { ...credential, apiKey: "tui-current" };
+      const alternative = { ...credential, apiKey: "tui-alternative" };
+      await saveCredential(current);
+      await saveCredential(alternative, { keepActive: true });
+      const options = config(); options.provider = "zai"; options.auth = { mode: "oauth" };
+      const auth = createConfiguredAuthManager(options);
+      auth.setOAuthCredential(current);
+      expect(await auth.getAvailableCredentialCount()).toBe(2);
+      expect((await auth.switchToNextCredential())?.apiKey).toBe("tui-alternative");
+    } finally {
+      if (previousStore === undefined) delete process.env.ZCODE_PROXY_STORE_DIR;
+      else process.env.ZCODE_PROXY_STORE_DIR = previousStore;
+      invalidateStoreCache();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it("uses the static key and coerces a start-plan tag to coding-plan without reading OAuth storage", async () => {
     const c = config(); c.provider = "zai"; c.plan = "start-plan"; c.auth = { mode: "apikey", apiKey: "static.secret" };
     const selected = await resolveConfiguredCredential(c, async () => { throw new Error("OAuth storage must not be read"); });

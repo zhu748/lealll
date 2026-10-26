@@ -1,3 +1,4 @@
+import { hostSetInterval, hostClearInterval } from "../utils/host-timers.js";
 import fs from "node:fs/promises";
 import os from "node:os";
 
@@ -77,7 +78,7 @@ export class CaptchaCpuGovernor {
   private lastCpuPercent = 0;
   private concurrency: number;
   private maxEffectiveTarget: number;
-  private timer: ReturnType<typeof setInterval> | null = null;
+  private timer: ReturnType<typeof hostSetInterval> | null = null;
 
   constructor(private cfg: CpuGovernorConfig) {
     this.concurrency = 1;
@@ -100,12 +101,12 @@ export class CaptchaCpuGovernor {
   start(): void {
     if (!this.enabled || this.timer) return;
     void this.tick();
-    this.timer = setInterval(() => void this.tick(), this.cfg.intervalMs);
+    this.timer = hostSetInterval(() => void this.tick(), this.cfg.intervalMs);
   }
 
   stop(): void {
     if (this.timer) {
-      clearInterval(this.timer);
+      hostClearInterval(this.timer);
       this.timer = null;
     }
   }

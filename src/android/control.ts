@@ -15,6 +15,7 @@
  * (via system browser), start/stop the proxy server, update runtime config
  * (provider/plan), poll logs, and shut down the Node process.
  */
+import { hostSetTimeout } from "../utils/host-timers.js";
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import type { ProviderId } from "../provider/types.js";
@@ -201,7 +202,7 @@ export function startControlListener(opts: StartControlOpts): Promise<{ port: nu
         onSetConfig: opts.onSetConfig,
         // The process may exit in this hook; wait until the reply is flushed.
         onShutdown: () => { res.once("finish", () => {
-          setTimeout(() => { void Promise.resolve().then(() => opts.onShutdown?.()).catch(console.error); }, 0);
+          hostSetTimeout(() => { void Promise.resolve().then(() => opts.onShutdown?.()).catch(console.error); }, 0);
         }); },
         onQuota: opts.onQuota,
         getCredential: opts.getCredential,

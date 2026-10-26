@@ -3,7 +3,7 @@
  * @see _reverse/NOTEPAD.md "How Credential is Used for LLM Calls"
  */
 import { describe, it, expect } from "bun:test";
-import { transformRequestBody } from "./body-transformer.js";
+import { transformRequestBody, transformParsedBody } from "./body-transformer.js";
 
 describe("transformRequestBody — general", () => {
   it("returns undefined unchanged", () => {
@@ -133,6 +133,25 @@ describe("transformRequestBody — cache_control (Anthropic)", () => {
     const out = transformRequestBody(body, { format: "anthropic" });
     // Already our target shape → the original string comes back untouched
     expect(out).toBe(body);
+  });
+
+  it("keeps the original formatting and marker reference when already canonical", () => {
+    const body = '{ "messages": [{ "role": "user", "content": [{ "cache_control": { "type": "ephemeral" }, "type": "text", "text": "hello" }] }] }';
+    expect(transformRequestBody(body, { format: "anthropic" })).toBe(body);
+    const parsed = JSON.parse(body);
+    const marker = parsed.messages[0].content[0].cache_control;
+    expect(transformParsedBody(parsed, { format: "anthropic" })).toBeUndefined();
+    expect(parsed.messages[0].content[0].cache_control).toBe(marker);
+  });
+
+  it("clears stray markers while keeping the canonical final marker", () => {
+    const marker = { type: "ephemeral" };
+    const first = { type: "text", text: "first", cache_control: { type: "ephemeral" } };
+    const last = { type: "text", text: "last", cache_control: marker };
+    const parsed = { messages: [{ role: "user", content: [first, last] }] };
+    expect(transformParsedBody(parsed, { format: "anthropic" })).toBeDefined();
+    expect(first.cache_control).toBeUndefined();
+    expect(last.cache_control).toBe(marker);
   });
 
   it("skips system messages — finds last non-system", () => {

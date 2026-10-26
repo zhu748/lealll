@@ -341,8 +341,15 @@ jobs:
           distribution: temurin
           java-version: "17"
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
       - name: Install JS dependencies
         run: bun install --frozen-lockfile
+
+      - name: Synchronous HTTP bridge bundle smoke test
+        run: bun scripts/sync-fetch-smoke.ts
 
       - name: Build server bundle (esbuild Node CJS)
         run: |
@@ -353,7 +360,12 @@ jobs:
           node dist/android/server.cjs version | grep -q "zcode-proxy ${{ steps.ver.outputs.version }}"
 
       - name: Copy server bundle into Android assets
-        run: cp dist/android/server.cjs Android-APP/app/src/main/assets/server_bundle/server.cjs
+        run: cp dist/android/{server,captcha-worker-entry}.cjs Android-APP/app/src/main/assets/server_bundle/
+
+      - name: Packaged CLI and Android control smoke tests
+        run: |
+          python3 scripts/cli-smoke.py
+          python3 scripts/android-smoke.py
 
       - name: Make gradlew executable
         working-directory: Android-APP

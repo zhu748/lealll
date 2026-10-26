@@ -12,6 +12,7 @@
  * previous snapshot (or none) and requests go to their original URL after a
  * cooldown. See `_reverse/NOTEPAD.md` "Server-side endpoint remapping".
  */
+import { hostSetTimeout, hostClearTimeout } from "../utils/host-timers.js";
 import { buildIdentityHeaders, identityCacheKey } from "./identity.js";
 import { readJsonLimited } from "../auth/quota.js";
 import type { ProxyIdentity } from "../config/types.js";
@@ -257,7 +258,7 @@ export class EndpointRoutingService {
     if (key) headers["x-api-key"] = key;
 
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.requestTimeoutMs);
+    const timer = hostSetTimeout(() => controller.abort(), this.requestTimeoutMs);
     try {
       const resp = await this.fetchImpl(this.configUrl, {
         method: "GET",
@@ -311,7 +312,7 @@ export class EndpointRoutingService {
     } catch {
       this.retryAfter = this.now() + this.failureCooldownMs;
     } finally {
-      clearTimeout(timer);
+      hostClearTimeout(timer);
     }
   }
 }

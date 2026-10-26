@@ -2,7 +2,7 @@
  * Tests for provider definitions and model catalog.
  */
 import { describe, it, expect } from "bun:test";
-import { getProvider } from "./providers.js";
+import { getProvider, getConfiguredProvider } from "./providers.js";
 import { MODELS, ADVERTISED_MODELS } from "./models.js";
 
 describe("providers", () => {
@@ -24,6 +24,20 @@ describe("providers", () => {
 
   it("getProvider throws on unknown id", () => {
     expect(() => getProvider("openai" as any)).toThrow(/Unknown provider/);
+  });
+
+  it("applies configured endpoints without changing provider defaults", () => {
+    const provider = getConfiguredProvider({
+      provider: "zai",
+      providers: {
+        zai: { anthropicBase: "http://127.0.0.1/custom-ant", openaiBase: "http://127.0.0.1/custom-oai" },
+        bigmodel: { anthropicBase: "unused", openaiBase: "unused" },
+      },
+    });
+    expect(provider.anthropicBaseURL).toBe("http://127.0.0.1/custom-ant");
+    expect(provider.openaiBaseURL).toBe("http://127.0.0.1/custom-oai");
+    expect(provider.bizHost).toBe(getProvider("zai").bizHost);
+    expect(getProvider("zai").anthropicBaseURL).toBe("https://api.z.ai/api/anthropic");
   });
 });
 

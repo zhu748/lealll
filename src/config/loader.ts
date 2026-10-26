@@ -4,6 +4,7 @@
 import { readFileSync, existsSync } from "node:fs";
 import { parse } from "yaml";
 import type { ClientIdentityConfig, ProxyConfig, ProviderEndpoints, ProxyIdentity, ResponsesConfig, McpConfig, AsyncConfig, EndpointRoutingConfig, ClientSigningConfig, HighspeedConfig, ClaimConfig, RetryConfig, RoutingRule, ModelMapping, ResponsesThinkingConfig, ClientConfigConfig, SubscriptionConfig } from "./types.js";
+import { RETRY_DEFAULTS } from "./retry.js";
 import { normalizePromptRewriteConfig } from "./prompt-rewrite.js";
 
 /** Environment variable keys that override YAML values. */
@@ -126,14 +127,6 @@ const DEFAULTS = {
   UPSTREAM_TIMEOUT_MS: 0,
   SSE_HEARTBEAT_MS: 15000,
   MAX_REQUEST_BODY_BYTES: 64 * 1024 * 1024,
-  RETRY_MAX_RETRIES: 3,
-  RETRY_INITIAL_DELAY_MS: 1000,
-  RETRY_MAX_DELAY_MS: 8000,
-  RETRY_BACKOFF_FACTOR: 2,
-  RETRY_STATUSES: [529, 429],
-  RETRY_CREDENTIAL_SWITCH_THRESHOLD: 2,
-  RETRY_EMPTY_STREAM_SWITCH_THRESHOLD: 3,
-  RETRY_TOTAL_DEADLINE_MS: 300000,
 };
 
 /** Printable-ASCII gate copied from the ZCode bundle's `rYn` helper. */
@@ -656,33 +649,33 @@ function validate(config: ProxyConfig): void {
 function resolveRetry(raw?: unknown): RetryConfig {
   const r = (typeof raw === "object" && raw !== null) ? raw as Record<string, unknown> : {};
 
-  const maxRetries = resolveNonNegativeInt(process.env[ENV.RETRY_MAX] ?? r.maxRetries, DEFAULTS.RETRY_MAX_RETRIES, "retry.maxRetries");
-  const initialDelayMs = resolvePositiveInt(process.env[ENV.RETRY_INITIAL_DELAY_MS] ?? r.initialDelayMs, DEFAULTS.RETRY_INITIAL_DELAY_MS, "retry.initialDelayMs");
-  const maxDelayMs = resolvePositiveInt(process.env[ENV.RETRY_MAX_DELAY_MS] ?? r.maxDelayMs, DEFAULTS.RETRY_MAX_DELAY_MS, "retry.maxDelayMs");
-  const backoffFactor = resolvePositiveFloat(process.env[ENV.RETRY_BACKOFF_FACTOR] ?? r.backoffFactor, DEFAULTS.RETRY_BACKOFF_FACTOR);
+  const maxRetries = resolveNonNegativeInt(process.env[ENV.RETRY_MAX] ?? r.maxRetries, RETRY_DEFAULTS.maxRetries, "retry.maxRetries");
+  const initialDelayMs = resolvePositiveInt(process.env[ENV.RETRY_INITIAL_DELAY_MS] ?? r.initialDelayMs, RETRY_DEFAULTS.initialDelayMs, "retry.initialDelayMs");
+  const maxDelayMs = resolvePositiveInt(process.env[ENV.RETRY_MAX_DELAY_MS] ?? r.maxDelayMs, RETRY_DEFAULTS.maxDelayMs, "retry.maxDelayMs");
+  const backoffFactor = resolvePositiveFloat(process.env[ENV.RETRY_BACKOFF_FACTOR] ?? r.backoffFactor, RETRY_DEFAULTS.backoffFactor);
 
   // retryableStatuses: env var is comma-separated (e.g. "529,429,503"), YAML is array
-  let retryableStatuses = [...DEFAULTS.RETRY_STATUSES];
+  let retryableStatuses = [...RETRY_DEFAULTS.retryableStatuses];
   const envStatuses = process.env[ENV.RETRY_STATUSES];
   if (typeof envStatuses === "string" && envStatuses.trim().length > 0) {
-    retryableStatuses = normalizeRetryableStatuses(envStatuses.split(","), DEFAULTS.RETRY_STATUSES);
+    retryableStatuses = normalizeRetryableStatuses(envStatuses.split(","), RETRY_DEFAULTS.retryableStatuses);
   } else if (Array.isArray(r.retryableStatuses) && r.retryableStatuses.length > 0) {
-    retryableStatuses = normalizeRetryableStatuses(r.retryableStatuses, DEFAULTS.RETRY_STATUSES);
+    retryableStatuses = normalizeRetryableStatuses(r.retryableStatuses, RETRY_DEFAULTS.retryableStatuses);
   }
 
   const credentialSwitchThreshold = resolveNonNegativeInt(
     process.env[ENV.RETRY_CREDENTIAL_SWITCH_THRESHOLD] ?? r.credentialSwitchThreshold,
-    DEFAULTS.RETRY_CREDENTIAL_SWITCH_THRESHOLD,
+    RETRY_DEFAULTS.credentialSwitchThreshold,
     "retry.credentialSwitchThreshold",
   );
   const emptyStreamSwitchThreshold = resolveNonNegativeInt(
     process.env[ENV.RETRY_EMPTY_STREAM_SWITCH_THRESHOLD] ?? r.emptyStreamSwitchThreshold,
-    DEFAULTS.RETRY_EMPTY_STREAM_SWITCH_THRESHOLD,
+    RETRY_DEFAULTS.emptyStreamSwitchThreshold,
     "retry.emptyStreamSwitchThreshold",
   );
   const totalDeadlineMs = resolveNonNegativeInt(
     process.env[ENV.RETRY_TOTAL_DEADLINE_MS] ?? r.totalDeadlineMs,
-    DEFAULTS.RETRY_TOTAL_DEADLINE_MS,
+    RETRY_DEFAULTS.totalDeadlineMs,
     "retry.totalDeadlineMs",
   );
 

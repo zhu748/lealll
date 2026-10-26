@@ -24,6 +24,7 @@
  *   429 只值秒级暂停）；传输失败退避 60s。心跳定时器 unref——
  *   永不自持进程（对齐 update-check 惯例，#58 的 docker-stop 教训）。
  */
+import { hostSetTimeout, hostClearTimeout } from "../utils/host-timers.js";
 import { randomUUID } from "node:crypto";
 import type { UpstreamHeaderPair } from "../proxy/upstream.js";
 import type { Credential } from "../auth/types.js";
@@ -112,7 +113,7 @@ export class HighspeedManager {
   private nextAttemptAt = 0;
   /** Loop deadline = last eligible request + IDLE_MS. */
   private loopUntil = 0;
-  private timer: ReturnType<typeof setTimeout> | null = null;
+  private timer: ReturnType<typeof hostSetTimeout> | null = null;
   private drawInFlight: Promise<void> | null = null;
   /** Most recent eligible request — the loop always draws with these params. */
   private latest: LatestDrawRequest | null = null;
@@ -303,7 +304,7 @@ export class HighspeedManager {
   /** Re-arm the heartbeat. unref'd: the loop never keeps the process alive. */
   private arm(): void {
     this.stopTimer();
-    const timer = setTimeout(() => {
+    const timer = hostSetTimeout(() => {
       this.timer = null;
       this.tick();
     }, this.retryMs);
@@ -313,14 +314,14 @@ export class HighspeedManager {
 
   private stopTimer(): void {
     if (this.timer) {
-      clearTimeout(this.timer);
+      hostClearTimeout(this.timer);
       this.timer = null;
     }
   }
 
   private async draw(model: string, taskId: string, auth: HighspeedAuth): Promise<void> {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), DRAW_TIMEOUT_MS);
+    const timer = hostSetTimeout(() => controller.abort(), DRAW_TIMEOUT_MS);
     let status = 0;
     let body: DrawResponseBody | null = null;
     try {
@@ -353,7 +354,7 @@ export class HighspeedManager {
       this.noteOnce("transport", "highspeed draw failed (network/timeout) — retrying later");
       return;
     } finally {
-      clearTimeout(timer);
+      hostClearTimeout(timer);
     }
 
     const now = this.now();

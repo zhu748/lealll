@@ -1,7 +1,7 @@
 import type { ProxyConfig } from "../config/types.js";
 import { createApiKeyCredential } from "./apikey.js";
 import { AuthManager } from "./manager.js";
-import { loadCredential } from "./store.js";
+import { loadCredential, exportAccounts } from "./store.js";
 import { isExpired, type Credential } from "./types.js";
 
 export function configuredAuthOptions(config: ProxyConfig) {
@@ -30,6 +30,10 @@ export async function resolveConfiguredCredential(
     : null;
 }
 
-export function createConfiguredAuthManager(config: ProxyConfig, listAllCredentials?: () => Promise<Credential[]>): AuthManager {
+/** Every entry point, including the TUI, gets the same account failover source. */
+export function createConfiguredAuthManager(
+  config: ProxyConfig,
+  listAllCredentials: () => Promise<Credential[]> = async () => (await exportAccounts()).map((account) => account.credential),
+): AuthManager {
   return new AuthManager({ ...configuredAuthOptions(config), listAllCredentials });
 }

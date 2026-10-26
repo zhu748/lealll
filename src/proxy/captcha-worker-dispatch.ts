@@ -31,6 +31,7 @@
  * keeper to worker-per-solve so a broken entry cannot spawn-storm. Mode
  * transitions are announced once on stderr for operators.
  */
+import { hostSetTimeout, hostClearTimeout, hostSetInterval, hostClearInterval } from "../utils/host-timers.js";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { Worker } from "node:worker_threads";
@@ -247,7 +248,7 @@ const WARM_SPAWN_BACKOFF_MS = 2_000;
 
 interface PendingSolve {
   id: number;
-  timer: ReturnType<typeof setTimeout>;
+  timer: ReturnType<typeof hostSetTimeout>;
   resolve: (param: string) => void;
   reject: (err: Error) => void;
 }
@@ -265,7 +266,7 @@ let warmWorkers: WarmHandle[] = [];
 let warmRapidDeaths = 0;
 let warmDisabled = false;
 let warmSpawnBlockedUntil = 0;
-let warmSweeper: ReturnType<typeof setInterval> | null = null;
+let warmSweeper: ReturnType<typeof hostSetInterval> | null = null;
 
 function dropFromPool(h: WarmHandle): void {
   warmWorkers = warmWorkers.filter((w) => w !== h);
@@ -279,7 +280,7 @@ function killWarm(h: WarmHandle, cause: string): void {
   const p = h.pending;
   h.pending = null;
   if (p) {
-    clearTimeout(p.timer);
+    hostClearTimeout(p.timer);
     p.reject(new Error(cause));
   }
   try { h.worker.removeAllListeners(); } catch {}
@@ -305,7 +306,7 @@ function noteWarmDeath(h: WarmHandle): void {
 
 function ensureWarmSweeper(): void {
   if (warmSweeper) return;
-  warmSweeper = setInterval(() => {
+  warmSweeper = hostSetInterval(() => {
     const now = Date.now();
     warmWorkers = warmWorkers.filter((h) => {
       if (!h.busy && now - h.lastUsedAt > WARM_IDLE_MS) {
@@ -315,7 +316,7 @@ function ensureWarmSweeper(): void {
       return true;
     });
     if (warmWorkers.length === 0 && warmSweeper) {
-      clearInterval(warmSweeper);
+      hostClearInterval(warmSweeper);
       warmSweeper = null;
     }
   }, 30_000);
@@ -341,7 +342,7 @@ function spawnWarm(entryPath: string): { handle?: WarmHandle; spawnError?: Error
     const p = h.pending;
     if (!p || !m || m.id !== p.id) return;
     h.pending = null;
-    clearTimeout(p.timer);
+    hostClearTimeout(p.timer);
     if (m.ok) p.resolve(m.param);
     else p.reject(new Error(m.error));
   });
@@ -372,7 +373,7 @@ function acquireWarm(entryPath: string): { handle?: WarmHandle; spawnError?: Err
 function dispatchToWarm(h: WarmHandle, req: { scene: string; region: string; prefix: string }): Promise<string> {
   return new Promise<string>((resolve, reject) => {
     const id = ++nextSolveId;
-    const timer = setTimeout(() => {
+    const timer = hostSetTimeout(() => {
       killWarm(h, `captcha worker timeout (${SOLVE_WORKER_TIMEOUT_MS}ms)`);
       dropFromPool(h);
       noteWarmDeath(h);
@@ -435,7 +436,7 @@ export function stopCaptchaWorkers(): void {
   warmDisabled = false;
   warmSpawnBlockedUntil = 0;
   if (warmSweeper) {
-    clearInterval(warmSweeper);
+    hostClearInterval(warmSweeper);
     warmSweeper = null;
   }
 }
@@ -457,11 +458,11 @@ function solveInWorker(
     const settle = (fn: () => void) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      hostClearTimeout(timer);
       try { worker?.terminate(); } catch {}
       fn();
     };
-    const timer = setTimeout(() => {
+    const timer = hostSetTimeout(() => {
       settle(() => reject(new Error(`captcha worker timeout (${SOLVE_WORKER_TIMEOUT_MS}ms)`)));
     }, SOLVE_WORKER_TIMEOUT_MS);
 

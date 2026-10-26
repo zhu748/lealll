@@ -137,15 +137,19 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
  * second-to-last message instead) is NOT implemented — this proxy always
  * writes cache.
  *
- * Output-stable: applying this to an already-canonical body yields the same
- * bytes (no duplicate markers, target block unchanged). Note the function
- * still reports `modified` in that case — the clear phase strips the target
- * block's own marker before phase 2 re-adds the identical one — so callers
- * re-serialize once more; harmless (byte-identical output), just not free.
+ * Preserve an already-canonical target marker. Reporting no mutation lets
+ * callers retain the original body without serializing the entire history.
  */
 function applyAnthropicCacheControl(body: Record<string, unknown>): boolean {
   const messages = body.messages;
   if (!Array.isArray(messages) || messages.length === 0) return false;
+
+  const targetMessage = messages.findLast((msg) => isPlainObject(msg) && msg.role !== "system");
+  const content = targetMessage?.content;
+  const targetBlock = Array.isArray(content) ? content[content.length - 1] : undefined;
+  const marker = isPlainObject(targetBlock) ? targetBlock.cache_control : undefined;
+  const canonicalTarget = isPlainObject(marker) && !Array.isArray(marker)
+    && marker.type === "ephemeral" && Object.keys(marker).length === 1;
 
   // Phase 1 (bundle `zsi`): clear stale markers on non-system messages.
   let cleaned = false;
@@ -155,33 +159,21 @@ function applyAnthropicCacheControl(body: Record<string, unknown>): boolean {
     if (!Array.isArray(msg.content)) continue;
     for (const block of msg.content) {
       if (typeof block === "object" && block !== null && "cache_control" in block) {
+        if (block === targetBlock && canonicalTarget) continue;
         delete block.cache_control;
         cleaned = true;
       }
     }
   }
 
-  // Phase 2 (bundle `Fsi`): mark the last non-system message's last block.
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i];
-    if (typeof msg !== "object" || msg === null) continue;
-    if (msg.role === "system") continue;
-
-    if (typeof msg.content === "string") {
-      msg.content = [{ type: "text", text: msg.content, cache_control: { type: "ephemeral" } }];
-      return true;
-    }
-    if (Array.isArray(msg.content) && msg.content.length > 0) {
-      const lastBlock = msg.content[msg.content.length - 1];
-      if (typeof lastBlock === "object" && lastBlock !== null && !lastBlock.cache_control) {
-        lastBlock.cache_control = { type: "ephemeral" };
-        return true;
-      }
-      // Already marked — only report modified if the clear phase stripped
-      // stray markers elsewhere (idempotency: avoid needless re-serialize).
-      return cleaned;
-    }
-    return cleaned;
+  // Phase 2 (bundle `Fsi`): mark only the final non-system message.
+  if (typeof content === "string") {
+    targetMessage.content = [{ type: "text", text: content, cache_control: { type: "ephemeral" } }];
+    return true;
+  }
+  if (isPlainObject(targetBlock) && !targetBlock.cache_control) {
+    targetBlock.cache_control = { type: "ephemeral" };
+    return true;
   }
   return cleaned;
 }

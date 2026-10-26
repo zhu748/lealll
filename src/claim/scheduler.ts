@@ -13,6 +13,7 @@
  * `starts_at` / `ends_at` / `failureEndsAt` are unix SECONDS (the desktop
  * client compares them against `Date.now()/1e3`).
  */
+import { hostSetTimeout, hostClearTimeout } from "../utils/host-timers.js";
 import type { ClaimOutcome, ClaimablePlan } from "./types.js";
 import { formatUnixSeconds } from "./types.js";
 import { ClaimPreviewError } from "./client.js";
@@ -56,7 +57,7 @@ const MAX_HOLD_MS = 24 * 60 * 60 * 1000;
 export class ClaimScheduler {
   private stopped = false;
   private holdUntil = 0;
-  private timer: ReturnType<typeof setTimeout> | null = null;
+  private timer: ReturnType<typeof hostSetTimeout> | null = null;
   private readonly now: () => number;
   private readonly log: (message: string) => void;
 
@@ -79,7 +80,7 @@ export class ClaimScheduler {
   stop(): void {
     this.stopped = true;
     if (this.timer !== null) {
-      clearTimeout(this.timer);
+      hostClearTimeout(this.timer);
       this.timer = null;
     }
   }
@@ -202,7 +203,7 @@ export class ClaimScheduler {
 
   private scheduleNext(delayMs: number): void {
     if (this.stopped) return;
-    this.timer = setTimeout(() => {
+    this.timer = hostSetTimeout(() => {
       this.timer = null;
       // .catch before .finally: any unexpected tick() throw (a bad upstream
       // payload, a deps.log crash) must surface as a logged error, not as an

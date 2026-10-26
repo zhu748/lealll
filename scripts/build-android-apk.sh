@@ -19,7 +19,7 @@ fi
 cd "$ROOT"
 if [[ ! -d node_modules ]]; then bun install --frozen-lockfile; fi
 bun run build:android-bundle
-cp dist/android/server.cjs Android-APP/app/src/main/assets/server_bundle/server.cjs
+cp dist/android/{server,captcha-worker-entry}.cjs Android-APP/app/src/main/assets/server_bundle/
 
 SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
 if [[ "$MODE" != docker ]] && command -v java >/dev/null 2>&1 &&
